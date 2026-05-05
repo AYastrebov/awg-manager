@@ -196,6 +196,48 @@
 			notifications.error(`Удаление: ${(e as Error).message}`);
 		}
 	}
+
+	// ─── Header card helpers (Task 7) ───
+	function rxRateBps(): number {
+		if (!tunnel) return 0;
+		void trafficTick;
+		const r = getTrafficRates(tunnel.id);
+		if (!r || !r.rx.length) return 0;
+		return r.rx[r.rx.length - 1] ?? 0;
+	}
+
+	function txRateBps(): number {
+		if (!tunnel) return 0;
+		void trafficTick;
+		const r = getTrafficRates(tunnel.id);
+		if (!r || !r.tx.length) return 0;
+		return r.tx[r.tx.length - 1] ?? 0;
+	}
+
+	function uptimeText(): string {
+		if (!tunnel || !isRunning) return '—';
+		// stateInfo.connectedAt is the canonical "running since" timestamp on
+		// the single-tunnel API response (TS type doesn't list it; cast).
+		const startedAt = (tunnel.stateInfo as any)?.connectedAt;
+		if (!startedAt) return '—';
+		void trafficTick; // tick keeps uptime fresh between fetches
+		const sec = secondsSince(startedAt);
+		if (!sec) return '—';
+		return formatDuration(sec);
+	}
+
+	function pingMs(): number | null {
+		if (!tunnel) return null;
+		// pingCheckStatus is a polling store: { data: TunnelPingStatus[] | null }.
+		// Flat array, look up by tunnelId.
+		const list = $pingCheckStatus.data;
+		if (!Array.isArray(list)) return null;
+		const status = list.find((s) => s.tunnelId === tunnel!.id);
+		if (!status || status.status !== 'alive') return null;
+		const lat = status.lastLatency;
+		if (lat === undefined || lat === null || lat <= 0) return null;
+		return Math.round(lat);
+	}
 </script>
 
 <div class="ch-page-container">
@@ -258,7 +300,62 @@
 			</div>
 		</header>
 
-		<!-- Task 7: Header card -->
+		<div class="ch-card detail-header">
+			<div class="header-left">
+				<div class="title-row">
+					<StatusDot
+						variant={statusToVariant(tunnel.state)}
+						halo={isRunning}
+						ariaLabel={tunnel.state}
+					/>
+					<h1 class="ch-title-lg detail-name">{tunnel.name}</h1>
+				</div>
+				<span class="ch-mono meta">
+					{tunnel.peer?.endpoint || '—'} · {tunnel.backend ?? 'kernel'} · {(tunnel as any).awgVersion ?? '—'} · MTU {tunnel.interface?.mtu ?? '?'}
+				</span>
+				<div class="autostart">
+					<Toggle
+						size="sm"
+						checked={tunnel.enabled}
+						onchange={async (next) => {
+							if (!tunnel) return;
+							try {
+								if (next) await tunnels.start(tunnel.id);
+								else await tunnels.stop(tunnel.id);
+								await loadTunnel();
+							} catch (e) {
+								notifications.error(`Auto-start: ${(e as Error).message}`);
+							}
+						}}
+					/>
+					<span class="ch-mono autostart-label">auto-start: {tunnel.enabled ? 'ON' : 'OFF'}</span>
+				</div>
+			</div>
+			<div class="hstat">
+				<div class="hstat-label">throughput</div>
+				<div class="hstat-value">
+					↓{(rxRateBps() / 1024 / 1024).toFixed(1)}
+					<span class="hstat-sub-inline">/ ↑{(txRateBps() / 1024 / 1024).toFixed(1)}</span>
+				</div>
+				<div class="hstat-sub">MB/s · live</div>
+			</div>
+			<div class="hstat">
+				<div class="hstat-label">handshake</div>
+				<div class="hstat-value">{tunnel.stateInfo?.lastHandshake ? formatRelativeTime(tunnel.stateInfo.lastHandshake) : '—'}</div>
+				<div class="hstat-sub">последний обмен</div>
+			</div>
+			<div class="hstat">
+				<div class="hstat-label">uptime</div>
+				<div class="hstat-value">{uptimeText()}</div>
+				<div class="hstat-sub">с момента запуска</div>
+			</div>
+			<div class="hstat">
+				<div class="hstat-label">latency</div>
+				<div class="hstat-value">{pingMs() !== null ? `${pingMs()}ms` : '—'}</div>
+				<div class="hstat-sub">pingcheck</div>
+			</div>
+		</div>
+
 		<!-- Task 8: Throughput chart -->
 		<!-- Task 9: Bottom row -->
 	{/if}
@@ -334,5 +431,70 @@
 		background: white;
 		padding: 8px;
 		border-radius: 8px;
+	}
+
+	.detail-header {
+		padding: 24px;
+		margin-bottom: 16px;
+		display: grid;
+		grid-template-columns: 1.2fr repeat(4, 1fr);
+		gap: 24px;
+		align-items: center;
+	}
+	.header-left {
+		min-width: 0;
+	}
+	.title-row {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		margin-bottom: 10px;
+	}
+	.detail-name {
+		font: 700 26px/1.1 var(--font-sans);
+		letter-spacing: -0.6px;
+		color: var(--color-text-primary);
+		margin: 0;
+	}
+	.meta {
+		display: block;
+		font: 500 12px/1.4 var(--font-mono);
+		color: var(--color-text-muted);
+	}
+	.autostart {
+		margin-top: 12px;
+		display: flex;
+		align-items: center;
+		gap: 10px;
+	}
+	.autostart-label {
+		font: 500 11px/1 var(--font-mono);
+		color: var(--color-text-secondary);
+	}
+	.hstat {
+		padding-left: 24px;
+		border-left: 1px solid var(--color-border);
+	}
+	.hstat-label {
+		font: 400 11px/1 var(--font-mono);
+		color: var(--color-text-muted);
+		text-transform: uppercase;
+		letter-spacing: 0.8px;
+		margin-bottom: 8px;
+	}
+	.hstat-value {
+		font: 700 22px/1 var(--font-sans);
+		color: var(--color-yellow);
+		letter-spacing: -0.5px;
+	}
+	.hstat-sub-inline {
+		font-size: 16px;
+		color: var(--color-text-secondary);
+		font-weight: 600;
+	}
+	.hstat-sub {
+		font: 400 11px/1.4 var(--font-mono);
+		color: var(--color-text-muted);
+		margin-top: 6px;
 	}
 </style>
