@@ -1180,9 +1180,10 @@ label {
 
 /* ─── ClickHouse layout primitives ──────────────────── */
 .ch-page-container {
-	max-width: 1440px;
-	margin: 0 auto;
+	width: 100%;
+	margin: 0;
 	padding: 24px 32px 32px;
+	box-sizing: border-box;
 }
 
 .ch-page-header {
@@ -1209,4 +1210,5 @@ label {
 .ch-hairline-strong { border-color: var(--color-border-hover); }
 
 /* Body background already canvas via Tailwind; force here for safety */
+html { scrollbar-gutter: stable; }
 body, html { background: var(--color-canvas); }
