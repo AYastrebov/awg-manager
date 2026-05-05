@@ -34,3 +34,4 @@ export { default as Icon } from './Icon.svelte';
 export type { TablerIconName } from './Icon.svelte';
 export { default as Eyebrow } from './Eyebrow.svelte';
 export { default as Stat } from './Stat.svelte';
+export { default as StatStrip } from './StatStrip.svelte';
