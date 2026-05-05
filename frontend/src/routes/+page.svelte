@@ -451,9 +451,7 @@
 					</div>
 					{#each externalList as et (et.interfaceName)}
 						<div class="row external">
-							<span class="ext-marker" aria-hidden="true">
-								<Icon name="plus" size={14} color="var(--color-text-muted)" />
-							</span>
+							<span></span>
 							<div class="cell-name">
 								<div class="name-line">
 									<span class="ch-title-sm muted-name">{et.interfaceName}</span>
@@ -463,13 +461,12 @@
 									{/if}
 								</div>
 								<div class="ch-mono sub">
-									{et.publicKey ? et.publicKey.slice(0, 16) + '…' : '—'} · #{et.tunnelNumber}
+									{et.publicKey ? et.publicKey.slice(0, 16) + '…' : ''} · #{et.tunnelNumber}
 								</div>
 							</div>
 							<span class="ch-mono muted">не управляется</span>
 							<div class="ch-mono">
-								<div>{et.endpoint || '—'}</div>
-								<div class="muted">—</div>
+								{et.endpoint || ''}
 							</div>
 							<div class="cell-rate">
 								<Sparkline data={[]} width={92} height={28} />
@@ -478,13 +475,13 @@
 									<div>↑ {fmtBytes(et.txBytes)}</div>
 								</div>
 							</div>
-							<span class="ch-mono handshake">
-								{et.lastHandshake ? formatRelativeTime(et.lastHandshake) : '—'}
-							</span>
-							<span class="cell-backend muted">—</span>
-							<div class="row-actions">
-								<Button variant="primary" size="sm" onclick={() => openAdoptDialog(et)}>
-									Взять
+							<span></span>
+							<div class="adopt-action">
+								<Button variant="primary" size="md" onclick={() => openAdoptDialog(et)}>
+									{#snippet iconBefore()}
+										<Icon name="plus" size={14} color="var(--color-canvas)" />
+									{/snippet}
+									Взять под управление
 								</Button>
 							</div>
 						</div>
@@ -812,15 +809,10 @@
 		text-transform: uppercase;
 		color: var(--color-text-muted);
 	}
-	.row.external .ext-marker {
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		width: 32px;
-		height: 32px;
-		border: 1px dashed var(--color-border-hover);
-		border-radius: 50%;
-		background: transparent;
+	.row.external .adopt-action {
+		grid-column: 7 / span 2;
+		display: flex;
+		justify-content: flex-end;
 	}
 	.row.external .muted-name {
 		color: var(--color-text-muted);
