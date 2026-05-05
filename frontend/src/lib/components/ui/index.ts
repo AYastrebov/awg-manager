@@ -38,3 +38,4 @@ export { default as StatStrip } from './StatStrip.svelte';
 export { default as Sparkline } from './Sparkline.svelte';
 export { default as Tooltip } from './Tooltip.svelte';
 export { default as Breadcrumb, type BreadcrumbItem } from './Breadcrumb.svelte';
+export { default as CodeBlock, type CodeBlockLanguage } from './CodeBlock.svelte';
