@@ -32,7 +32,7 @@
 	import type { UpdateInfo } from '$lib/types';
 	import LoginForm from '$lib/components/LoginForm.svelte';
 	import { Modal } from '$lib/components/ui';
-	import { AppHeader } from '$lib/components/layout';
+	import { AppNav } from '$lib/components/layout';
 	import '../app.css';
 
 	let { children }: { children: Snippet } = $props();
@@ -308,19 +308,7 @@
 		<div class="loading-spinner"></div>
 	</div>
 {:else}
-	<AppHeader
-		authenticated={$isAuthenticated}
-		authDisabled={$auth.authDisabled}
-		username={$auth.login}
-		theme={$theme}
-		{currentVersion}
-		{hasUpdate}
-		{isPreRelease}
-		bind:mobileMenuOpen
-		onToggleTheme={() => theme.toggle()}
-		onLogout={() => auth.logout()}
-		onOpenDonate={() => (donateModalOpen = true)}
-	/>
+	<AppNav {currentVersion} bellCount={0} />
 
 	{#if !$isAuthenticated}
 		<LoginForm />
