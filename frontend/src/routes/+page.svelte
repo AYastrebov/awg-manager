@@ -408,42 +408,32 @@
 			</div>
 		{/if}
 
-		<div class="ch-card info-row">
-			<div class="info-feed">
-				<div class="info-head">
-					<Eyebrow>Live event stream · /api/events</Eyebrow>
-				</div>
-				<div class="ch-mono feed-empty">
-					<em class="muted-italic">SSE-feed подключается в следующей миле.</em>
-				</div>
-			</div>
-			<div class="info-system">
-				<Eyebrow>System</Eyebrow>
-				<div class="ch-mono system-list">
-					<div>
-						<span class="muted">kernel</span>
-						{sysInfo?.firmwareVersion || '—'} · OS{sysInfo?.isOS5 ? '5' : '4'}
-					</div>
-					<div>
-						<span class="muted">arch</span>
-						{sysInfo?.goArch || '—'}
-					</div>
-					<div>
-						<span class="muted">module</span> amneziawg
-						<span class={sysInfo?.kernelModuleLoaded ? 'ok' : 'muted'}>
-							{sysInfo?.kernelModuleLoaded
-								? 'loaded'
-								: sysInfo?.kernelModuleExists
-									? 'present'
-									: 'missing'}
-						</span>
-					</div>
-					<div>
-						<span class="muted">singbox</span>
-						{sysInfo?.singbox?.version || '—'}
-						{#if sysInfo?.singbox?.installed}<span class="ok">installed</span>{/if}
-					</div>
-				</div>
+		<div class="ch-card system-row">
+			<Eyebrow>System</Eyebrow>
+			<div class="ch-mono system-line">
+				<span
+					><span class="muted">kernel</span>
+					{sysInfo?.firmwareVersion || '—'} · OS{sysInfo?.isOS5 ? '5' : '4'}</span
+				>
+				<span
+					><span class="muted">arch</span>
+					{sysInfo?.goArch || '—'}</span
+				>
+				<span
+					><span class="muted">module</span> amneziawg
+					<span class={sysInfo?.kernelModuleLoaded ? 'ok' : 'muted'}>
+						{sysInfo?.kernelModuleLoaded
+							? 'loaded'
+							: sysInfo?.kernelModuleExists
+								? 'present'
+								: 'missing'}
+					</span>
+				</span>
+				<span
+					><span class="muted">singbox</span>
+					{sysInfo?.singbox?.version || '—'}
+					{#if sysInfo?.singbox?.installed}<span class="ok">installed</span>{/if}
+				</span>
 			</div>
 		</div>
 	{/if}
@@ -515,14 +505,26 @@
 		background: var(--color-yellow);
 		border-color: transparent;
 	}
+	.chip:hover {
+		background: var(--color-bg-tertiary);
+		color: var(--color-text-primary);
+	}
+	.chip.active:hover {
+		background: var(--color-yellow-active);
+		color: var(--color-canvas);
+	}
 
 	.table {
 		overflow: hidden;
 		margin-bottom: 20px;
+		width: 100%;
 	}
 	.row {
 		display: grid;
-		grid-template-columns: 36px 2fr 1fr 1.4fr 1.5fr 1fr 80px 60px;
+		grid-template-columns: 36px minmax(0, 2fr) 1fr minmax(0, 1.4fr) minmax(
+				0,
+				1.5fr
+			) 1fr 80px 60px;
 		padding: 14px 20px;
 		border-bottom: 1px solid var(--color-border);
 		align-items: center;
@@ -537,6 +539,12 @@
 		letter-spacing: 1.2px;
 		text-transform: uppercase;
 		color: var(--color-text-muted);
+		align-items: center;
+	}
+	.row.head > span {
+		display: flex;
+		align-items: center;
+		min-width: 0;
 	}
 	.text-right {
 		text-align: right;
@@ -613,10 +621,6 @@
 	.muted {
 		color: var(--color-text-muted);
 	}
-	.muted-italic {
-		color: var(--color-text-muted);
-		font-style: italic;
-	}
 	.cell-backend {
 		font: 600 13px/1 var(--font-sans);
 		color: var(--color-text-secondary);
@@ -655,38 +659,25 @@
 		text-align: center;
 	}
 
-	.info-row {
+	.system-row {
 		margin-top: 20px;
-		padding: 16px;
+		padding: 14px 20px;
 		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+	.system-line {
+		display: flex;
+		flex-wrap: wrap;
 		gap: 24px;
-	}
-	.info-feed {
-		flex: 1;
-	}
-	.info-head {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		margin-bottom: 10px;
-	}
-	.feed-empty {
-		padding: 8px 0;
-	}
-	.info-system {
-		width: 280px;
-		border-left: 1px solid var(--color-border);
-		padding-left: 24px;
-	}
-	.system-list {
-		font: 400 12px/1.8 var(--font-mono);
+		font: 400 12px/1.5 var(--font-mono);
 		color: var(--color-text-secondary);
-		margin-top: 10px;
 	}
-	.system-list .muted {
+	.system-line .muted {
 		color: var(--color-text-muted);
 	}
-	.system-list .ok {
+	.system-line .ok {
 		color: var(--color-success);
+		margin-left: 4px;
 	}
 </style>
