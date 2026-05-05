@@ -19,7 +19,7 @@
 		Icon
 	} from '$lib/components/ui';
 	import { AdoptTunnelDialog } from '$lib/components/tunnels';
-	import { formatRelativeTime } from '$lib/utils/format';
+	import { formatRelativeTime, formatDuration, secondsSince } from '$lib/utils/format';
 	import type { TunnelListItem, ExternalTunnel, TunnelPingStatus } from '$lib/types';
 
 	type TunnelTab = 'awg' | 'singbox' | 'system';
@@ -185,12 +185,14 @@
 		return Math.round(p.lastLatency);
 	}
 
-	// No backend source for true uptime% — TunnelListItem has only
-	// startedAt (last successful start), and there's no historical
-	// downtime accounting. Returns null until backend exposes a real
-	// uptime metric; UI falls back to "—".
-	function uptimePctFor(_t: TunnelListItem): number | null {
-		return null;
+	// startedAt comes from NDMS uptime (RCI show interface, surfaced as
+	// StateInfo.ConnectedAt in the API). Reactive via trafficTick so the
+	// column ticks forward alongside the rest of the page.
+	function uptimeFor(t: TunnelListItem): string {
+		void trafficTick;
+		if (!t.startedAt) return '—';
+		if (statusBucket(t.status) !== 'running') return '—';
+		return formatDuration(secondsSince(t.startedAt));
 	}
 
 	// Pingcheck KPI for the StatStrip — counts only enabled tunnels in the
@@ -432,16 +434,17 @@
 							</div>
 						</div>
 						<div class="cell-status">
-							<StatusDot
-								variant={statusToVariant(t.status)}
-								halo={statusBucket(t.status) === 'running'}
-								ariaLabel={t.status}
-							/>
-							{#if pingLatencyFor(t.id) !== null}
-								<span class="latency ch-mono">{pingLatencyFor(t.id)}ms</span>
-							{:else}
-								<span class="latency ch-mono">—</span>
-							{/if}
+							<div class="status-line">
+								<StatusDot
+									variant={statusToVariant(t.status)}
+									halo={statusBucket(t.status) === 'running'}
+									ariaLabel={t.status}
+								/>
+								<span class="status-text ch-mono">{t.status.toUpperCase()}</span>
+							</div>
+							<span class="status-meta ch-mono">
+								{#if pingLatencyFor(t.id) !== null}{pingLatencyFor(t.id)}ms{:else}—{/if}
+							</span>
 						</div>
 						<div class="ch-mono">
 							<div>{t.endpoint || '—'}</div>
@@ -465,7 +468,7 @@
 							{t.lastHandshake ? formatRelativeTime(t.lastHandshake) : '—'}
 						</span>
 						<span class="cell-uptime">
-							{uptimePctFor(t) !== null ? `${uptimePctFor(t)!.toFixed(1)}%` : '—'}
+							{uptimeFor(t)}
 						</span>
 						<div class="row-actions">
 							<button
@@ -748,9 +751,22 @@
 		align-items: flex-start;
 		min-width: 0;
 	}
-	.cell-status .latency {
-		font-size: 11px;
+	.cell-status .status-line {
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
+		min-height: 18px;
+	}
+	.cell-status .status-text {
+		font: 500 11px/1 var(--font-mono);
+		color: var(--color-text-secondary);
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+	}
+	.cell-status .status-meta {
+		font: 400 11px/1.4 var(--font-mono);
 		color: var(--color-text-muted);
+		min-height: 14px;
 	}
 
 	.cell-rate {
