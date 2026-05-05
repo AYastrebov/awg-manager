@@ -238,6 +238,31 @@
 		if (lat === undefined || lat === null || lat <= 0) return null;
 		return Math.round(lat);
 	}
+
+	// ─── Throughput chart helpers (Task 8) ───
+	function chartRx(): number[] {
+		if (!tunnel) return [];
+		void trafficTick;
+		const r = getTrafficRates(tunnel.id);
+		return r?.rx ?? [];
+	}
+
+	function chartTx(): number[] {
+		if (!tunnel) return [];
+		void trafficTick;
+		const r = getTrafficRates(tunnel.id);
+		return r?.tx ?? [];
+	}
+
+	function timeAxisLabels(): string[] {
+		const now = new Date();
+		const labels: string[] = [];
+		for (let i = 6; i >= 0; i--) {
+			const t = new Date(now.getTime() - i * 10 * 60_000);
+			labels.push(`${t.getHours().toString().padStart(2, '0')}:${t.getMinutes().toString().padStart(2, '0')}`);
+		}
+		return labels;
+	}
 </script>
 
 <div class="ch-page-container">
@@ -357,6 +382,44 @@
 		</div>
 
 		<!-- Task 8: Throughput chart -->
+		<div class="ch-card throughput-card">
+			<div class="chart-header">
+				<div class="chart-title">
+					<Eyebrow>Throughput · 60 минут</Eyebrow>
+					<div class="chart-legend">
+						RX <span class="rx-num">{(rxRateBps() / 1024 / 1024).toFixed(1)} MB/s</span>
+						·
+						TX <span class="tx-num">{(txRateBps() / 1024 / 1024).toFixed(1)} MB/s</span>
+					</div>
+				</div>
+				<div class="range-chips">
+					{#each ['5m', '1h', '6h', '24h', '7d'] as r (r)}
+						{#if r === '1h'}
+							<span class="chip active" data-r={r}>{r}</span>
+						{:else}
+							<Tooltip text="Доступен только 1h-окно">
+								<span class="chip disabled" data-r={r}>{r}</span>
+							</Tooltip>
+						{/if}
+					{/each}
+				</div>
+			</div>
+
+			<div class="chart-body">
+				<TrafficChart
+					rxRates={chartRx()}
+					txRates={chartTx()}
+					height={220}
+				/>
+			</div>
+
+			<div class="time-axis">
+				{#each timeAxisLabels() as label, i (i)}
+					<span>{label}</span>
+				{/each}
+			</div>
+		</div>
+
 		<!-- Task 9: Bottom row -->
 	{/if}
 </div>
@@ -496,5 +559,72 @@
 		font: 400 11px/1.4 var(--font-mono);
 		color: var(--color-text-muted);
 		margin-top: 6px;
+	}
+
+	.throughput-card {
+		padding: 20px;
+		margin-bottom: 16px;
+	}
+	.chart-header {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		margin-bottom: 16px;
+		gap: 16px;
+	}
+	.chart-title {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.chart-legend {
+		font: 500 13px/1.4 var(--font-sans);
+		color: var(--color-text-muted);
+	}
+	.chart-legend .rx-num {
+		color: var(--color-yellow);
+		font-family: var(--font-mono);
+	}
+	.chart-legend .tx-num {
+		color: var(--color-info);
+		font-family: var(--font-mono);
+	}
+
+	.range-chips {
+		display: flex;
+		gap: 4px;
+		padding: 4px;
+		background: var(--color-bg-hover);
+		border-radius: 6px;
+	}
+	.range-chips .chip {
+		padding: 4px 10px;
+		font: 600 11px/1 var(--font-sans);
+		border-radius: 4px;
+		cursor: pointer;
+		user-select: none;
+		background: transparent;
+		color: var(--color-text-secondary);
+		transition: background 120ms ease, color 120ms ease;
+	}
+	.range-chips .chip.active {
+		background: var(--color-yellow);
+		color: var(--color-canvas);
+	}
+	.range-chips .chip.disabled {
+		opacity: 0.45;
+		cursor: not-allowed;
+	}
+
+	.chart-body {
+		height: 220px;
+	}
+
+	.time-axis {
+		display: flex;
+		justify-content: space-between;
+		margin-top: 12px;
+		font: 500 11px/1 var(--font-mono);
+		color: var(--color-text-muted);
 	}
 </style>
