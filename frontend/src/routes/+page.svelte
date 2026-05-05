@@ -392,7 +392,7 @@
 					<span>Endpoint · IP</span>
 					<span>Throughput</span>
 					<span>Handshake</span>
-					<span class="text-right">Uptime</span>
+					<span class="text-center">Uptime</span>
 					<span></span>
 				</div>
 				{#each visibleTunnels as t (t.id)}
@@ -699,6 +699,9 @@
 	.text-right {
 		text-align: right;
 	}
+	.text-center {
+		text-align: center;
+	}
 
 	.cell-name {
 		display: flex;
@@ -787,7 +790,7 @@
 	.cell-uptime {
 		font: 600 13px/1 var(--font-mono);
 		color: var(--color-text-secondary);
-		text-align: right;
+		text-align: center;
 	}
 
 	.row-actions {
