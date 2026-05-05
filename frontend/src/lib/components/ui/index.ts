@@ -32,3 +32,4 @@ export type { StatTile, StatTileAccent } from './StatRow.svelte';
 export { default as LatencySparkline } from './LatencySparkline.svelte';
 export { default as Icon } from './Icon.svelte';
 export type { TablerIconName } from './Icon.svelte';
+export { default as Eyebrow } from './Eyebrow.svelte';
