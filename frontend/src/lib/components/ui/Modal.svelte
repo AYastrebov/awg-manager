@@ -86,13 +86,13 @@
         align-items: center;
         justify-content: center;
         padding: 1rem;
-        background: rgba(0, 0, 0, 0.5);
+        background: rgb(0 0 0 / 0.7);
         overflow-y: auto;
     }
 
     .modal-card {
-        background: var(--bg-secondary);
-        border: 1px solid var(--border);
+        background: var(--color-bg-tertiary);
+        border: 1px solid var(--color-border);
         border-radius: var(--radius);
         width: 100%;
         /* min-width: 0 + box-sizing keeps the card from being inflated
