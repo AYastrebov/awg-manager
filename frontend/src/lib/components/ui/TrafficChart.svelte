@@ -160,8 +160,8 @@
 				y2={gradY2}
 				gradientUnits="userSpaceOnUse"
 			>
-				<stop offset="0%" stop-color="var(--accent, #60a5fa)" stop-opacity="0.55" />
-				<stop offset="100%" stop-color="var(--accent, #60a5fa)" stop-opacity="0" />
+				<stop offset="0%" stop-color="var(--color-yellow)" stop-opacity="0.22" />
+				<stop offset="100%" stop-color="var(--color-yellow)" stop-opacity="0" />
 			</linearGradient>
 			<linearGradient
 				id="tx-grad-card"
@@ -171,8 +171,8 @@
 				y2={gradY2}
 				gradientUnits="userSpaceOnUse"
 			>
-				<stop offset="0%" stop-color="var(--success, #4ade80)" stop-opacity="0.55" />
-				<stop offset="100%" stop-color="var(--success, #4ade80)" stop-opacity="0" />
+				<stop offset="0%" stop-color="var(--color-info)" stop-opacity="0.18" />
+				<stop offset="100%" stop-color="var(--color-info)" stop-opacity="0" />
 			</linearGradient>
 		</defs>
 
@@ -182,7 +182,7 @@
 			<path
 				d={rxLine}
 				fill="none"
-				stroke="var(--accent, #60a5fa)"
+				stroke="var(--color-yellow)"
 				stroke-width="1.4"
 				stroke-linejoin="round"
 				stroke-linecap="round"
@@ -191,7 +191,7 @@
 			<path
 				d={txLine}
 				fill="none"
-				stroke="var(--success, #4ade80)"
+				stroke="var(--color-info)"
 				stroke-width="1.2"
 				stroke-linejoin="round"
 				stroke-linecap="round"
@@ -252,11 +252,11 @@
 	}
 
 	.rate.rx {
-		color: var(--accent, #60a5fa);
+		color: var(--color-yellow);
 	}
 
 	.rate.tx {
-		color: var(--success, #4ade80);
+		color: var(--color-info);
 	}
 
 	.total {
