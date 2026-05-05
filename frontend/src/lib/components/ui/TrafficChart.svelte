@@ -221,7 +221,7 @@
 	}
 
 	.traffic-chart.clickable:hover {
-		background: rgba(96, 165, 250, 0.06);
+		background-color: color-mix(in srgb, var(--color-yellow) 6%, transparent);
 	}
 
 	.chart-top {
