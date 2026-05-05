@@ -263,6 +263,32 @@
 		}
 		return labels;
 	}
+
+	// ─── Monitoring targets helpers (Task 9) ───
+	type MonitoringTargetRow = {
+		targetId: string;
+		name: string;
+		latencyMs: number | null;
+		ok: boolean;
+		ts: string;
+	};
+
+	function monitoringTargets(): MonitoringTargetRow[] {
+		if (!tunnel) return [];
+		const snap = $monitoringStore.snapshot;
+		if (!snap) return [];
+		const cellsForTunnel = snap.cells.filter((c) => c.tunnelId === tunnel!.id);
+		if (cellsForTunnel.length === 0) return [];
+		const targetMap = new Map<string, { id: string; host: string; name: string }>();
+		for (const t of snap.targets) targetMap.set(t.id, t);
+		return cellsForTunnel.map((c) => ({
+			targetId: c.targetId,
+			name: targetMap.get(c.targetId)?.name ?? c.targetId,
+			latencyMs: c.latencyMs,
+			ok: c.ok,
+			ts: c.ts
+		}));
+	}
 </script>
 
 <div class="ch-page-container">
@@ -421,6 +447,76 @@
 		</div>
 
 		<!-- Task 9: Bottom row -->
+		<div class="bottom-row">
+			<div class="ch-card targets-card">
+				<div class="targets-head">
+					<div>
+						<Eyebrow>Цели мониторинга · {monitoringTargets().length}</Eyebrow>
+						<div class="ch-caption targets-sub">Что проверяет pingcheck через этот туннель</div>
+					</div>
+				</div>
+				{#if monitoringTargets().length === 0}
+					<div class="empty">
+						Pingcheck отключён или нет данных.
+						<a
+							class="link"
+							href={`/tunnels/${tunnelId}/edit?tab=routing`}
+							onclick={(e) => {
+								e.preventDefault();
+								goto(`/tunnels/${tunnelId}/edit?tab=routing`);
+							}}
+						>
+							Включить
+						</a>
+					</div>
+				{:else}
+					<div class="targets-table">
+						<div class="trow head">
+							<span>Target</span>
+							<span>Latency</span>
+							<span>Last check</span>
+							<span>Status</span>
+						</div>
+						{#each monitoringTargets() as row (row.targetId)}
+							<div class="trow">
+								<span class="target-name">{row.name}</span>
+								<span class="ch-mono">{row.latencyMs !== null ? `${row.latencyMs}ms` : '—'}</span>
+								<span class="ch-mono muted">{formatRelativeTime(row.ts)}</span>
+								<StatusDot
+									variant={row.ok ? 'success' : 'error'}
+									halo={row.ok}
+									ariaLabel={row.ok ? 'alive' : 'failed'}
+								/>
+							</div>
+						{/each}
+					</div>
+				{/if}
+			</div>
+
+			<div class="ch-card conf-card">
+				<div class="conf-head">
+					<div class="dots-row">
+						<span class="dot"></span><span class="dot"></span><span class="dot"></span>
+					</div>
+					<span class="ch-mono filename">{tunnel.name}.conf</span>
+					<span class="ch-mono synced">● synced</span>
+				</div>
+				<div class="conf-body">
+					{#if tunnel.configPreview}
+						<CodeBlock text={tunnel.configPreview} language="awg-conf" lineNumbers />
+					{:else}
+						<div class="empty">Превью конфига недоступно.</div>
+					{/if}
+				</div>
+				<div class="conf-foot">
+					<span class="ch-mono">{tunnel.configPreview ? tunnel.configPreview.split('\n').length : 0} строк · live</span>
+					<Button variant="secondary" size="sm" onclick={downloadConf}>
+						{#snippet iconBefore()}<Icon name="download" size={12} />{/snippet}
+						Скачать
+					</Button>
+				</div>
+			</div>
+		</div>
 	{/if}
 </div>
 
@@ -624,6 +720,115 @@
 		display: flex;
 		justify-content: space-between;
 		margin-top: 12px;
+		font: 500 11px/1 var(--font-mono);
+		color: var(--color-text-muted);
+	}
+
+	/* Task 9: Bottom row */
+	.bottom-row {
+		display: grid;
+		grid-template-columns: 1.4fr 1fr;
+		gap: 16px;
+	}
+
+	/* Targets card */
+	.targets-card {
+		overflow: hidden;
+	}
+	.targets-head {
+		padding: 16px 20px;
+		border-bottom: 1px solid var(--color-border);
+	}
+	.targets-sub {
+		margin-top: 4px;
+	}
+	.targets-table {
+		display: flex;
+		flex-direction: column;
+	}
+	.trow {
+		display: grid;
+		grid-template-columns: 2fr 1fr 1.2fr 80px;
+		padding: 12px 20px;
+		border-bottom: 1px solid var(--color-border);
+		align-items: center;
+		gap: 12px;
+	}
+	.trow:last-child {
+		border-bottom: none;
+	}
+	.trow.head {
+		font: 600 10px/1 var(--font-sans);
+		letter-spacing: 1.2px;
+		text-transform: uppercase;
+		color: var(--color-text-muted);
+	}
+	.target-name {
+		font: 600 13px/1.2 var(--font-sans);
+		color: var(--color-text-primary);
+	}
+	.muted {
+		color: var(--color-text-muted);
+	}
+	.empty {
+		padding: 24px;
+		text-align: center;
+		color: var(--color-text-muted);
+		font-size: 13px;
+	}
+	.empty .link {
+		color: var(--color-yellow);
+		text-decoration: none;
+		margin-left: 6px;
+	}
+	.empty .link:hover {
+		text-decoration: underline;
+	}
+
+	/* Conf card */
+	.conf-card {
+		overflow: hidden;
+		display: flex;
+		flex-direction: column;
+	}
+	.conf-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		padding: 12px 16px;
+		border-bottom: 1px solid var(--color-border);
+	}
+	.dots-row {
+		display: flex;
+		gap: 6px;
+	}
+	.dots-row .dot {
+		width: 9px;
+		height: 9px;
+		border-radius: 9999px;
+		background: var(--color-border-hover);
+	}
+	.filename {
+		font: 500 12px/1 var(--font-mono);
+		color: var(--color-text-muted);
+	}
+	.synced {
+		font: 500 11px/1 var(--font-mono);
+		color: var(--color-success);
+	}
+	.conf-body {
+		flex: 1;
+		max-height: 360px;
+		overflow: auto;
+	}
+	.conf-foot {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		padding: 10px 16px;
+		border-top: 1px solid var(--color-border);
+	}
+	.conf-foot .ch-mono {
 		font: 500 11px/1 var(--font-mono);
 		color: var(--color-text-muted);
 	}
