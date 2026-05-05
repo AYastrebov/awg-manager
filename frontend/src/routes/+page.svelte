@@ -521,7 +521,7 @@
 	}
 	.row {
 		display: grid;
-		grid-template-columns: 60px minmax(0, 2fr) 1fr minmax(0, 1.4fr) minmax(
+		grid-template-columns: 32px minmax(0, 2fr) 1fr minmax(0, 1.4fr) minmax(
 				0,
 				1.5fr
 			) 1fr 80px 60px;
@@ -679,5 +679,17 @@
 	.system-line .ok {
 		color: var(--color-success);
 		margin-left: 4px;
+	}
+
+	/* Centered toggle in tunnel rows: hide spinner-slot (the asymmetric pre-slider
+	   placeholder) so the slider sits flush in its column. Loading state will
+	   show the spinner where the slider was — acceptable tradeoff for alignment.
+	   Scoped via :global() because Svelte's scoped CSS doesn't reach into
+	   third-party Toggle internals. */
+	.row :global(.toggle-spinner-slot) {
+		display: none;
+	}
+	.row :global(.toggle-container) {
+		justify-self: center;
 	}
 </style>
