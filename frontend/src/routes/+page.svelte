@@ -17,7 +17,8 @@
 		StatStrip,
 		Sparkline,
 		Eyebrow,
-		Icon
+		Icon,
+		Tooltip
 	} from '$lib/components/ui';
 	import { AdoptTunnelDialog } from '$lib/components/tunnels';
 	import { formatRelativeTime, formatDuration, secondsSince } from '$lib/utils/format';
@@ -471,16 +472,20 @@
 							{uptimeFor(t)}
 						</span>
 						<div class="row-actions">
-							<button
-								class="icon-btn"
-								onclick={() => openDetail(t.id)}
-								aria-label="Открыть детали"
-							>
-								<Icon name="chart-line" size={14} color="var(--color-text-muted)" />
-							</button>
-							<button class="icon-btn" aria-label="Опции">
-								<Icon name="dots-vertical" size={14} color="var(--color-text-muted)" />
-							</button>
+							<Tooltip text="Подробнее">
+								<button
+									class="icon-btn"
+									onclick={() => openDetail(t.id)}
+									aria-label="Подробнее"
+								>
+									<Icon name="chart-line" size={14} color="var(--color-text-muted)" />
+								</button>
+							</Tooltip>
+							<Tooltip text="Опции">
+								<button class="icon-btn" aria-label="Опции">
+									<Icon name="dots-vertical" size={14} color="var(--color-text-muted)" />
+								</button>
+							</Tooltip>
 						</div>
 					</div>
 				{/each}
@@ -553,9 +558,11 @@
 								{st.status === 'up' && st.uptime ? formatDuration(st.uptime) : '—'}
 							</span>
 							<div class="row-actions">
-								<button class="icon-btn" aria-label="Опции">
-									<Icon name="dots-vertical" size={14} color="var(--color-text-muted)" />
-								</button>
+								<Tooltip text="Опции">
+									<button class="icon-btn" aria-label="Опции">
+										<Icon name="dots-vertical" size={14} color="var(--color-text-muted)" />
+									</button>
+								</Tooltip>
 							</div>
 						</div>
 					{/each}
