@@ -121,7 +121,7 @@
 
   .variant-primary {
     background: var(--color-accent);
-    color: white;
+    color: var(--color-on-yellow);
   }
   .variant-primary:hover:not(:disabled):not(.is-disabled) {
     background: var(--color-accent-hover);
