@@ -41,14 +41,8 @@
   let parsed = $derived(lines.map((l) => tokenize(l, language)));
 </script>
 
-<pre class="codeblock {cls}" data-line-numbers={lineNumbers ? 'true' : 'false'}>
-{#each parsed as tokens, i (i)}
-<span class="line">
-  {#if lineNumbers}<span class="ln">{i + 1}</span>{/if}
-  <span class="content">{#each tokens as t}<span class={`tok ${t.kind}`}>{t.text}</span>{/each}</span>
-</span>
-{/each}
-</pre>
+<pre class="codeblock {cls}" data-line-numbers={lineNumbers ? 'true' : 'false'}>{#each parsed as tokens, i (i)}<span class="line">{#if lineNumbers}<span class="ln">{i + 1}</span>{/if}<span class="content">{#each tokens as t}<span class={`tok ${t.kind}`}>{t.text}</span>{/each}</span>
+</span>{/each}</pre>
 
 <style>
   .codeblock {
