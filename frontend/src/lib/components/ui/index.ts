@@ -37,3 +37,4 @@ export { default as Stat } from './Stat.svelte';
 export { default as StatStrip } from './StatStrip.svelte';
 export { default as Sparkline } from './Sparkline.svelte';
 export { default as Tooltip } from './Tooltip.svelte';
+export { default as Breadcrumb, type BreadcrumbItem } from './Breadcrumb.svelte';
