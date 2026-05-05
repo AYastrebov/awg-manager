@@ -1209,4 +1209,4 @@ label {
 .ch-hairline-strong { border-color: var(--color-border-hover); }
 
 /* Body background already canvas via Tailwind; force here for safety */
-body, html { background: var(--color-canvas); color: var(--color-text-secondary); }
+body, html { background: var(--color-canvas); }
