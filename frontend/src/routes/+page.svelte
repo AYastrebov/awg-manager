@@ -521,7 +521,7 @@
 	}
 	.row {
 		display: grid;
-		grid-template-columns: 36px minmax(0, 2fr) 1fr minmax(0, 1.4fr) minmax(
+		grid-template-columns: 60px minmax(0, 2fr) 1fr minmax(0, 1.4fr) minmax(
 				0,
 				1.5fr
 			) 1fr 80px 60px;

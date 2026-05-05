@@ -35,7 +35,17 @@
     <path d={path} fill="none" stroke={color} stroke-width="1.5" />
   </svg>
 {:else}
-  <span style="display:inline-block;width:{width}px;height:{height}px"></span>
+  <svg {width} {height} class="sparkline" aria-hidden="true">
+    <line
+      x1="0"
+      y1={height / 2}
+      x2={width}
+      y2={height / 2}
+      stroke="var(--color-border-hover)"
+      stroke-width="1"
+      stroke-dasharray="3 3"
+    />
+  </svg>
 {/if}
 
 <style>
