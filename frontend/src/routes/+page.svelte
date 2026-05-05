@@ -6,6 +6,7 @@
 	import { notifications } from '$lib/stores/notifications';
 	import { feedTraffic, getTrafficRates, subscribeTraffic } from '$lib/stores/traffic';
 	import { singboxTunnels } from '$lib/stores/singbox';
+	import { pingCheckStatus } from '$lib/stores/pingcheck';
 	import {
 		Tabs,
 		Button,
@@ -19,7 +20,7 @@
 	} from '$lib/components/ui';
 	import { AdoptTunnelDialog } from '$lib/components/tunnels';
 	import { formatRelativeTime } from '$lib/utils/format';
-	import type { TunnelListItem, ExternalTunnel } from '$lib/types';
+	import type { TunnelListItem, ExternalTunnel, TunnelPingStatus } from '$lib/types';
 
 	type TunnelTab = 'awg' | 'singbox' | 'system';
 	type FilterChip = 'all' | 'running' | 'broken' | 'stopped';
@@ -28,6 +29,7 @@
 	// last unsubscribe stops polling.
 	let unsubTunnels: (() => void) | undefined;
 	let unsubSingboxTunnels: (() => void) | undefined;
+	let unsubPingcheck: (() => void) | undefined;
 	// Traffic store is callback-based, not a Svelte store. We keep a tick
 	// counter that the listener bumps on every feedTraffic() call so any
 	// $derived that reads getTrafficRates() re-runs in step with live data.
@@ -37,6 +39,7 @@
 	onMount(() => {
 		unsubTunnels = tunnels.subscribe(() => {});
 		unsubSingboxTunnels = singboxTunnels.subscribe(() => {});
+		unsubPingcheck = pingCheckStatus.subscribe(() => {});
 		unsubTraffic = subscribeTraffic(() => {
 			trafficTick += 1;
 		});
@@ -44,6 +47,7 @@
 	onDestroy(() => {
 		unsubTunnels?.();
 		unsubSingboxTunnels?.();
+		unsubPingcheck?.();
 		unsubTraffic?.();
 	});
 
@@ -161,18 +165,45 @@
 		return { mbps: max / (1024 * 1024), tunnel: name };
 	});
 
-	let mostRecentHandshake = $derived.by(() => {
-		for (const t of awgList) {
-			if (statusBucket(t.status) !== 'running') continue;
-			if (t.lastHandshake) {
-				return {
-					value: formatRelativeTime(t.lastHandshake),
-					name: t.name + (t.awgVersion ? ' · ' + t.awgVersion : '')
-				};
-			}
-		}
-		return { value: '—', name: '' };
+	// Per-tunnel latency (ms) sourced from /api/pingcheck/status; index by
+	// tunnelId for O(1) lookup in the row template. Re-derives whenever the
+	// pingcheck poll fires.
+	let pingMap = $derived.by(() => {
+		const list = $pingCheckStatus.data ?? [];
+		const map = new Map<string, TunnelPingStatus>();
+		for (const p of list) map.set(p.tunnelId, p);
+		return map;
 	});
+
+	function pingLatencyFor(id: string): number | null {
+		const p = pingMap.get(id);
+		if (!p) return null;
+		// lastLatency=0 with status=alive = "< 1ms"; treat as no-data when
+		// the tunnel isn't actively reporting (recovering/disabled/stopped).
+		if (p.status !== 'alive') return null;
+		if (typeof p.lastLatency !== 'number' || p.lastLatency <= 0) return null;
+		return Math.round(p.lastLatency);
+	}
+
+	// No backend source for true uptime% — TunnelListItem has only
+	// startedAt (last successful start), and there's no historical
+	// downtime accounting. Returns null until backend exposes a real
+	// uptime metric; UI falls back to "—".
+	function uptimePctFor(_t: TunnelListItem): number | null {
+		return null;
+	}
+
+	// Pingcheck KPI for the StatStrip — counts only enabled tunnels in the
+	// denominator so disabled-by-config doesn't drag the ratio down.
+	let aliveCount = $derived(
+		awgList.filter((t) => t.pingCheck?.status === 'alive').length
+	);
+	let totalPingcheckCount = $derived(
+		awgList.filter((t) => t.pingCheck?.status !== 'disabled').length
+	);
+	let recoveringCount = $derived(
+		awgList.filter((t) => t.pingCheck?.status === 'recovering').length
+	);
 
 	function fmtBytes(b: number): string {
 		if (!b) return '0 B';
@@ -317,11 +348,20 @@
 					label={`${fmtBytes(totalRx + totalTx).split(' ')[1] || ''} обмен с момента запуска`}
 					sub={`↓ ${fmtBytes(totalRx)}  ↑ ${fmtBytes(totalTx)}`}
 				/>
-				<Stat
-					value={mostRecentHandshake.value}
-					label="последний handshake"
-					sub={mostRecentHandshake.name || '—'}
-				/>
+				<a
+					href="/monitoring"
+					class="stat-link"
+					onclick={(e) => {
+						e.preventDefault();
+						goto('/monitoring');
+					}}
+				>
+					<Stat
+						value={`${aliveCount}/${totalPingcheckCount}`}
+						label="туннелей alive"
+						sub={`${recoveringCount} recovering · настроить →`}
+					/>
+				</a>
 			</StatStrip>
 		</div>
 
@@ -354,7 +394,7 @@
 					<span>Endpoint · IP</span>
 					<span>Throughput</span>
 					<span>Handshake</span>
-					<span class="text-right">Backend</span>
+					<span class="text-right">Uptime</span>
 					<span></span>
 				</div>
 				{#each visibleTunnels as t (t.id)}
@@ -397,7 +437,11 @@
 								halo={statusBucket(t.status) === 'running'}
 								ariaLabel={t.status}
 							/>
-							<span class="status-label">{t.status}</span>
+							{#if pingLatencyFor(t.id) !== null}
+								<span class="latency ch-mono">{pingLatencyFor(t.id)}ms</span>
+							{:else}
+								<span class="latency ch-mono">—</span>
+							{/if}
 						</div>
 						<div class="ch-mono">
 							<div>{t.endpoint || '—'}</div>
@@ -420,7 +464,9 @@
 						<span class="ch-mono handshake">
 							{t.lastHandshake ? formatRelativeTime(t.lastHandshake) : '—'}
 						</span>
-						<span class="cell-backend">{t.backend ?? '—'}</span>
+						<span class="cell-uptime">
+							{uptimePctFor(t) !== null ? `${uptimePctFor(t)!.toFixed(1)}%` : '—'}
+						</span>
 						<div class="row-actions">
 							<button
 								class="icon-btn"
@@ -697,14 +743,14 @@
 
 	.cell-status {
 		display: flex;
-		align-items: center;
-		gap: 8px;
+		flex-direction: column;
+		gap: 4px;
+		align-items: flex-start;
 		min-width: 0;
 	}
-	.status-label {
-		font: 500 12px/1 var(--font-mono);
+	.cell-status .latency {
+		font-size: 11px;
 		color: var(--color-text-muted);
-		text-transform: lowercase;
 	}
 
 	.cell-rate {
@@ -726,12 +772,21 @@
 	.muted {
 		color: var(--color-text-muted);
 	}
-	.cell-backend {
-		font: 600 13px/1 var(--font-sans);
+	.cell-uptime {
+		font: 600 13px/1 var(--font-mono);
 		color: var(--color-text-secondary);
 		text-align: right;
-		text-transform: uppercase;
-		letter-spacing: 0.5px;
+	}
+
+	/* StatStrip chip → /monitoring. display:contents lets the wrapped
+	   <Stat> participate in the strip's grid as if no anchor existed. */
+	.stat-link {
+		display: contents;
+		cursor: pointer;
+		text-decoration: none;
+	}
+	.stat-link:hover :global(.stat .value) {
+		color: var(--color-yellow-active);
 	}
 
 	.row-actions {
