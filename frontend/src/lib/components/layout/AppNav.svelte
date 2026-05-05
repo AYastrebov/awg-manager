@@ -15,7 +15,7 @@
 
   const NAV_ITEMS: NavItem[] = [
     { id: 'tunnels',     label: 'Туннели',       icon: 'plug',         href: '/',            matches: (p) => p === '/' || p.startsWith('/tunnels') || p.startsWith('/system-tunnels') || p.startsWith('/subscriptions') },
-    { id: 'servers',     label: 'Серверы',       icon: 'git-branch',   href: '/servers',     matches: (p) => p.startsWith('/servers') },
+    { id: 'servers',     label: 'Серверы',       icon: 'server',       href: '/servers',     matches: (p) => p.startsWith('/servers') },
     { id: 'routing',     label: 'Маршрутизация', icon: 'git-branch',   href: '/routing',     matches: (p) => p.startsWith('/routing') || p.startsWith('/singbox') },
     { id: 'monitoring',  label: 'Мониторинг',    icon: 'activity',     href: '/monitoring',  matches: (p) => p.startsWith('/monitoring') || p.startsWith('/pingcheck') || p.startsWith('/connections') },
     { id: 'diagnostics', label: 'Диагностика',   icon: 'stethoscope',  href: '/diagnostics', matches: (p) => p.startsWith('/diagnostics') },
