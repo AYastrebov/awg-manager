@@ -1,3 +1,33 @@
 {
-  "icons": []
+  "icons": [
+    "plug",
+    "git-branch",
+    "activity",
+    "stethoscope",
+    "notes",
+    "terminal-2",
+    "settings",
+    "bell",
+    "search",
+    "download",
+    "upload",
+    "plus",
+    "refresh",
+    "layout-grid",
+    "list",
+    "dots-vertical",
+    "chart-line",
+    "chevron-down",
+    "chevron-up",
+    "x",
+    "check",
+    "external-link",
+    "trash",
+    "copy",
+    "filter",
+    "eye",
+    "eye-off",
+    "pencil",
+    "lock"
+  ]
 }
