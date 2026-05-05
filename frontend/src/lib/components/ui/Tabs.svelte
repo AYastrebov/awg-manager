@@ -224,7 +224,7 @@
     }
 
     .tab.active {
-        color: var(--text-primary);
+        color: var(--color-yellow);
         border-bottom-color: var(--accent);
     }
 
@@ -240,11 +240,12 @@
         color: var(--text-muted);
         font-size: 0.6875rem;
         font-weight: 600;
+        font-family: var(--font-mono);
     }
 
     .tab.active .tab-badge {
         background: var(--accent);
-        color: #fff;
+        color: var(--color-on-yellow);
     }
 
     .tab-badge.success {
