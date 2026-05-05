@@ -347,7 +347,46 @@
 						<Icon name="dots-vertical" size={14} />
 					</button>
 				</Tooltip>
-				<!-- Task 10 fills dots popover here -->
+				{#if dotsOpen}
+					<button
+						class="dots-backdrop"
+						onclick={() => (dotsOpen = false)}
+						aria-label="Закрыть меню"
+					></button>
+					<div class="dots-menu" role="menu">
+						<button
+							class="dots-item"
+							onclick={() => {
+								dotsOpen = false;
+								replaceOpen = true;
+							}}
+						>
+							<Icon name="upload" size={14} />
+							Заменить конфиг
+						</button>
+						<button
+							class="dots-item"
+							onclick={() => {
+								dotsOpen = false;
+								goto(`/tunnels/${tunnelId}/edit?tab=routing`);
+							}}
+						>
+							<Icon name="git-branch" size={14} />
+							Маршрутизация
+						</button>
+						<div class="dots-divider"></div>
+						<button
+							class="dots-item danger"
+							onclick={() => {
+								dotsOpen = false;
+								deleteTunnel();
+							}}
+						>
+							<Icon name="trash" size={14} color="var(--color-error)" />
+							Удалить
+						</button>
+					</div>
+				{/if}
 			</div>
 		</header>
 
@@ -576,6 +615,59 @@
 	.dots-trigger {
 		height: 32px;
 		padding: 0 8px;
+	}
+	.dots-backdrop {
+		position: fixed;
+		inset: 0;
+		background: transparent;
+		border: none;
+		padding: 0;
+		cursor: default;
+		z-index: 50;
+	}
+	.dots-menu {
+		position: absolute;
+		top: 100%;
+		right: 0;
+		margin-top: 6px;
+		min-width: 220px;
+		background: var(--color-bg-tertiary);
+		border: 1px solid var(--color-border-hover);
+		border-radius: 8px;
+		padding: 6px;
+		z-index: 51;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+	.dots-item {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 8px 10px;
+		background: transparent;
+		border: none;
+		cursor: pointer;
+		text-align: left;
+		font: 500 13px/1 var(--font-sans);
+		color: var(--color-text-secondary);
+		border-radius: 4px;
+	}
+	.dots-item:hover {
+		background: var(--color-bg-hover);
+		color: var(--color-text-primary);
+	}
+	.dots-item.danger {
+		color: var(--color-error);
+	}
+	.dots-item.danger:hover {
+		background: color-mix(in srgb, var(--color-error) 10%, transparent);
+		color: var(--color-error);
+	}
+	.dots-divider {
+		height: 1px;
+		background: var(--color-border);
+		margin: 4px 0;
 	}
 
 	.qr-wrap {
