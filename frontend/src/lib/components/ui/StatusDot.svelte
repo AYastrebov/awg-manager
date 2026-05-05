@@ -9,6 +9,7 @@
     pulse?: boolean;
     size?: StatusDotSize;
     ariaLabel?: string;
+    halo?: boolean;
   }
 
   let {
@@ -16,6 +17,7 @@
     pulse = false,
     size = 'md',
     ariaLabel,
+    halo = false,
   }: Props = $props();
 </script>
 
@@ -29,6 +31,7 @@
   class:size-sm={size === 'sm'}
   class:size-md={size === 'md'}
   class:is-pulse={pulse}
+  class:is-halo={halo}
   role={ariaLabel ? 'img' : undefined}
   aria-label={ariaLabel}
 ></span>
@@ -52,6 +55,12 @@
   .is-pulse {
     animation: dot-pulse 1.4s ease-in-out infinite;
   }
+
+  .is-halo.variant-success { box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-success) 18%, transparent); }
+  .is-halo.variant-error   { box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-error) 18%, transparent); }
+  .is-halo.variant-warning { box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-warning) 18%, transparent); }
+  .is-halo.variant-info    { box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-info) 18%, transparent); }
+  .is-halo.variant-muted   { box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-text-muted) 18%, transparent); }
 
   @keyframes dot-pulse {
     0%, 100% { opacity: 1; }
