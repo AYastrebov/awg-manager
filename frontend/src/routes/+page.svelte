@@ -17,8 +17,9 @@
 		Eyebrow,
 		Icon
 	} from '$lib/components/ui';
+	import { AdoptTunnelDialog } from '$lib/components/tunnels';
 	import { formatRelativeTime } from '$lib/utils/format';
-	import type { TunnelListItem } from '$lib/types';
+	import type { TunnelListItem, ExternalTunnel } from '$lib/types';
 
 	type TunnelTab = 'awg' | 'singbox' | 'system';
 	type FilterChip = 'all' | 'running' | 'broken' | 'stopped';
@@ -50,6 +51,7 @@
 	let tunnelSnap = $derived($tunnels);
 	let awgList = $derived(tunnelSnap.data?.tunnels ?? []);
 	let systemList = $derived(tunnelSnap.data?.system ?? []);
+	let externalList = $derived(tunnelSnap.data?.external ?? []);
 	let loading = $derived(!sysInfo || tunnelSnap.lastFetchedAt === 0);
 
 	// System tunnels don't emit tunnel:traffic SSE events — feed the
@@ -178,6 +180,49 @@
 		const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
 		const i = Math.floor(Math.log(b) / Math.log(k));
 		return parseFloat((b / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+	}
+
+	// Adopt-external-tunnel dialog state. The dialog itself is keyed off
+	// `adoptingTunnel`; open/error/loading use the dialog's $bindable props.
+	let adoptingTunnel = $state<ExternalTunnel | null>(null);
+	let adoptDialogOpen = $state(false);
+	let adoptError = $state('');
+	let adoptLoading = $state(false);
+
+	function openAdoptDialog(et: ExternalTunnel): void {
+		adoptingTunnel = et;
+		adoptError = '';
+		adoptLoading = false;
+		adoptDialogOpen = true;
+	}
+
+	function closeAdoptDialog(): void {
+		adoptDialogOpen = false;
+		adoptingTunnel = null;
+		adoptError = '';
+		adoptLoading = false;
+	}
+
+	async function handleAdopt(data: { content: string; name: string }): Promise<void> {
+		if (!adoptingTunnel) return;
+		adoptLoading = true;
+		adoptError = '';
+		try {
+			const adopted = await tunnels.adoptExternal(
+				adoptingTunnel.interfaceName,
+				data.content,
+				data.name
+			);
+			if (adopted.warnings?.length) {
+				adopted.warnings.forEach((w) => notifications.warning(w));
+			}
+			notifications.success('Туннель импортирован');
+			closeAdoptDialog();
+		} catch (e) {
+			adoptError = e instanceof Error ? e.message : 'Не удалось импортировать туннель';
+		} finally {
+			adoptLoading = false;
+		}
 	}
 
 	let toggleLoading = $state<Record<string, boolean>>({});
@@ -390,8 +435,60 @@
 						</div>
 					</div>
 				{/each}
-				{#if visibleTunnels.length === 0}
+				{#if visibleTunnels.length === 0 && externalList.length === 0}
 					<div class="empty-row ch-caption">Туннели не найдены.</div>
+				{/if}
+				{#if externalList.length > 0}
+					<div class="row divider">
+						<span></span>
+						<span class="divider-label">Не управляются · {externalList.length}</span>
+						<span></span>
+						<span></span>
+						<span></span>
+						<span></span>
+						<span></span>
+						<span></span>
+					</div>
+					{#each externalList as et (et.interfaceName)}
+						<div class="row external">
+							<span class="ext-marker" aria-hidden="true">
+								<Icon name="plus" size={14} color="var(--color-text-muted)" />
+							</span>
+							<div class="cell-name">
+								<div class="name-line">
+									<span class="ch-title-sm muted-name">{et.interfaceName}</span>
+									<span class="badge external-badge">EXTERNAL</span>
+									{#if et.isAWG}
+										<span class="badge sig">AWG</span>
+									{/if}
+								</div>
+								<div class="ch-mono sub">
+									{et.publicKey ? et.publicKey.slice(0, 16) + '…' : '—'} · #{et.tunnelNumber}
+								</div>
+							</div>
+							<span class="ch-mono muted">не управляется</span>
+							<div class="ch-mono">
+								<div>{et.endpoint || '—'}</div>
+								<div class="muted">—</div>
+							</div>
+							<div class="cell-rate">
+								<Sparkline data={[]} width={92} height={28} />
+								<div class="ch-mono rate-text">
+									<div>↓ {fmtBytes(et.rxBytes)}</div>
+									<div>↑ {fmtBytes(et.txBytes)}</div>
+								</div>
+							</div>
+							<span class="ch-mono handshake">
+								{et.lastHandshake ? formatRelativeTime(et.lastHandshake) : '—'}
+							</span>
+							<span class="cell-backend muted">—</span>
+							<div class="row-actions">
+								<Button variant="primary" size="sm" onclick={() => openAdoptDialog(et)}>
+									Взять
+								</Button>
+							</div>
+						</div>
+					{/each}
 				{/if}
 			</div>
 		{:else if activeTab === 'singbox'}
@@ -438,6 +535,17 @@
 		</div>
 	{/if}
 </div>
+
+{#if adoptingTunnel}
+	<AdoptTunnelDialog
+		interfaceName={adoptingTunnel.interfaceName}
+		bind:open={adoptDialogOpen}
+		bind:error={adoptError}
+		bind:loading={adoptLoading}
+		onclose={closeAdoptDialog}
+		onadopt={handleAdopt}
+	/>
+{/if}
 
 <style>
 	.header-title {
@@ -691,5 +799,36 @@
 	}
 	.row :global(.toggle-container) {
 		justify-self: center;
+	}
+
+	.row.divider {
+		padding: 8px 20px;
+		background: var(--color-bg-secondary);
+		border-bottom: 1px solid var(--color-border);
+	}
+	.divider-label {
+		font: 600 11px/1.4 var(--font-sans);
+		letter-spacing: 1.5px;
+		text-transform: uppercase;
+		color: var(--color-text-muted);
+	}
+	.row.external .ext-marker {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 32px;
+		height: 32px;
+		border: 1px dashed var(--color-border-hover);
+		border-radius: 50%;
+		background: transparent;
+	}
+	.row.external .muted-name {
+		color: var(--color-text-muted);
+		font-weight: 500;
+	}
+	.badge.external-badge {
+		background: transparent;
+		color: var(--color-text-muted);
+		border: 1px dashed var(--color-border-hover);
 	}
 </style>
