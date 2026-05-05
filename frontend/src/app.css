@@ -1162,3 +1162,51 @@ label {
 	color: var(--color-error);
 	border-color: var(--color-error-border);
 }
+
+/* ─── ClickHouse semantic typography ──────────────────── */
+.ch-display-xl { font: 700 72px/1.05 var(--font-sans); letter-spacing: -2.5px; color: var(--color-text-primary); }
+.ch-display-lg { font: 700 56px/1.10 var(--font-sans); letter-spacing: -2px; color: var(--color-text-primary); }
+.ch-display-md { font: 700 40px/1.15 var(--font-sans); letter-spacing: -1.5px; color: var(--color-text-primary); }
+.ch-display-sm { font: 700 32px/1.20 var(--font-sans); letter-spacing: -1px; color: var(--color-text-primary); }
+.ch-title-lg   { font: 700 24px/1.30 var(--font-sans); letter-spacing: -0.3px; color: var(--color-text-primary); }
+.ch-title-md   { font: 600 18px/1.40 var(--font-sans); color: var(--color-text-primary); }
+.ch-title-sm   { font: 600 16px/1.40 var(--font-sans); color: var(--color-text-primary); }
+.ch-body       { font: 400 16px/1.55 var(--font-sans); color: var(--color-text-secondary); }
+.ch-body-sm    { font: 400 14px/1.55 var(--font-sans); color: var(--color-text-secondary); }
+.ch-caption    { font: 500 13px/1.40 var(--font-sans); color: var(--color-text-muted); }
+.ch-eyebrow    { font: 600 12px/1.40 var(--font-sans); letter-spacing: 1.5px; text-transform: uppercase; color: var(--color-text-muted); }
+.ch-code       { font: 400 14px/1.55 var(--font-mono); }
+.ch-mono       { font-family: var(--font-mono); }
+
+/* ─── ClickHouse layout primitives ──────────────────── */
+.ch-page-container {
+	max-width: 1440px;
+	margin: 0 auto;
+	padding: 24px 32px 32px;
+}
+
+.ch-page-header {
+	display: flex;
+	align-items: flex-end;
+	justify-content: space-between;
+	margin-bottom: 24px;
+	gap: 16px;
+	flex-wrap: wrap;
+}
+
+.ch-action-bar {
+	display: flex;
+	gap: 8px;
+}
+
+.ch-card {
+	background: var(--color-bg-tertiary);
+	border: 1px solid var(--color-border);
+	border-radius: 12px;
+}
+
+.ch-hairline      { border-color: var(--color-border); }
+.ch-hairline-strong { border-color: var(--color-border-hover); }
+
+/* Body background already canvas via Tailwind; force here for safety */
+body, html { background: var(--color-canvas); color: var(--color-text-secondary); }
