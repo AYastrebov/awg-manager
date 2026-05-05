@@ -7,6 +7,7 @@
 	import { feedTraffic, getTrafficRates, subscribeTraffic } from '$lib/stores/traffic';
 	import { singboxTunnels } from '$lib/stores/singbox';
 	import { pingCheckStatus } from '$lib/stores/pingcheck';
+	import { subscriptionsStore } from '$lib/stores/subscriptions';
 	import {
 		Tabs,
 		Button,
@@ -22,7 +23,7 @@
 	import { formatRelativeTime, formatDuration, secondsSince } from '$lib/utils/format';
 	import type { TunnelListItem, ExternalTunnel, TunnelPingStatus } from '$lib/types';
 
-	type TunnelTab = 'awg' | 'singbox' | 'system';
+	type TunnelTab = 'awg' | 'singbox' | 'subscriptions';
 	type FilterChip = 'all' | 'running' | 'broken' | 'stopped';
 
 	// Polling-store subscription: first subscriber triggers fetch,
@@ -83,10 +84,13 @@
 	let singboxList = $derived($singboxTunnels.data ?? []);
 	let singboxCount = $derived(singboxList.length);
 
+	let subSnap = $derived($subscriptionsStore);
+	let subscriptionsCount = $derived(subSnap.data?.length ?? 0);
+
 	let tabs = $derived([
-		{ id: 'awg', label: 'AmneziaWG', badge: awgList.length },
-		{ id: 'singbox', label: 'Sing-box', badge: singboxCount },
-		{ id: 'system', label: 'System', badge: systemList.length }
+		{ id: 'awg', label: 'AmneziaWG', badge: awgList.length + systemList.length },
+		{ id: 'singbox', label: 'Proxy', badge: singboxCount },
+		{ id: 'subscriptions', label: 'Подписки', badge: subscriptionsCount }
 	]);
 
 	function statusBucket(
@@ -480,8 +484,81 @@
 						</div>
 					</div>
 				{/each}
-				{#if visibleTunnels.length === 0 && externalList.length === 0}
+				{#if visibleTunnels.length === 0 && systemList.length === 0 && externalList.length === 0}
 					<div class="empty-row ch-caption">Туннели не найдены.</div>
+				{/if}
+				{#if systemList.length > 0}
+					<div class="row divider">
+						<span></span>
+						<span class="divider-label">Системные · {systemList.length}</span>
+						<span></span>
+						<span></span>
+						<span></span>
+						<span></span>
+						<span></span>
+						<span></span>
+					</div>
+					{#each systemList as st (st.id)}
+						{@const sysRates = (() => {
+							void trafficTick;
+							return getTrafficRates(st.id);
+						})()}
+						{@const sysSpark = sysRates.rx
+							.slice(-28)
+							.map((v, i) => v + (sysRates.tx.slice(-28)[i] ?? 0))}
+						<div class="row system">
+							<span></span>
+							<div class="cell-name">
+								<div class="name-line">
+									<span class="ch-title-sm">{st.description || st.interfaceName}</span>
+									<span class="badge system-badge">SYSTEM</span>
+								</div>
+								<div class="ch-mono sub">
+									{st.interfaceName}{st.address ? ` · ${st.address}` : ''} · MTU {st.mtu ?? '?'}
+								</div>
+							</div>
+							<div class="cell-status">
+								<div class="status-line">
+									<StatusDot
+										variant={st.status === 'up' ? 'success' : 'muted'}
+										halo={st.status === 'up'}
+										ariaLabel={st.status}
+									/>
+									<span class="status-text ch-mono">{st.status.toUpperCase()}</span>
+								</div>
+								<span class="status-meta ch-mono">—</span>
+							</div>
+							<div class="ch-mono">
+								<div>{st.peer?.endpoint || '—'}</div>
+								<div class="muted">{st.address || '—'}</div>
+							</div>
+							<div class="cell-rate">
+								<Sparkline
+									data={sysSpark}
+									color={st.status === 'up'
+										? 'var(--color-yellow)'
+										: 'var(--color-border-hover)'}
+									width={92}
+									height={28}
+								/>
+								<div class="ch-mono rate-text">
+									<div>↓ {fmtBytes(st.peer?.rxBytes ?? 0)}</div>
+									<div>↑ {fmtBytes(st.peer?.txBytes ?? 0)}</div>
+								</div>
+							</div>
+							<span class="ch-mono handshake">
+								{st.peer?.lastHandshake ? formatRelativeTime(st.peer.lastHandshake) : '—'}
+							</span>
+							<span class="cell-uptime">
+								{st.status === 'up' && st.uptime ? formatDuration(st.uptime) : '—'}
+							</span>
+							<div class="row-actions">
+								<button class="icon-btn" aria-label="Опции">
+									<Icon name="dots-vertical" size={14} color="var(--color-text-muted)" />
+								</button>
+							</div>
+						</div>
+					{/each}
 				{/if}
 				{#if externalList.length > 0}
 					<div class="row divider">
@@ -539,10 +616,10 @@
 					>Sing-box outbounds — полная страница будет в следующей миле редизайна.</span
 				>
 			</div>
-		{:else}
+		{:else if activeTab === 'subscriptions'}
 			<div class="ch-card placeholder">
 				<span class="ch-caption"
-					>Системные туннели — полная страница будет в следующей миле редизайна.</span
+					>Подписки — полная страница будет в следующей миле редизайна.</span
 				>
 			</div>
 		{/if}
@@ -881,5 +958,10 @@
 		background: transparent;
 		color: var(--color-text-muted);
 		border: 1px dashed var(--color-border-hover);
+	}
+	.badge.system-badge {
+		background: transparent;
+		color: var(--color-text-muted);
+		border: 1px solid var(--color-border-hover);
 	}
 </style>
