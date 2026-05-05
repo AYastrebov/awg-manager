@@ -112,7 +112,7 @@
         position: relative;
         width: 44px;
         height: 24px;
-        background: var(--color-bg-tertiary);
+        background: var(--color-border-hover);
         border-radius: var(--radius);
         transition: background 0.2s ease;
     }
@@ -135,7 +135,7 @@
 
     .toggle-container input:checked ~ .toggle-slider::before {
         transform: translateX(20px);
-        background: white;
+        background: var(--color-canvas);
     }
 
     .toggle-container:hover .toggle-slider {
