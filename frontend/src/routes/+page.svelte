@@ -1,55 +1,67 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { page } from '$app/stores';
 	import { tunnels } from '$lib/stores/tunnels';
 	import { systemInfo as systemInfoStore } from '$lib/stores/system';
 	import { notifications } from '$lib/stores/notifications';
-	import { api } from '$lib/api/client';
-	import { TunnelCard, ExternalTunnelCard, AdoptTunnelDialog, SystemTunnelCard, TunnelReferencedModal } from '$lib/components/tunnels';
-	import { PageContainer, LoadingSpinner, WelcomeBanner } from '$lib/components/layout';
-	import { Modal, StoreStatusBadge, TrafficChartModal, Button, Badge, Tabs } from '$lib/components/ui';
-	import { singboxStatus, singboxTunnels } from '$lib/stores/singbox';
-	import { SingboxInstallBanner, SingboxTunnelCard, SingboxGhostTerminal } from '$lib/components/singbox';
-	import { feedTraffic } from '$lib/stores/traffic';
-	import { usageLevel } from '$lib/stores/settings';
-	import { isSectionVisible } from '$lib/types/usageLevel';
-	import { subscriptionsStore } from '$lib/stores/subscriptions';
-	import SubscriptionList from '$lib/components/subscriptions/SubscriptionList.svelte';
-	import SubscriptionCreateModal from '$lib/components/subscriptions/SubscriptionCreateModal.svelte';
-	import SubscriptionActiveCard from '$lib/components/subscriptions/SubscriptionActiveCard.svelte';
-	import type { Subscription, SubscriptionMember } from '$lib/types';
+	import { feedTraffic, getTrafficRates, subscribeTraffic } from '$lib/stores/traffic';
+	import { singboxTunnels } from '$lib/stores/singbox';
+	import {
+		Tabs,
+		Button,
+		Toggle,
+		StatusDot,
+		Stat,
+		StatStrip,
+		Sparkline,
+		Eyebrow,
+		Icon
+	} from '$lib/components/ui';
+	import { formatRelativeTime } from '$lib/utils/format';
+	import type { TunnelListItem } from '$lib/types';
 
-	type TunnelTab = 'awg' | 'singbox' | 'subscriptions';
+	type TunnelTab = 'awg' | 'singbox' | 'system';
+	type FilterChip = 'all' | 'running' | 'broken' | 'stopped';
 
-	// Polling-store subscription: first subscriber triggers the fetch,
-	// the last unsubscribe stops polling. `$tunnels` yields a
-	// PollingState<TunnelsSnapshot> — unwrap below.
+	// Polling-store subscription: first subscriber triggers fetch,
+	// last unsubscribe stops polling.
 	let unsubTunnels: (() => void) | undefined;
-	onMount(() => { unsubTunnels = tunnels.subscribe(() => {}); });
-	onDestroy(() => unsubTunnels?.());
+	let unsubSingboxTunnels: (() => void) | undefined;
+	// Traffic store is callback-based, not a Svelte store. We keep a tick
+	// counter that the listener bumps on every feedTraffic() call so any
+	// $derived that reads getTrafficRates() re-runs in step with live data.
+	let trafficTick = $state(0);
+	let unsubTraffic: (() => void) | undefined;
+
+	onMount(() => {
+		unsubTunnels = tunnels.subscribe(() => {});
+		unsubSingboxTunnels = singboxTunnels.subscribe(() => {});
+		unsubTraffic = subscribeTraffic(() => {
+			trafficTick += 1;
+		});
+	});
+	onDestroy(() => {
+		unsubTunnels?.();
+		unsubSingboxTunnels?.();
+		unsubTraffic?.();
+	});
 
 	let sysInfo = $derived($systemInfoStore.data);
 	let tunnelSnap = $derived($tunnels);
 	let awgList = $derived(tunnelSnap.data?.tunnels ?? []);
-	let externalList = $derived(tunnelSnap.data?.external ?? []);
 	let systemList = $derived(tunnelSnap.data?.system ?? []);
-	// Wait for both system info AND the first tunnels snapshot before leaving
-	// the loading state — otherwise sysInfo arrives first and the empty-state
-	// flashes until /api/tunnels/all lands.
 	let loading = $derived(!sysInfo || tunnelSnap.lastFetchedAt === 0);
 
-	// System tunnels don't emit tunnel:traffic stream events (no awg-manager
-	// peer entry tracks them) — feed the traffic store from the polled
-	// snapshot so the per-system-tunnel rate chart stays alive. Runs on
-	// every snapshot refresh (~5s).
+	// System tunnels don't emit tunnel:traffic SSE events — feed the
+	// traffic store from the polled snapshot (~5s) so per-system-tunnel
+	// rates stay alive on this page. Skip ones already managed (their
+	// SSE feed is handled in +layout).
 	$effect(() => {
-		// Skip system tunnels that are ALSO tracked as managed — they receive
-		// tunnel:traffic stream events via +layout. Double-feeding doubles
-		// the rate sample and produces a spurious chart spike.
 		for (const st of systemList) {
-			const isManaged = awgList.some((m) =>
-				(m.ndmsName && m.ndmsName === st.id) || (m.interfaceName && m.interfaceName === st.id)
+			const isManaged = awgList.some(
+				(m) =>
+					(m.ndmsName && m.ndmsName === st.id) ||
+					(m.interfaceName && m.interfaceName === st.id)
 			);
 			if (isManaged) continue;
 			if (st.status === 'up' && st.peer) {
@@ -58,977 +70,623 @@
 		}
 	});
 
-	const goArch = $derived(sysInfo?.goArch ?? '');
+	let activeTab = $state<TunnelTab>('awg');
+	let filter = $state<FilterChip>('all');
+	let searchQuery = $state('');
 
-	let showUnsupportedBlock = $derived(
-		sysInfo !== null &&
-		!sysInfo.kernelModuleExists &&
-		!sysInfo.kernelModuleLoaded &&
-		!sysInfo.backendAvailability?.nativewg
-	);
+	let singboxList = $derived($singboxTunnels.data ?? []);
+	let singboxCount = $derived(singboxList.length);
 
-	let toggleLoading = $state<Record<string, boolean>>({});
-	let deleteLoading = $state<Record<string, boolean>>({});
-	let deleteConfirmId = $state<string | null>(null);
-	let referencedDetails = $state<import('$lib/types').TunnelReferencedError | null>(null);
-	let referencedTunnelName = $state<string>('');
+	let tabs = $derived([
+		{ id: 'awg', label: 'AWG', badge: awgList.length },
+		{ id: 'singbox', label: 'Sing-box', badge: singboxCount },
+		{ id: 'system', label: 'System', badge: systemList.length }
+	]);
 
-	let detailId = $state<string | null>(null);
-
-	function openDetail(id: string) {
-		detailId = id;
-		const url = new URL(window.location.href);
-		url.searchParams.set('detail', id);
-		history.replaceState(history.state, '', url);
+	function statusBucket(
+		raw: string
+	): 'running' | 'broken' | 'stopped' | 'starting' | 'other' {
+		const s = (raw || '').toLowerCase();
+		if (s === 'up' || s === 'running' || s === 'alive') return 'running';
+		if (s === 'broken' || s === 'error') return 'broken';
+		if (s === 'starting' || s === 'recovering' || s === 'pending') return 'starting';
+		if (s === 'down' || s === 'stopped' || s === 'disabled' || s === 'needs_start')
+			return 'stopped';
+		return 'other';
 	}
 
-	function closeDetail() {
-		detailId = null;
-		const url = new URL(window.location.href);
-		url.searchParams.delete('detail');
-		history.replaceState(history.state, '', url);
+	function statusToVariant(raw: string): 'success' | 'error' | 'warning' | 'muted' {
+		const b = statusBucket(raw);
+		if (b === 'running') return 'success';
+		if (b === 'broken') return 'error';
+		if (b === 'starting') return 'warning';
+		return 'muted';
 	}
 
-	// Sync from URL on mount + whenever the page store changes (back/forward).
-	$effect(() => {
-		const q = $page.url.searchParams.get('detail');
-		detailId = q && q.length > 0 ? q : null;
+	let visibleTunnels = $derived.by(() => {
+		let list: TunnelListItem[] = activeTab === 'awg' ? awgList : [];
+		if (filter !== 'all') {
+			list = list.filter((t) => statusBucket(t.status) === filter);
+		}
+		if (searchQuery) {
+			const q = searchQuery.toLowerCase();
+			list = list.filter(
+				(t) =>
+					t.name.toLowerCase().includes(q) ||
+					(t.endpoint || '').toLowerCase().includes(q) ||
+					(t.address || '').toLowerCase().includes(q)
+			);
+		}
+		return list;
 	});
 
-	async function markAsServer(id: string) {
-		try {
-			await api.markServerInterface(id);
-			// markServerInterface returns fresh ServersSnapshot; the tunnels
-			// list also changes (the system card disappears) — invalidate.
-			tunnels.invalidate();
-			notifications.success(`Туннель ${id} перенесён в серверы.`);
-		} catch (e) {
-			notifications.error(e instanceof Error ? e.message : 'Ошибка переноса в серверы');
-		}
+	let runningCount = $derived(
+		awgList.filter((t) => statusBucket(t.status) === 'running').length
+	);
+	let brokenCount = $derived(
+		awgList.filter((t) => statusBucket(t.status) === 'broken').length
+	);
+	let stoppedCount = $derived(
+		awgList.filter((t) => statusBucket(t.status) === 'stopped').length
+	);
+	let totalCount = $derived(awgList.length);
+	let totalRx = $derived(awgList.reduce((a, t) => a + (t.rxBytes ?? 0), 0));
+	let totalTx = $derived(awgList.reduce((a, t) => a + (t.txBytes ?? 0), 0));
+
+	// Reactively read the latest rate for a single tunnel — touches
+	// trafficTick so $derived re-runs on every feedTraffic notification.
+	function latestRate(id: string): { rx: number; tx: number } {
+		void trafficTick;
+		const r = getTrafficRates(id);
+		const rx = r.rx.length > 0 ? r.rx[r.rx.length - 1] : 0;
+		const tx = r.tx.length > 0 ? r.tx[r.tx.length - 1] : 0;
+		return { rx, tx };
 	}
 
-	async function handleToggleOnOff(id: string) {
-		const tunnel = awgList.find(t => t.id === id);
-		if (!tunnel) return;
-		// needs_start is NOT "on" — it means "intent up but not actually running",
-		// so the toggle should show OFF and the click should fire Start, not Stop.
-		const isOn = ['running', 'starting', 'broken'].includes(tunnel.status);
-		toggleLoading = { ...toggleLoading, [id]: true };
+	let peakRate = $derived.by(() => {
+		void trafficTick;
+		let max = 0;
+		let name = '';
+		for (const t of awgList) {
+			if (statusBucket(t.status) !== 'running') continue;
+			const { rx, tx } = latestRate(t.id);
+			const rate = rx + tx;
+			if (rate > max) {
+				max = rate;
+				name = t.name;
+			}
+		}
+		return { mbps: max / (1024 * 1024), tunnel: name };
+	});
+
+	let mostRecentHandshake = $derived.by(() => {
+		for (const t of awgList) {
+			if (statusBucket(t.status) !== 'running') continue;
+			if (t.lastHandshake) {
+				return {
+					value: formatRelativeTime(t.lastHandshake),
+					name: t.name + (t.awgVersion ? ' · ' + t.awgVersion : '')
+				};
+			}
+		}
+		return { value: '—', name: '' };
+	});
+
+	function fmtBytes(b: number): string {
+		if (!b) return '0 B';
+		const k = 1024;
+		const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+		const i = Math.floor(Math.log(b) / Math.log(k));
+		return parseFloat((b / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+	}
+
+	let toggleLoading = $state<Record<string, boolean>>({});
+	async function handleToggle(t: TunnelListItem) {
+		if (toggleLoading[t.id]) return;
+		// needs_start is NOT "on" — reuse the lifecycle interpretation
+		// from the previous home page so the toggle reflects intent.
+		const isOn = ['running', 'starting', 'broken'].includes(t.status);
+		toggleLoading = { ...toggleLoading, [t.id]: true };
 		try {
 			if (isOn) {
-				await tunnels.stop(id);
+				await tunnels.stop(t.id);
 				notifications.success('Туннель остановлен');
 			} else {
-				await tunnels.start(id);
+				await tunnels.start(t.id);
 				notifications.success('Туннель запущен');
 			}
 		} catch (e) {
 			notifications.error(e instanceof Error ? e.message : 'Ошибка');
 		} finally {
-			const { [id]: _, ...rest } = toggleLoading;
+			const { [t.id]: _, ...rest } = toggleLoading;
 			toggleLoading = rest;
 		}
 	}
 
-	function requestDelete(id: string) {
-		deleteConfirmId = id;
+	function openDetail(id: string) {
+		goto(`/tunnels/${id}`);
 	}
-
-	async function handleDelete(id: string) {
-		deleteConfirmId = null;
-		deleteLoading = { ...deleteLoading, [id]: true };
-		try {
-			const result = await tunnels.remove(id);
-			if (result.success && result.verified) {
-				notifications.success('Туннель удалён');
-			} else {
-				notifications.error('Не удалось верифицировать удаление');
-			}
-		} catch (e) {
-			if (e instanceof Error && e.message === 'tunnel_referenced') {
-				const refErr = e as Error & {
-					details: import('$lib/types').TunnelReferencedError;
-				};
-				referencedDetails = refErr.details;
-				referencedTunnelName = awgList.find((t) => t.id === id)?.name ?? id;
-			} else {
-				notifications.error(e instanceof Error ? e.message : 'Не удалось удалить туннель');
-			}
-		} finally {
-			const { [id]: _, ...rest } = deleteLoading;
-			deleteLoading = rest;
-		}
+	function createTunnel() {
+		goto('/tunnels/new');
 	}
-
-	// Polling-store subscriptions for sing-box status + tunnels list.
-	// First subscribe triggers fetch; last unsubscribe stops polling.
-	let unsubSingboxStatus: (() => void) | undefined;
-	let unsubSingboxTunnels: (() => void) | undefined;
-	onMount(() => {
-		unsubSingboxStatus = singboxStatus.subscribe(() => {});
-		unsubSingboxTunnels = singboxTunnels.subscribe(() => {});
-	});
-	onDestroy(() => {
-		unsubSingboxStatus?.();
-		unsubSingboxTunnels?.();
-	});
-
-	let singboxTunnelsList = $derived($singboxTunnels.data ?? []);
-
-	let unsubSubs: (() => void) | undefined;
-	onMount(() => { unsubSubs = subscriptionsStore.subscribe(() => {}); });
-	onDestroy(() => unsubSubs?.());
-
-	let subscriptionsList = $derived($subscriptionsStore.data ?? []);
-	let createModalOpen = $state(false);
-
-	const subscriptionsActiveCards = $derived(
-		($subscriptionsStore.data ?? [])
-			.filter((s) => s.enabled && s.activeMember)
-			.map((s) => {
-				const m = s.members?.find((mm) => mm.tag === s.activeMember);
-				return m ? { subscription: s, activeMember: m } : null;
-			})
-			.filter((x): x is { subscription: Subscription; activeMember: SubscriptionMember } => x !== null),
-	);
-
-	// Tabs
-	let activeTab = $state<TunnelTab>('awg');
-
-	const tunnelTabs = $derived(
-		[
-			{ id: 'awg', label: 'AWG', badge: awgList.length + systemList.length },
-			isSectionVisible($usageLevel, 'singboxTunnels')
-				? { id: 'singbox', label: 'Sing-box', badge: singboxTunnelsList.length }
-				: null,
-			isSectionVisible($usageLevel, 'singboxTunnels')
-				? { id: 'subscriptions', label: 'Подписки', badge: subscriptionsList.length }
-				: null,
-		].filter((t): t is { id: string; label: string; badge: number } => t !== null),
-	);
-
-	// Auto-switch off sing-box tab if it becomes hidden (basic mode).
-	$effect(() => {
-		if (!tunnelTabs.find((t) => t.id === activeTab)) {
-			activeTab = 'awg';
-		}
-	});
-
-	onMount(() => {
-		// URL query wins over sessionStorage — lets other pages
-		// (e.g. /singbox/new) land the user on the right tab after an action.
-		const fromQuery = $page.url.searchParams.get('tab');
-		if (fromQuery === 'awg' || fromQuery === 'singbox' || fromQuery === 'subscriptions') {
-			activeTab = fromQuery;
-			return;
-		}
-		const stored = sessionStorage.getItem('tunnelsTab');
-		if (stored === 'awg' || stored === 'singbox' || stored === 'subscriptions') {
-			activeTab = stored;
-		}
-	});
-
-	$effect(() => {
-		sessionStorage.setItem('tunnelsTab', activeTab);
-	});
-
-	// External tunnels
-	let adoptDialogOpen = $state(false);
-	let adoptingInterface = $state('');
-	let adoptError = $state('');
-	let adoptLoading = $state(false);
-
-	function handleAdoptClick(interfaceName: string): void {
-		adoptingInterface = interfaceName;
-		adoptDialogOpen = true;
+	function importTunnel() {
+		// First-mile: route to the existing /tunnels/new page (link-import
+		// tab already accepts pasted .conf content). Real drag-and-drop
+		// landing page is a later mile.
+		goto('/tunnels/new?tab=link');
 	}
-
-	async function handleAdopt(data: { content: string; name: string }): Promise<void> {
-		adoptLoading = true;
-		adoptError = '';
-		try {
-			const adopted = await tunnels.adoptExternal(adoptingInterface, data.content, data.name);
-			if (adopted.warnings?.length) {
-				adopted.warnings.forEach(w => notifications.warning(w));
-			}
-			notifications.success('Туннель успешно импортирован');
-			adoptDialogOpen = false;
-		} catch (e) {
-			adoptError = e instanceof Error ? e.message : 'Не удалось импортировать туннель';
-		} finally {
-			adoptLoading = false;
-		}
-	}
-
-	// Empty state: inline drag-and-drop import
-	let dragOver = $state(false);
-	let importing = $state(false);
-
-	let exporting = $state(false);
-
-	async function handleExportAll() {
-		exporting = true;
-		try {
-			const blob = await api.exportAllTunnels();
-			const { downloadBlob } = await import('$lib/utils/download');
-			downloadBlob(blob, 'awg-tunnels.zip');
-		} catch (e) {
-			notifications.error('Не удалось экспортировать конфиги');
-		} finally {
-			exporting = false;
-		}
-	}
-
-	function handleDrop(event: DragEvent) {
-		event.preventDefault();
-		dragOver = false;
-		if (event.dataTransfer?.files?.[0]) {
-			readAndImport(event.dataTransfer.files[0]);
-		}
-	}
-
-	function handleDragOver(event: DragEvent) {
-		event.preventDefault();
-		dragOver = true;
-	}
-
-	function handleDragLeave() {
-		dragOver = false;
-	}
-
-	let selectedBackend = $state<'nativewg' | 'kernel'>('nativewg');
-
-	// Auto-select backend based on availability
-	$effect(() => {
-		if (sysInfo?.backendAvailability && !sysInfo.backendAvailability.nativewg && sysInfo.backendAvailability.kernel) {
-			selectedBackend = 'kernel';
-		}
-	});
-
-	let fileInput = $state<HTMLInputElement>();
-
-	function handleFileSelect(event: Event) {
-		const input = event.target as HTMLInputElement;
-		if (input.files?.[0]) {
-			readAndImport(input.files[0]);
-		}
-	}
-
-	function readAndImport(file: File) {
-		const reader = new FileReader();
-		reader.onload = async (e) => {
-			const content = e.target?.result as string;
-			if (!content?.trim()) return;
-			importing = true;
-			try {
-				const name = file.name.replace(/\.conf$/i, '');
-				const tunnel = await tunnels.importConfig(content, name, selectedBackend);
-				if (tunnel.warnings?.length) {
-					tunnel.warnings.forEach(w => notifications.warning(w));
-				}
-				notifications.success('Туннель импортирован');
-				goto(`/tunnels/${tunnel.id}`);
-			} catch (err) {
-				notifications.error(err instanceof Error ? err.message : 'Ошибка импорта');
-			} finally {
-				importing = false;
-			}
-		};
-		reader.readAsText(file);
-	}
-
-	// Terminal status line
-	let statusLine = $derived.by(() => {
-		if (!sysInfo) return '';
-		const count = awgList.length;
-		const word = count === 0 ? 'туннелей' : count === 1 ? 'туннель' : count < 5 ? 'туннеля' : 'туннелей';
-		return `${sysInfo.version}  ·  ${sysInfo.goArch}  ·  ${count} ${word}`;
-	});
-
-
 </script>
 
 <svelte:head>
 	<title>Туннели - AWG Manager</title>
 </svelte:head>
 
-<PageContainer width="full">
-	<WelcomeBanner />
+<div class="ch-page-container">
 	{#if loading}
-		<div class="py-12">
-			<LoadingSpinner size="lg" message="Загрузка туннелей..." />
-		</div>
+		<p class="ch-body">Загрузка туннелей…</p>
 	{:else}
-		<Tabs
-			tabs={tunnelTabs}
-			active={activeTab}
-			onchange={(id) => (activeTab = id as TunnelTab)}
-		/>
+		<header class="ch-page-header">
+			<div>
+				<Eyebrow color="yellow">AWG · WireGuard fork</Eyebrow>
+				<h1 class="ch-display-sm header-title">
+					Туннели <span class="dim">· {totalCount}</span>
+				</h1>
+				<p class="ch-caption header-sub">
+					{runningCount} активны · {brokenCount} broken · {stoppedCount} остановлен
+				</p>
+			</div>
+			<div class="ch-action-bar">
+				<Button variant="secondary" size="md" onclick={importTunnel}>
+					{#snippet iconBefore()}
+						<Icon name="upload" size={14} />
+					{/snippet}
+					Импорт .conf
+				</Button>
+				<Button variant="primary" size="md" onclick={createTunnel}>
+					{#snippet iconBefore()}
+						<Icon name="plus" size={14} color="var(--color-on-yellow)" />
+					{/snippet}
+					Создать туннель
+				</Button>
+			</div>
+		</header>
+
+		<div class="tabs-row">
+			<Tabs {tabs} active={activeTab} onchange={(id) => (activeTab = id as TunnelTab)} />
+		</div>
+
+		<div class="strip-row">
+			<StatStrip>
+				<Stat
+					value={`${runningCount}/${totalCount}`}
+					label="туннелей online"
+					sub={totalCount === 0 ? 'нет туннелей' : 'из подключённых AWG'}
+				/>
+				<Stat
+					value={peakRate.mbps.toFixed(1)}
+					label="MB/s ↓ пиковая"
+					sub={peakRate.tunnel || '—'}
+				/>
+				<Stat
+					value={fmtBytes(totalRx + totalTx).split(' ')[0]}
+					label={`${fmtBytes(totalRx + totalTx).split(' ')[1] || ''} обмен с момента запуска`}
+					sub={`↓ ${fmtBytes(totalRx)}  ↑ ${fmtBytes(totalTx)}`}
+				/>
+				<Stat
+					value={mostRecentHandshake.value}
+					label="последний handshake"
+					sub={mostRecentHandshake.name || '—'}
+				/>
+			</StatStrip>
+		</div>
+
+		<div class="search-row">
+			<div class="search-input">
+				<Icon name="search" size={14} color="var(--color-text-muted)" />
+				<input
+					type="text"
+					bind:value={searchQuery}
+					placeholder="SELECT * FROM tunnels WHERE status = 'running' …"
+				/>
+			</div>
+			<div class="filter-chips">
+				{#each ['all', 'running', 'broken', 'stopped'] as f (f)}
+					<button
+						class="chip"
+						class:active={filter === f}
+						onclick={() => (filter = f as FilterChip)}>{f}</button
+					>
+				{/each}
+			</div>
+		</div>
 
 		{#if activeTab === 'awg'}
-		{#if awgList.length === 0 && systemList.length === 0}
-		<!-- svelte-ignore a11y_no_static_element_interactions -->
-		<div
-			class="ghost-terminal"
-			class:drag-over={dragOver}
-			ondrop={handleDrop}
-			ondragover={handleDragOver}
-			ondragleave={handleDragLeave}
-		>
-			{#if dragOver}
-				<div class="drop-overlay">
-					<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="40" height="40">
-						<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-						<polyline points="17 8 12 3 7 8"/>
-						<line x1="12" y1="3" x2="12" y2="15"/>
-					</svg>
-					<span class="drop-text">Отпустите для импорта</span>
+			<div class="ch-card table">
+				<div class="row head">
+					<span></span>
+					<span>Туннель</span>
+					<span>Status</span>
+					<span>Endpoint · IP</span>
+					<span>Throughput</span>
+					<span>Handshake</span>
+					<span class="text-right">Backend</span>
+					<span></span>
 				</div>
-			{:else if importing}
-				<div class="drop-overlay">
-					<div class="spinner"></div>
-					<span class="drop-text">Импорт...</span>
-				</div>
-			{:else}
-				<div class="term-status">
-					<span class="term-prompt">$ awg status</span>
-					{#if statusLine}
-						<span class="term-info">{statusLine}</span>
-					{/if}
-				</div>
-
-				<div class="term-action-group">
-					<div class="term-drop-hint">
-						<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="28" height="28">
-							<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-							<polyline points="17 8 12 3 7 8"/>
-							<line x1="12" y1="3" x2="12" y2="15"/>
-						</svg>
-						<span>Перетащите .conf сюда</span>
-					</div>
-
-					<div class="term-backend-selector">
-						<button
-							type="button"
-							class="term-backend-btn"
-							class:selected={selectedBackend === 'nativewg'}
-							class:disabled={sysInfo !== null && !sysInfo.backendAvailability?.nativewg}
-							disabled={sysInfo !== null && !sysInfo.backendAvailability?.nativewg}
-							onclick={() => selectedBackend = 'nativewg'}
-						>
-							NativeWG
-						</button>
-						<button
-							type="button"
-							class="term-backend-btn"
-							class:selected={selectedBackend === 'kernel'}
-							class:disabled={sysInfo !== null && !sysInfo.backendAvailability?.kernel}
-							disabled={sysInfo !== null && !sysInfo.backendAvailability?.kernel}
-							onclick={() => selectedBackend = 'kernel'}
-						>
-							Kernel
-						</button>
-					</div>
-
-					<div class="term-commands">
-						{#if externalList.length > 0}
-							<span class="term-found">
-								найдено {externalList.length} внешних интерфейс{externalList.length === 1 ? '' : 'а'}
-							</span>
-							<button class="term-cmd term-cmd-primary" onclick={() => {
-								adoptingInterface = externalList[0].interfaceName;
-								adoptDialogOpen = true;
-							}}>
-								<span class="term-arrow">{'>'}</span> подхватить интерфейсы
+				{#each visibleTunnels as t (t.id)}
+					{@const rate = latestRate(t.id)}
+					{@const rxArr = (() => {
+						void trafficTick;
+						return getTrafficRates(t.id).rx;
+					})()}
+					{@const txArr = (() => {
+						void trafficTick;
+						return getTrafficRates(t.id).tx;
+					})()}
+					{@const sparkData = rxArr
+						.slice(-28)
+						.map((v, i) => v + (txArr.slice(-28)[i] ?? 0))}
+					<div class="row">
+						<Toggle
+							checked={['running', 'starting', 'broken'].includes(t.status)}
+							size="sm"
+							loading={!!toggleLoading[t.id]}
+							onchange={() => handleToggle(t)}
+						/>
+						<div class="cell-name">
+							<div class="name-line">
+								<span class="ch-title-sm name-text">{t.name}</span>
+								{#if t.backend}
+									<span class="badge backend" data-backend={t.backend}>{t.backend}</span>
+								{/if}
+								{#if t.awgVersion}
+									<span class="badge sig">{t.awgVersion}</span>
+								{/if}
+							</div>
+							<div class="ch-mono sub">
+								{t.address || '—'} · MTU {t.mtu ?? '?'}
+							</div>
+						</div>
+						<div class="cell-status">
+							<StatusDot
+								variant={statusToVariant(t.status)}
+								halo={statusBucket(t.status) === 'running'}
+								ariaLabel={t.status}
+							/>
+							<span class="status-label">{t.status}</span>
+						</div>
+						<div class="ch-mono">
+							<div>{t.endpoint || '—'}</div>
+							<div class="muted">{t.address || '—'}</div>
+						</div>
+						<div class="cell-rate">
+							<Sparkline
+								data={sparkData}
+								color={statusBucket(t.status) === 'running'
+									? 'var(--color-yellow)'
+									: 'var(--color-border-hover)'}
+								width={92}
+								height={28}
+							/>
+							<div class="ch-mono rate-text">
+								<div class="up">↓ {(rate.rx / 1024 / 1024).toFixed(1)} MB/s</div>
+								<div>↑ {(rate.tx / 1024 / 1024).toFixed(1)} MB/s</div>
+							</div>
+						</div>
+						<span class="ch-mono handshake">
+							{t.lastHandshake ? formatRelativeTime(t.lastHandshake) : '—'}
+						</span>
+						<span class="cell-backend">{t.backend ?? '—'}</span>
+						<div class="row-actions">
+							<button
+								class="icon-btn"
+								onclick={() => openDetail(t.id)}
+								aria-label="Открыть детали"
+							>
+								<Icon name="chart-line" size={14} color="var(--color-text-muted)" />
 							</button>
-						{/if}
-						<button class="term-cmd" onclick={() => fileInput?.click()}>
-							<span class="term-arrow">{'>'}</span> импортировать файл
-						</button>
-						<button class="term-cmd" onclick={() => goto('/tunnels/new?tab=link')}>
-							<span class="term-arrow">{'>'}</span> импортировать ссылку
-						</button>
+							<button class="icon-btn" aria-label="Опции">
+								<Icon name="dots-vertical" size={14} color="var(--color-text-muted)" />
+							</button>
+						</div>
 					</div>
-				</div>
-
-				<input
-					type="file"
-					accept=".conf"
-					bind:this={fileInput}
-					onchange={handleFileSelect}
-					style="display: none"
-				/>
-			{/if}
-		</div>
-
-		<div class="info-card">
-			<h3 class="info-title">Об AmneziaWG</h3>
-			<p class="info-section-desc">
-				Форк WireGuard с обфускацией трафика. Три поколения протокола:
-			</p>
-			<div class="info-versions">
-				<div class="info-version">
-					<Badge variant="accent" size="sm" mono>AWG 1.0</Badge>
-					<span class="info-version-desc">Базовая обфускация: модификация заголовков (H1–H4), junk-пакеты (Jc/Jmin/Jmax), размеры сообщений (S1–S2).</span>
-				</div>
-				<div class="info-version">
-					<Badge variant="info" size="sm" mono>AWG 1.5</Badge>
-					<span class="info-version-desc">Мимикрия протоколов: initiation-пакеты (I1–I5) маскируют соединение под QUIC, DTLS, STUN, DNS.</span>
-				</div>
-				<div class="info-version">
-					<Badge variant="success" size="sm" mono>AWG 2.0</Badge>
-					<span class="info-version-desc">Рандомизация заголовков: H1–H4 задаются диапазонами, генерируются при каждом хэндшейке.</span>
-				</div>
-			</div>
-			<p class="info-text info-kernel">
-				Работает через <strong>модуль ядра</strong> — трафик обрабатывается напрямую в ядре Linux, что снижает нагрузку на CPU.
-			</p>
-		</div>
-
-		{:else}
-			{@const totalCount = awgList.length + systemList.length}
-			<div class="tunnels-toolbar">
-				<div class="count-group">
-					<span class="tunnel-count">{totalCount} {totalCount === 1 ? 'туннель' : totalCount < 5 ? 'туннеля' : 'туннелей'}</span>
-					<StoreStatusBadge store={tunnels} />
-				</div>
-				<div class="toolbar-actions">
-					<Button variant="secondary" size="md" onclick={handleExportAll} disabled={exporting} iconBefore={exportIcon}>
-						Экспорт
-					</Button>
-					<Button variant="primary" size="md" href="/tunnels/new">+ Создать</Button>
-				</div>
-			</div>
-			<div class="tunnel-grid">
-				{#each awgList as tunnel (tunnel.id)}
-					<TunnelCard
-						{tunnel}
-						toggleLoading={toggleLoading[tunnel.id] ?? false}
-						deleteLoading={deleteLoading[tunnel.id] ?? false}
-						onToggleOnOff={() => handleToggleOnOff(tunnel.id)}
-						ondelete={() => requestDelete(tunnel.id)}
-						ondetail={(id) => openDetail(id)}
-					/>
 				{/each}
-				{#each systemList.filter((st) =>
-					// Defense against backend dedup races: if a managed tunnel
-					// already claims this NDMS name, don't render the system
-					// card (it would be a ghost duplicate). System tunnel id
-					// is the NDMS name ("WireguardN"), so we compare against
-					// the managed tunnel's ndmsName.
-					!awgList.some((mt) =>
-						(mt.ndmsName && mt.ndmsName === st.id) ||
-						(mt.interfaceName && mt.interfaceName === st.id)
-					)
-				) as tunnel (tunnel.id)}
-					<SystemTunnelCard
-						{tunnel}
-						onMarkServer={markAsServer}
-						ondetail={(id) => openDetail(id)}
-					/>
-				{/each}
+				{#if visibleTunnels.length === 0}
+					<div class="empty-row ch-caption">Туннели не найдены.</div>
+				{/if}
 			</div>
-
-			{#if externalList.length > 0}
-			<div class="external-section">
-				<h2 class="section-title">Внешние туннели</h2>
-				<div class="tunnel-grid">
-					{#each externalList as extTunnel (extTunnel.interfaceName)}
-						<ExternalTunnelCard
-							tunnel={extTunnel}
-							onadopt={(name) => handleAdoptClick(name)}
-						/>
-					{/each}
-				</div>
+		{:else if activeTab === 'singbox'}
+			<div class="ch-card placeholder">
+				<span class="ch-caption"
+					>Sing-box outbounds — полная страница будет в следующей миле редизайна.</span
+				>
 			</div>
-		{/if}
-		{/if}
-		{:else if activeTab === 'subscriptions'}
-			<div class="tunnels-toolbar">
-				<span class="tunnel-count">
-					{subscriptionsList.length}
-					{subscriptionsList.length === 1 ? 'подписка' : subscriptionsList.length < 5 ? 'подписки' : 'подписок'}
-				</span>
-				<div class="toolbar-actions">
-					<Button variant="primary" size="md" onclick={() => (createModalOpen = true)}>+ Добавить подписку</Button>
-				</div>
-			</div>
-			<SubscriptionList subscriptions={subscriptionsList} onAdd={() => (createModalOpen = true)} />
 		{:else}
-			<SingboxInstallBanner />
-			{#if singboxTunnelsList.length === 0 && subscriptionsActiveCards.length === 0}
-				<SingboxGhostTerminal />
-				<div class="info-card">
-					<h3 class="info-title">О Sing-box</h3>
-					<p class="info-section-desc">
-						Универсальный прокси с поддержкой современных протоколов:
-					</p>
-					<div class="info-versions">
-						<div class="info-version">
-							<Badge variant="accent" size="sm" mono>VLESS</Badge>
-							<span class="info-version-desc">Лёгкий протокол без шифрования на уровне протокола. Поддерживает <strong>Reality</strong> (маскировка под настоящий TLS-сервер) и транспорт gRPC для обхода DPI.</span>
-						</div>
-						<div class="info-version">
-							<Badge variant="warning" size="sm" mono>Hysteria2</Badge>
-							<span class="info-version-desc">QUIC-based, устойчив к потерям пакетов и работает поверх UDP. Паролевая аутентификация, обфускация salamander.</span>
-						</div>
-						<div class="info-version">
-							<Badge variant="info" size="sm" mono>NaiveProxy</Badge>
-							<span class="info-version-desc">HTTP/2 с полноценным TLS-маскированием под обычный HTTPS-сервер. Сложно отличим от браузерного трафика.</span>
-						</div>
-					</div>
-				</div>
-			{:else if singboxTunnelsList.length > 0}
-				<div class="tunnels-toolbar">
-					<span class="tunnel-count">
-						{singboxTunnelsList.length}
-						{singboxTunnelsList.length === 1 ? 'туннель' : singboxTunnelsList.length < 5 ? 'туннеля' : 'туннелей'}
-					</span>
-					<div class="toolbar-actions">
-						<Button variant="primary" size="md" href="/singbox/new">+ Добавить</Button>
-					</div>
-				</div>
-				<div class="tunnel-grid">
-					{#each singboxTunnelsList as tunnel (tunnel.tag)}
-						<SingboxTunnelCard {tunnel} />
-					{/each}
-				</div>
-			{/if}
-			{#if subscriptionsActiveCards.length > 0}
-				<h3 class="section-head">Подписки — активные ({subscriptionsActiveCards.length})</h3>
-				<div class="active-grid">
-					{#each subscriptionsActiveCards as card (card.subscription.id)}
-						<SubscriptionActiveCard
-							subscription={card.subscription}
-							activeMember={card.activeMember}
-						/>
-					{/each}
-				</div>
-			{/if}
+			<div class="ch-card placeholder">
+				<span class="ch-caption"
+					>Системные туннели — полная страница будет в следующей миле редизайна.</span
+				>
+			</div>
 		{/if}
+
+		<div class="ch-card info-row">
+			<div class="info-feed">
+				<div class="info-head">
+					<Eyebrow>Live event stream · /api/events</Eyebrow>
+				</div>
+				<div class="ch-mono feed-empty">
+					<em class="muted-italic">SSE-feed подключается в следующей миле.</em>
+				</div>
+			</div>
+			<div class="info-system">
+				<Eyebrow>System</Eyebrow>
+				<div class="ch-mono system-list">
+					<div>
+						<span class="muted">kernel</span>
+						{sysInfo?.firmwareVersion || '—'} · OS{sysInfo?.isOS5 ? '5' : '4'}
+					</div>
+					<div>
+						<span class="muted">arch</span>
+						{sysInfo?.goArch || '—'}
+					</div>
+					<div>
+						<span class="muted">module</span> amneziawg
+						<span class={sysInfo?.kernelModuleLoaded ? 'ok' : 'muted'}>
+							{sysInfo?.kernelModuleLoaded
+								? 'loaded'
+								: sysInfo?.kernelModuleExists
+									? 'present'
+									: 'missing'}
+						</span>
+					</div>
+					<div>
+						<span class="muted">singbox</span>
+						{sysInfo?.singbox?.version || '—'}
+						{#if sysInfo?.singbox?.installed}<span class="ok">installed</span>{/if}
+					</div>
+				</div>
+			</div>
+		</div>
 	{/if}
-</PageContainer>
-
-<AdoptTunnelDialog
-	interfaceName={adoptingInterface}
-	bind:open={adoptDialogOpen}
-	bind:error={adoptError}
-	bind:loading={adoptLoading}
-	onclose={() => adoptDialogOpen = false}
-	onadopt={handleAdopt}
-/>
-
-{#if deleteConfirmId}
-	{@const tunnelName = awgList.find(t => t.id === deleteConfirmId)?.name ?? deleteConfirmId}
-	<Modal
-		open={true}
-		title="Удалить туннель"
-		size="sm"
-		onclose={() => deleteConfirmId = null}
-	>
-		<p class="confirm-text">Удалить туннель <strong>{tunnelName}</strong>?</p>
-		{#snippet actions()}
-			<Button variant="ghost" size="md" onclick={() => deleteConfirmId = null}>Отмена</Button>
-			<Button variant="danger" size="md" onclick={() => handleDelete(deleteConfirmId!)}>Удалить</Button>
-		{/snippet}
-	</Modal>
-{/if}
-
-<TunnelReferencedModal
-	open={referencedDetails !== null}
-	details={referencedDetails}
-	tunnelName={referencedTunnelName}
-	onclose={() => { referencedDetails = null; referencedTunnelName = ''; }}
-/>
-
-<SubscriptionCreateModal bind:open={createModalOpen} />
-
-{#if detailId}
-	{@const managed = awgList.find((x) => x.id === detailId)}
-	{@const sys = systemList.find((x) => x.id === detailId)}
-	<TrafficChartModal
-		open={true}
-		tunnelId={detailId}
-		tunnelName={managed?.name ?? sys?.description ?? detailId}
-		ifaceName={managed?.interfaceName ?? sys?.interfaceName ?? ''}
-		onclose={closeDetail}
-	/>
-{/if}
-
-{#snippet exportIcon()}
-	<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-		<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-		<polyline points="7 10 12 15 17 10"/>
-		<line x1="12" y1="15" x2="12" y2="3"/>
-	</svg>
-{/snippet}
-
-{#if showUnsupportedBlock}
-	<div class="unsupported-overlay">
-		<div class="unsupported-card">
-			<div class="unsupported-icon">
-				<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="48" height="48">
-					<path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
-					<line x1="12" y1="9" x2="12" y2="13"/>
-					<line x1="12" y1="17" x2="12.01" y2="17"/>
-				</svg>
-			</div>
-			<h2 class="unsupported-title">Модуль ядра недоступен</h2>
-			<p class="unsupported-text">
-				Модель роутера <strong>{sysInfo?.kernelModuleModel || '(неизвестна)'}</strong> не имеет скомпилированный модуль ядра в настоящий момент.
-			</p>
-			<div class="unsupported-actions">
-				<a href="https://t.me/awgmanager" target="_blank" rel="noopener" class="unsupported-link unsupported-link-primary">
-					Написать в @awgmanager
-				</a>
-				<a href="https://gitlab.com/AmneziaVPN/amneziawg/amneziawg-linux-kernel-module" target="_blank" rel="noopener" class="unsupported-link">
-					Установить вручную
-				</a>
-			</div>
-		</div>
-	</div>
-{/if}
+</div>
 
 <style>
-	/* Toolbar (count + actions row above the tunnel grid) */
-	.tunnels-toolbar {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		margin-bottom: 1rem;
+	.header-title {
+		margin: 8px 0 4px;
 	}
-
-	.tunnel-count {
-		font-size: 0.8125rem;
+	.header-title .dim {
 		color: var(--color-text-muted);
-	}
-
-	.count-group {
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
-	}
-
-	.toolbar-actions {
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
-	}
-
-	/* Empty-state ghost terminal — page-specific */
-	.ghost-terminal {
-		margin: 3rem 0;
-		border: 2px dashed var(--color-border);
-		border-radius: var(--radius);
-		padding: 2rem 2rem 1.5rem;
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 1.5rem;
-		transition: border-color var(--t-fast) ease, background var(--t-fast) ease;
-	}
-
-	.ghost-terminal.drag-over {
-		border-color: var(--color-accent);
-		border-style: solid;
-		background: var(--color-accent-tint);
-	}
-
-	.term-status {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 0.25rem;
-		font-family: var(--font-mono);
-	}
-
-	.term-prompt {
-		font-size: 0.8125rem;
-		color: var(--color-text-muted);
-	}
-
-	.term-info {
-		font-size: 0.75rem;
-		color: var(--color-text-muted);
-		opacity: 0.7;
-	}
-
-	.term-action-group {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 1.5rem;
-	}
-
-	.term-drop-hint {
-		display: flex;
-		align-items: center;
-		gap: 0.625rem;
-		color: var(--color-accent);
-		font-size: 1.0625rem;
 		font-weight: 500;
 	}
-
-	.term-drop-hint svg {
-		flex-shrink: 0;
-		opacity: 0.8;
+	.header-sub {
+		margin: 0;
 	}
 
-	.term-commands {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 0.125rem;
-		font-family: var(--font-mono);
+	.tabs-row {
+		margin-top: 16px;
+	}
+	.strip-row {
+		margin-top: 16px;
 	}
 
-	.term-found {
-		font-size: 0.8125rem;
-		color: var(--color-accent);
-		margin-bottom: 0.375rem;
-	}
-
-	.term-cmd {
+	.search-row {
 		display: flex;
 		align-items: center;
-		gap: 0.5rem;
-		background: none;
+		gap: 12px;
+		margin: 16px 0 12px;
+	}
+	.search-input {
+		flex: 1;
+		height: 36px;
+		background: var(--color-bg-tertiary);
+		border: 1px solid var(--color-border);
+		border-radius: 8px;
+		padding: 0 12px;
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.search-input input {
+		flex: 1;
+		background: transparent;
 		border: none;
+		outline: none;
+		font: 400 13px/1 var(--font-mono);
 		color: var(--color-text-secondary);
-		font-family: inherit;
-		font-size: 0.875rem;
-		padding: 0.375rem 0.5rem;
-		border-radius: var(--radius-sm);
-		cursor: pointer;
-		transition: color var(--t-fast) ease, background var(--t-fast) ease;
-		text-decoration: none;
 	}
-
-	.term-cmd:hover {
-		color: var(--color-text-primary);
-		background: var(--color-bg-hover);
+	.search-input input::placeholder {
+		color: var(--color-text-muted-soft);
 	}
-
-	.term-cmd-primary {
-		color: var(--color-accent);
-	}
-
-	.term-cmd-primary:hover {
-		color: var(--color-accent-hover);
-	}
-
-	.term-arrow {
-		color: var(--color-text-muted);
-	}
-
-	/* Backend selector — chip-like toggles for nativewg/kernel */
-	.term-backend-selector {
+	.filter-chips {
 		display: flex;
 		gap: 8px;
 	}
-
-	.term-backend-btn {
-		font-family: var(--font-mono);
-		font-size: 0.8125rem;
-		padding: 0.375rem 1rem;
-		border: 1px solid var(--color-border);
-		border-radius: var(--radius-sm);
+	.chip {
+		padding: 7px 12px;
+		font: 500 12px/1 var(--font-sans);
+		color: var(--color-text-secondary);
 		background: transparent;
-		color: var(--color-text-muted);
+		border: 1px solid var(--color-border-hover);
+		border-radius: 6px;
 		cursor: pointer;
-		transition: border-color var(--t-fast) ease, color var(--t-fast) ease, background var(--t-fast) ease;
+		text-transform: capitalize;
+	}
+	.chip.active {
+		color: var(--color-on-yellow);
+		background: var(--color-yellow);
+		border-color: transparent;
 	}
 
-	.term-backend-btn:hover:not(.disabled) {
-		border-color: var(--color-accent);
-		color: var(--color-text-secondary);
+	.table {
+		overflow: hidden;
+		margin-bottom: 20px;
 	}
-
-	.term-backend-btn.selected {
-		border-color: var(--color-accent);
-		color: var(--color-accent);
-		background: var(--color-accent-tint);
-	}
-
-	.term-backend-btn.disabled {
-		opacity: 0.4;
-		cursor: not-allowed;
-	}
-
-	/* Drag-over / importing overlays */
-	.drop-overlay {
-		display: flex;
-		flex-direction: column;
+	.row {
+		display: grid;
+		grid-template-columns: 36px 2fr 1fr 1.4fr 1.5fr 1fr 80px 60px;
+		padding: 14px 20px;
+		border-bottom: 1px solid var(--color-border);
 		align-items: center;
-		gap: 0.75rem;
-		padding: 2rem 0;
-		color: var(--color-accent);
+		gap: 16px;
 	}
-
-	.drop-text {
-		font-size: 1.0625rem;
-		font-weight: 500;
+	.row:last-child {
+		border-bottom: none;
 	}
-
-	/* "About AmneziaWG / Sing-box" info card — page-specific */
-	.info-card {
-		border-left: 3px solid var(--color-accent);
-		background: var(--color-bg-secondary);
-		border-radius: 0 var(--radius) var(--radius) 0;
-		padding: 1.25rem 1.5rem;
-		margin-top: 1.5rem;
-	}
-
-	.info-title {
-		font-size: 1rem;
-		font-weight: 600;
-		margin-bottom: 0.75rem;
-	}
-
-	.info-text {
-		font-size: 0.8125rem;
-		color: var(--color-text-secondary);
-		line-height: 1.6;
-		margin: 0;
-	}
-
-	.info-section-desc {
-		font-size: 0.85rem;
+	.row.head {
+		padding: 12px 20px;
+		font: 600 11px/1 var(--font-sans);
+		letter-spacing: 1.2px;
+		text-transform: uppercase;
 		color: var(--color-text-muted);
-		margin: 0 0 0.75rem 0;
+	}
+	.text-right {
+		text-align: right;
 	}
 
-	.info-versions {
+	.cell-name {
 		display: flex;
 		flex-direction: column;
-		gap: 0.625rem;
-		margin: 0.75rem 0;
+		gap: 4px;
+		min-width: 0;
 	}
-
-	.info-version {
-		display: flex;
-		gap: 0.75rem;
-		align-items: baseline;
-	}
-
-	.info-version-desc {
-		font-size: 0.8125rem;
-		color: var(--color-text-secondary);
-		line-height: 1.5;
-	}
-
-	.info-kernel {
-		margin-top: 0.75rem;
-		padding-top: 0.75rem;
-		border-top: 1px solid var(--color-border);
-	}
-
-	.info-kernel strong {
-		color: var(--color-text-primary);
-	}
-
-	/* "Kernel module unavailable" full-screen overlay — page-specific */
-	.unsupported-overlay {
-		position: fixed;
-		inset: 0;
-		z-index: 100;
-		background: rgba(0, 0, 0, 0.85);
+	.name-line {
 		display: flex;
 		align-items: center;
-		justify-content: center;
-		padding: 1rem;
+		gap: 10px;
+		flex-wrap: wrap;
 	}
-
-	.unsupported-card {
-		background: var(--color-bg-primary);
-		border: 1px solid var(--color-border);
-		border-radius: var(--radius);
-		padding: 2rem;
-		max-width: 420px;
-		width: 100%;
-		text-align: center;
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 1rem;
+	.name-text {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
-
-	.unsupported-icon {
-		color: var(--color-warning);
-	}
-
-	.unsupported-title {
-		font-size: 1.25rem;
-		font-weight: 600;
-		margin: 0;
-	}
-
-	.unsupported-text {
-		font-size: 0.875rem;
-		color: var(--color-text-secondary);
-		line-height: 1.6;
-		margin: 0;
-	}
-
-	.unsupported-text strong {
-		color: var(--color-text-primary);
-	}
-
-	.unsupported-actions {
-		display: flex;
-		flex-direction: column;
-		gap: 0.5rem;
-		width: 100%;
-		margin-top: 0.5rem;
-	}
-
-	.unsupported-link {
-		display: block;
-		padding: 0.625rem 1rem;
-		border-radius: var(--radius-sm);
-		font-size: 0.875rem;
-		font-weight: 500;
-		text-decoration: none;
-		text-align: center;
-		transition: opacity var(--t-fast) ease;
-		border: 1px solid var(--color-border);
-		color: var(--color-text-secondary);
-		background: var(--color-bg-secondary);
-	}
-
-	.unsupported-link:hover {
-		opacity: 0.85;
-	}
-
-	.unsupported-link-primary {
-		background: var(--color-accent);
-		color: #fff;
-		border-color: var(--color-accent);
-	}
-
-	.external-section {
-		margin-top: 2rem;
-		padding-top: 1.5rem;
-		border-top: 1px solid var(--border);
-	}
-
-	.section-title {
-		font-size: 1rem;
-		font-weight: 600;
-		color: var(--text-secondary);
-		margin-bottom: 1rem;
-	}
-
-	.section-head {
-		margin: 1.5rem 0 0.75rem;
-		font-size: 0.85rem;
+	.badge {
+		font: 500 10px/1 var(--font-mono);
+		padding: 3px 6px;
+		border-radius: 4px;
 		text-transform: uppercase;
 		letter-spacing: 0.5px;
+	}
+	.badge.backend {
+		background: var(--color-bg-hover);
+		color: var(--color-text-secondary);
+	}
+	.badge.backend[data-backend='nativewg'] {
+		color: var(--color-info);
+	}
+	.badge.sig {
+		color: var(--color-text-muted);
+		border: 1px solid var(--color-border-hover);
+	}
+	.sub {
+		font-size: 11px;
 		color: var(--color-text-muted);
 	}
-	.active-grid {
-		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-		gap: 0.75rem;
+
+	.cell-status {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		min-width: 0;
+	}
+	.status-label {
+		font: 500 12px/1 var(--font-mono);
+		color: var(--color-text-muted);
+		text-transform: lowercase;
+	}
+
+	.cell-rate {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+	}
+	.rate-text {
+		font: 500 11px/1.4 var(--font-mono);
+		color: var(--color-text-secondary);
+	}
+	.rate-text .up {
+		color: var(--color-success);
+	}
+	.handshake {
+		font-size: 12px;
+		color: var(--color-text-secondary);
+	}
+	.muted {
+		color: var(--color-text-muted);
+	}
+	.muted-italic {
+		color: var(--color-text-muted);
+		font-style: italic;
+	}
+	.cell-backend {
+		font: 600 13px/1 var(--font-sans);
+		color: var(--color-text-secondary);
+		text-align: right;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+	}
+
+	.row-actions {
+		display: flex;
+		gap: 6px;
+		justify-content: flex-end;
+	}
+	.icon-btn {
+		background: transparent;
+		border: none;
+		cursor: pointer;
+		padding: 4px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		border-radius: 4px;
+		color: var(--color-text-muted);
+	}
+	.icon-btn:hover {
+		background: var(--color-bg-hover);
+		color: var(--color-text-primary);
+	}
+
+	.empty-row {
+		padding: 32px 20px;
+		text-align: center;
+	}
+	.placeholder {
+		padding: 24px;
+		text-align: center;
+	}
+
+	.info-row {
+		margin-top: 20px;
+		padding: 16px;
+		display: flex;
+		gap: 24px;
+	}
+	.info-feed {
+		flex: 1;
+	}
+	.info-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		margin-bottom: 10px;
+	}
+	.feed-empty {
+		padding: 8px 0;
+	}
+	.info-system {
+		width: 280px;
+		border-left: 1px solid var(--color-border);
+		padding-left: 24px;
+	}
+	.system-list {
+		font: 400 12px/1.8 var(--font-mono);
+		color: var(--color-text-secondary);
+		margin-top: 10px;
+	}
+	.system-list .muted {
+		color: var(--color-text-muted);
+	}
+	.system-list .ok {
+		color: var(--color-success);
 	}
 </style>
