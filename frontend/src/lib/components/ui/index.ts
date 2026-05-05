@@ -35,3 +35,4 @@ export type { TablerIconName } from './Icon.svelte';
 export { default as Eyebrow } from './Eyebrow.svelte';
 export { default as Stat } from './Stat.svelte';
 export { default as StatStrip } from './StatStrip.svelte';
+export { default as Sparkline } from './Sparkline.svelte';
