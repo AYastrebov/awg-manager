@@ -84,7 +84,7 @@
 	let singboxCount = $derived(singboxList.length);
 
 	let tabs = $derived([
-		{ id: 'awg', label: 'AWG', badge: awgList.length },
+		{ id: 'awg', label: 'AmneziaWG', badge: awgList.length },
 		{ id: 'singbox', label: 'Sing-box', badge: singboxCount },
 		{ id: 'system', label: 'System', badge: systemList.length }
 	]);
@@ -165,6 +165,21 @@
 		return { mbps: max / (1024 * 1024), tunnel: name };
 	});
 
+	// Tunnel with the most cumulative traffic (rx+tx) since boot/reset.
+	// null when nothing has moved bytes yet — UI shows a dash placeholder.
+	let trafficLeader = $derived.by(() => {
+		let max = 0;
+		let name = '';
+		for (const t of awgList) {
+			const total = (t.rxBytes ?? 0) + (t.txBytes ?? 0);
+			if (total > max) {
+				max = total;
+				name = t.name;
+			}
+		}
+		return max > 0 ? { bytes: max, name } : null;
+	});
+
 	// Per-tunnel latency (ms) sourced from /api/pingcheck/status; index by
 	// tunnelId for O(1) lookup in the row template. Re-derives whenever the
 	// pingcheck poll fires.
@@ -194,18 +209,6 @@
 		if (statusBucket(t.status) !== 'running') return '—';
 		return formatDuration(secondsSince(t.startedAt));
 	}
-
-	// Pingcheck KPI for the StatStrip — counts only enabled tunnels in the
-	// denominator so disabled-by-config doesn't drag the ratio down.
-	let aliveCount = $derived(
-		awgList.filter((t) => t.pingCheck?.status === 'alive').length
-	);
-	let totalPingcheckCount = $derived(
-		awgList.filter((t) => t.pingCheck?.status !== 'disabled').length
-	);
-	let recoveringCount = $derived(
-		awgList.filter((t) => t.pingCheck?.status === 'recovering').length
-	);
 
 	function fmtBytes(b: number): string {
 		if (!b) return '0 B';
@@ -350,20 +353,13 @@
 					label={`${fmtBytes(totalRx + totalTx).split(' ')[1] || ''} обмен с момента запуска`}
 					sub={`↓ ${fmtBytes(totalRx)}  ↑ ${fmtBytes(totalTx)}`}
 				/>
-				<a
-					href="/monitoring"
-					class="stat-link"
-					onclick={(e) => {
-						e.preventDefault();
-						goto('/monitoring');
-					}}
-				>
-					<Stat
-						value={`${aliveCount}/${totalPingcheckCount}`}
-						label="туннелей alive"
-						sub={`${recoveringCount} recovering · настроить →`}
-					/>
-				</a>
+				<Stat
+					value={trafficLeader ? fmtBytes(trafficLeader.bytes).split(' ')[0] : '—'}
+					label={trafficLeader
+						? `${fmtBytes(trafficLeader.bytes).split(' ')[1] || ''} лидер по трафику`
+						: 'нет данных'}
+					sub={trafficLeader?.name ?? '—'}
+				/>
 			</StatStrip>
 		</div>
 
@@ -792,17 +788,6 @@
 		font: 600 13px/1 var(--font-mono);
 		color: var(--color-text-secondary);
 		text-align: right;
-	}
-
-	/* StatStrip chip → /monitoring. display:contents lets the wrapped
-	   <Stat> participate in the strip's grid as if no anchor existed. */
-	.stat-link {
-		display: contents;
-		cursor: pointer;
-		text-decoration: none;
-	}
-	.stat-link:hover :global(.stat .value) {
-		color: var(--color-yellow-active);
 	}
 
 	.row-actions {
