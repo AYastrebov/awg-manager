@@ -5,6 +5,7 @@
   import { Button } from '$lib/components/ui';
   import { api } from '$lib/api/client';
   import { notifications } from '$lib/stores/notifications';
+  import { usageLevel, settings } from '$lib/stores/settings';
   import { copyToClipboard } from '$lib/utils/clipboard';
   import LogRow from './LogRow.svelte';
   import LogsToolbar, { ALL_LEVELS } from './LogsToolbar.svelte';
@@ -74,6 +75,14 @@
   let initialFetchDone = $state(false);
   let prevLen = $state(0);
   let pageOffset = $state(0);
+
+  /** Subgroup `profiling` is expert-only UI; discard saved filter once settings say non-expert. */
+  $effect(() => {
+    if (!$settings) return;
+    if ($usageLevel === 'expert') return;
+    if (filter.subgroup !== 'profiling') return;
+    void applyFilter({ ...filter, subgroup: '' });
+  });
   let loadingMore = $state(false);
   let availableSubgroups = $state<string[]>([]);
   const subgroupCache = new Map<string, string[]>();
@@ -213,6 +222,7 @@
     saveFilter(f);
     // Group changed → refresh subgroup catalog; subgroup change keeps catalog.
     await refreshSubgroups();
+    await loadBucketFresh(bucket);
   }
 
   async function setBucket(b: LogBucket) {

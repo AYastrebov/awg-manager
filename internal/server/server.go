@@ -17,10 +17,10 @@ import (
 
 	"github.com/hoaxisr/awg-manager/internal/accesspolicy"
 	"github.com/hoaxisr/awg-manager/internal/api"
-	"github.com/hoaxisr/awg-manager/internal/deviceproxy"
 	"github.com/hoaxisr/awg-manager/internal/auth"
 	"github.com/hoaxisr/awg-manager/internal/clientroute"
 	"github.com/hoaxisr/awg-manager/internal/connections"
+	"github.com/hoaxisr/awg-manager/internal/deviceproxy"
 	"github.com/hoaxisr/awg-manager/internal/diagnostics"
 	"github.com/hoaxisr/awg-manager/internal/dnscheck"
 	"github.com/hoaxisr/awg-manager/internal/events"
@@ -63,59 +63,70 @@ type Config struct {
 	LoopbackListenAddr string // optional: 127.0.0.1:port for reverse proxy support
 	WebRoot            string // Path to static files (SPA)
 	Version            string
+
+	// PprofStandaloneAddr, if non-empty, starts an additional listener that
+	// serves only Go's /debug/pprof/* endpoints (recommended: 127.0.0.1:6060).
+	PprofStandaloneAddr string
+	// PprofOnMain mounts the same endpoints on the primary HTTP mux (reachable on
+	// every listen addr — LAN and loopback). Use sparingly when the API is exposed.
+	PprofOnMain bool
+	// SlowRequestThreshold, if positive, logs requests whose handler runs longer than
+	// this duration to stderr (via slog); long-lived SSE/WebSocket routes are skipped.
+	SlowRequestThreshold time.Duration
 }
 
 // Server is the HTTP server for awg-manager.
 type Server struct {
-	config              Config
-	log                 *logger.Logger
-	tunnelService       api.TunnelService
-	externalService     api.ExternalTunnelService
-	testingService      *testing.Service
-	keenetic            *auth.KeeneticClient
-	sessions            *auth.SessionStore
-	settings            *storage.SettingsStore
-	tunnels             *storage.AWGTunnelStore
-	pingCheckService    api.PingCheckService
-	loggingService      *logging.Service
-	activeBackend       backend.Backend
-	kmodLoader          *kmod.Loader
-	updaterService      *updater.Service
-	ndmsQueries         *ndmsquery.Queries
-	trafficHistory      *traffic.History
-	dnsRouteService     api.DNSRouteService
-	staticRouteService  api.StaticRouteService
-	systemTunnelService systemtunnel.Service
-	managedService      managed.ManagedServerService
-	nwgOp               *nwg.OperatorNativeWG
-	terminalManager     terminal.Manager
-	accessPolicyService accesspolicy.Service
-	clientRouteService  clientroute.Service
-	catalog             routing.Catalog
-	hydraService        *hydraroute.Service
-	orch                *orchestrator.Orchestrator
-	bus                 *events.Bus
+	config                Config
+	log                   *logger.Logger
+	tunnelService         api.TunnelService
+	externalService       api.ExternalTunnelService
+	testingService        *testing.Service
+	keenetic              *auth.KeeneticClient
+	sessions              *auth.SessionStore
+	settings              *storage.SettingsStore
+	tunnels               *storage.AWGTunnelStore
+	pingCheckService      api.PingCheckService
+	loggingService        *logging.Service
+	activeBackend         backend.Backend
+	kmodLoader            *kmod.Loader
+	updaterService        *updater.Service
+	ndmsQueries           *ndmsquery.Queries
+	trafficHistory        *traffic.History
+	dnsRouteService       api.DNSRouteService
+	staticRouteService    api.StaticRouteService
+	systemTunnelService   systemtunnel.Service
+	managedService        managed.ManagedServerService
+	nwgOp                 *nwg.OperatorNativeWG
+	terminalManager       terminal.Manager
+	accessPolicyService   accesspolicy.Service
+	clientRouteService    clientroute.Service
+	catalog               routing.Catalog
+	hydraService          *hydraroute.Service
+	orch                  *orchestrator.Orchestrator
+	bus                   *events.Bus
 	singboxHandler        *api.SingboxHandler
 	singboxConnsHandler   *api.SingboxConnectionsHandler
 	singboxRouterHandler  *api.SingboxRouterHandler
 	singboxConfigHandler  *api.SingboxConfigHandler
-	singboxProxiesHandler   *api.SingboxProxiesHandler
-	awgOutboundsHandler     *api.AWGOutboundsHandler
-	subscriptionHandler     *api.SubscriptionHandler
-	clashProxy          *api.ClashProxy
-	singboxOp           *singbox.Operator
-	deviceProxySvc      *deviceproxy.Service
-	monitoringService   *monitoring.Service
-	singboxSubMembersFn func() []diagnostics.SingboxSubMember
-	dnsCheckService     *dnscheck.Service
-	authMiddleware      *auth.Middleware
-	httpServer          *http.Server
-	loopbackListener    net.Listener // optional loopback listener for reverse proxy
+	singboxProxiesHandler *api.SingboxProxiesHandler
+	awgOutboundsHandler   *api.AWGOutboundsHandler
+	subscriptionHandler   *api.SubscriptionHandler
+	clashProxy            *api.ClashProxy
+	singboxOp             *singbox.Operator
+	deviceProxySvc        *deviceproxy.Service
+	monitoringService     *monitoring.Service
+	singboxSubMembersFn   func() []diagnostics.SingboxSubMember
+	dnsCheckService       *dnscheck.Service
+	authMiddleware        *auth.Middleware
+	httpServer            *http.Server
+	loopbackListener      net.Listener // optional loopback listener for reverse proxy
 
 	ndmsDispatcher api.HookDispatcher
 	ndmsTransport  *ndmstransport.Client
 	ndmsSaveCoord  *ndmscommand.SaveCoordinator
 	metricsPoller  *ndmsmetrics.Poller
+	pprofServer    *http.Server // optional standalone pprof-only listener
 
 	instanceID string // unique per process, changes on restart
 
@@ -349,10 +360,34 @@ func (s *Server) SetLoopbackAddr(addr string) {
 
 // Start starts the HTTP server.
 func (s *Server) Start() error {
+	if addr := strings.TrimSpace(s.config.PprofStandaloneAddr); addr != "" {
+		pm := http.NewServeMux()
+		registerPprofRoutes(pm)
+		s.pprofServer = &http.Server{
+			Addr:              addr,
+			Handler:           pm,
+			ReadHeaderTimeout: 5 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+		go func() {
+			if err := s.pprofServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				s.log.Warn("pprof listener stopped", map[string]interface{}{"error": err.Error(), "addr": addr})
+			}
+		}()
+		fmt.Fprintf(os.Stderr, "awg-manager: pprof (standalone): http://%s/debug/pprof/\n", addr)
+	}
+
 	mux := http.NewServeMux()
+	if s.config.PprofOnMain {
+		registerPprofRoutes(mux)
+	}
 	s.registerRoutes(mux)
 
-	handler := s.loggingMiddleware(mux)
+	core := http.Handler(mux)
+	if s.config.SlowRequestThreshold > 0 {
+		core = s.slowRequestMiddleware(s.config.SlowRequestThreshold, core)
+	}
+	handler := s.loggingMiddleware(core)
 
 	s.httpServer = &http.Server{
 		Handler:           handler,
@@ -398,6 +433,12 @@ func (s *Server) Start() error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s.loopbackListener != nil {
 		s.loopbackListener.Close()
+	}
+	if s.pprofServer != nil {
+		shutdownCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		_ = s.pprofServer.Shutdown(shutdownCtx)
+		cancel()
+		s.pprofServer = nil
 	}
 	if s.httpServer == nil {
 		return nil
