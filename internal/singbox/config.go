@@ -22,50 +22,15 @@ type Config struct {
 	raw map[string]any
 }
 
+// NewConfig returns the empty slot-shape skeleton for 10-tunnels.json:
+// inbounds + outbounds + route only. log/dns/experimental are intentionally
+// omitted — those keys belong to 00-base.json (owned by ensureBaseConfig).
+// Emitting them here used to pollute 10-tunnels.json on first tunnel-add
+// with dns-bootstrap/dns-doh tags that 00-base owns, tripping the
+// orchestrator's cross-slot duplicate-tag validator.
 func NewConfig() *Config {
 	return &Config{
 		raw: map[string]any{
-			"log": map[string]any{"level": "info", "timestamp": true},
-			"dns": map[string]any{
-				"strategy": "ipv4_only",
-				"servers": []any{
-					// sing-box 1.13+ native schema: when `type` is set,
-					// the server is addressed via `server` + optional
-					// `server_port`/`path`, NOT the legacy `address`
-					// field (that was the 1.11/1.12 shape). `address`
-					// is rejected with "unknown field" once a type is
-					// declared.
-					// Bootstrap omits `detour` intentionally: sing-box
-					// 1.13 flags "detour to an empty direct outbound
-					// makes no sense" and FATALs at startup. With
-					// route.final = "direct" the DNS query ends up at
-					// the same place anyway. When M2+ routes traffic
-					// through a tunnel, we'll add an explicit route
-					// rule pinning bootstrap UDP/53 to direct so the
-					// chicken-and-egg stays broken.
-					map[string]any{
-						"type":   "udp",
-						"tag":    "dns-bootstrap",
-						"server": "1.1.1.1",
-					},
-					map[string]any{
-						"type":            "https",
-						"tag":             "dns-doh",
-						"server":          "cloudflare-dns.com",
-						"domain_resolver": "dns-bootstrap",
-					},
-				},
-				"final": "dns-doh",
-			},
-			"experimental": map[string]any{
-				// Port 9099 (not the default 9090) so a user-managed
-				// sing-box instance already bound to 9090 doesn't steal
-				// our log/traffic streams — we'd otherwise forward the
-				// user's tunnels into our UI and miss our own events.
-				"clash_api": map[string]any{
-					"external_controller": "127.0.0.1:9099",
-				},
-			},
 			"inbounds":  []any{},
 			"outbounds": []any{},
 			"route": map[string]any{
@@ -86,6 +51,24 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config.json: %w", err)
 	}
 	return &Config{raw: m}, nil
+}
+
+// MarshalJSON exposes the in-memory config as the same JSON shape Save
+// would write. Lets callers (orchestrator slot builders, migrations,
+// tests) obtain bytes without going through disk.
+func (c *Config) MarshalJSON() ([]byte, error) {
+	return json.Marshal(c.raw)
+}
+
+// UnmarshalJSON parses a sing-box config document into c. Mirrors
+// LoadConfig but for callers that already hold the bytes.
+func (c *Config) UnmarshalJSON(data []byte) error {
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+	c.raw = m
+	return nil
 }
 
 // Save atomically writes config.json to disk (tmp file + rename).
@@ -480,6 +463,20 @@ type DeviceProxySpec struct {
 	SBTags      []string // sing-box tunnel tags (user outbounds)
 }
 
+// DeviceProxyInstanceSpec describes one user-facing proxy instance.
+// ID controls generated inbound/selector tags. ID "default" keeps the
+// legacy tags device-proxy-in / device-proxy-selector for compatibility.
+type DeviceProxyInstanceSpec struct {
+	ID          string
+	Enabled     bool
+	ListenAddr  string
+	Port        int
+	Auth        DeviceProxyAuth
+	SelectedTag string
+	AWGTags     []string
+	SBTags      []string
+}
+
 type DeviceProxyAuth struct {
 	Enabled  bool
 	Username string
@@ -492,6 +489,23 @@ const (
 	deviceProxyAWGPrefix   = "awg-"
 )
 
+func deviceProxyInstanceTags(id string) (inboundTag, selectorTag string) {
+	if id == "" || id == "default" {
+		return deviceProxyInboundTag, deviceProxySelectorTag
+	}
+	return "device-proxy-" + id + "-in", "device-proxy-" + id + "-selector"
+}
+
+func isDeviceProxyInboundTag(tag string) bool {
+	return tag == deviceProxyInboundTag ||
+		(strings.HasPrefix(tag, "device-proxy-") && strings.HasSuffix(tag, "-in"))
+}
+
+func isDeviceProxySelectorTag(tag string) bool {
+	return tag == deviceProxySelectorTag ||
+		(strings.HasPrefix(tag, "device-proxy-") && strings.HasSuffix(tag, "-selector"))
+}
+
 // EnsureDeviceProxy writes (or overwrites) the inbound + selector
 // outbound + route rule described by spec. Idempotent. Callers that
 // toggle Enabled=false should use RemoveDeviceProxy.
@@ -501,15 +515,32 @@ const (
 // resolve to outbounds already declared there. Legacy awg-* outbounds
 // from pre-refactor builds are stripped on every call (idempotent).
 func (c *Config) EnsureDeviceProxy(spec DeviceProxySpec) error {
+	return c.EnsureDeviceProxyInstance(DeviceProxyInstanceSpec{
+		ID:          "default",
+		Enabled:     spec.Enabled,
+		ListenAddr:  spec.ListenAddr,
+		Port:        spec.Port,
+		Auth:        spec.Auth,
+		SelectedTag: spec.SelectedTag,
+		AWGTags:     spec.AWGTags,
+		SBTags:      spec.SBTags,
+	})
+}
+
+// EnsureDeviceProxyInstance writes or overwrites one device-proxy instance.
+// Non-default instances use unique tags derived from spec.ID.
+func (c *Config) EnsureDeviceProxyInstance(spec DeviceProxyInstanceSpec) error {
 	if !spec.Enabled {
-		c.RemoveDeviceProxy()
+		c.RemoveDeviceProxyInstance(spec.ID)
 		return nil
 	}
 
 	// Inbound
+	inboundTag, selectorTag := deviceProxyInstanceTags(spec.ID)
+
 	inbound := map[string]any{
 		"type":        "mixed",
-		"tag":         deviceProxyInboundTag,
+		"tag":         inboundTag,
 		"listen":      spec.ListenAddr,
 		"listen_port": spec.Port,
 	}
@@ -521,15 +552,12 @@ func (c *Config) EnsureDeviceProxy(spec DeviceProxySpec) error {
 			},
 		}
 	}
-	c.upsertInbound(deviceProxyInboundTag, inbound)
+	c.upsertInbound(inboundTag, inbound)
 
 	// Strip any legacy awg-* outbounds left over from the pre-15-awg.json
-	// era (one-shot cleanup; idempotent, no-op once the file is clean).
+	// era. AWG outbounds now live in 15-awg.json.
 	c.pruneAWGOutbounds(nil)
 
-	// Selector outbound — members in deterministic order: direct, sb tags,
-	// sorted awg tags from spec. AWG outbounds themselves live in
-	// 15-awg.json; the selector just references them by tag.
 	members := []any{"direct"}
 	for _, tag := range spec.SBTags {
 		members = append(members, tag)
@@ -539,28 +567,150 @@ func (c *Config) EnsureDeviceProxy(spec DeviceProxySpec) error {
 	for _, tag := range awgTagsCopy {
 		members = append(members, tag)
 	}
+
 	selector := map[string]any{
 		"type":      "selector",
-		"tag":       deviceProxySelectorTag,
+		"tag":       selectorTag,
 		"outbounds": members,
 	}
 	if spec.SelectedTag != "" {
 		selector["default"] = spec.SelectedTag
 	}
-	c.upsertOutbound(deviceProxySelectorTag, selector)
+	c.upsertOutbound(selectorTag, selector)
 
-	// Route rule at front of rules list.
-	c.ensureDeviceProxyRouteRule()
+	c.ensureDeviceProxyInstanceRouteRule(inboundTag, selectorTag)
 	return nil
 }
 
 // RemoveDeviceProxy strips every artefact EnsureDeviceProxy adds.
 // Idempotent — safe on a config that never had the proxy.
 func (c *Config) RemoveDeviceProxy() {
-	c.removeInbound(deviceProxyInboundTag)
-	c.removeOutbound(deviceProxySelectorTag)
+	c.RemoveDeviceProxyInstance("default")
+}
+
+// RemoveDeviceProxyInstance strips every artefact created for one instance.
+func (c *Config) RemoveDeviceProxyInstance(id string) {
+	inboundTag, selectorTag := deviceProxyInstanceTags(id)
+	c.removeInbound(inboundTag)
+	c.removeOutbound(selectorTag)
 	c.pruneAWGOutbounds(nil)
-	c.removeDeviceProxyRouteRule()
+	c.removeDeviceProxyInstanceRouteRule(inboundTag)
+}
+
+// RemoveAllDeviceProxyInstances strips every device-proxy inbound/selector/rule
+// (default and named instances). Idempotent.
+func (c *Config) RemoveAllDeviceProxyInstances() {
+	inbounds := c.inbounds()
+	nextInbounds := make([]any, 0, len(inbounds))
+	for _, v := range inbounds {
+		ib, ok := v.(map[string]any)
+		if !ok {
+			nextInbounds = append(nextInbounds, v)
+			continue
+		}
+		tag, _ := ib["tag"].(string)
+		if isDeviceProxyInboundTag(tag) {
+			continue
+		}
+		nextInbounds = append(nextInbounds, v)
+	}
+	c.setInbounds(nextInbounds)
+
+	outbounds := c.outbounds()
+	nextOutbounds := make([]any, 0, len(outbounds))
+	for _, v := range outbounds {
+		ob, ok := v.(map[string]any)
+		if !ok {
+			nextOutbounds = append(nextOutbounds, v)
+			continue
+		}
+		tag, _ := ob["tag"].(string)
+		if isDeviceProxySelectorTag(tag) {
+			continue
+		}
+		nextOutbounds = append(nextOutbounds, v)
+	}
+	c.setOutbounds(nextOutbounds)
+
+	rules := c.routeRules()
+	nextRules := make([]any, 0, len(rules))
+	for _, v := range rules {
+		r, ok := v.(map[string]any)
+		if !ok {
+			nextRules = append(nextRules, v)
+			continue
+		}
+		inbound, _ := r["inbound"].(string)
+		if isDeviceProxyInboundTag(inbound) {
+			continue
+		}
+		nextRules = append(nextRules, v)
+	}
+	c.setRouteRules(nextRules)
+
+	c.pruneAWGOutbounds(nil)
+}
+
+// HasDeviceProxy reports whether the config contains the device-proxy
+// inbound (tag = deviceProxyInboundTag). Used by the slot migration
+// to detect legacy single-file layouts where device-proxy lived inside
+// 10-tunnels.json.
+func (c *Config) HasDeviceProxy() bool {
+	for _, v := range c.inbounds() {
+		ib, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, _ := ib["tag"].(string); t == deviceProxyInboundTag {
+			return true
+		}
+	}
+	return false
+}
+
+// ExtractDeviceProxy returns a NEW *Config containing ONLY the
+// device-proxy artefacts (inbound, selector outbound, route rule)
+// pulled from the receiver. The receiver is NOT modified — callers
+// that want to strip the artefacts from the source must call
+// RemoveDeviceProxy on it afterwards.
+//
+// The returned config is slot-shaped: it has inbounds/outbounds/route
+// keys but NO log/dns/experimental defaults, so it can safely live in
+// its own config.d slot file without colliding with 00-base.json.
+func (c *Config) ExtractDeviceProxy() *Config {
+	out := &Config{raw: map[string]any{
+		"inbounds":  []any{},
+		"outbounds": []any{},
+		"route":     map[string]any{"rules": []any{}},
+	}}
+	for _, v := range c.inbounds() {
+		ib, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, _ := ib["tag"].(string); isDeviceProxyInboundTag(t) {
+			out.upsertInbound(t, ib)
+		}
+	}
+	for _, v := range c.outbounds() {
+		ob, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, _ := ob["tag"].(string); isDeviceProxySelectorTag(t) {
+			out.upsertOutbound(t, ob)
+		}
+	}
+	for _, v := range c.routeRules() {
+		r, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if inbound, _ := r["inbound"].(string); isDeviceProxyInboundTag(inbound) {
+			out.setRouteRules(append(out.routeRules(), r))
+		}
+	}
+	return out
 }
 
 // upsertInbound replaces the inbound whose tag matches, or appends if
@@ -668,9 +818,13 @@ func (c *Config) pruneAWGOutbounds(keep map[string]string) {
 }
 
 func (c *Config) ensureDeviceProxyRouteRule() {
+	c.ensureDeviceProxyInstanceRouteRule(deviceProxyInboundTag, deviceProxySelectorTag)
+}
+
+func (c *Config) ensureDeviceProxyInstanceRouteRule(inboundTag, selectorTag string) {
 	rule := map[string]any{
-		"inbound":  deviceProxyInboundTag,
-		"outbound": deviceProxySelectorTag,
+		"inbound":  inboundTag,
+		"outbound": selectorTag,
 	}
 	rules := c.routeRules()
 	filtered := make([]any, 0, len(rules))
@@ -680,7 +834,7 @@ func (c *Config) ensureDeviceProxyRouteRule() {
 			filtered = append(filtered, v)
 			continue
 		}
-		if r["inbound"] == deviceProxyInboundTag {
+		if r["inbound"] == inboundTag {
 			continue
 		}
 		filtered = append(filtered, v)
@@ -689,6 +843,10 @@ func (c *Config) ensureDeviceProxyRouteRule() {
 }
 
 func (c *Config) removeDeviceProxyRouteRule() {
+	c.removeDeviceProxyInstanceRouteRule(deviceProxyInboundTag)
+}
+
+func (c *Config) removeDeviceProxyInstanceRouteRule(inboundTag string) {
 	rules := c.routeRules()
 	out := make([]any, 0, len(rules))
 	for _, v := range rules {
@@ -697,7 +855,7 @@ func (c *Config) removeDeviceProxyRouteRule() {
 			out = append(out, v)
 			continue
 		}
-		if r["inbound"] == deviceProxyInboundTag {
+		if r["inbound"] == inboundTag {
 			continue
 		}
 		out = append(out, v)

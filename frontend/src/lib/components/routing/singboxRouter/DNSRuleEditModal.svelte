@@ -1,17 +1,35 @@
 <script lang="ts">
 	import Modal from '$lib/components/ui/Modal.svelte';
-	import type { SingboxRouterDNSRule, SingboxRouterDNSServer } from '$lib/types';
+	import { Dropdown, ChipMultiSelect, type DropdownOption, type ChipOption } from '$lib/components/ui';
+	import type { SingboxRouterDNSRule, SingboxRouterDNSServer, SingboxRouterRuleSet } from '$lib/types';
 
 	interface Props {
 		rule?: SingboxRouterDNSRule;
 		servers: SingboxRouterDNSServer[];
+		availableRuleSets: SingboxRouterRuleSet[];
 		onClose: () => void;
 		onSave: (rule: SingboxRouterDNSRule) => Promise<void> | void;
 	}
-	let { rule, servers, onClose, onSave }: Props = $props();
+	let { rule, servers, availableRuleSets, onClose, onSave }: Props = $props();
+
+	function normalizeTags(tags: string[]): string[] {
+		return [...new Set(tags.map((s) => s.trim()).filter(Boolean))];
+	}
+
+	const serverOptions = $derived<DropdownOption[]>([
+		{ value: '', label: '— выберите —' },
+		...servers.map((s) => ({
+			value: s.tag,
+			label: s.tag,
+			description: `${s.type} · ${s.server}`,
+		})),
+	]);
 
 	// svelte-ignore state_referenced_locally
-	let ruleSetStr = $state((rule?.rule_set ?? []).join(', '));
+	let ruleSetTags = $state<string[]>(rule?.rule_set ?? []);
+	const ruleSetOptions = $derived<ChipOption[]>(
+		availableRuleSets.map((rs) => ({ value: rs.tag, label: rs.tag })),
+	);
 	// svelte-ignore state_referenced_locally
 	let domainSuffixStr = $state((rule?.domain_suffix ?? []).join('\n'));
 	// svelte-ignore state_referenced_locally
@@ -28,11 +46,53 @@
 	let busy = $state(false);
 	let error = $state('');
 
+	// Snapshot initial state for isDirty detection
+	let initialRuleSetTagsSnapshot = $state<string[]>([]);
+	let initialDomainSuffixStr = $state('');
+	let initialDomainStr = $state('');
+	let initialDomainKeywordStr = $state('');
+	let initialQueryTypeStr = $state('');
+	let initialAction: 'route' | 'reject' = $state('route');
+	let initialServer = $state('');
+
+	// Initialize snapshot when modal opens
+	$effect(() => {
+		if (rule) {
+			initialRuleSetTagsSnapshot = [...(rule.rule_set ?? [])];
+			initialDomainSuffixStr = (rule.domain_suffix ?? []).join('\n');
+			initialDomainStr = (rule.domain ?? []).join('\n');
+			initialDomainKeywordStr = (rule.domain_keyword ?? []).join(', ');
+			initialQueryTypeStr = (rule.query_type ?? []).join(', ');
+			initialAction = rule.action === 'reject' ? 'reject' : 'route';
+			initialServer = rule.server ?? '';
+		} else {
+			initialRuleSetTagsSnapshot = [];
+			initialDomainSuffixStr = '';
+			initialDomainStr = '';
+			initialDomainKeywordStr = '';
+			initialQueryTypeStr = '';
+			initialAction = 'route';
+			initialServer = '';
+		}
+	});
+
+	const isDirty = $derived.by(() => {
+		return (
+			normalizeTags(ruleSetTags).join(',') !== normalizeTags(initialRuleSetTagsSnapshot).join(',') ||
+			domainSuffixStr !== initialDomainSuffixStr ||
+			domainStr !== initialDomainStr ||
+			domainKeywordStr !== initialDomainKeywordStr ||
+			queryTypeStr !== initialQueryTypeStr ||
+			action !== initialAction ||
+			server !== initialServer
+		);
+	});
+
 	async function save(): Promise<void> {
 		busy = true;
 		error = '';
 		try {
-			const rule_set = ruleSetStr.split(',').map((s) => s.trim()).filter(Boolean);
+			const rule_set = normalizeTags(ruleSetTags);
 			const domain_suffix = domainSuffixStr.split('\n').map((s) => s.trim()).filter(Boolean);
 			const domain = domainStr.split('\n').map((s) => s.trim()).filter(Boolean);
 			const domain_keyword = domainKeywordStr.split(',').map((s) => s.trim()).filter(Boolean);
@@ -74,13 +134,19 @@
 	}
 </script>
 
-<Modal open onclose={onClose} title={rule ? 'Редактировать DNS правило' : 'Новое DNS правило'}>
+<Modal open onclose={onClose} title={rule ? 'Редактировать DNS правило' : 'Новое DNS правило'} hasUnsavedChanges={() => isDirty}>
 	<div class="form">
 		<div class="section-label">Matchers (минимум один)</div>
 
 		<label class="field">
-			<div class="lbl">Rule sets (через запятую)</div>
-			<input bind:value={ruleSetStr} placeholder="geosite-youtube, geoip-ru" />
+			<div class="lbl">Rule sets</div>
+			<ChipMultiSelect
+				values={ruleSetTags}
+				options={ruleSetOptions}
+				onchange={(next) => (ruleSetTags = next)}
+				placeholder="не выбрано"
+				allowOrphans
+			/>
 		</label>
 
 		<label class="field">
@@ -113,12 +179,7 @@
 			{#if action === 'route'}
 				<label class="field">
 					<div class="lbl">DNS сервер</div>
-					<select bind:value={server}>
-						<option value="">— выберите —</option>
-						{#each servers as s}
-							<option value={s.tag}>{s.tag} ({s.type} · {s.server})</option>
-						{/each}
-					</select>
+					<Dropdown bind:value={server} options={serverOptions} fullWidth />
 				</label>
 			{/if}
 		</div>
@@ -136,7 +197,7 @@
 	.form {
 		display: grid;
 		gap: 0.6rem;
-		min-width: 420px;
+		min-width: 0;
 	}
 	.section-label {
 		font-size: 0.7rem;
@@ -154,8 +215,7 @@
 		color: var(--muted-text);
 	}
 	.field textarea,
-	.field input,
-	.field select {
+	.field input {
 		background: var(--bg);
 		border: 1px solid var(--border);
 		padding: 0.4rem 0.6rem;
@@ -194,7 +254,7 @@
 	}
 	.segment button.active {
 		background: var(--accent, #3b82f6);
-		color: white;
+		color: var(--color-accent-contrast, #ffffff);
 		font-weight: 600;
 	}
 	.error {

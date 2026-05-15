@@ -3,11 +3,12 @@
     import { api } from '$lib/api/client';
     import type { DnsRoute, RoutingTunnel } from '$lib/types';
     import type { ServicePreset } from '$lib/data/presets';
-    import { Modal, StoreStatusBadge, Button, Dropdown, type DropdownOption } from '$lib/components/ui';
-    import { DnsRouteCard, DnsRouteEditModal, DnsRouteImportModal, DnsRoutePresetModal } from '$lib/components/dnsroutes';
+    import { ConfirmModal, StoreStatusBadge, Button, Dropdown, type DropdownOption } from '$lib/components/ui';
+    import { DnsRouteCard, DnsRouteEditModal, DnsRouteImportModal, DnsRoutePresetModal, IconPickerModal } from '$lib/components/dnsroutes';
     import { exportRoutes, downloadJson } from '$lib/utils/dns-export';
     import { notifications } from '$lib/stores/notifications';
     import { dnsRoutesStore } from '$lib/stores/routing';
+    import RoutingTabBodySkeleton from './RoutingTabBodySkeleton.svelte';
 
     interface Props {
         dnsRoutes: DnsRoute[];
@@ -16,9 +17,19 @@
         editRuleCounter?: number;
         isOS5?: boolean;
         hasDnsEngine?: boolean;
+        /** Тело вкладки ещё грузится — шапка видна, ниже скелетон. */
+        bodyLoading?: boolean;
     }
 
-    let { dnsRoutes: allDnsRoutes, routingTunnels, editRuleId = '', editRuleCounter = 0, isOS5 = false, hasDnsEngine = false }: Props = $props();
+    let {
+        dnsRoutes: allDnsRoutes,
+        routingTunnels,
+        editRuleId = '',
+        editRuleCounter = 0,
+        isOS5 = false,
+        hasDnsEngine = false,
+        bodyLoading = false,
+    }: Props = $props();
 
     // HR-backed rules live in their own tab now; this tab shows only NDMS.
     let dnsRoutes = $derived(allDnsRoutes.filter((r) => r.backend !== 'hydraroute'));
@@ -51,6 +62,8 @@
     let dnsSaving = $state(false);
     let dnsModalOpen = $state(false);
     let addMenuOpen = $state(false);
+    let iconPickerOpen = $state(false);
+    let pickingForRoute = $state<DnsRoute | null>(null);
 
     function handleClickOutside() { addMenuOpen = false; }
     onMount(() => document.addEventListener('click', handleClickOutside));
@@ -294,14 +307,20 @@
 {:else}
 <div class="section-header">
     {#if !dnsSelectionMode}
-        <span class="section-summary">{dnsRoutes.length} правил, {dnsActiveCount} активных</span>
+        <span class="section-summary">
+            {#if bodyLoading}
+                …
+            {:else}
+                {dnsRoutes.length} правил, {dnsActiveCount} активных
+            {/if}
+        </span>
         <div class="section-buttons">
             <StoreStatusBadge store={dnsRoutesStore} />
             {#if dnsRoutes.length > 0}
-                <Button variant="ghost" size="sm" onclick={() => { dnsSelectionMode = true; dnsSelected = new Set(); }}>Выбрать</Button>
+                <Button variant="ghost" size="sm" onclick={() => { dnsSelectionMode = true; dnsSelected = new Set(); }} disabled={bodyLoading}>Выбрать</Button>
             {/if}
             <div class="dropdown-wrapper">
-                <Button variant="primary" size="sm" onclick={(e) => { e.stopPropagation(); addMenuOpen = !addMenuOpen; }}>
+                <Button variant="primary" size="sm" disabled={bodyLoading} onclick={(e) => { e.stopPropagation(); addMenuOpen = !addMenuOpen; }}>
                     + Добавить
                     {#snippet iconAfter()}
                         <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor"><path d="M2 4l3 3 3-3"/></svg>
@@ -364,7 +383,9 @@
     {/if}
 </div>
 
-{#if dnsRoutes.length === 0}
+{#if bodyLoading}
+    <RoutingTabBodySkeleton />
+{:else if dnsRoutes.length === 0}
     <div class="empty-state-rich">
         <div class="empty-icon">
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -376,14 +397,14 @@
         <div class="empty-title">DNS-маршрутов пока нет</div>
         <div class="empty-desc">Выберите сервисы из каталога или создайте правило вручную</div>
         <div class="empty-actions">
-            <Button variant="primary" onclick={() => dnsPresetOpen = true}>
+            <Button variant="primary" disabled={bodyLoading} onclick={() => dnsPresetOpen = true}>
                 {#snippet iconBefore()}
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
                 {/snippet}
                 Из каталога
             </Button>
-            <Button variant="secondary" onclick={() => { editingDnsRoute = null; dnsModalOpen = true; }}>+ Создать вручную</Button>
-            <Button variant="ghost" onclick={() => dnsImportOpen = true}>
+            <Button variant="secondary" disabled={bodyLoading} onclick={() => { editingDnsRoute = null; dnsModalOpen = true; }}>+ Создать вручную</Button>
+            <Button variant="ghost" disabled={bodyLoading} onclick={() => dnsImportOpen = true}>
                 {#snippet iconBefore()}
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
                 {/snippet}
@@ -409,6 +430,7 @@
                         selectable={dnsSelectionMode}
                         selected={dnsSelected.has(route.id)}
                         onselect={() => toggleDnsSelect(route.id)}
+                        onicon={() => { pickingForRoute = route; iconPickerOpen = true; }}
                     />
                 {/each}
             </div>
@@ -429,6 +451,7 @@
                     selectable={dnsSelectionMode}
                     selected={dnsSelected.has(route.id)}
                     onselect={() => toggleDnsSelect(route.id)}
+                    onicon={() => { pickingForRoute = route; iconPickerOpen = true; }}
                 />
             {/each}
         </div>
@@ -466,23 +489,44 @@
 
 {#if dnsDeleteId}
     {@const routeToDelete = dnsRoutes.find(r => r.id === dnsDeleteId)}
-    <Modal open={true} title="Удалить DNS-маршрут" size="sm" onclose={() => dnsDeleteId = null}>
-        <p class="confirm-text">Удалить DNS-маршрут <strong>{routeToDelete?.name ?? dnsDeleteId}</strong>?</p>
-        {#snippet actions()}
-            <Button variant="secondary" onclick={() => dnsDeleteId = null}>Отмена</Button>
-            <Button variant="danger" onclick={deleteDnsRoute}>Удалить</Button>
-        {/snippet}
-    </Modal>
+    <ConfirmModal
+        open={true}
+        title="Удалить DNS-маршрут"
+        message={`Удалить DNS-маршрут «${routeToDelete?.name ?? dnsDeleteId}»?`}
+        onConfirm={deleteDnsRoute}
+        onClose={() => dnsDeleteId = null}
+    />
 {/if}
 
 {#if dnsBulkDeleteConfirm}
-    <Modal open={true} title="Удаление" size="sm" onclose={() => dnsBulkDeleteConfirm = false}>
-        <p class="confirm-text">Удалить {dnsSelected.size} DNS-маршрутов?</p>
-        {#snippet actions()}
-            <Button variant="ghost" onclick={() => dnsBulkDeleteConfirm = false}>Отмена</Button>
-            <Button variant="danger" onclick={bulkDnsDelete}>Удалить</Button>
-        {/snippet}
-    </Modal>
+    <ConfirmModal
+        open={true}
+        title="Удаление"
+        message={`Удалить ${dnsSelected.size} DNS-маршрутов?`}
+        onConfirm={bulkDnsDelete}
+        onClose={() => dnsBulkDeleteConfirm = false}
+    />
+{/if}
+
+{#if pickingForRoute}
+    <IconPickerModal
+        open={iconPickerOpen}
+        iconUrl={pickingForRoute.iconUrl}
+        ruleName={pickingForRoute.name}
+        onclose={() => { iconPickerOpen = false; pickingForRoute = null; }}
+        onapply={async (newUrl) => {
+            if (!pickingForRoute) return;
+            const route = pickingForRoute;
+            iconPickerOpen = false;
+            pickingForRoute = null;
+            try {
+                await api.updateDnsRoute(route.id, { ...route, iconUrl: newUrl ?? undefined });
+                notifications.success(newUrl ? 'Иконка изменена' : 'Иконка сброшена');
+            } catch (e: any) {
+                notifications.error(e?.message || 'Не удалось обновить иконку');
+            }
+        }}
+    />
 {/if}
 {/if}
 

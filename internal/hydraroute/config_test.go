@@ -189,7 +189,9 @@ ConntrackFlush=false
 		}
 	}
 
-	// Known keys must be updated.
+	// Known keys must be updated, preserving the case the original
+	// file used (AutoStart, DirectRouteEnabled, ConntrackFlush were
+	// all PascalCase on disk).
 	if !strContains(text, "AutoStart=true") {
 		t.Errorf("AutoStart not updated\nfull output:\n%s", text)
 	}
@@ -199,7 +201,9 @@ ConntrackFlush=false
 	if !strContains(text, "ConntrackFlush=true") {
 		t.Errorf("ConntrackFlush not updated\nfull output:\n%s", text)
 	}
-	if !strContains(text, "Log=debug") {
+	// Log was missing from the original — appended using hr-neo's
+	// own lowercase convention so the daemon recognises it.
+	if !strContains(text, "log=debug") {
 		t.Errorf("Log not written\nfull output:\n%s", text)
 	}
 }
@@ -349,4 +353,259 @@ func strContains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// strCount returns the number of non-overlapping occurrences of sub in s.
+func strCount(s, sub string) int {
+	if sub == "" {
+		return 0
+	}
+	n := 0
+	for i := 0; i <= len(s)-len(sub); {
+		if s[i:i+len(sub)] == sub {
+			n++
+			i += len(sub)
+		} else {
+			i++
+		}
+	}
+	return n
+}
+
+// TestReadConfig_AcceptsDaemonCasing covers the production regression:
+// hr-neo writes hrneo.conf with a mix of camelCase, lowercase, and
+// PascalCase keys. The old case-sensitive switch missed the camelCase
+// and lowercase variants, so UI showed default-zero values for keys
+// the daemon had actively set. Reader now lowercases the key before
+// dispatching, so every casing the daemon emits is accepted.
+func TestReadConfig_AcceptsDaemonCasing(t *testing.T) {
+	// Exact snippet from a production hrneo.conf, minus the appended
+	// PascalCase duplicates the old writer added.
+	content := `autoStart=true
+clearIPSet=true
+IpsetEnableTimeout=true
+IpsetTimeout=21600
+CIDR=true
+log=off
+logfile=/opt/var/log/LOGhrneo.log
+DirectRouteEnabled=true
+GlobalRouting=false
+ConntrackFlush=true
+`
+	setupTestConf(t, content)
+
+	cfg, err := ReadConfig()
+	if err != nil {
+		t.Fatalf("ReadConfig: %v", err)
+	}
+	if !cfg.AutoStart {
+		t.Errorf("AutoStart: want true (from camelCase autoStart=true)")
+	}
+	if !cfg.ClearIPSet {
+		t.Errorf("ClearIPSet: want true (from mixed-case clearIPSet=true)")
+	}
+	if cfg.Log != "off" {
+		t.Errorf("Log: want %q (from lowercase log=off), got %q", "off", cfg.Log)
+	}
+	if cfg.LogFile != "/opt/var/log/LOGhrneo.log" {
+		t.Errorf("LogFile: want path (from lowercase logfile=...), got %q", cfg.LogFile)
+	}
+}
+
+// TestWriteConfig_PreservesOriginalCase verifies the writer rewrites
+// each managed key in the exact casing the existing line used —
+// daemon-cased lines stay daemon-cased so subsequent daemon reads
+// still see the value. Without this, our writer was producing PascalCase
+// lines for daemon-cased keys, causing the duplicate-key disaster.
+func TestWriteConfig_PreservesOriginalCase(t *testing.T) {
+	content := `autoStart=true
+clearIPSet=false
+log=off
+logfile=/some/path
+ConntrackFlush=true
+`
+	setupTestConf(t, content)
+
+	cfg := &Config{
+		AutoStart:      false, // flip
+		ClearIPSet:     true,  // flip
+		Log:            "debug",
+		LogFile:        "/new/path",
+		ConntrackFlush: false, // flip
+	}
+	if err := WriteConfig(cfg); err != nil {
+		t.Fatalf("WriteConfig: %v", err)
+	}
+	raw, _ := os.ReadFile(hrConfPath)
+	text := string(raw)
+
+	// Original casing must be preserved.
+	for _, want := range []string{
+		"autoStart=false",
+		"clearIPSet=true",
+		"log=debug",
+		"logfile=/new/path",
+		"ConntrackFlush=false",
+	} {
+		if !strContains(text, want) {
+			t.Errorf("missing %q\nfull output:\n%s", want, text)
+		}
+	}
+	// And the WRONG casing must not appear as a new line.
+	for _, mustNot := range []string{
+		"AutoStart=", "ClearIPSet=", "Log=", "LogFile=",
+	} {
+		if strContains(text, mustNot) {
+			t.Errorf("unexpected PascalCase duplicate %q\nfull output:\n%s", mustNot, text)
+		}
+	}
+}
+
+// TestWriteConfig_DedupsCaseInsensitiveDuplicates feeds the writer a
+// file in the exact broken shape we saw in production — daemon-cased
+// keys followed by PascalCase duplicates appended by the old writer.
+// After one WriteConfig pass the file must have ONE line per managed
+// key, in daemon casing, with the new value.
+func TestWriteConfig_DedupsCaseInsensitiveDuplicates(t *testing.T) {
+	content := `autoStart=true
+clearIPSet=true
+IpsetEnableTimeout=true
+IpsetTimeout=21600
+CIDR=true
+CIDRfile=/opt/etc/HydraRoute/ip.list
+log=off
+logfile=/opt/var/log/LOGhrneo.log
+DirectRouteEnabled=true
+InterfaceFwMarkStart=12289
+InterfaceTableStart=301
+GlobalRouting=false
+ConntrackFlush=true
+GeoIPFile=/opt/etc/HydraRoute/geoip_GA.dat
+GeoSiteFile=/opt/etc/HydraRoute/geosite_GA.dat
+PolicyOrder=HydraRoute
+AutoStart=false
+ClearIPSet=false
+IpsetMaxElem=0
+Log=
+LogFile=
+`
+	setupTestConf(t, content)
+
+	cfg := &Config{
+		AutoStart:          true, // user toggles ON in UI
+		ClearIPSet:         true,
+		CIDR:               true,
+		IpsetEnableTimeout: true,
+		IpsetTimeout:       21600,
+		IpsetMaxElem:       0,
+		DirectRouteEnabled: true,
+		ConntrackFlush:     true,
+		Log:                "off",
+		LogFile:            "/opt/var/log/LOGhrneo.log",
+		GeoIPFiles:         []string{"/opt/etc/HydraRoute/geoip_GA.dat"},
+		GeoSiteFiles:       []string{"/opt/etc/HydraRoute/geosite_GA.dat"},
+		PolicyOrder:        []string{"HydraRoute"},
+	}
+	if err := WriteConfig(cfg); err != nil {
+		t.Fatalf("WriteConfig: %v", err)
+	}
+	raw, _ := os.ReadFile(hrConfPath)
+	text := string(raw)
+
+	// Each managed key must appear exactly once.
+	for key, wantCount := range map[string]int{
+		// Daemon-cased lines (originals from line 1-16 of input). The
+		// strings match a non-substring of another key.
+		"autoStart=": 1, "clearIPSet=": 1, "log=": 1, "logfile=": 1,
+		"IpsetEnableTimeout=": 1, "IpsetTimeout=": 1,
+		"DirectRouteEnabled=": 1, "GlobalRouting=": 1, "ConntrackFlush=": 1,
+		"GeoIPFile=": 1, "GeoSiteFile=": 1, "PolicyOrder=": 1,
+		// PascalCase duplicates from the bottom of the input must be gone.
+		"AutoStart=":  0,
+		"ClearIPSet=": 0,
+		"Log=":        0,
+		"LogFile=":    0,
+		// CIDR-only line (not the CIDRfile unknown key).
+		"CIDR=true": 1,
+	} {
+		if got := strCount(text, key); got != wantCount {
+			t.Errorf("key %q appears %d times, want %d\nfull output:\n%s", key, got, wantCount, text)
+		}
+	}
+
+	// Unknown keys preserved.
+	for _, want := range []string{
+		"CIDRfile=/opt/etc/HydraRoute/ip.list",
+		"InterfaceFwMarkStart=12289",
+		"InterfaceTableStart=301",
+	} {
+		if !strContains(text, want) {
+			t.Errorf("preserved-unknown %q missing\nfull output:\n%s", want, text)
+		}
+	}
+
+	// New value applied: autoStart now true.
+	if !strContains(text, "autoStart=true") {
+		t.Errorf("autoStart not toggled to true\nfull output:\n%s", text)
+	}
+
+	// Sanity: re-read should round-trip cleanly.
+	got, err := ReadConfig()
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if !got.AutoStart || !got.ClearIPSet || got.Log != "off" {
+		t.Errorf("round-trip mismatch: %#v", got)
+	}
+}
+
+// TestWriteConfig_AppendsNewKeysWithCanonicalCase covers the
+// fresh-install path (or a file that never had a given managed key):
+// when WriteConfig appends a key not previously present, it must use
+// the casing hr-neo itself would have used, NOT our former hard-coded
+// PascalCase. Otherwise the next daemon write would create a new
+// duplicate.
+func TestWriteConfig_AppendsNewKeysWithCanonicalCase(t *testing.T) {
+	setupEmptyConf(t)
+
+	cfg := &Config{
+		AutoStart:      true,
+		ClearIPSet:     true,
+		ConntrackFlush: true,
+		Log:            "info",
+		LogFile:        "/var/log/hr.log",
+	}
+	if err := WriteConfig(cfg); err != nil {
+		t.Fatalf("WriteConfig: %v", err)
+	}
+	raw, _ := os.ReadFile(hrConfPath)
+	text := string(raw)
+
+	// camel / lower for these — daemon's convention.
+	for _, want := range []string{
+		"autoStart=true",
+		"clearIPSet=true",
+		"log=info",
+		"logfile=/var/log/hr.log",
+	} {
+		if !strContains(text, want) {
+			t.Errorf("missing %q\nfull output:\n%s", want, text)
+		}
+	}
+	// Pascal for these.
+	for _, want := range []string{
+		"ConntrackFlush=true",
+	} {
+		if !strContains(text, want) {
+			t.Errorf("missing %q\nfull output:\n%s", want, text)
+		}
+	}
+	// No PascalCase variants of the daemon-cased keys.
+	for _, mustNot := range []string{
+		"AutoStart=", "ClearIPSet=", "Log=", "LogFile=",
+	} {
+		if strContains(text, mustNot) {
+			t.Errorf("unexpected PascalCase append %q\nfull output:\n%s", mustNot, text)
+		}
+	}
 }

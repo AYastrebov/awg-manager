@@ -10,8 +10,8 @@ package deviceproxy
 // storage file is treated as a disabled zero-value Config.
 type Config struct {
 	Enabled          bool     `json:"enabled"`
-	ListenAll        bool     `json:"listenAll"`        // true → bind 0.0.0.0
-	ListenInterface  string   `json:"listenInterface"`  // NDMS interface id when ListenAll=false, e.g. "Bridge0"
+	ListenAll        bool     `json:"listenAll"`       // true → bind 0.0.0.0
+	ListenInterface  string   `json:"listenInterface"` // NDMS interface id when ListenAll=false, e.g. "Bridge0"
 	Port             int      `json:"port"`
 	Auth             AuthSpec `json:"auth"`
 	SelectedOutbound string   `json:"selectedOutbound"` // sing-box tag of the active member
@@ -22,6 +22,64 @@ type AuthSpec struct {
 	Enabled  bool   `json:"enabled"`
 	Username string `json:"username"`
 	Password string `json:"password"`
+}
+
+// Instance represents one logical proxy instance with independent proxy settings.
+type Instance struct {
+	ID               string   `json:"id"`
+	Name             string   `json:"name"`
+	Enabled          bool     `json:"enabled"`
+	ListenAll        bool     `json:"listenAll"`
+	ListenInterface  string   `json:"listenInterface"`
+	Port             int      `json:"port"`
+	Auth             AuthSpec `json:"auth"`
+	SelectedOutbound string   `json:"selectedOutbound"`
+}
+
+// Snapshot holds the current set of proxy instances.
+type Snapshot struct {
+	Instances []Instance `json:"instances"`
+}
+
+// defaultInstance returns a default proxy instance populated from defaultConfig.
+func defaultInstance() Instance {
+	cfg := defaultConfig()
+	return Instance{
+		ID:               "default",
+		Name:             "Прокси",
+		Enabled:          cfg.Enabled,
+		ListenAll:        cfg.ListenAll,
+		ListenInterface:  cfg.ListenInterface,
+		Port:             cfg.Port,
+		Auth:             cfg.Auth,
+		SelectedOutbound: cfg.SelectedOutbound,
+	}
+}
+
+// instanceToConfig converts an Instance to a legacy Config structure.
+func instanceToConfig(in Instance) Config {
+	return Config{
+		Enabled:          in.Enabled,
+		ListenAll:        in.ListenAll,
+		ListenInterface:  in.ListenInterface,
+		Port:             in.Port,
+		Auth:             in.Auth,
+		SelectedOutbound: in.SelectedOutbound,
+	}
+}
+
+// configToDefaultInstance converts a Config into the default-named Instance.
+func configToDefaultInstance(cfg Config) Instance {
+	return Instance{
+		ID:               "default",
+		Name:             "Прокси",
+		Enabled:          cfg.Enabled,
+		ListenAll:        cfg.ListenAll,
+		ListenInterface:  cfg.ListenInterface,
+		Port:             cfg.Port,
+		Auth:             cfg.Auth,
+		SelectedOutbound: cfg.SelectedOutbound,
+	}
 }
 
 // defaultConfig is used when deviceproxy.json does not exist yet.

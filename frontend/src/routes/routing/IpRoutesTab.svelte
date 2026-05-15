@@ -1,21 +1,24 @@
 <script lang="ts">
     import { api } from '$lib/api/client';
     import type { StaticRouteList, RoutingTunnel } from '$lib/types';
-    import { Modal, StoreStatusBadge, Button, Dropdown, type DropdownOption } from '$lib/components/ui';
+    import { ConfirmModal, StoreStatusBadge, Button, Dropdown, type DropdownOption } from '$lib/components/ui';
     import { IpRouteCard, IpRouteEditModal, IpRouteImportModal } from '$lib/components/routing';
+    import { IconPickerModal } from '$lib/components/dnsroutes';
     import { exportStaticRoutes, type PortableStaticRoute } from '$lib/utils/staticroute-export';
     import { downloadJson } from '$lib/utils/dns-export';
     import { notifications } from '$lib/stores/notifications';
     import { staticRoutesStore } from '$lib/stores/routing';
+    import RoutingTabBodySkeleton from './RoutingTabBodySkeleton.svelte';
 
     interface Props {
         ipRoutes: StaticRouteList[];
         routingTunnels: RoutingTunnel[];
         editRuleId?: string;
         editRuleCounter?: number;
+        bodyLoading?: boolean;
     }
 
-    let { ipRoutes, routingTunnels, editRuleId = '', editRuleCounter = 0 }: Props = $props();
+    let { ipRoutes, routingTunnels, editRuleId = '', editRuleCounter = 0, bodyLoading = false }: Props = $props();
 
     // Open edit modal when search result is clicked.
     // Capture counter at mount to skip stale values on tab re-mount.
@@ -43,6 +46,8 @@
     let ipToggling = $state<string | null>(null);
     let ipSaving = $state(false);
     let ipCreateOpen = $state(false);
+    let iconPickerOpen = $state(false);
+    let pickingForRoute = $state<StaticRouteList | null>(null);
 
     // Orphan = list whose tunnel was deleted (TunnelID=""). Kept in storage
     // so the user can reassign it via the Edit dialog instead of rebuilding
@@ -51,7 +56,7 @@
     let boundRoutes = $derived(ipRoutes.filter(r => r.tunnelID));
     let ipActiveCount = $derived(boundRoutes.filter(r => r.enabled).length);
 
-    async function saveIpRoute(data: { name: string; tunnelID: string; subnets: string[]; fallback: '' | 'reject' }) {
+    async function saveIpRoute(data: { name: string; tunnelID: string; subnets: string[]; fallback: '' | 'reject'; iconUrl?: string }) {
         ipSaving = true;
         try {
             if (editingIpRoute) {
@@ -61,6 +66,7 @@
                     tunnelID: data.tunnelID,
                     subnets: data.subnets,
                     fallback: data.fallback,
+                    iconUrl: data.iconUrl,
                 });
                 notifications.success('IP-маршрут обновлён');
             } else {
@@ -69,6 +75,7 @@
                     tunnelID: data.tunnelID,
                     subnets: data.subnets,
                     fallback: data.fallback,
+                    iconUrl: data.iconUrl,
                     enabled: true,
                 });
                 notifications.success('IP-маршрут создан');
@@ -209,15 +216,19 @@
 <div class="section-header">
     {#if !ipSelectionMode}
         <span class="section-summary">
-            {boundRoutes.length} правил, {ipActiveCount} активных{#if orphanRoutes.length > 0}, <span class="orphan-count">несвязанных: {orphanRoutes.length}</span>{/if}
+            {#if bodyLoading}
+                …
+            {:else}
+                {boundRoutes.length} правил, {ipActiveCount} активных{#if orphanRoutes.length > 0}, <span class="orphan-count">несвязанных: {orphanRoutes.length}</span>{/if}
+            {/if}
         </span>
         <div class="section-buttons">
             <StoreStatusBadge store={staticRoutesStore} />
-            <Button variant="ghost" size="sm" onclick={() => ipImportOpen = true}>Загрузить набор правил</Button>
+            <Button variant="ghost" size="sm" disabled={bodyLoading} onclick={() => ipImportOpen = true}>Загрузить набор правил</Button>
             {#if ipRoutes.length > 0}
-                <Button variant="ghost" size="sm" onclick={() => { ipSelectionMode = true; ipSelected = new Set(); }}>Выбрать</Button>
+                <Button variant="ghost" size="sm" disabled={bodyLoading} onclick={() => { ipSelectionMode = true; ipSelected = new Set(); }}>Выбрать</Button>
             {/if}
-            <Button variant="primary" size="sm" onclick={() => { editingIpRoute = null; ipCreateOpen = true; }}>+ Новое правило</Button>
+            <Button variant="primary" size="sm" disabled={bodyLoading} onclick={() => { editingIpRoute = null; ipCreateOpen = true; }}>+ Новое правило</Button>
         </div>
     {:else}
         <div class="bulk-bar">
@@ -257,7 +268,9 @@
     {/if}
 </div>
 
-{#if ipRoutes.length === 0}
+{#if bodyLoading}
+    <RoutingTabBodySkeleton />
+{:else if ipRoutes.length === 0}
     <div class="empty-hint">Нет IP-маршрутов</div>
 {:else}
     {#if orphanRoutes.length > 0}
@@ -276,6 +289,7 @@
                         selectable={ipSelectionMode}
                         selected={ipSelected.has(route.id)}
                         onselect={() => toggleIpSelect(route.id)}
+                        onicon={() => { pickingForRoute = route; iconPickerOpen = true; }}
                     />
                 {/each}
             </div>
@@ -295,6 +309,7 @@
                     selectable={ipSelectionMode}
                     selected={ipSelected.has(route.id)}
                     onselect={() => toggleIpSelect(route.id)}
+                    onicon={() => { pickingForRoute = route; iconPickerOpen = true; }}
                 />
             {/each}
         </div>
@@ -320,23 +335,44 @@
 
 {#if ipDeleteId}
     {@const routeToDelete = ipRoutes.find(r => r.id === ipDeleteId)}
-    <Modal open={true} title="Удаление" size="sm" onclose={() => ipDeleteId = null}>
-        <p class="confirm-text">Удалить список маршрутов «{routeToDelete?.name ?? ipDeleteId}»?</p>
-        {#snippet actions()}
-            <Button variant="ghost" onclick={() => ipDeleteId = null}>Отмена</Button>
-            <Button variant="danger" onclick={() => deleteIpRoute()}>Удалить</Button>
-        {/snippet}
-    </Modal>
+    <ConfirmModal
+        open={true}
+        title="Удаление"
+        message={`Удалить список маршрутов «${routeToDelete?.name ?? ipDeleteId}»?`}
+        onConfirm={() => deleteIpRoute()}
+        onClose={() => ipDeleteId = null}
+    />
 {/if}
 
 {#if ipBulkDeleteConfirm}
-    <Modal open={true} title="Удаление" size="sm" onclose={() => ipBulkDeleteConfirm = false}>
-        <p class="confirm-text">Удалить {ipSelected.size} IP-маршрутов?</p>
-        {#snippet actions()}
-            <Button variant="ghost" onclick={() => ipBulkDeleteConfirm = false}>Отмена</Button>
-            <Button variant="danger" onclick={bulkIpDelete}>Удалить</Button>
-        {/snippet}
-    </Modal>
+    <ConfirmModal
+        open={true}
+        title="Удаление"
+        message={`Удалить ${ipSelected.size} IP-маршрутов?`}
+        onConfirm={bulkIpDelete}
+        onClose={() => ipBulkDeleteConfirm = false}
+    />
+{/if}
+
+{#if pickingForRoute}
+    <IconPickerModal
+        open={iconPickerOpen}
+        iconUrl={pickingForRoute.iconUrl}
+        ruleName={pickingForRoute.name}
+        onclose={() => { iconPickerOpen = false; pickingForRoute = null; }}
+        onapply={async (newUrl) => {
+            if (!pickingForRoute) return;
+            const route = pickingForRoute;
+            iconPickerOpen = false;
+            pickingForRoute = null;
+            try {
+                await api.updateStaticRoute({ ...route, iconUrl: newUrl ?? undefined });
+                notifications.success(newUrl ? 'Иконка изменена' : 'Иконка сброшена');
+            } catch (e: any) {
+                notifications.error(e?.message || 'Не удалось обновить иконку');
+            }
+        }}
+    />
 {/if}
 
 <style>

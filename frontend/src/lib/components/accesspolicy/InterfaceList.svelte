@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { AccessPolicyInterface, PolicyGlobalInterface } from '$lib/types';
-	import { Modal, Button } from '$lib/components/ui';
+	import { ConfirmModal } from '$lib/components/ui';
 	import { api } from '$lib/api/client';
 	import { notifications } from '$lib/stores/notifications';
 
@@ -169,51 +169,23 @@
 </div>
 
 {#if confirmToggle}
-	<Modal open={true} title={confirmToggle.currentlyUp ? 'Выключение интерфейса' : 'Включение интерфейса'} size="sm" onclose={() => confirmToggle = null}>
-		<div class="confirm-content">
-			{#if confirmToggle.currentlyUp}
-				<p class="confirm-warning">Это действие <strong>выключит</strong> интерфейс <strong>{confirmToggle.label}</strong> на роутере!</p>
-				<p class="confirm-detail">Интерфейс перестанет работать для всех сервисов, не только для этой политики. Все подключения через этот интерфейс будут разорваны.</p>
-			{:else}
-				<p class="confirm-info">Это действие <strong>включит</strong> интерфейс <strong>{confirmToggle.label}</strong> на роутере.</p>
-				<p class="confirm-detail">Интерфейс станет доступен для всех сервисов, не только для этой политики.</p>
-			{/if}
-		</div>
-		{#snippet actions()}
-			<Button variant="ghost" onclick={() => confirmToggle = null}>Отмена</Button>
-			{#if confirmToggle?.currentlyUp}
-				<Button variant="danger" onclick={executeToggle}>Выключить</Button>
-			{:else}
-				<Button variant="primary" onclick={executeToggle}>Включить</Button>
-			{/if}
-		{/snippet}
-	</Modal>
+	<ConfirmModal
+		open={true}
+		title={confirmToggle.currentlyUp ? 'Выключение интерфейса' : 'Включение интерфейса'}
+		message={confirmToggle.currentlyUp
+			? `Это действие выключит интерфейс «${confirmToggle.label}» на роутере.`
+			: `Это действие включит интерфейс «${confirmToggle.label}» на роутере.`}
+		secondary={confirmToggle.currentlyUp
+			? 'Интерфейс перестанет работать для всех сервисов, не только для этой политики. Все подключения через этот интерфейс будут разорваны.'
+			: 'Интерфейс станет доступен для всех сервисов, не только для этой политики.'}
+		variant={confirmToggle.currentlyUp ? 'danger' : 'primary'}
+		confirmLabel={confirmToggle.currentlyUp ? 'Выключить' : 'Включить'}
+		onConfirm={executeToggle}
+		onClose={() => confirmToggle = null}
+	/>
 {/if}
 
 <style>
-	.confirm-content {
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-	}
-
-	.confirm-warning {
-		color: var(--error);
-		font-size: 0.9375rem;
-		margin: 0;
-	}
-
-	.confirm-info {
-		color: var(--text-primary);
-		font-size: 0.9375rem;
-		margin: 0;
-	}
-
-	.confirm-detail {
-		color: var(--text-muted);
-		font-size: 0.8125rem;
-		margin: 0;
-	}
 	.iface-section {
 		display: flex;
 		flex-direction: column;

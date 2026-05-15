@@ -133,6 +133,85 @@ func TestEnumerate_SystemOnly(t *testing.T) {
 	}
 }
 
+// fakeManagedServers implements ManagedServersQuery for tests.
+type fakeManagedServers struct{ names []string }
+
+func (f *fakeManagedServers) ManagedServerInterfaceNames(ctx context.Context) []string {
+	return f.names
+}
+
+func TestEnumerate_SkipsManagedServerInterfaces(t *testing.T) {
+	root := makeIfacePresent(t, "nwg0", "nwg1")
+	svc := &ServiceImpl{
+		deps: Deps{
+			AWGTunnels: &fakeAWGStore{},
+			SystemTunnels: &fakeSystemStore{tunnels: []SystemTunnelInfo{
+				{ID: "Wireguard0", InterfaceName: "nwg0", Description: "Our managed server"},
+				{ID: "Wireguard1", InterfaceName: "nwg1", Description: "User tunnel"},
+			}},
+			ManagedServers: &fakeManagedServers{names: []string{"nwg0"}},
+		},
+		sysClassNet: root,
+	}
+
+	got, err := svc.enumerate(context.Background())
+	if err != nil {
+		t.Fatalf("enumerate: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 entry (nwg1), got %d: %+v", len(got), got)
+	}
+	if got[0].Iface != "nwg1" {
+		t.Errorf("kept iface = %s, want nwg1", got[0].Iface)
+	}
+}
+
+func TestEnumerate_ManagedServersNilFilter(t *testing.T) {
+	// ManagedServers == nil must not crash and must not filter anything.
+	root := makeIfacePresent(t, "nwg0")
+	svc := &ServiceImpl{
+		deps: Deps{
+			SystemTunnels: &fakeSystemStore{tunnels: []SystemTunnelInfo{
+				{ID: "Wireguard0", InterfaceName: "nwg0", Description: "Any"},
+			}},
+			ManagedServers: nil,
+		},
+		sysClassNet: root,
+	}
+	got, err := svc.enumerate(context.Background())
+	if err != nil {
+		t.Fatalf("enumerate: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(got))
+	}
+}
+
+func TestEnumerate_SkipsAWGMDescriptionPrefix(t *testing.T) {
+	// Validates the description-prefix fallback filter: a system tunnel whose
+	// description starts with "AWGM" (the ManagedServerDescription prefix in
+	// internal/managed/types.go) must be excluded even when ManagedServers is
+	// nil (i.e., the interface-name set is empty / stale).
+	root := makeIfacePresent(t, "Wireguard1")
+	s := &ServiceImpl{
+		deps: Deps{
+			AWGTunnels: &fakeAWGStore{},
+			SystemTunnels: &fakeSystemStore{tunnels: []SystemTunnelInfo{
+				{ID: "Wireguard1", InterfaceName: "Wireguard1", Description: "AWGM WG Server"},
+			}},
+			ManagedServers: nil, // confirm fallback alone catches it
+		},
+		sysClassNet: root,
+	}
+	out, err := s.enumerate(context.Background())
+	if err != nil {
+		t.Fatalf("enumerate: %v", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("expected 0 entries (server-side WG must be filtered by description prefix), got %d: %+v", len(out), out)
+	}
+}
+
 func TestEnumerate_DedupBySystemAlsoManaged(t *testing.T) {
 	root := makeIfacePresent(t, "nwg0")
 	s := &ServiceImpl{

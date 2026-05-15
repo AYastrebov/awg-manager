@@ -1,6 +1,9 @@
 <script lang="ts">
 	import type { MonitoringSnapshot, MonitoringTarget, MonitoringTunnel, MonitoringCell } from '$lib/types';
 	import MatrixCell from './MatrixCell.svelte';
+	import { Badge, LatencySparkline } from '$lib/components/ui';
+	import { latencyTier } from '$lib/utils/latencyTier';
+	import { latencyHistory } from '$lib/stores/singboxProxies';
 
 	interface Props {
 		snapshot: MonitoringSnapshot;
@@ -17,8 +20,13 @@
 		return t.id.startsWith('sys-');
 	}
 
+	function isSingbox(t: MonitoringTunnel): boolean {
+		return t.source === 'singbox';
+	}
+
 	// Managed AWG tunnels open the pingcheck drawer on the monitoring page.
-	// System tunnels are read-only — Keenetic owns their pingcheck.
+	// System tunnels and sing-box t2sX are read-only — neither has NDMS-side
+	// pingcheck (Keenetic owns the system case; sing-box uses Clash urltest).
 	function tunnelHref(t: MonitoringTunnel): string {
 		return `/monitoring?pingcheck=${encodeURIComponent(t.id)}`;
 	}
@@ -47,7 +55,11 @@
 					{#each sortedTunnels as t (t.id)}
 						<th class="th-tunnel">
 							{#if isSystem(t)}
-								<span class="tunnel-system" title="Системный туннель Keenetic — pingcheck управляется в системе">
+								<span class="tunnel-system" title="Системный туннель роутера — pingcheck управляется в системе">
+									{t.name}
+								</span>
+							{:else if isSingbox(t)}
+								<span class="tunnel-system" title="Sing-box туннель — мониторинг через Clash urltest, NDMS pingcheck не применяется">
 									{t.name}
 								</span>
 							{:else}
@@ -55,6 +67,21 @@
 									{t.name}
 									<span class="settings-icon" aria-hidden="true">›</span>
 								</a>
+							{/if}
+							{#if t.source === 'singbox' && t.clashDelay && t.clashDelay > 0}
+								<Badge
+									variant={latencyTier(t.clashDelay)}
+									size="sm"
+									mono
+									title={`Источник: urltest группа "${t.urltestGroup ?? ''}"`}
+								>
+									<span class="clash-num">clash: <span class="clash-val">{t.clashDelay}</span>ms</span>
+									<LatencySparkline
+										history={$latencyHistory.get(t.singboxTag ?? '') ?? []}
+										width={36}
+										height={10}
+									/>
+								</Badge>
 							{/if}
 						</th>
 					{/each}
@@ -102,6 +129,16 @@
 <style>
 	.wrap {
 		overflow-x: auto;
+	}
+
+	.clash-num {
+		font-variant-numeric: tabular-nums;
+	}
+
+	.clash-val {
+		display: inline-block;
+		min-width: 3ch;
+		text-align: right;
 	}
 
 	.matrix {

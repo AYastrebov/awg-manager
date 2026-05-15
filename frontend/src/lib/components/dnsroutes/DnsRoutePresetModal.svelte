@@ -247,7 +247,7 @@
         height: 18px;
         border-radius: 4px;
         background: var(--color-accent);
-        color: #fff;
+        color: var(--color-accent-contrast, #fff);
         font-size: 11px;
         display: flex;
         align-items: center;

@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	CurrentSchemaVersion = 15
+	CurrentSchemaVersion = 17
 	DefaultPort          = 2222
 	DefaultInterface     = "br0"
 )
@@ -103,6 +103,12 @@ func (s *SettingsStore) Load() (*Settings, error) {
 		if settings.SchemaVersion < 15 {
 			s.migrateToV15(&settings)
 		}
+		if settings.SchemaVersion < 16 {
+			s.migrateToV16(&settings)
+		}
+		if settings.SchemaVersion < 17 {
+			s.migrateToV17(&settings)
+		}
 		// Save migrated settings
 		if err := s.saveUnlocked(&settings); err != nil {
 			return nil, err
@@ -118,6 +124,7 @@ func (s *SettingsStore) defaultSettings() *Settings {
 	return &Settings{
 		SchemaVersion: CurrentSchemaVersion,
 		AuthEnabled:   false,
+		UsageLevel:    UsageLevelBasic,
 		Server: ServerSettings{
 			Port:      DefaultPort,
 			Interface: DefaultInterface,
@@ -133,8 +140,10 @@ func (s *SettingsStore) defaultSettings() *Settings {
 			},
 		},
 		Logging: LoggingSettings{
-			Enabled: true,
-			MaxAge:  2,
+			Enabled:           true,
+			MaxAge:            2,
+			AppMaxEntries:     5000,
+			SingboxMaxEntries: 5000,
 		},
 		Updates: UpdateSettings{
 			CheckEnabled: true,
@@ -210,9 +219,10 @@ func (s *SettingsStore) migrateToV6(settings *Settings) {
 	settings.SchemaVersion = 6
 }
 
-// migrateToV7 migrates settings from v6 to v7.
+// migrateToV7 was a version bump for an experimental field that was
+// removed before reaching production. Kept as a no-op so the schema
+// ladder remains contiguous.
 func (s *SettingsStore) migrateToV7(settings *Settings) {
-	// OnboardingCompleted defaults to false (zero value) — no action needed
 	settings.SchemaVersion = 7
 }
 
@@ -271,6 +281,29 @@ func (s *SettingsStore) migrateToV15(settings *Settings) {
 	settings.SingboxRouter.PolicyName = ""
 	settings.SingboxRouter.Enabled = false
 	settings.SchemaVersion = 15
+}
+
+// migrateToV16 introduces UsageLevel. Any user reaching this migration
+// already has a working settings file (the file existed on disk before
+// the upgrade), so they are an existing user — set advanced. Fresh
+// installs never run this migration: defaultSettings() ships v16 with
+// usageLevel="basic".
+func (s *SettingsStore) migrateToV16(settings *Settings) {
+	settings.UsageLevel = UsageLevelAdvanced
+	settings.SchemaVersion = 16
+}
+
+// migrateToV17 introduces per-bucket buffer caps for the logging system.
+// Existing installs default to 5000 entries each (matches the prior
+// hardcoded MaxEntries that lived in internal/logging/buffer.go).
+func (s *SettingsStore) migrateToV17(settings *Settings) {
+	if settings.Logging.AppMaxEntries == 0 {
+		settings.Logging.AppMaxEntries = 5000
+	}
+	if settings.Logging.SingboxMaxEntries == 0 {
+		settings.Logging.SingboxMaxEntries = 5000
+	}
+	settings.SchemaVersion = 17
 }
 
 // migrateManagedServers moves a legacy singular managedServer into the
@@ -389,6 +422,20 @@ func (s *SettingsStore) SaveManagedServers(servers []ManagedServer) error {
 	}
 	s.settings.ManagedServers = servers
 	s.settings.ManagedServer = nil
+	return s.saveUnlocked(s.settings)
+}
+
+// SetSingboxManuallyStopped atomically updates the sing-box sticky-stop
+// flag under the store lock so concurrent Load→mutate→Save writers on
+// other Settings fields (e.g. SingboxRouter toggles from router service)
+// cannot silently overwrite the change. Mirrors SaveManagedServers.
+func (s *SettingsStore) SetSingboxManuallyStopped(v bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return fmt.Errorf("settings not loaded")
+	}
+	s.settings.SingboxManuallyStopped = v
 	return s.saveUnlocked(s.settings)
 }
 
@@ -553,6 +600,30 @@ func (s *SettingsStore) GetLoggingMaxAge() int {
 		return 2
 	}
 	return settings.Logging.MaxAge
+}
+
+// GetAppMaxEntries returns the cap for the app log buffer.
+func (s *SettingsStore) GetAppMaxEntries() int {
+	settings, err := s.Get()
+	if err != nil {
+		return 5000
+	}
+	if settings.Logging.AppMaxEntries <= 0 {
+		return 5000
+	}
+	return settings.Logging.AppMaxEntries
+}
+
+// GetSingboxMaxEntries returns the cap for the sing-box log buffer.
+func (s *SettingsStore) GetSingboxMaxEntries() int {
+	settings, err := s.Get()
+	if err != nil {
+		return 5000
+	}
+	if settings.Logging.SingboxMaxEntries <= 0 {
+		return 5000
+	}
+	return settings.Logging.SingboxMaxEntries
 }
 
 // AddManagedPolicy adds a policy name to the managed policies list.

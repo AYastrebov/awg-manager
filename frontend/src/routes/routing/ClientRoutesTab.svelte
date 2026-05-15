@@ -1,18 +1,20 @@
 <script lang="ts">
     import { api } from '$lib/api/client';
     import type { ClientRoute, PolicyDevice, RoutingTunnel } from '$lib/types';
-    import { Modal, StoreStatusBadge, Button, Dropdown, type DropdownOption } from '$lib/components/ui';
+    import { ConfirmModal, StoreStatusBadge, Button, Dropdown, type DropdownOption } from '$lib/components/ui';
     import { ClientRouteCard, ClientRouteCreateModal } from '$lib/components/clientroute';
     import { notifications } from '$lib/stores/notifications';
     import { clientRoutesStore } from '$lib/stores/routing';
+    import RoutingTabBodySkeleton from './RoutingTabBodySkeleton.svelte';
 
     interface Props {
         clientRoutes: ClientRoute[];
         policyDevices: PolicyDevice[];
         routingTunnels: RoutingTunnel[];
+        bodyLoading?: boolean;
     }
 
-    let { clientRoutes, policyDevices, routingTunnels }: Props = $props();
+    let { clientRoutes, policyDevices, routingTunnels, bodyLoading = false }: Props = $props();
 
     let clientRouteSaving = $state(false);
     let clientRouteDeleteId = $state<string | null>(null);
@@ -152,13 +154,19 @@
 
 <div class="section-header">
     {#if !clientSelectionMode}
-        <span class="section-summary">{clientRoutes.length} правил</span>
+        <span class="section-summary">
+            {#if bodyLoading}
+                …
+            {:else}
+                {clientRoutes.length} правил
+            {/if}
+        </span>
         <div class="section-buttons">
             <StoreStatusBadge store={clientRoutesStore} />
             {#if clientRoutes.length > 0}
-                <Button variant="ghost" size="sm" onclick={() => { clientSelectionMode = true; clientSelected = new Set(); }}>Выбрать</Button>
+                <Button variant="ghost" size="sm" disabled={bodyLoading} onclick={() => { clientSelectionMode = true; clientSelected = new Set(); }}>Выбрать</Button>
             {/if}
-            <Button variant="primary" size="sm" onclick={() => { editingClientRoute = null; clientRouteModalOpen = true; }}>+ Создать</Button>
+            <Button variant="primary" size="sm" disabled={bodyLoading} onclick={() => { editingClientRoute = null; clientRouteModalOpen = true; }}>+ Создать</Button>
         </div>
     {:else}
         <div class="bulk-bar">
@@ -197,7 +205,9 @@
     {/if}
 </div>
 
-{#if clientRoutes.length === 0}
+{#if bodyLoading}
+    <RoutingTabBodySkeleton />
+{:else if clientRoutes.length === 0}
     <div class="empty-hint">Нет правил VPN для устройств. Создайте правило, чтобы направить трафик устройства через VPN-туннель.</div>
 {:else}
     <div class="route-grid">
@@ -229,21 +239,21 @@
 />
 
 {#if clientRouteDeleteId}
-    <Modal open={true} title="Удаление правила" size="sm" onclose={() => clientRouteDeleteId = null}>
-        <p class="confirm-text">Удалить VPN-правило для «{clientRoutes.find(r => r.id === clientRouteDeleteId)?.clientHostname}»?</p>
-        {#snippet actions()}
-            <Button variant="ghost" onclick={() => clientRouteDeleteId = null}>Отмена</Button>
-            <Button variant="danger" onclick={deleteClientRoute}>Удалить</Button>
-        {/snippet}
-    </Modal>
+    <ConfirmModal
+        open={true}
+        title="Удаление правила"
+        message={`Удалить VPN-правило для «${clientRoutes.find(r => r.id === clientRouteDeleteId)?.clientHostname}»?`}
+        onConfirm={deleteClientRoute}
+        onClose={() => clientRouteDeleteId = null}
+    />
 {/if}
 
 {#if clientBulkDeleteConfirm}
-    <Modal open={true} title="Удаление" size="sm" onclose={() => clientBulkDeleteConfirm = false}>
-        <p class="confirm-text">Удалить {clientSelected.size} VPN-правил?</p>
-        {#snippet actions()}
-            <Button variant="ghost" onclick={() => clientBulkDeleteConfirm = false}>Отмена</Button>
-            <Button variant="danger" onclick={bulkClientDelete}>Удалить</Button>
-        {/snippet}
-    </Modal>
+    <ConfirmModal
+        open={true}
+        title="Удаление"
+        message={`Удалить ${clientSelected.size} VPN-правил?`}
+        onConfirm={bulkClientDelete}
+        onClose={() => clientBulkDeleteConfirm = false}
+    />
 {/if}

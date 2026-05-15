@@ -11,9 +11,11 @@ export type ResourceKey =
 	| 'servers'                     // ResourceServers
 	| 'singbox.status'              // ResourceSingboxStatus
 	| 'singbox.tunnels'             // ResourceSingboxTunnels
+	| 'singbox.proxies'             // ResourceSingboxProxies (no backend publisher yet — invalidate via store.refetch)
 	| 'sysInfo'                     // ResourceSysInfo
 	| 'pingcheck'                   // ResourcePingcheck
 	| 'saveStatus'                  // ResourceSaveStatus
+	| 'settings'                    // ResourceSettings
 	| 'routing.dnsRoutes'           // ResourceRoutingDnsRoutes
 	| 'routing.staticRoutes'        // ResourceRoutingStaticRoutes
 	| 'routing.accessPolicies'      // ResourceRoutingAccessPolicies
@@ -24,30 +26,34 @@ export type ResourceKey =
 	| 'routing.hydrarouteStatus'    // ResourceRoutingHydrarouteStatus
 	| 'deviceproxy.config'           // ResourceDeviceProxyConfig   — also clears missing-target banner
 	| 'deviceproxy.outbounds'       // ResourceDeviceProxyOutbounds
-	| 'deviceproxy.runtime';        // ResourceDeviceProxyRuntime
+	| 'deviceproxy.runtime'         // ResourceDeviceProxyRuntime
+	| 'singbox.router.staging'      // emitted by emitStagingEvent — triggers loadStaging()
+	| 'singbox.router.rules';       // emitted by emitRulesEvent — triggers loadRulesSnapshot()
 
 /**
- * Resource key → polling store. Populated as stores are migrated to
- * createPollingStore (Phase B). The SSE `resource:invalidated` handler
- * looks up the store here and calls `.invalidate()`.
+ * Resource key → list of polling stores. Multiple stores can register under
+ * the same resource key (e.g. legacy deviceProxyConfig and new
+ * deviceProxyInstances both subscribe to "deviceproxy.config" invalidations).
+ * The SSE `resource:invalidated` handler iterates all registered stores and
+ * calls `.invalidate()` on each.
  */
-const registry = new Map<string, PollingStore<unknown>>();
+const registry = new Map<string, PollingStore<unknown>[]>();
 
 /**
  * Register a polling store under a resource key. Call this once per store,
  * typically at store construction. Subsequent `invalidateResource(key)` calls
- * will trigger an immediate refetch on that store. Typed by `ResourceKey`
- * so typos become compile errors rather than silent invalidation misses.
+ * will trigger an immediate refetch on all stores registered for that key.
+ * Typed by `ResourceKey` so typos become compile errors rather than silent
+ * invalidation misses.
  */
 export function registerStore<T>(resource: ResourceKey, store: PollingStore<T>): void {
-	if (import.meta.env.DEV && registry.has(resource)) {
-		console.warn(`storeRegistry: overwriting store for "${resource}"`);
-	}
-	registry.set(resource, store as PollingStore<unknown>);
+	const stores = registry.get(resource) ?? [];
+	stores.push(store as PollingStore<unknown>);
+	registry.set(resource, stores);
 }
 
 /**
- * Trigger `invalidate()` on the store registered under `resource`. No-op if
+ * Trigger `invalidate()` on all stores registered under `resource`. No-op if
  * no store is registered — either because the resource key is unknown, or
  * because the store has not been migrated to createPollingStore yet.
  *
@@ -56,7 +62,9 @@ export function registerStore<T>(resource: ResourceKey, store: PollingStore<T>):
  * is intentional.
  */
 export function invalidateResource(resource: string): void {
-	registry.get(resource)?.invalidate();
+	for (const store of registry.get(resource) ?? []) {
+		store.invalidate();
+	}
 }
 
 /**
@@ -66,7 +74,12 @@ export function invalidateResource(resource: string): void {
  * the outage.
  */
 export function invalidateAll(): void {
-	for (const store of registry.values()) {
-		store.invalidate();
+	const seen = new Set<PollingStore<unknown>>();
+	for (const stores of registry.values()) {
+		for (const store of stores) {
+			if (seen.has(store)) continue;
+			seen.add(store);
+			store.invalidate();
+		}
 	}
 }

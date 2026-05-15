@@ -2,14 +2,18 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hoaxisr/awg-manager/internal/events"
 	"github.com/hoaxisr/awg-manager/internal/logger"
+	"github.com/hoaxisr/awg-manager/internal/singbox/orchestrator"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 )
 
@@ -21,6 +25,8 @@ type Service interface {
 	GetSettings(ctx context.Context) (storage.SingboxRouterSettings, error)
 	UpdateSettings(ctx context.Context, s storage.SingboxRouterSettings) error
 
+	SetRouteFinal(ctx context.Context, tag string) error
+
 	ListRules(ctx context.Context) ([]Rule, error)
 	AddRule(ctx context.Context, rule Rule) error
 	UpdateRule(ctx context.Context, index int, rule Rule) error
@@ -29,10 +35,11 @@ type Service interface {
 
 	ListRuleSets(ctx context.Context) ([]RuleSet, error)
 	AddRuleSet(ctx context.Context, rs RuleSet) error
+	UpdateRuleSet(ctx context.Context, tag string, rs RuleSet) error
 	DeleteRuleSet(ctx context.Context, tag string, force bool) error
 	RefreshRuleSet(ctx context.Context, tag string) error
 
-	ListCompositeOutbounds(ctx context.Context) ([]Outbound, error)
+	ListCompositeOutbounds(ctx context.Context) ([]CompositeOutboundView, error)
 	AddCompositeOutbound(ctx context.Context, o Outbound) error
 	UpdateCompositeOutbound(ctx context.Context, tag string, o Outbound) error
 	DeleteCompositeOutbound(ctx context.Context, tag string, force bool) error
@@ -58,6 +65,12 @@ type Service interface {
 
 	GetDNSGlobals(ctx context.Context) (final, strategy string, err error)
 	SetDNSGlobals(ctx context.Context, final, strategy string) error
+
+	Inspect(ctx context.Context, input InspectInput) (InspectResult, error)
+
+	StagingStatus(ctx context.Context) StagingStatus
+	ApplyStaging(ctx context.Context) (orchestrator.ValidationResult, error)
+	DiscardStaging(ctx context.Context) error
 }
 
 type SingboxController interface {
@@ -66,6 +79,11 @@ type SingboxController interface {
 	Start() error
 	ValidateConfigDir(ctx context.Context) error
 	ConfigDir() string
+	// Binary returns the absolute path (or PATH-resolvable name) of the
+	// sing-box executable. Inspect shells out to it for `rule-set match`
+	// evaluation. May return empty string when the binary is unknown —
+	// callers must tolerate that and degrade gracefully.
+	Binary() string
 }
 
 // PolicyDevice is one LAN device known to NDMS hotspot, annotated with
@@ -111,26 +129,105 @@ type AWGTag struct {
 	Tag string
 }
 
+// SingboxTunnelCatalog returns the outbound tags for sing-box tunnels
+// owned by internal/singbox (lives in 10-tunnels.json). Routes can
+// reference these tags as their Outbound (e.g. "veesp" for a VLESS
+// outbound) — without this catalog, computeIssues would flag every
+// such reference as a dangling outbound, surfacing a misleading
+// "правило ссылается на несуществующий outbound" warn even though
+// sing-box itself merges the tags across slots and the rule resolves
+// at runtime.
+type SingboxTunnelCatalog interface {
+	ListTunnelTags(ctx context.Context) ([]string, error)
+}
+
+// StagingEventBus is the narrow interface the router service uses to
+// publish resource:invalidated events for the staging/draft flow.
+// *events.Bus satisfies it; tests pass a mockBus.
+type StagingEventBus interface {
+	Publish(event string, data any)
+}
+
 type Deps struct {
-	Log      *logger.Logger
-	Settings *storage.SettingsStore
-	Singbox  SingboxController
-	Policies AccessPolicyProvider
-	Events   *events.Bus
-	IPTables *IPTables
-	AWGTags  AWGTagCatalog // optional — when nil, computeIssues only sees cfg.Outbounds
+	Log          *logger.Logger
+	Settings     *storage.SettingsStore
+	Singbox      SingboxController
+	Policies     AccessPolicyProvider
+	Events       *events.Bus
+	IPTables     *IPTables
+	AWGTags      AWGTagCatalog        // optional — when nil, computeIssues only sees cfg.Outbounds
+	SingboxTunnels SingboxTunnelCatalog // optional — when nil, computeIssues skips cross-slot tunnel tags
+	// SubscriptionComposites lists composite outbounds owned by the
+	// subscription slot (40-subscriptions.json). Optional — when nil,
+	// ListCompositeOutbounds returns only this service's own composites.
+	SubscriptionComposites *SubscriptionCompositesAdapter
+	// Orch is the config.d orchestrator. When non-nil (production),
+	// persistConfig writes 20-router.json through the slot writer and
+	// Enable / Disable toggle SlotRouter so the file moves between
+	// active and disabled/ — sing-box only sees the file when the
+	// router is enabled. When nil (tests), persistConfig falls back
+	// to the legacy in-place write at routerConfigPath().
+	Orch *orchestrator.Orchestrator
+	// Bus receives resource:invalidated events for the staging/draft
+	// flow (SaveDraft, ApplyDraft, DiscardDraft). Optional — when nil,
+	// staging event emission is silently skipped.
+	Bus StagingEventBus
+	// WANIPCollector returns the router's own IP addresses on
+	// default-route interfaces. Used by Enable to populate WAN-IP
+	// exclusions in the AWGM-TPROXY/AWGM-REDIRECT chains so LAN
+	// traffic destined to the router's public WAN/tunnel IPs does
+	// not loop back into sing-box. Optional — when nil, NewService
+	// defaults to the production collector backed by d.Log.
+	WANIPCollector WANIPCollector
+}
+
+// routerLoggerAdapter narrows *logger.Logger to the wanLogger
+// interface required by NewWANIPCollector. Needed because
+// logger.Logger.Warn / .Info have variadic fields, which doesn't
+// satisfy a literal Warn(msg string) / Info(msg string) interface.
+type routerLoggerAdapter struct {
+	log *logger.Logger
+}
+
+func (a *routerLoggerAdapter) Warn(msg string) {
+	if a.log == nil {
+		return
+	}
+	a.log.Warn(msg)
+}
+
+func (a *routerLoggerAdapter) Info(msg string) {
+	if a.log == nil {
+		return
+	}
+	a.log.Info(msg)
 }
 
 type ServiceImpl struct {
-	deps        Deps
-	mu          sync.Mutex
-	currentMark string // last-installed iptables mark; used by Reconcile to detect change
+	deps           Deps
+	mu             sync.Mutex
+	currentMark    string   // last-installed iptables mark; used by Reconcile to detect change
+	currentWANIPs  []string // last-collected WAN IPs; used by Reconcile to detect change
+
+	// inspectCache backs the route-inspector's rule_set match path. Lazy
+	// constructed on first Inspect call so dev-machine builds (no
+	// sing-box binary, no /tmp writes during NewService) stay clean.
+	inspectCacheOnce sync.Once
+	inspectCache     *ruleSetCache
 }
 
 func NewService(d Deps) *ServiceImpl {
 	if d.IPTables == nil {
 		d.IPTables = NewIPTables()
 	}
+	if d.WANIPCollector == nil {
+		d.WANIPCollector = NewWANIPCollector(&routerLoggerAdapter{log: d.Log})
+	}
+	// Idempotently refresh the netfilter hook script: if a previous
+	// version is on disk (older AWGM without pidof guard), this writes
+	// the current version. No-op when the file is absent — Install
+	// creates it on first Enable.
+	refreshNetfilterHookIfPresent()
 	return &ServiceImpl{deps: d}
 }
 
@@ -138,11 +235,71 @@ func (s *ServiceImpl) routerConfigPath() string {
 	return filepath.Join(s.deps.Singbox.ConfigDir(), "20-router.json")
 }
 
+// loadRouterConfig returns the router config the user is currently editing.
+// When the orchestrator is wired, it delegates to LoadEffective which
+// prefers pending/ over active/ — so UI callers (ListRules etc.) always
+// see "what's being edited" rather than "what's currently live". Falls
+// back to an empty config when neither file exists yet.
 func (s *ServiceImpl) loadRouterConfig() (*RouterConfig, error) {
-	return LoadConfig(s.routerConfigPath())
+	if s.deps.Orch != nil {
+		data, err := s.deps.Orch.LoadEffective(orchestrator.SlotRouter)
+		if err != nil {
+			return nil, fmt.Errorf("load router config: %w", err)
+		}
+		if data == nil {
+			return NewEmptyConfig(), nil
+		}
+		cfg := NewEmptyConfig()
+		if err := json.Unmarshal(data, cfg); err != nil {
+			return nil, fmt.Errorf("parse router config: %w", err)
+		}
+		if cfg.Inbounds == nil {
+			cfg.Inbounds = []Inbound{}
+		}
+		if cfg.Outbounds == nil {
+			cfg.Outbounds = []Outbound{}
+		}
+		if cfg.Route.RuleSet == nil {
+			cfg.Route.RuleSet = []RuleSet{}
+		}
+		if cfg.Route.Rules == nil {
+			cfg.Route.Rules = []Rule{}
+		}
+		if cfg.DNS.Servers == nil {
+			cfg.DNS.Servers = []DNSServer{}
+		}
+		if cfg.DNS.Rules == nil {
+			cfg.DNS.Rules = []DNSRule{}
+		}
+		return cfg, nil
+	}
+	// Legacy fallback (no orchestrator): read from active path directly.
+	activePath := s.routerConfigPath()
+	if _, statErr := os.Stat(activePath); statErr == nil {
+		return LoadConfig(activePath)
+	} else if !os.IsNotExist(statErr) {
+		return nil, statErr
+	}
+	return LoadConfig(activePath) // returns NewEmptyConfig per contract
 }
 
 func (s *ServiceImpl) persistConfig(ctx context.Context, cfg *RouterConfig) error {
+	if s.deps.Orch != nil {
+		// Orchestrator path — write to pending/ (staging). The draft will
+		// be applied explicitly via ApplyStaging. No SIGHUP is triggered
+		// here; sing-box keeps running with the previously-applied config.
+		data, err := json.MarshalIndent(cfg, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshal router config: %w", err)
+		}
+		if err := s.deps.Orch.SaveDraft(orchestrator.SlotRouter, data); err != nil {
+			return err
+		}
+		s.emitStagingEvent("staged")
+		return nil
+	}
+
+	// Legacy fallback (tests) — in-place write + sing-box check + reload.
 	path := s.routerConfigPath()
 	backupPath := path + ".bak"
 
@@ -216,7 +373,7 @@ func (s *ServiceImpl) Enable(ctx context.Context) error {
 	}
 	mark, err := s.deps.Policies.GetPolicyMark(ctx, sr.PolicyName)
 	if err != nil || mark == "" {
-		return ErrPolicyMissing
+		return fmt.Errorf("policy %q: %w", sr.PolicyName, ErrPolicyMissing)
 	}
 
 	if err := EnsureTProxyModule(ctx); err != nil {
@@ -239,19 +396,50 @@ func (s *ServiceImpl) Enable(ctx context.Context) error {
 	if err := s.persistConfig(ctx, cfg); err != nil {
 		return err
 	}
-	if running, _ := s.deps.Singbox.IsRunning(); !running {
-		if err := s.deps.Singbox.Start(); err != nil {
-			return fmt.Errorf("sing-box start: %w", err)
+	// Promote SlotRouter to active so the orchestrator's reload picks
+	// up 20-router.json. The orchestrator handles starting sing-box if
+	// it isn't already running. When orch is unwired (tests), we keep
+	// the legacy explicit Start call.
+	if s.deps.Orch != nil {
+		if err := s.deps.Orch.SetEnabled(orchestrator.SlotRouter, true); err != nil {
+			return fmt.Errorf("orchestrator enable router: %w", err)
+		}
+	} else {
+		if running, _ := s.deps.Singbox.IsRunning(); !running {
+			if err := s.deps.Singbox.Start(); err != nil {
+				return fmt.Errorf("sing-box start: %w", err)
+			}
 		}
 	}
 
-	if err := s.deps.IPTables.Install(ctx, mark); err != nil {
-		rollback := filterTProxyInbound(cfg.Inbounds)
-		cfg.Inbounds = rollback
-		_ = s.persistConfig(ctx, cfg)
+	// Collect WAN IPs BEFORE Install: the router's own public-IP
+	// addresses on default-route interfaces become RETURN rules in
+	// AWGM-TPROXY/AWGM-REDIRECT, preventing LAN-to-router-WAN-IP
+	// traffic from looping back into sing-box. A collector failure
+	// is fatal — installing without the exclusions would silently
+	// expose the loop edge case to users.
+	wanIPs, err := s.deps.WANIPCollector.Collect(ctx)
+	if err != nil {
+		return fmt.Errorf("collect WAN IPs: %w", err)
+	}
+
+	if err := s.deps.IPTables.Install(ctx, RestoreInputSpec{PolicyMark: mark, WANIPs: wanIPs}); err != nil {
+		// Stop sing-box from listening on the now-orphan TPROXY port,
+		// but DO NOT corrupt the persisted user config. With orchestrator
+		// wired we just park the slot back under disabled/ — sing-box
+		// stops seeing it on next reload, the file's content (including
+		// tproxy-in) is preserved verbatim. Without the orchestrator
+		// (legacy fallback) the only recourse is to strip the inbound.
+		if s.deps.Orch != nil {
+			_ = s.deps.Orch.SetEnabled(orchestrator.SlotRouter, false)
+		} else {
+			cfg.Inbounds = filterTProxyInbound(cfg.Inbounds)
+			_ = s.persistConfig(ctx, cfg)
+		}
 		return fmt.Errorf("iptables install: %w", err)
 	}
 	s.currentMark = mark
+	s.currentWANIPs = wanIPs
 
 	settings.SingboxRouter = sr
 	if err := s.deps.Settings.Save(settings); err != nil {
@@ -272,19 +460,102 @@ func filterTProxyInbound(in []Inbound) []Inbound {
 	return out
 }
 
-func ensureTProxyInbound(in []Inbound) []Inbound {
-	for _, i := range in {
-		if i.Tag == "tproxy-in" {
-			return in
+// healTProxyInbound checks the persisted router config and re-adds the
+// tproxy-in inbound if missing. Idempotent. Used by Reconcile to
+// recover from a prior failed-Install rollback (which used to strip
+// the inbound destructively).
+func (s *ServiceImpl) healTProxyInbound(ctx context.Context) error {
+	cfg, err := s.loadRouterConfig()
+	if err != nil {
+		return err
+	}
+	for _, in := range cfg.Inbounds {
+		if in.Tag == "tproxy-in" {
+			return nil // already present, nothing to do
 		}
 	}
-	return append([]Inbound{{
-		Type:        "tproxy",
-		Tag:         "tproxy-in",
-		Listen:      "127.0.0.1",
-		ListenPort:  TPROXYPort,
-		RoutingMark: Fwmark,
-	}}, in...)
+	cfg.Inbounds = ensureTProxyInbound(cfg.Inbounds)
+	return s.persistConfig(ctx, cfg)
+}
+
+// ensureTProxyInbound enforces the SKeen-style split: tproxy-in
+// handles UDP only, redirect-in handles TCP. TPROXY for TCP relies on
+// `-m socket --transparent` to deliver established-connection packets
+// to sing-box's accept()ed transparent socket, but that match
+// evaluates to 0 on Keenetic 4.9-ndm-5 — established TCP packets fall
+// through to the listener and get RST. NAT REDIRECT sidesteps the
+// problem: conntrack records the DNAT for SYN, established packets
+// are auto-translated.
+//
+// Both inbounds bind to 0.0.0.0 because iptables REDIRECT rewrites
+// the packet destination to the *primary IP of the inbound interface*
+// (e.g. 10.10.10.1 on br0), NOT to 127.0.0.1. A listener on 127.0.0.1
+// would never see redirected packets — kernel emits RST. SKeen uses
+// "::" for the same reason.
+const inboundListen = "0.0.0.0"
+
+func ensureTProxyInbound(in []Inbound) []Inbound {
+	hasTProxy := false
+	hasRedirect := false
+	for i := range in {
+		switch in[i].Tag {
+		case "tproxy-in":
+			hasTProxy = true
+			// Force UDP-only on existing entry. Older configs had no
+			// `network` field which means TCP+UDP — that's the broken
+			// behaviour we're moving away from.
+			if in[i].Network != "udp" {
+				in[i].Network = "udp"
+			}
+			if !in[i].UDPFragment {
+				in[i].UDPFragment = true
+			}
+			if in[i].UDPTimeout == "" {
+				in[i].UDPTimeout = "3m0s"
+			}
+			// tcp_fast_open is meaningless on a UDP-only inbound.
+			if in[i].TCPFastOpen {
+				in[i].TCPFastOpen = false
+			}
+			// Strip RoutingMark — see history note below.
+			if in[i].RoutingMark != 0 {
+				in[i].RoutingMark = 0
+			}
+			if in[i].Listen != inboundListen {
+				in[i].Listen = inboundListen
+			}
+		case "redirect-in":
+			hasRedirect = true
+			if !in[i].TCPFastOpen {
+				in[i].TCPFastOpen = true
+			}
+			if in[i].Listen != inboundListen {
+				in[i].Listen = inboundListen
+			}
+		}
+	}
+	out := in
+	if !hasTProxy {
+		out = append([]Inbound{{
+			Type:        "tproxy",
+			Tag:         "tproxy-in",
+			Listen:      inboundListen,
+			ListenPort:  TPROXYPort,
+			Network:     "udp",
+			UDPFragment: true,
+			UDPTimeout:  "3m0s",
+		}}, out...)
+	}
+	if !hasRedirect {
+		out = append([]Inbound{{
+			Type:        "redirect",
+			Tag:         "redirect-in",
+			Listen:      inboundListen,
+			ListenPort:  RedirectPort,
+			TCPFastOpen: true,
+		}}, out...)
+	}
+	return out
 }
 
 
@@ -294,6 +565,25 @@ func (s *ServiceImpl) emitStatus(ctx context.Context) {
 	}
 	status, _ := s.GetStatus(ctx)
 	s.deps.Events.Publish("singbox-router:status", status)
+}
+
+func (s *ServiceImpl) emitStagingEvent(reason string) {
+	if s.deps.Bus == nil {
+		return
+	}
+	s.deps.Bus.Publish("resource:invalidated", map[string]any{
+		"resource": "singbox.router.staging",
+		"reason":   reason,
+	})
+}
+
+func (s *ServiceImpl) emitRulesEvent() {
+	if s.deps.Bus == nil {
+		return
+	}
+	s.deps.Bus.Publish("resource:invalidated", map[string]any{
+		"resource": "singbox.router.rules",
+	})
 }
 
 func (s *ServiceImpl) GetStatus(ctx context.Context) (Status, error) {
@@ -353,17 +643,31 @@ func (s *ServiceImpl) Disable(ctx context.Context) error {
 		s.deps.Log.Warn(fmt.Sprintf("router iptables uninstall: %v", err))
 	}
 	s.currentMark = ""
+	s.currentWANIPs = nil
 
-	cfg, err := s.loadRouterConfig()
-	if err == nil && cfg != nil {
-		filtered := make([]Inbound, 0, len(cfg.Inbounds))
-		for _, in := range cfg.Inbounds {
-			if in.Tag != "tproxy-in" {
-				filtered = append(filtered, in)
-			}
+	if s.deps.Orch != nil {
+		// Move 20-router.json under disabled/ — sing-box's non-recursive
+		// -C config.d does not see it after the next reload, so the
+		// tproxy inbound, route rules, DNS rules and composite outbounds
+		// all disappear from the merged config in one atomic rename.
+		if err := s.deps.Orch.SetEnabled(orchestrator.SlotRouter, false); err != nil {
+			s.deps.Log.Warn(fmt.Sprintf("orchestrator disable router: %v", err))
 		}
-		cfg.Inbounds = filtered
-		_ = s.persistConfig(ctx, cfg)
+	} else {
+		// Legacy fallback: strip the tproxy inbound in place so
+		// the running sing-box stops accepting on the TPROXY port
+		// after the persistConfig reload.
+		cfg, err := s.loadRouterConfig()
+		if err == nil && cfg != nil {
+			filtered := make([]Inbound, 0, len(cfg.Inbounds))
+			for _, in := range cfg.Inbounds {
+				if in.Tag != "tproxy-in" {
+					filtered = append(filtered, in)
+				}
+			}
+			cfg.Inbounds = filtered
+			_ = s.persistConfig(ctx, cfg)
+		}
 	}
 
 	settings, err := s.deps.Settings.Load()
@@ -392,20 +696,47 @@ func (s *ServiceImpl) Reconcile(ctx context.Context) error {
 	case !sr.Enabled && installed:
 		return s.Disable(ctx)
 	case sr.Enabled && installed:
-		mark, err := s.deps.Policies.GetPolicyMark(ctx, sr.PolicyName)
-		if err != nil || mark == "" {
-			// Policy gone upstream — fail-safe disable, no auto-recovery.
-			return s.Disable(ctx)
-		}
-		if mark != s.currentMark {
-			s.mu.Lock()
-			if err := s.deps.IPTables.Install(ctx, mark); err != nil {
-				s.mu.Unlock()
-				return err
-			}
-			s.currentMark = mark
+		return s.reconcileInstalled(ctx, sr)
+	}
+	return nil
+}
+
+// reconcileInstalled handles the "Enabled && installed" branch:
+// detect mark or WAN-IP changes and re-Install. Extracted from Reconcile
+// to keep the decision tree testable without stubbing IsInstalled.
+func (s *ServiceImpl) reconcileInstalled(ctx context.Context, sr storage.SingboxRouterSettings) error {
+	mark, err := s.deps.Policies.GetPolicyMark(ctx, sr.PolicyName)
+	if err != nil || mark == "" {
+		// Policy gone upstream — fail-safe disable, no auto-recovery.
+		return s.Disable(ctx)
+	}
+	wanIPs, err := s.deps.WANIPCollector.Collect(ctx)
+	if err != nil {
+		return fmt.Errorf("collect WAN IPs: %w", err)
+	}
+
+	markChanged := mark != s.currentMark
+	wanIPsChanged := !slices.Equal(s.currentWANIPs, wanIPs)
+
+	if markChanged || wanIPsChanged {
+		s.mu.Lock()
+		if err := s.deps.IPTables.Install(ctx, RestoreInputSpec{
+			PolicyMark: mark,
+			WANIPs:     wanIPs,
+		}); err != nil {
 			s.mu.Unlock()
+			return err
 		}
+		s.currentMark = mark
+		s.currentWANIPs = wanIPs
+		s.mu.Unlock()
+	}
+
+	// Self-heal: a previous Install rollback or upgrade hop may
+	// have left 20-router.json without the tproxy-in inbound. Re-add
+	// it idempotently so sing-box keeps listening on TPROXYPort.
+	if err := s.healTProxyInbound(ctx); err != nil {
+		s.deps.Log.Warn(fmt.Sprintf("router: heal tproxy inbound: %v", err))
 	}
 	return nil
 }
@@ -474,6 +805,50 @@ func (s *ServiceImpl) MoveRule(ctx context.Context, from, to int) error {
 	return s.withConfig(ctx, "rules", func(c *RouterConfig) error { return c.MoveRule(from, to) })
 }
 
+func (s *ServiceImpl) SetRouteFinal(ctx context.Context, tag string) error {
+	return s.withConfig(ctx, "route", func(c *RouterConfig) error {
+		if !s.isKnownOutboundTag(ctx, tag, c) {
+			return fmt.Errorf("unknown outbound tag %q for route.final", tag)
+		}
+		return c.SetRouteFinal(tag)
+	})
+}
+
+// isKnownOutboundTag returns true if tag is a sing-box built-in or matches
+// an outbound from any known catalog (router composites, AWG, sing-box tunnels).
+func (s *ServiceImpl) isKnownOutboundTag(ctx context.Context, tag string, cfg *RouterConfig) bool {
+	if tag == "direct" || tag == "block" || tag == "dns" {
+		return true
+	}
+	// Router-managed composites
+	for _, o := range cfg.Outbounds {
+		if o.Tag == tag {
+			return true
+		}
+	}
+	// AWG-direct outbounds (managed + system)
+	if s.deps.AWGTags != nil {
+		if tags, err := s.deps.AWGTags.ListTags(ctx); err == nil {
+			for _, t := range tags {
+				if t.Tag == tag {
+					return true
+				}
+			}
+		}
+	}
+	// Sing-box tunnels (10-tunnels.json)
+	if s.deps.SingboxTunnels != nil {
+		if tags, err := s.deps.SingboxTunnels.ListTunnelTags(ctx); err == nil {
+			for _, t := range tags {
+				if t == tag {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (s *ServiceImpl) ListRuleSets(ctx context.Context) ([]RuleSet, error) {
 	cfg, err := s.loadRouterConfig()
 	if err != nil {
@@ -486,13 +861,26 @@ func (s *ServiceImpl) AddRuleSet(ctx context.Context, rs RuleSet) error {
 	if rs.Type == "" {
 		rs.Type = "remote"
 	}
-	if rs.Format == "" {
+	if rs.Format == "" && rs.Type != "inline" {
 		rs.Format = "binary"
 	}
-	if rs.UpdateInterval == "" {
+	if rs.UpdateInterval == "" && rs.Type == "remote" {
 		rs.UpdateInterval = "24h"
 	}
 	return s.withConfig(ctx, "rulesets", func(c *RouterConfig) error { return c.AddRuleSet(rs) })
+}
+
+func (s *ServiceImpl) UpdateRuleSet(ctx context.Context, tag string, rs RuleSet) error {
+	if rs.Type == "" {
+		rs.Type = "remote"
+	}
+	if rs.Format == "" && rs.Type != "inline" {
+		rs.Format = "binary"
+	}
+	if rs.UpdateInterval == "" && rs.Type == "remote" {
+		rs.UpdateInterval = "24h"
+	}
+	return s.withConfig(ctx, "rulesets", func(c *RouterConfig) error { return c.UpdateRuleSet(tag, rs) })
 }
 
 func (s *ServiceImpl) DeleteRuleSet(ctx context.Context, tag string, force bool) error {
@@ -518,12 +906,22 @@ func (s *ServiceImpl) RefreshRuleSet(ctx context.Context, tag string) error {
 	return s.deps.Singbox.Reload()
 }
 
-func (s *ServiceImpl) ListCompositeOutbounds(ctx context.Context) ([]Outbound, error) {
+func (s *ServiceImpl) ListCompositeOutbounds(ctx context.Context) ([]CompositeOutboundView, error) {
 	cfg, err := s.loadRouterConfig()
 	if err != nil {
 		return nil, err
 	}
-	return cfg.CompositeOutbounds(), nil
+	own := cfg.CompositeOutbounds()
+	out := make([]CompositeOutboundView, 0, len(own))
+	for _, o := range own {
+		out = append(out, CompositeOutboundView{Outbound: o, Source: "router"})
+	}
+	if s.deps.SubscriptionComposites != nil {
+		for _, o := range s.deps.SubscriptionComposites.ListSubscriptionComposites() {
+			out = append(out, CompositeOutboundView{Outbound: o, Source: "subscription"})
+		}
+	}
+	return out, nil
 }
 
 func (s *ServiceImpl) AddCompositeOutbound(ctx context.Context, o Outbound) error {
@@ -577,6 +975,25 @@ func (s *ServiceImpl) computeIssues(cfg *RouterConfig) []Issue {
 		if awgTags, err := s.deps.AWGTags.ListTags(context.Background()); err == nil {
 			for _, t := range awgTags {
 				outboundTags[t.Tag] = struct{}{}
+			}
+		}
+	}
+	// Sing-box tunnels live in 10-tunnels.json owned by internal/singbox.
+	// Their tags (e.g. "veesp" for a VLESS outbound) are valid route
+	// targets but invisible to a router-only view of cfg.Outbounds.
+	if s.deps.SingboxTunnels != nil {
+		if tags, err := s.deps.SingboxTunnels.ListTunnelTags(context.Background()); err == nil {
+			for _, tag := range tags {
+				outboundTags[tag] = struct{}{}
+			}
+		}
+	}
+	// Subscription composites live in 40-subscriptions.json owned by subscription slot.
+	// Their tags are valid route targets but invisible to a router-only view of cfg.Outbounds.
+	if s.deps.SubscriptionComposites != nil {
+		for _, o := range s.deps.SubscriptionComposites.ListSubscriptionComposites() {
+			if o.Tag != "" {
+				outboundTags[o.Tag] = struct{}{}
 			}
 		}
 	}
@@ -652,4 +1069,88 @@ func (s *ServiceImpl) UnbindDevice(ctx context.Context, mac string) error {
 		return fmt.Errorf("mac required")
 	}
 	return s.deps.Policies.UnassignDevice(ctx, mac)
+}
+
+// Inspect simulates which router rule would match the given input
+// (a domain or an IP). The matcher walk is purely Go; only rule_set
+// matchers shell out to `sing-box rule-set match` to consult the
+// binary or downloaded JSON list. Reads the current persisted config so
+// the result reflects what the user would observe at runtime.
+//
+// When the sing-box binary is unavailable (dev machine, fresh install
+// before the user has installed the package) rule_set matchers degrade
+// to no-match and a Note is appended to the result — the rest of the
+// inspector still works.
+func (s *ServiceImpl) Inspect(ctx context.Context, input InspectInput) (InspectResult, error) {
+	cfg, err := s.loadRouterConfig()
+	if err != nil {
+		return InspectResult{}, err
+	}
+	if cfg == nil {
+		cfg = NewEmptyConfig()
+	}
+	final := cfg.Route.Final
+	if final == "" {
+		final = "direct"
+	}
+	binary := ""
+	if s.deps.Singbox != nil {
+		binary = s.deps.Singbox.Binary()
+	}
+	s.inspectCacheOnce.Do(func() {
+		s.inspectCache = newRuleSetCache("")
+	})
+	return Inspect(input, cfg.Route.Rules, cfg.Route.RuleSet, final, binary, s.inspectCache), nil
+}
+
+// ---------------------------------------------------------------------------
+// Staging API
+// ---------------------------------------------------------------------------
+
+// StagingStatus is what /api/singbox/router/staging returns.
+type StagingStatus struct {
+	HasDraft   bool
+	DraftedAt  time.Time
+	Validation *orchestrator.ValidationResult
+}
+
+// StagingStatus returns metadata about the current pending draft for the
+// router slot. When a draft exists, Validation is populated with the
+// current cross-slot diagnostic so the UI can render a preview of "what
+// Apply would say".
+func (s *ServiceImpl) StagingStatus(ctx context.Context) StagingStatus {
+	info := s.deps.Orch.DraftInfo(orchestrator.SlotRouter)
+	st := StagingStatus{HasDraft: info.HasDraft, DraftedAt: info.DraftedAt}
+	if !info.HasDraft {
+		return st
+	}
+	bytes, err := s.deps.Orch.LoadEffective(orchestrator.SlotRouter)
+	if err != nil || bytes == nil {
+		return st
+	}
+	res := s.deps.Orch.ValidateDraft(orchestrator.SlotRouter, bytes)
+	st.Validation = &res
+	return st
+}
+
+// ApplyStaging is the service-level wrapper around Orch.ApplyDraft. On
+// success it emits "singbox.router.staging" + "singbox.router.rules" SSE
+// invalidations.
+func (s *ServiceImpl) ApplyStaging(ctx context.Context) (orchestrator.ValidationResult, error) {
+	res, err := s.deps.Orch.ApplyDraft(orchestrator.SlotRouter)
+	if err == nil && res.Ok() {
+		s.emitStagingEvent("applied")
+		s.emitRulesEvent()
+	}
+	return res, err
+}
+
+// DiscardStaging removes the pending draft for the router slot.
+func (s *ServiceImpl) DiscardStaging(ctx context.Context) error {
+	if err := s.deps.Orch.DiscardDraft(orchestrator.SlotRouter); err != nil {
+		return err
+	}
+	s.emitStagingEvent("discarded")
+	s.emitRulesEvent()
+	return nil
 }

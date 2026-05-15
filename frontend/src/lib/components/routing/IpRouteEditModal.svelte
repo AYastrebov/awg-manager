@@ -1,13 +1,14 @@
 <script lang="ts">
 	import type { StaticRouteList, RoutingTunnel } from '$lib/types';
 	import { Modal, Button, Dropdown, type DropdownOption } from '$lib/components/ui';
+	import { ServiceIcon, IconPickerModal } from '$lib/components/dnsroutes';
 
 	interface Props {
 		open: boolean;
 		route: StaticRouteList | null;
 		tunnels: RoutingTunnel[];
 		saving: boolean;
-		onsave: (data: { name: string; tunnelID: string; subnets: string[]; fallback: '' | 'reject' }) => void;
+		onsave: (data: { name: string; tunnelID: string; subnets: string[]; fallback: '' | 'reject'; iconUrl?: string }) => void;
 		onclose: () => void;
 	}
 
@@ -19,8 +20,17 @@
 	let tunnelID = $state('');
 	let fallback = $state<'' | 'reject'>('');
 	let subnetsText = $state('');
+	let iconUrl = $state<string | undefined>(undefined);
+	let iconPickerOpen = $state(false);
 	let isInitialized = $state(false);
 	let attempted = $state(false);
+
+	// Snapshot initial state for isDirty detection
+	let initialName = $state('');
+	let initialTunnelID = $state('');
+	let initialFallback = $state<'' | 'reject'>('');
+	let initialSubnetsText = $state('');
+	let initialIconUrl = $state<string | undefined>(undefined);
 
 	// Reset form when modal opens (only once per open, not on every poll tick)
 	$effect(() => {
@@ -32,11 +42,25 @@
 					tunnelID = route.tunnelID;
 					fallback = route.fallback || '';
 					subnetsText = (route.subnets ?? []).join('\n');
+					iconUrl = route.iconUrl;
+					// Capture snapshot for isDirty
+					initialName = route.name;
+					initialTunnelID = route.tunnelID;
+					initialFallback = route.fallback || '';
+					initialSubnetsText = subnetsText;
+					initialIconUrl = route.iconUrl;
 				} else {
 					name = '';
 					tunnelID = tunnels.length > 0 ? tunnels[0].id : '';
 					fallback = '';
 					subnetsText = '';
+					iconUrl = undefined;
+					// Capture snapshot for isDirty (create mode defaults)
+					initialName = '';
+					initialTunnelID = tunnelID;
+					initialFallback = '';
+					initialSubnetsText = '';
+					initialIconUrl = undefined;
 				}
 				isInitialized = true;
 			}
@@ -61,6 +85,15 @@
 	let nameError = $derived(attempted && name.trim() === '');
 	let tunnelError = $derived(attempted && tunnelID === '');
 	let subnetError = $derived(attempted && parsedSubnets.length === 0);
+
+	// isDirty: compare with snapshot (edit mode) or defaults (create mode)
+	let isDirty = $derived(
+		name !== initialName ||
+		tunnelID !== initialTunnelID ||
+		fallback !== initialFallback ||
+		subnetsText !== initialSubnetsText ||
+		iconUrl !== initialIconUrl
+	);
 
 	let userTunnels = $derived(tunnels.filter(t => t.type === 'managed'));
 	let systemTunnels = $derived(tunnels.filter(t => t.type === 'system'));
@@ -146,11 +179,12 @@
 			tunnelID,
 			subnets: parsedSubnets,
 			fallback,
+			iconUrl: iconUrl || undefined,
 		});
 	}
 </script>
 
-<Modal {open} {title} size="lg" onclose={onclose}>
+<Modal {open} {title} size="lg" onclose={onclose} hasUnsavedChanges={() => isDirty}>
 	<!-- Name -->
 	<div class="form-group" class:field-error={nameError}>
 		<!-- svelte-ignore a11y_label_has_associated_control -->
@@ -163,6 +197,29 @@
 			oninput={(e) => { name = (e.target as HTMLInputElement).value; }}
 		/>
 		<div class="error-text" class:visible={nameError}>Введите название</div>
+	</div>
+
+	<!-- Icon -->
+	<div class="form-group">
+		<!-- svelte-ignore a11y_label_has_associated_control -->
+		<label class="field-label">Иконка</label>
+		<div class="icon-row">
+			<ServiceIcon {iconUrl} name={name || 'rule'} size={36} />
+			<div class="icon-meta">
+				{#if iconUrl}
+					<div class="icon-src">Кастомная иконка</div>
+					<div class="icon-hint" title={iconUrl}>{iconUrl}</div>
+				{:else}
+					<div class="icon-src">Авто-определение по имени</div>
+					<div class="icon-hint">
+						{name ? `Подбирается по «${name}»` : 'Введите имя — иконка подберётся автоматически'}
+					</div>
+				{/if}
+			</div>
+			<Button variant="ghost" size="sm" onclick={() => (iconPickerOpen = true)}>
+				{iconUrl ? 'Сменить' : 'Выбрать'}
+			</Button>
+		</div>
 	</div>
 
 	<!-- Tunnel -->
@@ -239,6 +296,17 @@
 	{/snippet}
 </Modal>
 
+<IconPickerModal
+	open={iconPickerOpen}
+	{iconUrl}
+	ruleName={name}
+	onclose={() => (iconPickerOpen = false)}
+	onapply={(newUrl) => {
+		iconUrl = newUrl ?? undefined;
+		iconPickerOpen = false;
+	}}
+/>
+
 <style>
 	.form-group {
 		margin-bottom: 1rem;
@@ -302,4 +370,5 @@
 		border-color: var(--color-error);
 		box-shadow: 0 0 0 2px var(--color-error-tint);
 	}
+
 </style>

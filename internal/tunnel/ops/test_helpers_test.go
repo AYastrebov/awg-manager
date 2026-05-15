@@ -40,10 +40,6 @@ func (m *MockWGClient) Show(ctx context.Context, iface string) (*wg.ShowResult, 
 	return &wg.ShowResult{HasPeer: m.hasPeer}, nil
 }
 
-func (m *MockWGClient) RemovePeer(ctx context.Context, iface, publicKey string) error {
-	return nil
-}
-
 func (m *MockWGClient) GetPeerPublicKey(ctx context.Context, iface string) (string, error) {
 	if m.hasPeer {
 		return "mock-key", nil

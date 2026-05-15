@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { auth } from '$lib/stores/auth';
 	import { Button } from '$lib/components/ui';
+	import BrandLogoMark from '$lib/components/layout/BrandLogoMark.svelte';
 
 	let login = $state('');
 	let password = $state('');
@@ -24,11 +25,11 @@
 <div class="login-container">
 	<div class="login-card">
 		<div class="login-header">
-			<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="login-icon">
-				<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-			</svg>
+			<div class="login-brand">
+				<BrandLogoMark dimension={52} />
+			</div>
 			<h1>AWG Manager</h1>
-			<p class="login-subtitle">Введите данные от роутера Keenetic</p>
+			<p class="login-subtitle">Введите данные от входа в админ-панель роутера</p>
 		</div>
 
 		{#if $auth.error}
@@ -81,10 +82,14 @@
 			</div>
 		</form>
 
-		<p class="login-hint">
-			Используйте логин и пароль администратора роутера
-		</p>
-	</div>
+	<p class="login-hint">
+		Используйте логин и пароль администратора роутера
+	</p>
+
+	<p class="login-hint" style="margin-top: 0.2rem;">
+		Продолжая использование, вы соглашаетесь с <a href="/terms">пользовательским соглашением</a>
+	</p>
+</div>
 </div>
 
 <style>
@@ -112,10 +117,9 @@
 		margin-bottom: 1.5rem;
 	}
 
-	.login-icon {
-		width: 48px;
-		height: 48px;
-		color: var(--accent);
+	.login-brand {
+		display: flex;
+		justify-content: center;
 		margin-bottom: 0.75rem;
 	}
 
@@ -161,5 +165,15 @@
 		text-align: center;
 		font-size: 0.75rem;
 		color: var(--text-muted);
+	}
+
+	.login-hint a {
+		color: var(--color-accent, var(--text-muted));
+		text-decoration: underline;
+		text-underline-offset: 2px;
+	}
+
+	.login-hint a:hover {
+		opacity: 0.8;
 	}
 </style>

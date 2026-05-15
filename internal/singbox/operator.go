@@ -8,13 +8,20 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hoaxisr/awg-manager/internal/events"
+	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/ndms/command"
 	"github.com/hoaxisr/awg-manager/internal/ndms/query"
+	"github.com/hoaxisr/awg-manager/internal/singbox/configmerge"
+	"github.com/hoaxisr/awg-manager/internal/singbox/installer"
+	"github.com/hoaxisr/awg-manager/internal/singbox/orchestrator"
+	"github.com/hoaxisr/awg-manager/internal/singbox/vlink"
 	"github.com/hoaxisr/awg-manager/internal/sys/ndmsinfo"
 )
 
@@ -29,11 +36,27 @@ const (
 	// 200ms keeps the wait snappy on fast starts (~200ms to detect ready)
 	// without hammering the daemon when it takes the full 15s.
 	singboxProbeInterval = 200 * time.Millisecond
+
+	// singboxVersionProbeTimeout bounds external `sing-box version` probe
+	// duration so a broken/blocked binary cannot accumulate hung child
+	// processes and starve router memory.
+	//
+	// Entware/UPX builds on Keenetic (especially older MIPS with UPX
+	// self-decompression) can spend several seconds inflating before
+	// emitting the banner. Keep the headroom so the first probe still
+	// completes successfully on slow targets.
+	singboxVersionProbeTimeout = 6 * time.Second
+
+	// singboxVersionCacheTTL keeps version/features probe reasonably fresh
+	// while avoiding process-spawn on every /singbox/status poll.
+	singboxVersionCacheTTL = 5 * time.Minute
 )
 
 const (
-	defaultBinary = "sing-box"
-	defaultDir    = "/opt/etc/awg-manager/singbox"
+	// defaultBinary is the absolute path used when no explicit binary is
+	// configured. Matches installer.DefaultBinaryPath so our managed binary
+	// is always used instead of a user-installed sing-box on PATH.
+	defaultBinary = installer.DefaultBinaryPath
 
 	// clashAPIAddr is the Clash API endpoint baked into our generated
 	// config.json. Port 9099 is chosen to not collide with a user-managed
@@ -42,6 +65,17 @@ const (
 	// their process and stream their tunnels into our UI.
 	clashAPIAddr = "127.0.0.1:9099"
 )
+
+// defaultDir is the directory of the managed binary. var (not const) so
+// it stays in lockstep with installer.DefaultBinaryPath if that ever moves.
+var defaultDir = filepath.Dir(installer.DefaultBinaryPath)
+
+// defaultCacheDBPath is the absolute path for sing-box's experimental.cache_file.
+// Must live in a writable directory — sing-box resolves relative paths against
+// CWD ("/" when the manager runs as a service on Entware), which is read-only.
+// var (not const) because filepath.Join requires runtime evaluation; tests can
+// override defaultDir to redirect this too.
+var defaultCacheDBPath = filepath.Join(defaultDir, "cache.db")
 
 // Operator is the high-level facade for sing-box integration.
 type Operator struct {
@@ -57,23 +91,54 @@ type Operator struct {
 	clash     *ClashClient
 	bus       *events.Bus
 
+	// processLogger forwards sing-box stdout/stderr lines into the app
+	// log under singbox/process so users can see daemon output at
+	// /diagnostics?tab=logs without ssh'ing in. nil-safe (ScopedLogger
+	// methods no-op on nil), so zero-value Operator structs in tests
+	// stay usable.
+	processLogger *logging.ScopedLogger
+
 	// lastError holds the last fatal exit reason (stderr tail or wait
 	// error) captured by Process.OnExit. Surfaced via Status.LastError so
 	// the UI can explain crashes without forcing the user to ssh in.
 	lastErrorMu sync.RWMutex
 	lastError   string
 
-	// reloadFn is the underlying SIGHUP function; defaults to o.proc.Reload.
-	// Tests inject a closure to bypass real signal delivery.
-	reloadFn func() error
+	// orch is the config.d orchestrator. When non-nil, ApplyConfig
+	// writes 10-tunnels.json through the orchestrator's slot writer
+	// (which handles validate + debounced reload). Wired post-construction
+	// via SetOrch — orchestrator construction needs Operator.Process()
+	// so we can't pass it through OperatorDeps without a cycle.
+	orch *orchestrator.Orchestrator
 
-	// Reload coalescing — see Reload() comment for the contract.
-	reloadMu       sync.Mutex
-	reloadTimer    *time.Timer
-	reloadFirstAt  time.Time
-	reloadPending  bool
-	reloadLastErr  error
-	reloadDoneChan chan struct{}
+	// inst is the managed-binary installer. Wired post-construction via
+	// SetInstaller so existing tests that build an Operator without an
+	// installer still work for non-install-related code paths.
+	inst *installer.Installer
+
+	// installProgress is the optional reporter wired by the daemon to
+	// publish install/update lifecycle events over SSE. When nil, all
+	// reports are silently dropped (used by unit tests).
+	installProgress InstallProgressFn
+
+	// versionProbeMu guards cached output of `sing-box version`.
+	versionProbeMu       sync.Mutex
+	versionProbeValue    string
+	versionProbeFeatures []string
+	versionProbeAt       time.Time
+
+	// manuallyStopped is the sticky-stop intent: true means Control("stop")
+	// was called and Reconcile must skip starting the daemon until
+	// Control("start") or Control("restart") clears it. Mirrors
+	// Settings.SingboxManuallyStopped in memory so the watchdog hot path
+	// avoids hitting storage on every tick.
+	manuallyStopped atomic.Bool
+
+	// persistManualStop writes the intent through to settings.json. nil
+	// in unit tests; production wires a closure that updates the storage
+	// settings. Called BEFORE proc transitions so a persistence error
+	// short-circuits the action instead of leaving an unpersisted intent.
+	persistManualStop func(bool) error
 }
 
 // OperatorDeps are external dependencies for DI.
@@ -81,8 +146,22 @@ type OperatorDeps struct {
 	Log      *slog.Logger
 	Queries  *query.Queries
 	Commands *command.Commands
-	Dir      string // optional; defaults to /opt/etc/awg-manager/singbox
-	Binary   string // optional; defaults to "sing-box"
+	// AppLogger surfaces sing-box stdout/stderr in the in-memory app
+	// log buffer (visible at /diagnostics?tab=logs). Optional — when
+	// nil, process output is only mirrored to slog.
+	AppLogger logging.AppLogger
+	Dir       string // optional; defaults to /opt/etc/awg-manager/singbox
+	// Binary is the absolute path to the sing-box binary. Defaults to
+	// installer.DefaultBinaryPath when empty.
+	Binary string
+	// InitialManuallyStopped seeds the sticky-stop flag from persisted
+	// settings on construction. Watchdog and Reconcile honour it from
+	// the first tick after awgm boots.
+	InitialManuallyStopped bool
+	// SetManuallyStopped is invoked by Control("stop"/"start"/"restart")
+	// to persist the new intent to settings.json. Optional — when nil,
+	// the in-memory flag still works but does not survive an awgm restart.
+	SetManuallyStopped func(bool) error
 }
 
 func NewOperator(d OperatorDeps) *Operator {
@@ -107,23 +186,45 @@ func NewOperator(d OperatorDeps) *Operator {
 	pidPath := filepath.Join(dir, "sing-box.pid")
 
 	ensureBaseConfig(configPath)
+	ensureLegacyConfigMigrated(dir)
+	patchTunnelsSlotStripBaseDNS(filepath.Join(configPath, "10-tunnels.json"))
+	stripStrayDirectPlaceholder(configPath)
 
 	op := &Operator{
-		log:        log,
-		dir:        dir,
-		binary:     binary,
-		configPath: configPath,
-		pidPath:    pidPath,
-		proc:       NewProcess(binary, configPath, pidPath),
-		validator:  NewValidator(binary),
-		proxyMgr:   NewProxyManager(d.Queries, d.Commands),
-		clash:      NewClashClient(clashAPIAddr),
+		log:               log,
+		dir:               dir,
+		binary:            binary,
+		configPath:        configPath,
+		pidPath:           pidPath,
+		proc:              NewProcess(binary, configPath, pidPath),
+		validator:         NewValidator(binary),
+		proxyMgr:          NewProxyManager(d.Queries, d.Commands),
+		clash:             NewClashClient(clashAPIAddr),
+		processLogger:     logging.NewScopedLogger(d.AppLogger, logging.GroupSingbox, logging.SubSBProcess),
+		persistManualStop: d.SetManuallyStopped,
 	}
+	op.manuallyStopped.Store(d.InitialManuallyStopped)
 	op.proc.OnStderrLine = op.handleStderrLine
+	op.proc.OnStdoutLine = op.handleStdoutLine
 	op.proc.OnExit = op.handleExit
-	op.reloadFn = op.proc.Reload
-	op.reloadDoneChan = make(chan struct{})
 	return op
+}
+
+// singBoxStderrTextHead matches the wall-clock prefix sing-box's text logger
+// emits on stderr (e.g. "+0000 2026-05-14 21:45:56 …"). Used so JSON or
+// other structured blobs that mention "fatal" do not populate LastError.
+var singBoxStderrTextHead = regexp.MustCompile(`^\s*\+[0-9]{1,4}\s+\d{4}-\d{2}-\d{2}\b`)
+
+func stderrLineIndicatesSingBoxFatal(line string) bool {
+	u := strings.ToUpper(line)
+	if !strings.Contains(u, "FATAL") {
+		return false
+	}
+	// Bracket level token (… FATAL[0000] …) without requiring the date prefix.
+	if strings.Contains(u, "FATAL[") {
+		return true
+	}
+	return singBoxStderrTextHead.MatchString(line)
 }
 
 // handleStderrLine is invoked by Process for every line sing-box writes
@@ -134,13 +235,47 @@ func NewOperator(d OperatorDeps) *Operator {
 func (o *Operator) handleStderrLine(line string) {
 	upper := strings.ToUpper(line)
 	switch {
-	case strings.Contains(upper, "FATAL"):
+	case stderrLineIndicatesSingBoxFatal(line):
 		o.log.Error("singbox stderr", "line", line)
 		o.setLastError(line)
 	case strings.Contains(upper, "ERROR"):
 		o.log.Warn("singbox stderr", "line", line)
 	default:
 		o.log.Info("singbox stderr", "line", line)
+	}
+}
+
+// handleStdoutLine forwards each sing-box stdout line into the app log
+// under singbox/process. Level chosen by classifyProcessLine.
+func (o *Operator) handleStdoutLine(line string) {
+	if o.processLogger == nil {
+		return
+	}
+	switch classifyProcessLine(line) {
+	case logging.LevelError:
+		o.processLogger.Error("stdout", "", line)
+	case logging.LevelWarn:
+		o.processLogger.Warn("stdout", "", line)
+	default:
+		o.processLogger.Info("stdout", "", line)
+	}
+}
+
+// classifyProcessLine picks a log level from a sing-box stdout/stderr
+// line by simple substring heuristic. Used to surface FATAL/ERROR
+// messages at the right severity in the app log.
+func classifyProcessLine(line string) logging.Level {
+	lower := strings.ToLower(line)
+	switch {
+	case strings.Contains(lower, "panic") ||
+		strings.Contains(lower, "fatal") ||
+		strings.Contains(lower, "error") ||
+		strings.Contains(lower, "failed"):
+		return logging.LevelError
+	case strings.Contains(lower, "warn"):
+		return logging.LevelWarn
+	default:
+		return logging.LevelInfo
 	}
 }
 
@@ -189,6 +324,35 @@ func (o *Operator) LastError() string {
 // other subscribers in the future).
 func (o *Operator) SetEventBus(bus *events.Bus) { o.bus = bus }
 
+// Process exposes the underlying *Process so the orchestrator can
+// drive lifecycle (Start / Stop / Reload / IsRunning). The Process
+// type satisfies orchestrator.ProcessController by structural match.
+func (o *Operator) Process() *Process { return o.proc }
+
+// SetOrch wires the config.d orchestrator after construction. ApplyConfig
+// uses it (when non-nil) to write 10-tunnels.json through the slot
+// writer instead of the legacy direct-write path.
+func (o *Operator) SetOrch(orch *orchestrator.Orchestrator) { o.orch = orch }
+
+// SetInstaller wires the managed-binary installer. Optional — Operator
+// works without it for read-only paths; install/update/cleanup of the
+// managed binary requires it.
+func (o *Operator) SetInstaller(inst *installer.Installer) { o.inst = inst }
+
+// InstallProgressFn receives lifecycle events for an install/update flow.
+// op is "install" or "update". phase is one of "download", "activate",
+// "stop", "start", "done", "error". Byte counters are populated only
+// for the download phase. errMsg is set only for "error".
+type InstallProgressFn func(op, phase string, downloaded, total int64, errMsg string)
+
+// SetInstallProgressReporter wires a callback that receives Install/Update
+// lifecycle events. Optional — nil is safe (no reporting). The daemon
+// wires this to publish over the SSE event bus so the UI can render a
+// live progress bar.
+func (o *Operator) SetInstallProgressReporter(fn InstallProgressFn) {
+	o.installProgress = fn
+}
+
 // tunnelsFile is the canonical path for the tunnels.json fragment
 // (config.d/10-tunnels.json). Used by applyConfig + RemoveTunnel.
 func (o *Operator) tunnelsFile() string {
@@ -197,18 +361,534 @@ func (o *Operator) tunnelsFile() string {
 
 // ensureBaseConfig writes a minimal 00-base.json if config.d is empty,
 // so sing-box starts standalone (direct outbound + bootstrap DNS) before
-// any tunnels are added.
+// any tunnels are added. Also surgically self-heals an older base config
+// that hard-coded the wrong Clash API port (9090 instead of
+// clashAPIAddr's 9099), which silently broke our LogForwarder /
+// DelayChecker on existing installs.
 func ensureBaseConfig(configDir string) {
 	basePath := filepath.Join(configDir, "00-base.json")
 	if _, err := os.Stat(basePath); err == nil {
+		patchBaseClashPort(basePath)
+		patchBaseLogLevel(basePath)
+		patchBaseDomainResolver(basePath)
+		patchBaseDirectOutbound(basePath)
+		patchBaseCacheFilePath(basePath)
 		return
 	}
 	_ = os.MkdirAll(configDir, 0755)
-	base := map[string]any{
+	_ = writeJSONFile(basePath, freshBaseConfig())
+}
+
+// ensureLegacyConfigMigrated copies user-added sing-box tunnels from a
+// pre-2.9.10 single-file config.json into the new slot layout
+// (config.d/10-tunnels.json), then removes the legacy file.
+//
+// pre-2.9.10 layout: <dir>/config.json — sing-box read this single file.
+// 2.9.10+ layout:    <dir>/config.d/<NN-name>.json — directory merged.
+//
+// Idempotent: returns silently when legacy is absent, when 10-tunnels.json
+// already exists, when legacy is unparseable, or when legacy is a
+// directory (degenerate). On parse failure we leave the legacy file in
+// place so a manual fix or next-boot retry can recover.
+//
+// dir is the singbox parent dir (e.g. /opt/etc/awg-manager/singbox).
+func ensureLegacyConfigMigrated(dir string) {
+	legacy := filepath.Join(dir, "config.json")
+	target := filepath.Join(dir, "config.d", "10-tunnels.json")
+
+	st, err := os.Stat(legacy)
+	if err != nil || st.IsDir() {
+		return
+	}
+	if _, err := os.Stat(target); err == nil {
+		return
+	}
+
+	cfg, err := LoadConfig(legacy)
+	if err != nil {
+		// Parse failure — leave legacy in place for retry.
+		return
+	}
+
+	// Legacy may include device-proxy artefacts; modern code emits those
+	// in their own 30-deviceproxy.json slot. Strip leftovers so the user
+	// can re-enable device proxy without tag collisions on next start.
+	inbounds := filterOutDeviceProxyTags(cfg.inbounds())
+	outbounds := filterOutDeviceProxyTags(filterOutDirectPlaceholder(cfg.outbounds()))
+	rules := filterOutDeviceProxyRouteRules(cfg.routeRules())
+
+	raw := map[string]any{
+		"inbounds":  inbounds,
+		"outbounds": outbounds,
+		"route":     map[string]any{"rules": rules},
+	}
+
+	// Custom DNS: copy user-defined servers (excluding our bootstrap/doh
+	// which 00-base owns) plus dns.rules. configmerge will concatenate
+	// across slots.
+	dnsBlock, _ := cfg.raw["dns"].(map[string]any)
+	if dnsBlock != nil {
+		dnsSlot := map[string]any{}
+		if servers, ok := dnsBlock["servers"].([]any); ok {
+			if filtered := filterOutOurDNSServers(servers); len(filtered) > 0 {
+				dnsSlot["servers"] = filtered
+			}
+		}
+		if rulesArr, ok := dnsBlock["rules"].([]any); ok && len(rulesArr) > 0 {
+			dnsSlot["rules"] = rulesArr
+		}
+		if len(dnsSlot) > 0 {
+			raw["dns"] = dnsSlot
+		}
+	}
+
+	slot := &Config{raw: raw}
+
+	if err := slot.Save(target); err != nil {
+		return
+	}
+	_ = os.Remove(legacy)
+}
+
+// filterOutDirectPlaceholder drops the {type:"direct", tag:"direct"}
+// outbound that v2.8.2 wrote into its skeleton. Modern config.d/00-base.json
+// owns no placeholder direct, but the configmerge collision check rejects
+// duplicate tags — so we strip it here. Other entries pass through verbatim.
+func filterOutDirectPlaceholder(in []any) []any {
+	out := make([]any, 0, len(in))
+	for _, v := range in {
+		ob, ok := v.(map[string]any)
+		if !ok {
+			out = append(out, v)
+			continue
+		}
+		typ, _ := ob["type"].(string)
+		tag, _ := ob["tag"].(string)
+		if typ == "direct" && tag == "direct" {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// filterOutDeviceProxyTags drops inbound/outbound entries whose "tag"
+// field starts with "device-proxy". Those artefacts belong in the
+// dedicated 30-deviceproxy.json slot; keeping them in 10-tunnels.json
+// causes a tag-collision FATAL when deviceproxy.Service later writes its
+// own slot.
+func filterOutDeviceProxyTags(in []any) []any {
+	out := make([]any, 0, len(in))
+	for _, v := range in {
+		ob, ok := v.(map[string]any)
+		if !ok {
+			out = append(out, v)
+			continue
+		}
+		tag, _ := ob["tag"].(string)
+		if strings.HasPrefix(tag, "device-proxy") {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// filterOutDeviceProxyRouteRules drops route rules whose "inbound" or
+// "outbound" field references a device-proxy tag. Both fields may be a
+// plain string or an array of strings — either form is checked.
+func filterOutDeviceProxyRouteRules(in []any) []any {
+	mentionsDeviceProxy := func(v any) bool {
+		switch s := v.(type) {
+		case string:
+			return strings.HasPrefix(s, "device-proxy")
+		case []any:
+			for _, item := range s {
+				if str, ok := item.(string); ok && strings.HasPrefix(str, "device-proxy") {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	out := make([]any, 0, len(in))
+	for _, v := range in {
+		r, ok := v.(map[string]any)
+		if !ok {
+			out = append(out, v)
+			continue
+		}
+		if mentionsDeviceProxy(r["inbound"]) || mentionsDeviceProxy(r["outbound"]) {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// filterOutOurDNSServers removes dns.servers entries whose tag is one of
+// the well-known tags 00-base.json owns ("dns-bootstrap", "dns-doh"). All
+// other entries — user-added custom resolvers — pass through so they end
+// up in 10-tunnels.json and survive the migration.
+func filterOutOurDNSServers(in []any) []any {
+	owned := map[string]bool{
+		"dns-bootstrap": true,
+		"dns-doh":       true,
+	}
+	out := make([]any, 0, len(in))
+	for _, v := range in {
+		s, ok := v.(map[string]any)
+		if !ok {
+			out = append(out, v)
+			continue
+		}
+		tag, _ := s["tag"].(string)
+		if owned[tag] {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// patchBaseLogLevel raises the sing-box log level to "trace" when it is
+// missing or set to a coarser level (info/warn/error). Trace is the
+// default for fresh installs (see freshBaseConfig) — without it,
+// router-traffic diagnosis is hard because connection-level events are
+// suppressed. Idempotent on already-trace files; respects "debug" or
+// "panic"/"fatal" without overwriting (those are deliberate user choices).
+func patchBaseLogLevel(basePath string) {
+	data, err := os.ReadFile(basePath)
+	if err != nil {
+		return
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return
+	}
+	logBlock, _ := m["log"].(map[string]any)
+	if logBlock == nil {
+		logBlock = map[string]any{}
+		m["log"] = logBlock
+	}
+	current, _ := logBlock["level"].(string)
+	switch current {
+	case "trace", "debug", "panic", "fatal":
+		return
+	}
+	logBlock["level"] = "trace"
+	if _, ok := logBlock["timestamp"]; !ok {
+		logBlock["timestamp"] = true
+	}
+	_ = writeJSONFile(basePath, m)
+}
+
+// patchBaseClashPort rewrites only the experimental.clash_api.external_controller
+// field if it points anywhere other than clashAPIAddr. Other fields
+// (user customizations: log level, DNS servers, etc.) are preserved
+// verbatim. No-op when the file already has the correct port or has no
+// experimental.clash_api block at all (latter case: the user removed
+// clash_api on purpose; respect that).
+func patchBaseClashPort(basePath string) {
+	data, err := os.ReadFile(basePath)
+	if err != nil {
+		return
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return
+	}
+	exp, _ := m["experimental"].(map[string]any)
+	if exp == nil {
+		return
+	}
+	clash, _ := exp["clash_api"].(map[string]any)
+	if clash == nil {
+		return
+	}
+	current, _ := clash["external_controller"].(string)
+	if current == clashAPIAddr {
+		return
+	}
+	clash["external_controller"] = clashAPIAddr
+	_ = writeJSONFile(basePath, m)
+}
+
+// patchBaseDomainResolver self-heals legacy 00-base.json files that
+// pre-date the route.default_domain_resolver requirement. sing-box 1.12
+// deprecates and 1.13+ FATALs on startup with:
+//
+//	missing `route.default_domain_resolver` or `domain_resolver` in dial
+//	fields is deprecated in sing-box 1.12.0 and will be removed in
+//	sing-box 1.14.0
+//
+// Without the resolver, sing-box refuses to start and the user sees only
+// the FATAL line in /logs. Always materialises the route block + the
+// resolver key when missing — sing-box 1.13+ won't start without it, so
+// the "user intentionally deleted route block" interpretation does not
+// apply: the program is unusable without this key, period. A user-set
+// custom resolver value is preserved.
+func patchBaseDomainResolver(basePath string) {
+	data, err := os.ReadFile(basePath)
+	if err != nil {
+		return
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return
+	}
+	route, _ := m["route"].(map[string]any)
+	if route == nil {
+		route = map[string]any{}
+		m["route"] = route
+	}
+	if _, has := route["default_domain_resolver"]; has {
+		return
+	}
+	route["default_domain_resolver"] = "dns-bootstrap"
+	_ = writeJSONFile(basePath, m)
+}
+
+// patchBaseDirectOutbound self-heals legacy 00-base.json files that
+// pre-date the canonical {type:"direct", tag:"direct"} outbound. With
+// router.NewEmptyConfig now defaulting route.final to "direct"
+// (commit 56bbab35), every merged config references that tag — but
+// older base files written before freshBaseConfig included the entry
+// never had it, so sing-box FATALs on start with
+// "default outbound not found: direct". Adds the entry when missing;
+// preserves any pre-existing outbounds (including a user-customised
+// direct, e.g. one with bind_interface). No-op when outbounds is
+// missing entirely AND the merged config never references "direct" —
+// but cheaper to always inject than to second-guess the merge.
+func patchBaseDirectOutbound(basePath string) {
+	data, err := os.ReadFile(basePath)
+	if err != nil {
+		return
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return
+	}
+	obs, _ := m["outbounds"].([]any)
+	for _, v := range obs {
+		ob, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if tag, _ := ob["tag"].(string); tag == "direct" {
+			return
+		}
+	}
+	m["outbounds"] = append(obs, map[string]any{"type": "direct", "tag": "direct"})
+	_ = writeJSONFile(basePath, m)
+}
+
+// stripStrayDirectPlaceholder removes the canonical
+// {type:"direct", tag:"direct"} placeholder from every slot file in
+// configDir EXCEPT 00-base.json. Sing-box rejects the merged config
+// with "duplicate outbound/endpoint tag: direct" when the placeholder
+// appears in more than one slot — the typical cause is a v2.8.x
+// single-file config.json that migrated to 10-tunnels.json before
+// commit 1186280b (2026-05-03) wired filterOutDirectPlaceholder into
+// the migration path. patchBaseDirectOutbound then injects the
+// placeholder into 00-base.json as well, creating the collision.
+//
+// User-customised direct outbounds that DO have additional fields
+// (e.g. bind_interface) are also dropped — same semantics as
+// filterOutDirectPlaceholder, used during the legacy migration. The
+// canonical placeholder is owned by 00-base.json; if a user needs a
+// per-WAN direct outbound, they should give it a distinct tag.
+//
+// Subdirectories (disabled/, pending/) are skipped — sing-box does not
+// merge them. Idempotent: a clean slot tree is a no-op.
+func stripStrayDirectPlaceholder(configDir string) {
+	entries, err := os.ReadDir(configDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if name == "00-base.json" || filepath.Ext(name) != ".json" {
+			continue
+		}
+		slotPath := filepath.Join(configDir, name)
+		data, err := os.ReadFile(slotPath)
+		if err != nil {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal(data, &m); err != nil {
+			continue
+		}
+		before, _ := m["outbounds"].([]any)
+		if len(before) == 0 {
+			continue
+		}
+		after := filterOutDirectPlaceholder(before)
+		if len(after) == len(before) {
+			continue
+		}
+		m["outbounds"] = after
+		_ = writeJSONFile(slotPath, m)
+	}
+}
+
+// legacyCacheFilePath is the hardcoded path some older sing-box docs/configs
+// suggested. It lives under a read-only Entware mount so cache writes
+// silently fail. We treat it as a known-bad migration target, not as a
+// legitimate user customization.
+const legacyCacheFilePath = "/opt/etc/sing-box/cache.db"
+
+// patchBaseCacheFilePath ensures experimental.cache_file is present with a
+// writable path. Three cases:
+//
+//  1. Block missing entirely — add it with enabled:true + defaultCacheDBPath.
+//     Older installs predating our cache_file work didn't include the block;
+//     adding it post-hoc gives them the same on-disk benefits as fresh installs.
+//
+//  2. Relative path ("cache.db") — sing-box resolves against CWD which is "/"
+//     when the manager runs as a service on Entware. Replace with absolute.
+//
+//  3. Legacy absolute path /opt/etc/sing-box/cache.db — known-bad value from
+//     older docs / pre-2.x installer drafts. Read-only on Entware. Replace
+//     with defaultCacheDBPath.
+//
+// Any OTHER user-set absolute path is left untouched (legitimate
+// customization).
+func patchBaseCacheFilePath(basePath string) {
+	raw, err := os.ReadFile(basePath)
+	if err != nil {
+		return
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return
+	}
+	exp, ok := m["experimental"].(map[string]any)
+	if !ok {
+		// experimental block missing entirely — out of scope for cache_file
+		// patcher. Other patches (clash_port etc.) handle their own gaps.
+		return
+	}
+
+	cf, ok := exp["cache_file"].(map[string]any)
+	if !ok {
+		// Case 1: block missing — add it.
+		exp["cache_file"] = map[string]any{
+			"enabled": true,
+			"path":    defaultCacheDBPath,
+		}
+		_ = writeJSONFile(basePath, m)
+		return
+	}
+
+	path, _ := cf["path"].(string)
+	switch {
+	case path == "":
+		// Empty/missing path — set to absolute default.
+		cf["path"] = defaultCacheDBPath
+	case !strings.HasPrefix(path, "/"):
+		// Case 2: relative path — rewrite to absolute.
+		cf["path"] = defaultCacheDBPath
+	case path == legacyCacheFilePath:
+		// Case 3: known-bad legacy absolute — replace.
+		cf["path"] = defaultCacheDBPath
+	default:
+		// Any other absolute path — legitimate user customization, leave alone.
+		return
+	}
+	_ = writeJSONFile(basePath, m)
+}
+
+// patchTunnelsSlotStripBaseDNS self-heals 10-tunnels.json files polluted
+// by a pre-fix bootstrap. Older NewConfig() emitted log/dns/experimental
+// into the fresh skeleton — when AddTunnels (operator.go AddTunnels →
+// loadOrInitConfig) created 10-tunnels.json for the first time, those
+// base-owned blocks landed in the tunnels slot. The cross-slot validator
+// then rejects every subsequent reload with "duplicate-dns: dns-bootstrap
+// (also declared in [base])", blocking subscription saves and any other
+// reload-triggering write.
+//
+// This patcher reads the slot file, runs dns.servers through
+// filterOutOurDNSServers (drops dns-bootstrap / dns-doh, keeps custom
+// user resolvers), and rewrites the file. The `dns` key is removed
+// entirely when nothing user-relevant remains, restoring the canonical
+// slot shape (no DNS in 10-tunnels.json).
+//
+// Idempotent: no-op when the file is missing, when there is no `dns`
+// key, or when the dns block has no servers from the owned-set. Safe to
+// run on every NewOperator. Does NOT touch `log` / `experimental` blocks
+// that pre-fix NewConfig() also emitted — the cross-slot validator
+// (orchestrator/validate.go) only inspects inbounds/outbounds/dns.servers
+// tags, so duplicate log/experimental keys in 10-tunnels.json are
+// harmless noise that sing-box merges over. Kept out of scope to keep
+// this targeted fix narrow.
+func patchTunnelsSlotStripBaseDNS(tunnelsPath string) {
+	data, err := os.ReadFile(tunnelsPath)
+	if err != nil {
+		return
+	}
+	var m map[string]any
+	if err := json.Unmarshal(data, &m); err != nil {
+		return
+	}
+	dns, ok := m["dns"].(map[string]any)
+	if !ok {
+		return
+	}
+	servers, _ := dns["servers"].([]any)
+	filtered := filterOutOurDNSServers(servers)
+
+	// Detect whether anything user-relevant remains. The dns block can be
+	// dropped entirely only when servers came back empty AND no user
+	// rules/final/strategy were customized beyond what 00-base provides.
+	rulesArr, _ := dns["rules"].([]any)
+	hasUserRules := len(rulesArr) > 0
+	if len(filtered) == 0 && !hasUserRules {
+		delete(m, "dns")
+	} else {
+		if len(filtered) == 0 {
+			delete(dns, "servers")
+		} else {
+			dns["servers"] = filtered
+		}
+		// Strip final/strategy keys that mirror 00-base defaults — they
+		// would otherwise persist as zombie config noise after the
+		// owned-set servers vanish.
+		if final, _ := dns["final"].(string); final == "dns-doh" || final == "dns-bootstrap" {
+			delete(dns, "final")
+		}
+		if strategy, _ := dns["strategy"].(string); strategy == "ipv4_only" {
+			delete(dns, "strategy")
+		}
+		if len(dns) == 0 {
+			delete(m, "dns")
+		}
+	}
+	_ = writeJSONFile(tunnelsPath, m)
+}
+
+// freshBaseConfig returns the canonical base sing-box config. Single
+// source of truth for ensureBaseConfig (initial write + self-heal path).
+func freshBaseConfig() map[string]any {
+	return map[string]any{
 		"log": map[string]any{"level": "trace", "timestamp": true},
 		"experimental": map[string]any{
-			"clash_api":  map[string]any{"external_controller": "127.0.0.1:9090"},
-			"cache_file": map[string]any{"enabled": true, "path": "cache.db"},
+			// MUST match clashAPIAddr — our ClashClient and LogForwarder
+			// connect here. Hard-coding 9090 (sing-box default) used to
+			// silently break log forwarding on existing installs.
+			"clash_api": map[string]any{"external_controller": clashAPIAddr},
+			// Absolute path to writable dir. Sing-box default resolves
+			// relative path against CWD which is "/" (read-only on Entware) —
+			// caused FATAL on user installs.
+			"cache_file": map[string]any{
+				"enabled": true,
+				"path":    defaultCacheDBPath,
+			},
 		},
 		"dns": map[string]any{
 			"strategy": "ipv4_only",
@@ -225,12 +905,16 @@ func ensureBaseConfig(configDir string) {
 			"default_domain_resolver": "dns-bootstrap",
 		},
 	}
-	_ = writeJSONFile(basePath, base)
 }
 
 // ConfigDir returns the config.d directory path (used by sing-box-router
 // to drop additional config fragments alongside ours).
 func (o *Operator) ConfigDir() string { return o.configPath }
+
+// Binary returns the path to the sing-box executable. Used by the
+// router's Inspect path to shell out to `sing-box rule-set match` when
+// evaluating rule_set matchers in the Route Inspector.
+func (o *Operator) Binary() string { return o.binary }
 
 // ValidateConfigDir runs `sing-box check` over the entire config.d.
 // Used by callers that just wrote a fragment and want to verify the
@@ -239,139 +923,104 @@ func (o *Operator) ValidateConfigDir(ctx context.Context) error {
 	return o.validator.Validate(o.configPath)
 }
 
-const (
-	reloadDebounce = 200 * time.Millisecond
-	reloadMaxWait  = 500 * time.Millisecond
-)
-
-// Reload schedules a coalesced sing-box config reload (SIGHUP).
+// preflightConfigDir validates config.d/ before any action that would
+// have sing-box parse it (cold start, post-write reload, etc.).
 //
-// Behavior:
-//   - Returns nil immediately; the actual reload happens after a
-//     trailing-debounce window (reloadDebounce) — successive calls
-//     within the window reset the timer so a burst of writers
-//     produces a single SIGHUP.
-//   - If the burst keeps going past reloadMaxWait from the first call
-//     in the burst, the existing scheduled reload fires anyway
-//     (starvation guard).
-//   - Errors from the underlying SIGHUP are stored in reloadLastErr
-//     and reachable via ReloadAndWait. Production callers ignore them
-//     here and rely on Status.LastError populated by Process.OnExit.
-func (o *Operator) Reload() error {
-	o.reloadMu.Lock()
-	defer o.reloadMu.Unlock()
-
-	now := time.Now()
-	if !o.reloadPending {
-		o.reloadFirstAt = now
-		o.reloadPending = true
-		// Lazy-init for zero-value test structs that bypass NewOperator;
-		// production paths always have it pre-initialised.
-		if o.reloadDoneChan == nil {
-			o.reloadDoneChan = make(chan struct{})
-		}
-	}
-
-	// Past max-wait — let the already-scheduled timer fire on schedule.
-	if now.Sub(o.reloadFirstAt) >= reloadMaxWait {
-		return nil
-	}
-
-	if o.reloadTimer != nil {
-		o.reloadTimer.Stop()
-	}
-
-	delay := reloadDebounce
-	if remaining := reloadMaxWait - now.Sub(o.reloadFirstAt); remaining < delay {
-		delay = remaining
-	}
-	o.reloadTimer = time.AfterFunc(delay, o.fireReload)
-	return nil
-}
-
-func (o *Operator) fireReload() {
-	o.reloadMu.Lock()
-	o.reloadPending = false
-	o.reloadFirstAt = time.Time{}
-	done := o.reloadDoneChan
-	o.reloadDoneChan = make(chan struct{})
-	fn := o.reloadFn
-	o.reloadMu.Unlock()
-
-	if fn == nil {
-		fn = o.proc.Reload
-	}
-	err := fn()
-
-	o.reloadMu.Lock()
-	o.reloadLastErr = err
-	o.reloadMu.Unlock()
-
-	close(done)
-}
-
-// ReloadAndWait blocks until the next reload (already-scheduled or
-// freshly-triggered) completes, returning that reload's error. Used
-// by tests and the rare blocking caller that must observe the result.
-func (o *Operator) ReloadAndWait(ctx context.Context) error {
-	o.reloadMu.Lock()
-	if !o.reloadPending {
-		o.reloadMu.Unlock()
-		fn := o.reloadFn
-		if fn == nil {
-			fn = o.proc.Reload
-		}
-		err := fn()
-		o.reloadMu.Lock()
-		o.reloadLastErr = err
-		o.reloadMu.Unlock()
+// Runs our local configmerge first: when two slot files contribute
+// conflicting tags inside the same merged array, MergeDir returns a
+// *configmerge.CollisionError naming BOTH offending files —
+//
+//	"tag collision: outbounds \"direct\" appears in both
+//	 00-base.json and 10-tunnels.json"
+//
+// sing-box itself only reports the tag ("duplicate outbound/endpoint
+// tag: direct"), so surfacing our message into LastError gives users
+// an actionable diagnostic without needing SSH access to grep through
+// config.d/. Falls through to `sing-box check` for everything our
+// merge doesn't cover (parse errors, schema violations, unknown
+// option keys, etc.).
+func (o *Operator) preflightConfigDir() error {
+	if _, err := configmerge.MergeDir(o.configPath); err != nil {
 		return err
 	}
-	done := o.reloadDoneChan
-	o.reloadMu.Unlock()
-
-	select {
-	case <-done:
-		o.reloadMu.Lock()
-		err := o.reloadLastErr
-		o.reloadMu.Unlock()
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return o.validator.Validate(o.configPath)
 }
 
 // IsRunning reports whether the sing-box process is alive (and its PID).
 // Public version of o.proc.IsRunning for cross-package callers.
 func (o *Operator) IsRunning() (bool, int) { return o.proc.IsRunning() }
 
+// Reload sends SIGHUP to the sing-box process directly, bypassing any
+// debouncing. Production callers go through the orchestrator's
+// debounced reload (250ms in internal/singbox/orchestrator/reload.go);
+// this passthrough exists for legacy fallback paths and the
+// SingboxController contract (router uses it when Orch is unwired in
+// tests, and the scheduler / RefreshRuleSet call it directly).
+func (o *Operator) Reload() error { return o.proc.Reload() }
+
 // Start cold-starts sing-box after validating the config.d. Public
 // version of the internal startAndWait — used by router.Service.Enable
 // when sing-box wasn't already running.
 func (o *Operator) Start() error {
-	if err := o.validator.Validate(o.configPath); err != nil {
+	if err := o.preflightConfigDir(); err != nil {
 		return err
 	}
 	return o.proc.Start()
 }
 
-// IsInstalled reports whether the sing-box binary is on PATH.
-// Cheap — just an exec.LookPath probe (does not read config or check process).
+// isExecutable returns true when path exists, is a regular file, and
+// has at least one executable bit set. Shared by IsInstalled / GetStatus
+// to keep their guards identical.
+func isExecutable(path string) bool {
+	st, err := os.Stat(path)
+	if err != nil || st.IsDir() {
+		return false
+	}
+	return st.Mode().Perm()&0111 != 0
+}
+
+// IsInstalled reports whether the sing-box binary exists at the absolute
+// path and is executable. Uses os.Stat instead of exec.LookPath so it
+// checks our managed path only — not an unrelated user-installed sing-box
+// somewhere on PATH.
 func (o *Operator) IsInstalled() (bool, string) {
-	path, err := exec.LookPath(o.binary)
-	if err != nil || path == "" {
+	if !isExecutable(o.binary) {
 		return false, ""
 	}
-	version, _ := detectVersionAndFeatures(o.binary)
-	return true, version
+	if o.inst != nil {
+		return true, o.inst.CurrentVersion(context.Background())
+	}
+	v, _ := o.detectVersionAndFeaturesCached(context.Background())
+	return true, v
+}
+
+// RequiredVersion is the version this awg-manager build is pinned to.
+// Returns empty when the installer is not wired (legacy paths or tests).
+func (o *Operator) RequiredVersion() string {
+	if o.inst == nil {
+		return ""
+	}
+	return o.inst.RequiredVersion()
 }
 
 // GetStatus returns install + run status.
 func (o *Operator) GetStatus(ctx context.Context) Status {
 	s := Status{}
-	if path, err := exec.LookPath(o.binary); err == nil && path != "" {
+	if isExecutable(o.binary) {
 		s.Installed = true
-		s.Version, s.Features = detectVersionAndFeatures(o.binary)
+		detectedVersion, detectedFeatures := o.detectVersionAndFeaturesCached(ctx)
+		s.Features = detectedFeatures
+		if o.inst != nil {
+			s.Version = o.inst.CurrentVersion(ctx)
+			// Some builds print a slightly different version banner that
+			// CurrentVersion may fail to parse. Fall back to runtime detect
+			// so status always exposes a usable semantic version.
+			if s.Version == "" {
+				s.Version = detectedVersion
+			}
+		} else {
+			s.Version = detectedVersion
+		}
 	}
 	if running, pid := o.proc.IsRunning(); running {
 		s.Running = true
@@ -384,18 +1033,39 @@ func (o *Operator) GetStatus(ctx context.Context) Status {
 	if !s.Running {
 		s.LastError = o.LastError()
 	}
+	s.CurrentVersion = s.Version
+	s.RequiredVersion = o.RequiredVersion()
+	s.UpdateAvailable = s.CurrentVersion != "" && s.CurrentVersion != s.RequiredVersion
 	return s
 }
 
 // detectVersionAndFeatures shells out to `<binary> version` and returns
 // the version string and build tags parsed from its output. Exec
 // failure returns empty values.
-func detectVersionAndFeatures(binary string) (string, []string) {
-	out, err := exec.Command(binary, "version").Output()
+func detectVersionAndFeatures(ctx context.Context, binary string) (string, []string) {
+	probeCtx, cancel := context.WithTimeout(ctx, singboxVersionProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(probeCtx, binary, "version").Output()
 	if err != nil {
 		return "", nil
 	}
 	return parseSingboxVersionOutput(string(out))
+}
+
+func (o *Operator) detectVersionAndFeaturesCached(ctx context.Context) (string, []string) {
+	now := time.Now()
+	o.versionProbeMu.Lock()
+	defer o.versionProbeMu.Unlock()
+
+	if !o.versionProbeAt.IsZero() && now.Sub(o.versionProbeAt) < singboxVersionCacheTTL {
+		return o.versionProbeValue, append([]string(nil), o.versionProbeFeatures...)
+	}
+
+	v, f := detectVersionAndFeatures(ctx, o.binary)
+	o.versionProbeValue = v
+	o.versionProbeFeatures = append([]string(nil), f...)
+	o.versionProbeAt = now
+	return v, append([]string(nil), f...)
 }
 
 // parseSingboxVersionOutput parses the multi-line text produced by
@@ -414,20 +1084,21 @@ func detectVersionAndFeatures(binary string) (string, []string) {
 func parseSingboxVersionOutput(out string) (string, []string) {
 	var version string
 	var features []string
+	versionRe := regexp.MustCompile(`(?i)\bsing-?box\b\s+version\b\s+([^\s]+)`)
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		if version == "" && strings.HasPrefix(line, "sing-box version") {
-			parts := strings.Fields(line)
-			if len(parts) >= 3 {
-				version = parts[2]
+		if version == "" {
+			if m := versionRe.FindStringSubmatch(line); len(m) == 2 {
+				version = strings.TrimSpace(m[1])
+				continue
 			}
-			continue
 		}
-		if strings.HasPrefix(line, "Tags:") {
-			tagsRaw := strings.TrimSpace(strings.TrimPrefix(line, "Tags:"))
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "tags:") {
+			tagsRaw := strings.TrimSpace(line[len("Tags:"):])
 			for _, t := range strings.Split(tagsRaw, ",") {
 				t = strings.TrimSpace(t)
 				if t != "" {
@@ -437,6 +1108,12 @@ func parseSingboxVersionOutput(out string) (string, []string) {
 		}
 	}
 	return version, features
+}
+
+// IsPresent reports whether the managed sing-box binary exists and is executable.
+// Fast path for UI/system probes that must not block on `sing-box version`.
+func (o *Operator) IsPresent() bool {
+	return isExecutable(o.binary)
 }
 
 // ListTunnels returns the current tunnels from config.json enriched with
@@ -481,11 +1158,56 @@ func (o *Operator) GetTunnel(ctx context.Context, tag string) (json.RawMessage, 
 	return cfg.GetOutbound(tag)
 }
 
+// tunnelTagsInUse returns outbound tags already present in cfg.
+func tunnelTagsInUse(cfg *Config) map[string]bool {
+	used := make(map[string]bool)
+	for _, t := range cfg.Tunnels() {
+		used[t.Tag] = true
+	}
+	return used
+}
+
+// allocUniqueTunnelTag returns base if unused; otherwise base-2, base-3, …
+// (Share links often reuse the same URI fragment for different nodes — sing-box
+// tags must stay unique.)
+func allocUniqueTunnelTag(used map[string]bool, base string) string {
+	if base == "" {
+		base = "tunnel"
+	}
+	candidate := base
+	if !used[candidate] {
+		return candidate
+	}
+	for n := 2; ; n++ {
+		candidate = fmt.Sprintf("%s-%d", base, n)
+		if !used[candidate] {
+			return candidate
+		}
+	}
+}
+
+func outboundJSONWithTag(raw json.RawMessage, tag string) (json.RawMessage, error) {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, fmt.Errorf("outbound json: %w", err)
+	}
+	m["tag"] = tag
+	out, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(out), nil
+}
+
 // AddTunnels parses one or more links and atomically adds them.
 // Returns successfully-added tunnels and parse errors.
 func (o *Operator) AddTunnels(ctx context.Context, linksText string) ([]TunnelInfo, []BatchError, error) {
-	parsed, parseErrs := ParseBatch(linksText)
-	if len(parsed) == 0 {
+	batchResult := vlink.ParseBatch(strings.Split(linksText, "\n"))
+	var parseErrs []BatchError
+	for _, pe := range batchResult.Errors {
+		parseErrs = append(parseErrs, BatchError{Line: pe.LineIdx + 1, Input: pe.Scheme, Err: fmt.Errorf("%s", pe.Message)})
+	}
+	if len(batchResult.Outbounds) == 0 {
 		return nil, parseErrs, nil
 	}
 
@@ -493,24 +1215,32 @@ func (o *Operator) AddTunnels(ctx context.Context, linksText string) ([]TunnelIn
 	if err != nil {
 		return nil, parseErrs, err
 	}
+	tagOccupied := tunnelTagsInUse(cfg)
 	// reserved tracks ProxyN indices we've handed out in this batch so
 	// NextFreeIndex doesn't reuse the same slot twice before the batch
 	// is committed to NDMS.
 	reserved := make(map[int]bool)
 	var addedTags []string
-	for _, p := range parsed {
+	for _, p := range batchResult.Outbounds {
 		freeIdx, idxErr := o.proxyMgr.NextFreeIndex(ctx, reserved)
 		if idxErr != nil {
 			parseErrs = append(parseErrs, BatchError{Input: p.Tag, Err: fmt.Errorf("allocate proxy slot: %w", idxErr)})
 			continue
 		}
 		listenPort := firstPort + freeIdx
-		if err := cfg.AddTunnelWithListenPort(p.Tag, p.Protocol, p.Server, p.Port, listenPort, p.Outbound); err != nil {
+		tag := allocUniqueTunnelTag(tagOccupied, p.Tag)
+		outbound, jerr := outboundJSONWithTag(p.Outbound, tag)
+		if jerr != nil {
+			parseErrs = append(parseErrs, BatchError{Input: p.Tag, Err: jerr})
+			continue
+		}
+		if err := cfg.AddTunnelWithListenPort(tag, p.Protocol, p.Server, int(p.Port), listenPort, outbound); err != nil {
 			parseErrs = append(parseErrs, BatchError{Input: p.Tag, Err: err})
 			continue
 		}
+		tagOccupied[tag] = true
 		reserved[freeIdx] = true
-		addedTags = append(addedTags, p.Tag)
+		addedTags = append(addedTags, tag)
 	}
 	if len(addedTags) == 0 {
 		return nil, parseErrs, nil
@@ -610,7 +1340,12 @@ func (o *Operator) UpdateTunnel(ctx context.Context, tag string, outbound json.R
 }
 
 // Reconcile: ensure process is running if config has tunnels; ensure Proxies are up.
+// Honours the sticky-stop intent — when the user pressed Stop, watchdog/Reconcile
+// must not bring sing-box back up. Cleared only by Control("start"/"restart").
 func (o *Operator) Reconcile(ctx context.Context) error {
+	if o.manuallyStopped.Load() {
+		return nil
+	}
 	cfg, err := o.loadConfig()
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -632,9 +1367,17 @@ func (o *Operator) Reconcile(ctx context.Context) error {
 
 // Control starts/stops/restarts the sing-box daemon. Mirrors the shape of
 // hydraroute.Service.Control so the API handler can dispatch by action
-// name. "start" is a no-op when already running; "stop" is a no-op when
-// already stopped; "restart" is stop + start regardless of current state.
-// Errors only on actual transition failures.
+// name. "start" is a no-op for the process when already running; "stop" is
+// a no-op for the process when already stopped; "restart" is stop + start
+// regardless of current state. Errors only on actual transition failures.
+//
+// All three actions update the in-memory sticky-stop flag and persist it
+// to settings.json BEFORE touching the process: "stop" sets the intent
+// true, "start" and "restart" clear it. On persistence failure the flag
+// is rolled back (see setManualStop) and the process is left untouched —
+// so a partial state where the disk and the daemon disagree is impossible.
+// The persisted intent survives awgm restarts so the watchdog never
+// resurrects a daemon the user shut down.
 func (o *Operator) Control(ctx context.Context, action string) error {
 	if installed, _ := o.IsInstalled(); !installed {
 		return fmt.Errorf("sing-box is not installed")
@@ -642,16 +1385,25 @@ func (o *Operator) Control(ctx context.Context, action string) error {
 	running, _ := o.IsRunningPublic()
 	switch action {
 	case "start":
+		if err := o.setManualStop(false); err != nil {
+			return err
+		}
 		if running {
 			return nil
 		}
 		return o.startAndWait(ctx)
 	case "stop":
+		if err := o.setManualStop(true); err != nil {
+			return err
+		}
 		if !running {
 			return nil
 		}
 		return o.proc.Stop()
 	case "restart":
+		if err := o.setManualStop(false); err != nil {
+			return err
+		}
 		if running {
 			if err := o.proc.Stop(); err != nil {
 				return fmt.Errorf("stop: %w", err)
@@ -661,6 +1413,32 @@ func (o *Operator) Control(ctx context.Context, action string) error {
 	default:
 		return fmt.Errorf("unknown action: %s", action)
 	}
+}
+
+// IsManuallyStopped reports whether the user-pressed-Stop sticky flag
+// is currently set. Read-only view of the in-memory atomic mirror of
+// Settings.SingboxManuallyStopped; cheap enough to hit on every reload
+// or watchdog tick. Used to plumb the intent into orchestrator.SetShouldRun.
+func (o *Operator) IsManuallyStopped() bool {
+	return o.manuallyStopped.Load()
+}
+
+// setManualStop updates the in-memory sticky-stop flag and persists it
+// through to settings.json. The in-memory flag is updated FIRST so the
+// watchdog sees the new value immediately; persistence happens second so
+// a storage error is surfaced before any irreversible process action.
+// On persistence error the in-memory flag is rolled back to keep memory
+// and disk consistent.
+func (o *Operator) setManualStop(v bool) error {
+	prev := o.manuallyStopped.Swap(v)
+	if o.persistManualStop == nil {
+		return nil
+	}
+	if err := o.persistManualStop(v); err != nil {
+		o.manuallyStopped.Store(prev)
+		return fmt.Errorf("persist manual-stop intent: %w", err)
+	}
+	return nil
 }
 
 // startAndWait launches sing-box and blocks until Clash API responds or
@@ -709,24 +1487,92 @@ func (o *Operator) waitClashReady(ctx context.Context, timeout time.Duration) er
 	}
 }
 
-// Install installs sing-box-naive from the awg-manager repo (Entware
-// repo list). Entware's stock `sing-box` package is built without
-// `-tags with_naive_outbound`, so importing naive+https:// links fails
-// with "naive outbound is not included in this build". Our repacked
-// package `sing-box-naive` carries the vendor-default DEFAULT_BUILD_TAGS
-// (naive + quic + wireguard + utls + clash_api + tailscale + dhcp +
-// gvisor + acme), statically linked, installed to /opt/bin/sing-box.
-//
-// opkg update runs first so a router that was provisioned before we
-// started publishing this package still sees it.
+// Install downloads the managed sing-box binary, verifies SHA256, and
+// places it at /opt/etc/awg-manager/singbox/sing-box. Used by the UI
+// "Install" action when sing-box is not yet present.
 func (o *Operator) Install(ctx context.Context) error {
-	if out, err := exec.CommandContext(ctx, "opkg", "update").CombinedOutput(); err != nil {
-		return fmt.Errorf("opkg update: %s: %w", string(out), err)
+	if o.inst == nil {
+		return fmt.Errorf("installer not wired")
 	}
-	out, err := exec.CommandContext(ctx, "opkg", "install", "sing-box-naive").CombinedOutput()
+	report := func(phase string, downloaded, total int64, errMsg string) {
+		if o.installProgress != nil {
+			o.installProgress("install", phase, downloaded, total, errMsg)
+		}
+	}
+	bytesProgress := func(downloaded, total int64) {
+		report("download", downloaded, total, "")
+	}
+	tmp, err := o.inst.Download(ctx, bytesProgress)
 	if err != nil {
-		return fmt.Errorf("opkg install sing-box-naive: %s: %w", string(out), err)
+		report("error", 0, 0, err.Error())
+		return fmt.Errorf("download sing-box: %w", err)
 	}
+	report("activate", 0, 0, "")
+	if err := o.inst.Activate(tmp); err != nil {
+		report("error", 0, 0, err.Error())
+		return fmt.Errorf("activate sing-box: %w", err)
+	}
+	report("done", 0, 0, "")
+	return nil
+}
+
+// Update replaces an installed managed binary with the version this
+// awg-manager build is pinned to. Stops sing-box, swaps the binary, restarts.
+// No-op when current and required versions match.
+func (o *Operator) Update(ctx context.Context) error {
+	if o.inst == nil {
+		return fmt.Errorf("installer not wired")
+	}
+	if o.inst.CurrentVersion(ctx) == o.inst.RequiredVersion() {
+		return nil
+	}
+	report := func(phase string, downloaded, total int64, errMsg string) {
+		if o.installProgress != nil {
+			o.installProgress("update", phase, downloaded, total, errMsg)
+		}
+	}
+	bytesProgress := func(downloaded, total int64) {
+		report("download", downloaded, total, "")
+	}
+	tmp, err := o.inst.Download(ctx, bytesProgress)
+	if err != nil {
+		report("error", 0, 0, err.Error())
+		return fmt.Errorf("download sing-box: %w", err)
+	}
+	wasRunning, _ := o.proc.IsRunning()
+	if wasRunning {
+		report("stop", 0, 0, "")
+		if err := o.proc.Stop(); err != nil {
+			_ = os.Remove(tmp)
+			report("error", 0, 0, err.Error())
+			return fmt.Errorf("stop: %w", err)
+		}
+	}
+	report("activate", 0, 0, "")
+	if err := o.inst.Activate(tmp); err != nil {
+		// Activate already removed the tmp on failure; we now have an
+		// awkward state — daemon stopped, old binary still in place,
+		// no swap. Surface the terminal "error" event first so the SSE
+		// stream closes from the UI's perspective immediately, then do
+		// the best-effort restart in the background — startAndWait can
+		// take up to 15s and we don't want it to hold the progress bar
+		// hostage on a stale "activate" frame.
+		report("error", 0, 0, err.Error())
+		if wasRunning {
+			if startErr := o.startAndWait(ctx); startErr != nil {
+				o.log.Warn("update: failed to restart after Activate error", "err", startErr)
+			}
+		}
+		return fmt.Errorf("activate: %w", err)
+	}
+	if wasRunning {
+		report("start", 0, 0, "")
+		if err := o.startAndWait(ctx); err != nil {
+			report("error", 0, 0, err.Error())
+			return fmt.Errorf("start: %w", err)
+		}
+	}
+	report("done", 0, 0, "")
 	return nil
 }
 
@@ -779,6 +1625,14 @@ func (o *Operator) Cleanup(ctx context.Context) error {
 			o.log.Warn("cleanup: remove file failed", "path", path, "err", err)
 		}
 	}
+
+	// Remove our managed binary directory entirely — the user explicitly
+	// asked for cleanup, and our singbox subtree carries the binary, pid,
+	// and any UPX-cached state. /opt/etc/awg-manager/singbox/...
+	binDir := filepath.Dir(o.binary)
+	if err := os.RemoveAll(binDir); err != nil {
+		o.log.Warn("cleanup: remove managed binary dir", "path", binDir, "err", err)
+	}
 	return nil
 }
 
@@ -804,7 +1658,7 @@ func (o *Operator) applyConfig(ctx context.Context, cfg *Config) error {
 		restore()
 		return err
 	}
-	if err := o.validator.Validate(o.configPath); err != nil {
+	if err := o.preflightConfigDir(); err != nil {
 		restore()
 		return fmt.Errorf("validate: %w", err)
 	}
@@ -824,11 +1678,36 @@ func (o *Operator) loadConfig() (*Config, error) {
 	return LoadConfig(o.tunnelsFile())
 }
 
+// HasUserTunnels reports whether 10-tunnels.json defines at least one
+// user-managed sing-box tunnel. Wired into orchestrator.SlotTunnels
+// HasContent so an empty tunnels file does not, by itself, keep the
+// daemon running.
+func (o *Operator) HasUserTunnels() bool {
+	cfg, err := o.loadConfig()
+	if err != nil {
+		return false
+	}
+	return len(cfg.Tunnels()) > 0
+}
+
 // ApplyConfig runs the full Save + Validate + Promote + Reload sequence
 // on an externally-mutated Config. deviceproxy.Service uses this after
 // it has inserted its inbound/outbound/rule into the current config.
+//
+// When the orchestrator is wired (production), the tunnels payload is
+// extracted and written through SlotTunnels — validation + reload are
+// handled by the orchestrator's debounced pipeline. When unwired
+// (tests / pre-bootstrap), falls back to the legacy direct-write path
+// that writes 10-tunnels.json + sing-box check + SIGHUP inline.
 func (o *Operator) ApplyConfig(ctx context.Context, cfg *Config) error {
-	return o.applyConfig(ctx, cfg)
+	if o.orch == nil {
+		return o.applyConfig(ctx, cfg)
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal tunnels config: %w", err)
+	}
+	return o.orch.Save(orchestrator.SlotTunnels, data)
 }
 
 // ApplyConfigNoReload runs Save + Validate + Promote on an externally
@@ -841,6 +1720,11 @@ func (o *Operator) ApplyConfig(ctx context.Context, cfg *Config) error {
 // deviceproxy.Service uses this on the "default-only change" save
 // path: rewriting config.json changes selector.default for next boot
 // without disturbing the live selector.
+//
+// Bypass orchestrator: this path intentionally avoids SIGHUP. The
+// orchestrator's debounced reload is normally desirable, but here the
+// caller has explicitly opted out to preserve live selector.now. We
+// take the legacy direct-write route even when orch is wired.
 func (o *Operator) ApplyConfigNoReload(ctx context.Context, cfg *Config) error {
 	// Defense-in-depth: no-reload assumes the running daemon will continue
 	// serving with its current in-memory config. If the process is down,

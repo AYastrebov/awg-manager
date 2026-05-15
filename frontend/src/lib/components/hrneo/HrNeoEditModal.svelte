@@ -68,6 +68,17 @@
 	let attempted = $state(false);
 	let wasOpen = $state(false);
 
+	// Snapshot initial state for isDirty detection
+	let initialName = $state('');
+	let initialDomainsText = $state('');
+	let initialCidrText = $state('');
+	let initialMode = $state<'interface' | 'policy'>('interface');
+	let initialTunnelId = $state('');
+	let initialPolicyChoice = $state<'existing' | 'new'>('existing');
+	let initialExistingPolicyName = $state('');
+	let initialNewPolicyName = $state('');
+	let initialNewPolicyIfaces = $state<AccessPolicyInterface[]>([]);
+
 	let isNew = $derived(rule === null);
 	let title = $derived(isNew ? 'Новое HR правило' : `Редактирование: ${rule?.name ?? ''}`);
 
@@ -90,6 +101,25 @@
 			domainsText = allDomains.join('\n');
 			cidrText = allSubnets.join('\n');
 			mode = rule.hrRouteMode === 'policy' ? 'policy' : 'interface';
+			// Self-correcting reclassification: HR Neo stores Target as a
+			// single string. The backend classifies it as policy/interface
+			// by checking against the live policy list. If the user's router
+			// has a policy with the same name as one of their interfaces
+			// (e.g. legacy "Wireguard0" auto-created by Keenetic or imported
+			// configs) the rule is misclassified as policy mode, and saving
+			// fails because validateHRPolicyName rejects digits in the name.
+			// When the policy-mode hrPolicyName actually matches an existing
+			// interface, treat it as interface mode — that's how HR Neo
+			// itself routes the traffic anyway.
+			if (mode === 'policy' && rule.hrPolicyName) {
+				const ifaceMatch = tunnels.find(
+					(t) => t.iface === rule.hrPolicyName || t.name === rule.hrPolicyName || t.id === rule.hrPolicyName,
+				);
+				const policyIfaceMatch = policyInterfaces.find((i) => i.name === rule.hrPolicyName);
+				if (ifaceMatch || policyIfaceMatch) {
+					mode = 'interface';
+				}
+			}
 			if (mode === 'policy') {
 				policyChoice = 'existing';
 				existingPolicyName = rule.hrPolicyName ?? '';
@@ -101,16 +131,29 @@
 				// ("nwg0"), not our internal tunnel id ("awg10"). Resolve
 				// the select's value by matching any of those fields against
 				// every tunnel property so the dropdown shows the right
-				// option instead of blanking out.
+				// option instead of blanking out. Also handle the
+				// reclassification case above where the iface name lived in
+				// hrPolicyName.
 				const route = rule.routes?.[0];
+				const candidate = route?.tunnelId || route?.interface || rule.hrPolicyName || '';
 				const match = tunnels.find(
 					(x) =>
-						x.id === route?.tunnelId ||
-						x.iface === route?.tunnelId ||
-						x.iface === route?.interface,
+						x.id === candidate ||
+						x.iface === candidate ||
+						x.name === candidate,
 				);
 				tunnelId = match?.id ?? tunnels[0]?.id ?? '';
 			}
+			// Capture snapshot for isDirty
+			initialName = rule.name;
+			initialDomainsText = domainsText;
+			initialCidrText = cidrText;
+			initialMode = mode;
+			initialTunnelId = tunnelId;
+			initialPolicyChoice = policyChoice;
+			initialExistingPolicyName = existingPolicyName;
+			initialNewPolicyName = newPolicyName;
+			initialNewPolicyIfaces = [...newPolicyIfaces];
 		} else {
 			name = '';
 			domainsText = '';
@@ -132,6 +175,16 @@
 			if (!existingPolicyName) existingPolicyName = policies[0]?.name ?? '';
 			newPolicyName = '';
 			newPolicyIfaces = [];
+			// Capture snapshot for isDirty (create mode)
+			initialName = '';
+			initialDomainsText = '';
+			initialCidrText = '';
+			initialMode = mode;
+			initialTunnelId = tunnelId;
+			initialPolicyChoice = policyChoice;
+			initialExistingPolicyName = existingPolicyName;
+			initialNewPolicyName = newPolicyName;
+			initialNewPolicyIfaces = [];
 		}
 	});
 
@@ -187,7 +240,7 @@
 		if (v === '') return 'Введите имя политики';
 		if (v.length > HR_POLICY_NAME_MAX) return `Максимум ${HR_POLICY_NAME_MAX} символов`;
 		if (SYSTEM_POLICY_RE.test(v))
-			return `Имя ${v} зарезервировано для системных политик Keenetic — HR Neo не может в них маршрутизировать`;
+			return `Имя ${v} зарезервировано для системных политик роутера — HR Neo не может в них маршрутизировать`;
 		if (!HR_POLICY_NAME_RE.test(v))
 			return 'Только латинские буквы (a-z, A-Z), без цифр, пробелов и спецсимволов';
 		return '';
@@ -229,6 +282,28 @@
 		if (newPolicyNameValidationError !== '') return false;
 		if (newPolicyNameDuplicateHint !== '') return false;
 		return activeNewPolicyIfaces.length > 0;
+	});
+
+	// isDirty: deep comparison with snapshot
+	let isDirty = $derived.by(() => {
+		const compareIfaces = (a: AccessPolicyInterface[], b: AccessPolicyInterface[]) => {
+			if (a.length !== b.length) return true;
+			return a.some((aIface, i) => {
+				const bIface = b[i];
+				return aIface.name !== bIface.name || aIface.denied !== bIface.denied;
+			});
+		};
+		return (
+			name !== initialName ||
+			domainsText !== initialDomainsText ||
+			cidrText !== initialCidrText ||
+			mode !== initialMode ||
+			tunnelId !== initialTunnelId ||
+			policyChoice !== initialPolicyChoice ||
+			existingPolicyName !== initialExistingPolicyName ||
+			newPolicyName !== initialNewPolicyName ||
+			compareIfaces(newPolicyIfaces, initialNewPolicyIfaces)
+		);
 	});
 
 	// Local InterfaceList callbacks for the new-policy flow — accumulate
@@ -278,7 +353,7 @@
 	}
 </script>
 
-<Modal {open} {title} size="lg" {onclose}>
+<Modal {open} {title} size="lg" {onclose} hasUnsavedChanges={() => isDirty}>
 	<!-- Preset bar -->
 	<div class="preset-bar">
 		<div class="preset-bar-left">
@@ -324,6 +399,106 @@
 		/>
 		{#if attempted && !name.trim()}<div class="error-text">Введите название</div>{/if}
 	</div>
+
+	<!-- Target — placed near the top so the routing decision (the most
+	     important user choice) is visible without scrolling past long
+	     domain/CIDR textareas. -->
+	<section class="form-section">
+		<div class="field-label">Target</div>
+		<div class="seg-tabs">
+			<button
+				type="button"
+				class="seg-tab"
+				class:active={mode === 'interface'}
+				onclick={() => (mode = 'interface')}>Интерфейс</button
+			>
+			<button
+				type="button"
+				class="seg-tab"
+				class:active={mode === 'policy'}
+				onclick={() => (mode = 'policy')}>Политика</button
+			>
+		</div>
+
+		{#if mode === 'interface'}
+			{@const tunnelOpts: DropdownOption[] = tunnels.map((t) => ({
+				value: t.id,
+				label: t.name + (t.iface ? ` · ${t.iface}` : ''),
+			}))}
+			<Dropdown bind:value={tunnelId} options={tunnelOpts} fullWidth />
+		{:else}
+			<div class="radio-block">
+				<label class="radio-option" class:active={policyChoice === 'existing'}>
+					<input type="radio" bind:group={policyChoice} value="existing" />
+					<span>Существующая</span>
+				</label>
+				<label class="radio-option" class:active={policyChoice === 'new'}>
+					<input type="radio" bind:group={policyChoice} value="new" />
+					<span>Новая</span>
+				</label>
+			</div>
+
+			{#if policyChoice === 'existing'}
+				{#if hrCompatiblePolicies.length === 0}
+					<div class="form-hint muted">
+						Нет HR-совместимых политик. Создайте новую.
+						{#if policies.length > hrCompatiblePolicies.length}
+							Системные политики роутера (<code>PolicyN</code>) не отображаются —
+							HR Neo не может маршрутизировать в них.
+						{/if}
+					</div>
+				{:else}
+					{@const policyOpts: DropdownOption[] = hrCompatiblePolicies.map((p) => ({
+						value: p.name,
+						label: p.name + (p.description ? ` (${p.description})` : ''),
+					}))}
+					<Dropdown bind:value={existingPolicyName} options={policyOpts} fullWidth />
+					<div class="form-hint">
+						Интерфейсы политики редактируются на её карточке в сайдбаре.
+					</div>
+				{/if}
+			{:else}
+				<div class="policy-card">
+					<div class="policy-card-header">Новая политика на роутере</div>
+					<div class="form-group" class:field-error={attempted && newPolicyNameValidationError !== ''}>
+						<label class="field-label" for="hr-new-policy-name">Имя политики</label>
+						<input
+							id="hr-new-policy-name"
+							class="field-input"
+							type="text"
+							placeholder="Streaming"
+							maxlength={HR_POLICY_NAME_MAX}
+							bind:value={newPolicyName}
+						/>
+						{#if attempted && newPolicyNameValidationError !== ''}
+							<div class="error-text">{newPolicyNameValidationError}</div>
+						{:else if newPolicyNameDuplicateHint !== ''}
+							<div class="error-text">{newPolicyNameDuplicateHint}</div>
+						{:else if newPolicyNameInterfaceHint !== ''}
+							<div class="warn-text">{newPolicyNameInterfaceHint}</div>
+						{:else}
+							<div class="form-hint">
+								Только латинские буквы (a–Z), до {HR_POLICY_NAME_MAX} символов.
+							</div>
+						{/if}
+					</div>
+					<div class="form-group">
+						<InterfaceList
+							interfaces={newPolicyIfaces}
+							availableInterfaces={policyInterfaces}
+							onpermit={newPermit}
+							ondeny={newDeny}
+							onreorder={newReorder}
+							onupdate={() => {}}
+						/>
+					</div>
+					<div class="form-hint">
+						Политика и привязки создаются после нажатия «Сохранить».
+					</div>
+				</div>
+			{/if}
+		{/if}
+	</section>
 
 	<!-- Domains -->
 	<section class="form-section">
@@ -394,104 +569,6 @@
 			placeholder="10.0.0.0/8&#10;2001:db8::/32&#10;geoip:RU"
 		></textarea>
 		<div class="form-hint">CIDR · geoip:TAG — строкой на запись. Блок в ip.list.</div>
-	</section>
-
-	<!-- Target -->
-	<section class="form-section">
-		<div class="field-label">Target</div>
-		<div class="seg-tabs">
-			<button
-				type="button"
-				class="seg-tab"
-				class:active={mode === 'interface'}
-				onclick={() => (mode = 'interface')}>Интерфейс</button
-			>
-			<button
-				type="button"
-				class="seg-tab"
-				class:active={mode === 'policy'}
-				onclick={() => (mode = 'policy')}>Политика</button
-			>
-		</div>
-
-		{#if mode === 'interface'}
-			{@const tunnelOpts: DropdownOption[] = tunnels.map((t) => ({
-				value: t.id,
-				label: t.name + (t.iface ? ` · ${t.iface}` : ''),
-			}))}
-			<Dropdown bind:value={tunnelId} options={tunnelOpts} fullWidth />
-		{:else}
-			<div class="radio-block">
-				<label class="radio-option" class:active={policyChoice === 'existing'}>
-					<input type="radio" bind:group={policyChoice} value="existing" />
-					<span>Существующая</span>
-				</label>
-				<label class="radio-option" class:active={policyChoice === 'new'}>
-					<input type="radio" bind:group={policyChoice} value="new" />
-					<span>Новая</span>
-				</label>
-			</div>
-
-			{#if policyChoice === 'existing'}
-				{#if hrCompatiblePolicies.length === 0}
-					<div class="form-hint muted">
-						Нет HR-совместимых политик. Создайте новую.
-						{#if policies.length > hrCompatiblePolicies.length}
-							Системные политики Keenetic (<code>PolicyN</code>) не отображаются —
-							HR Neo не может маршрутизировать в них.
-						{/if}
-					</div>
-				{:else}
-					{@const policyOpts: DropdownOption[] = hrCompatiblePolicies.map((p) => ({
-						value: p.name,
-						label: p.name + (p.description ? ` (${p.description})` : ''),
-					}))}
-					<Dropdown bind:value={existingPolicyName} options={policyOpts} fullWidth />
-					<div class="form-hint">
-						Интерфейсы политики редактируются на её карточке в сайдбаре.
-					</div>
-				{/if}
-			{:else}
-				<div class="policy-card">
-					<div class="policy-card-header">Новая политика Keenetic</div>
-					<div class="form-group" class:field-error={attempted && newPolicyNameValidationError !== ''}>
-						<label class="field-label" for="hr-new-policy-name">Имя политики</label>
-						<input
-							id="hr-new-policy-name"
-							class="field-input"
-							type="text"
-							placeholder="Streaming"
-							maxlength={HR_POLICY_NAME_MAX}
-							bind:value={newPolicyName}
-						/>
-						{#if attempted && newPolicyNameValidationError !== ''}
-							<div class="error-text">{newPolicyNameValidationError}</div>
-						{:else if newPolicyNameDuplicateHint !== ''}
-							<div class="error-text">{newPolicyNameDuplicateHint}</div>
-						{:else if newPolicyNameInterfaceHint !== ''}
-							<div class="warn-text">{newPolicyNameInterfaceHint}</div>
-						{:else}
-							<div class="form-hint">
-								Только латинские буквы (a–Z), до {HR_POLICY_NAME_MAX} символов.
-							</div>
-						{/if}
-					</div>
-					<div class="form-group">
-						<InterfaceList
-							interfaces={newPolicyIfaces}
-							availableInterfaces={policyInterfaces}
-							onpermit={newPermit}
-							ondeny={newDeny}
-							onreorder={newReorder}
-							onupdate={() => {}}
-						/>
-					</div>
-					<div class="form-hint">
-						Политика и привязки создаются после нажатия «Сохранить».
-					</div>
-				</div>
-			{/if}
-		{/if}
 	</section>
 
 	{#snippet actions()}

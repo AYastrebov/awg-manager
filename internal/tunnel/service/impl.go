@@ -494,7 +494,7 @@ func (s *ServiceImpl) applyDiffNWG(ctx context.Context, oldStored, newStored *st
 	}
 
 	if !awgPeerEqual(oldStored.Peer, newStored.Peer) {
-		if err := s.nwgOperator.SyncPeer(ctx, newStored); err != nil {
+		if err := s.nwgOperator.SyncPeer(ctx, newStored, oldStored.Peer.PublicKey); err != nil {
 			s.logWarn("update", tunnelID, "Failed to sync NWG peer: "+err.Error())
 			errs = append(errs, fmt.Errorf("sync peer: %w", err))
 		}
@@ -744,10 +744,21 @@ func (s *ServiceImpl) ReplaceConfig(ctx context.Context, tunnelID, confContent, 
 	}
 
 	wasNativeRunning := false
-	if s.nwgOperator != nil && s.isNativeWG(stored) {
+	wasKernelRunning := false
+	switch {
+	case s.nwgOperator != nil && s.isNativeWG(stored):
 		stateInfo := s.nwgOperator.GetState(ctx, stored)
 		wasNativeRunning = stateInfo.State == tunnel.StateRunning || stateInfo.State == tunnel.StateStarting
+	case s.legacyOperator != nil:
+		stateInfo := s.state.GetState(ctx, tunnelID)
+		wasKernelRunning = stateInfo.State == tunnel.StateRunning || stateInfo.State == tunnel.StateStarting
 	}
+
+	// Capture the old peer's public key BEFORE overwriting Interface/Peer.
+	// SyncPeer needs it to remove the orphan peer entry from NDMS when the
+	// new conf carries a different PublicKey — without this the interface
+	// ends up with both old and new peers (NDMS indexes by key).
+	oldPublicKey := stored.Peer.PublicKey
 
 	// Replace Interface + Peer entirely
 	stored.Interface = parsed.Interface
@@ -782,7 +793,7 @@ func (s *ServiceImpl) ReplaceConfig(ctx context.Context, tunnelID, confContent, 
 				s.logWarn("replace-config", tunnelID, "Stop before peer sync failed: "+err.Error())
 			}
 		}
-		if err := s.nwgOperator.SyncPeer(ctx, stored); err != nil {
+		if err := s.nwgOperator.SyncPeer(ctx, stored, oldPublicKey); err != nil {
 			s.logWarn("replace-config", tunnelID, "SyncPeer failed: "+err.Error())
 		}
 		if err := s.nwgOperator.SyncAddressMTU(ctx, stored); err != nil {
@@ -798,6 +809,18 @@ func (s *ServiceImpl) ReplaceConfig(ctx context.Context, tunnelID, confContent, 
 			if err := s.nwgOperator.Start(ctx, stored); err != nil {
 				s.logWarn("replace-config", tunnelID, "Start after peer sync failed: "+err.Error())
 			}
+		}
+	}
+
+	// Kernel-backend tunnels: hot-apply the new conf to a running interface
+	// via `awg setconf`. setconf carries WGDEVICE_REPLACE_PEERS, so the
+	// kernel atomically swaps the entire peer set — no orphan-peer cleanup
+	// needed (unlike NDMS). When the tunnel is stopped, skip — the new
+	// conf will be applied on next Start.
+	if !s.isNativeWG(stored) && s.legacyOperator != nil && wasKernelRunning {
+		confPath := tunnel.NewNames(tunnelID).ConfPath
+		if err := s.legacyOperator.ApplyConfig(ctx, tunnelID, confPath); err != nil {
+			s.logWarn("replace-config", tunnelID, "ApplyConfig failed: "+err.Error())
 		}
 	}
 
@@ -1009,6 +1032,49 @@ func (s *ServiceImpl) MigrateISPInterfaceToKernel() {
 			_ = s.store.Save(&t)
 		}
 	}
+}
+
+// HealStaleActiveWAN clears stored.ActiveWAN entries that are not real
+// kernel interface names. NativeWG tunnels persist ResolveActiveWAN's
+// return value into storage; on certain Keenetic firmwares the resolver
+// used to short-circuit on a cached `interface-name` field that held a
+// logical NDMS label (e.g. "ISP") instead of the kernel device. The
+// resolver itself is now hardened, but historical garbage stays in
+// storage until next successful resolve — which never happens for
+// disabled tunnels. UI labels and tunnel chaining (resolves via
+// parent.ActiveWAN) keep seeing the stale value.
+//
+// Called once at startup. The next ResolveActiveWAN call after Heal
+// will populate the empty field with the correct kernel name.
+func (s *ServiceImpl) HealStaleActiveWAN() {
+	tunnels, err := s.store.List()
+	if err != nil {
+		return
+	}
+	for _, t := range tunnels {
+		if t.ActiveWAN == "" || tunnel.IsTunnelRoute(t.ActiveWAN) {
+			continue
+		}
+		if kernelIfaceExists(t.ActiveWAN) {
+			continue
+		}
+		s.logInfo("migrate", t.ID, fmt.Sprintf("Clearing stale ActiveWAN=%q (not a kernel interface)", t.ActiveWAN))
+		t.ActiveWAN = ""
+		_ = s.store.Save(&t)
+	}
+}
+
+// kernelIfaceExists reports whether a Linux network interface with the
+// given name is present in the running kernel. Kept inline (rather than
+// shared with internal/ndms/query) because the dependency is one syscall;
+// a separate helper package would be premature. Stored as a package-level
+// variable so tests can override it without touching /sys/class/net.
+var kernelIfaceExists = func(name string) bool {
+	if name == "" {
+		return false
+	}
+	_, err := os.Stat("/sys/class/net/" + name)
+	return err == nil
 }
 
 // isNativeWG returns true if the tunnel uses the NativeWG backend.

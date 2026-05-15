@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { api } from '$lib/api/client';
 	import type { GeoFileEntry } from '$lib/types';
-	import { Modal, Button, Dropdown } from '$lib/components/ui';
+	import { ConfirmModal, Button, Dropdown } from '$lib/components/ui';
 	import { geoDownloadProgress } from '$lib/stores/geoDownload';
 
 	interface Props {
@@ -15,14 +15,22 @@
 	let addType = $state<'geoip' | 'geosite'>('geosite');
 	let busy = $state<string | null>(null);
 	let err = $state('');
+	// URL of the in-flight add — captured at submit time so the progress
+	// bar in the Add section keeps tracking the original download even
+	// if the user starts typing a different URL into the input or the
+	// field gets cleared after success. Without this, $geoDownloadProgress
+	// lookup keyed by the live `addUrl` value would lose the bar
+	// mid-download.
+	let inFlightAddUrl = $state<string | null>(null);
 
 	const GROUND_ZERRO_GEOIP_URL =
 		'https://raw.githubusercontent.com/Ground-Zerro/Geo-Aggregator/main/geodat/geoip_GA.dat';
 	const GROUND_ZERRO_GEOSITE_URL =
 		'https://raw.githubusercontent.com/Ground-Zerro/Geo-Aggregator/main/geodat/geosite_GA.dat';
 
-	// Progress for the currently in-flight add (keyed by URL). Populated by SSE.
-	let progress = $derived($geoDownloadProgress[addUrl.trim()] ?? null);
+	// Progress for the currently in-flight add. Keyed by the submitted
+	// URL captured at submit time, not the live input value.
+	let progress = $derived(inFlightAddUrl ? ($geoDownloadProgress[inFlightAddUrl] ?? null) : null);
 	let progressByPath = $derived($geoDownloadProgress);
 
 	function progressFor(url: string) {
@@ -39,23 +47,27 @@
 
 
 	async function add() {
-		if (!addUrl.trim()) return;
+		const submitted = addUrl.trim();
+		if (!submitted) return;
 		busy = 'add';
 		err = '';
+		inFlightAddUrl = submitted;
 		try {
-			await api.addGeoFile(addType, addUrl.trim());
+			await api.addGeoFile(addType, submitted);
 			addUrl = '';
 			onrefresh();
 		} catch (e: unknown) {
 			err = e instanceof Error ? e.message : String(e);
 		} finally {
 			busy = null;
+			inFlightAddUrl = null;
 		}
 	}
 
 	async function addPreset(type: 'geoip' | 'geosite', url: string) {
 		busy = 'add';
 		err = '';
+		inFlightAddUrl = url;
 		try {
 			await api.addGeoFile(type, url);
 			onrefresh();
@@ -63,6 +75,7 @@
 			err = e instanceof Error ? e.message : String(e);
 		} finally {
 			busy = null;
+			inFlightAddUrl = null;
 		}
 	}
 
@@ -255,24 +268,15 @@
 
 {#if pendingDelete}
 	{@const pd = pendingDelete}
-	<Modal open={true} title="Удалить гео-файл" size="sm" onclose={() => (pendingDelete = null)}>
-		<p class="confirm-text">
-			Удалить <strong>{fileName(pd.path)}</strong>?
-		</p>
-		<p class="confirm-hint">
-			Файл удалится с диска и пропадёт из
-			<code>{pd.type === 'geosite' ? 'GeoSiteFile' : 'GeoIPFile'}=</code> в hrneo.conf.
-			Правила, использующие теги из этого файла, перестанут резолвиться.
-		</p>
-		{#snippet actions()}
-			<Button variant="secondary" onclick={() => (pendingDelete = null)} disabled={busy === pd.path}>
-				Отмена
-			</Button>
-			<Button variant="danger" onclick={confirmRemove} loading={busy === pd.path}>
-				Удалить
-			</Button>
-		{/snippet}
-	</Modal>
+	<ConfirmModal
+		open={true}
+		title="Удалить гео-файл"
+		message={`Удалить «${fileName(pd.path)}»?`}
+		secondary={`Файл удалится с диска и пропадёт из ${pd.type === 'geosite' ? 'GeoSiteFile=' : 'GeoIPFile='} в hrneo.conf. Правила, использующие теги из этого файла, перестанут резолвиться.`}
+		busy={busy === pd.path}
+		onConfirm={confirmRemove}
+		onClose={() => (pendingDelete = null)}
+	/>
 {/if}
 
 <style>
@@ -482,23 +486,6 @@
 		color: var(--accent);
 		font-size: 0.75rem;
 		font-family: ui-monospace, monospace;
-	}
-
-	.confirm-text {
-		margin: 0 0 8px;
-		color: var(--text-primary);
-	}
-	.confirm-hint {
-		margin: 0;
-		color: var(--text-muted);
-		font-size: 0.8125rem;
-	}
-	.confirm-hint code {
-		background: var(--bg-tertiary);
-		padding: 0 4px;
-		border-radius: 3px;
-		font-family: ui-monospace, monospace;
-		font-size: 0.75rem;
 	}
 
 	@media (max-width: 640px) {

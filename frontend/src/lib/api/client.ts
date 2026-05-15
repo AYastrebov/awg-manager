@@ -23,8 +23,6 @@ import type {
 	UpdateInfo,
 	DiagnosticsStatus,
 	DiagEvent,
-	DiagMode,
-	DiagRouteMode,
 	DnsRoute,
 	SignatureCaptureResult,
 	StaticRouteList,
@@ -51,12 +49,16 @@ import type {
 	HydraRouteOversizedResponse,
 	IpsetUsage,
 	DnsCheckStartResponse,
+	PolicyDevice,
 	SingboxTunnel,
 	SingboxStatus,
 	SingboxImportResponse,
+	SingboxConfigPreview,
 	DeviceProxyConfig,
+	DeviceProxyInstance,
 	DeviceProxyOutbound,
 	DeviceProxyRuntime,
+	DeviceProxyInstanceIPCheckResult,
 	AWGTagInfo,
 	TunnelReferencedError,
 	MonitoringSnapshot,
@@ -68,11 +70,26 @@ import type {
 	SingboxRouterOutbound,
 	SingboxRouterPreset,
 	RouterPolicy,
-	RouterPolicyDevice,
 	SingboxRouterDNSServer,
 	SingboxRouterDNSRule,
-	SingboxRouterDNSGlobals
+	SingboxRouterDNSGlobals,
+	SingboxRouterInspectRequest,
+	SingboxRouterInspectResult,
+	SingboxProxiesListResponse,
+	SingboxProxiesSelectRequest,
+	SingboxProxiesTestRequest,
+	SingboxProxiesTestResponse,
+	Subscription,
+	SubscriptionHeader,
+	SubscriptionRefreshResult,
+	SubscriptionActiveNowResponse,
+	CreateSubscriptionInput,
+	UpdateSubscriptionInput,
+	RouterStagingStatusResponse
 } from '$lib/types';
+import { isMockDevMode } from '$lib/env';
+
+export type TrafficPeriod = '5m' | '10m' | '30m' | '1h' | '3h' | '6h' | '12h' | '24h' | '48h';
 
 interface ApiResponse<T> {
 	success?: boolean;
@@ -182,7 +199,7 @@ class ApiClient {
 
 	async getTraffic(
 		id: string,
-		period: '1h' | '24h'
+		period: TrafficPeriod
 	): Promise<{
 		points: { t: number; rx: number; tx: number }[];
 		stats: {
@@ -192,6 +209,8 @@ class ApiClient {
 			avgTx: number;
 			currentRx: number;
 			currentTx: number;
+			volumeRx?: number;
+			volumeTx?: number;
 		};
 	}> {
 		return this.request(
@@ -488,10 +507,17 @@ class ApiClient {
 	}
 
 	async updateSettings(settings: Settings): Promise<Settings> {
-		return this.request('/settings/update', {
+		const updated = await this.request<Settings>('/settings/update', {
 			method: 'POST',
 			body: JSON.stringify(settings)
 		});
+		// Prism mock is stateless: it often returns schema examples instead of
+		// echoing persisted values. In mock-dev mode keep UI controls usable by
+		// honoring the submitted payload.
+		if (this.isMockDevMode()) {
+			return settings;
+		}
+		return updated;
 	}
 
 	async regenerateApiKey(): Promise<Settings> {
@@ -595,6 +621,7 @@ class ApiClient {
 	// ─────────────────────────────────────────────
 
 	async getLogs(params?: {
+		bucket?: 'app' | 'singbox';
 		group?: string;
 		subgroup?: string;
 		level?: string;
@@ -603,6 +630,7 @@ class ApiClient {
 		offset?: number;
 	}): Promise<LogsResponse> {
 		const query = new URLSearchParams();
+		if (params?.bucket) query.set('bucket', params.bucket);
 		if (params?.group) query.set('group', params.group);
 		if (params?.subgroup) query.set('subgroup', params.subgroup);
 		if (params?.level) query.set('level', params.level);
@@ -613,8 +641,12 @@ class ApiClient {
 		return this.request(`/logs${qs ? '?' + qs : ''}`);
 	}
 
-	async clearLogs(): Promise<void> {
-		await this.request('/logs/clear', { method: 'POST' });
+	async clearLogs(bucket: 'app' | 'singbox' = 'app'): Promise<void> {
+		await this.request(`/logs/clear?bucket=${bucket}`, { method: 'POST' });
+	}
+
+	async getLogsSubgroups(group: string): Promise<{ group: string; subgroups: string[] }> {
+		return this.request(`/logs/subgroups?group=${encodeURIComponent(group)}`);
 	}
 
 	// #endregion
@@ -868,21 +900,13 @@ class ApiClient {
 	}
 
 	streamDiagnostics(
-		mode: DiagMode,
 		restart: boolean,
-		routeMode: DiagRouteMode,
-		routeTunnelId: string,
 		onEvent: (event: DiagEvent) => void,
 		onError: (error: Event) => void
 	): EventSource {
 		const params = new URLSearchParams({
-			mode,
 			restart: String(restart),
-			route: routeMode
 		});
-		if (routeMode === 'tunnel' && routeTunnelId) {
-			params.set('tunnelId', routeTunnelId);
-		}
 		const es = new EventSource(`/api/diagnostics/stream?${params}`);
 
 		const handleEvent = (e: MessageEvent) => {
@@ -1105,6 +1129,10 @@ class ApiClient {
 		});
 	}
 
+	async listPolicyDevices(): Promise<PolicyDevice[]> {
+		return this.request<PolicyDevice[]>('/routing/policy-devices');
+	}
+
 	async setPolicyInterfaceUp(name: string, up: boolean): Promise<void> {
 		return this.request('/access-policies/interface-up', {
 			method: 'POST',
@@ -1192,8 +1220,40 @@ class ApiClient {
 		return this.request('/singbox/status');
 	}
 
+	async singboxGetClientsByIP(): Promise<{ clientsByIP: Record<string, string> }> {
+		return this.request('/singbox/connections/clients');
+	}
+
+	// Kill a single sing-box connection by Clash UUID. Bypasses request()
+	// because ClashProxy returns 204 with no JSON envelope. Returns true on
+	// success so callers can decide whether to roll back optimistic UI.
+	async singboxKillConnection(id: string): Promise<boolean> {
+		const url = `${this.baseUrl}/singbox/clash/connections/${encodeURIComponent(id)}`;
+		try {
+			const r = await fetch(url, {
+				method: 'DELETE',
+				credentials: 'same-origin',
+				signal: this.abortController.signal,
+			});
+			return r.ok;
+		} catch {
+			return false;
+		}
+	}
+
+	// Bulk-kill: returns counts so the caller can surface partial failure.
+	async singboxKillConnections(ids: string[]): Promise<{ ok: number; total: number }> {
+		const results = await Promise.all(ids.map((id) => this.singboxKillConnection(id)));
+		const ok = results.filter(Boolean).length;
+		return { ok, total: ids.length };
+	}
+
 	async singboxInstall(): Promise<SingboxStatus> {
 		return this.request('/singbox/install', { method: 'POST' });
+	}
+
+	async singboxUpdate(): Promise<SingboxStatus> {
+		return this.request('/singbox/update', { method: 'POST' });
 	}
 
 	async singboxControl(action: 'start' | 'stop' | 'restart'): Promise<SingboxStatus> {
@@ -1201,6 +1261,78 @@ class ApiClient {
 			method: 'POST',
 			body: JSON.stringify({ action }),
 		});
+	}
+
+	private isMockDevMode(): boolean {
+		return isMockDevMode();
+	}
+
+	private ensureMockSubscriptionMembers(sub: Subscription): Subscription {
+		if (!this.isMockDevMode()) return sub;
+		const baseMembers = Array.isArray(sub.members) ? [...sub.members] : [];
+		const normalized: Subscription = {
+			...sub,
+			id: sub.id || 'sub-demo',
+			label: sub.label || 'Demo Provider',
+			selectorTag: sub.selectorTag || 'sub-demo',
+			inboundTag: sub.inboundTag || 'sub-demo-in',
+			listenPort: sub.listenPort || 11000,
+			enabled: sub.enabled ?? true,
+			lastError: '',
+		};
+		if (baseMembers.length >= 3) {
+			const memberTags = baseMembers.map((m) => m.tag).filter(Boolean);
+			const activeMember = normalized.activeMember && memberTags.includes(normalized.activeMember)
+				? normalized.activeMember
+				: memberTags[0] || '';
+			return {
+				...normalized,
+				memberTags,
+				members: baseMembers,
+				activeMember,
+				enabled: true,
+			};
+		}
+
+		const seed = baseMembers[0] ?? {
+			tag: `${normalized.selectorTag || 'sub-demo'}-001`,
+			label: 'DE vless-tcp-reality #1',
+			protocol: 'vless',
+			server: 'demo-1.example.com',
+			port: 443,
+			sni: 'cdn.example.com',
+			transport: 'tcp',
+			security: 'reality',
+		};
+
+		for (let i = baseMembers.length; i < 3; i++) {
+			const n = i + 1;
+			const tag = `${normalized.selectorTag || 'sub-demo'}-${String(n).padStart(3, '0')}`;
+			baseMembers.push({
+				...seed,
+				tag,
+				label: `DE vless-tcp-reality #${n}`,
+				server: `demo-${n}.example.com`,
+				port: 443 + i,
+			});
+		}
+
+		const memberTags = baseMembers.map((m) => m.tag).filter(Boolean);
+		const activeMember = normalized.activeMember && memberTags.includes(normalized.activeMember)
+			? normalized.activeMember
+			: memberTags[0] || '';
+
+		return {
+			...normalized,
+			memberTags,
+			members: baseMembers,
+			activeMember,
+			enabled: true,
+		};
+	}
+
+	async singboxGetConfigPreview(): Promise<SingboxConfigPreview> {
+		return this.request<SingboxConfigPreview>('/singbox/config-preview');
 	}
 
 	async singboxListTunnels(): Promise<SingboxTunnel[]> {
@@ -1215,7 +1347,56 @@ class ApiClient {
 	}
 
 	async singboxGetTunnel(tag: string): Promise<{ tag: string; outbound: unknown }> {
-		return this.request(`/singbox/tunnels?tag=${encodeURIComponent(tag)}`);
+		const isMockDev = this.isMockDevMode();
+		try {
+			const raw = await this.request<unknown>(`/singbox/tunnels?tag=${encodeURIComponent(tag)}`);
+			// Normal backend shape.
+			if (raw && typeof raw === 'object' && 'outbound' in raw && 'tag' in raw) {
+				const obj = raw as { tag: string; outbound: unknown };
+				if (obj.outbound) return obj;
+			}
+			// Prism may return a SingboxTunnel-like item directly instead of {tag,outbound}.
+			if (isMockDev && raw && typeof raw === 'object' && 'tag' in raw) {
+				const t = raw as SingboxTunnel;
+				return { tag: t.tag, outbound: this.buildMockOutboundFromTunnel(t) };
+			}
+		} catch (err) {
+			if (!isMockDev) throw err;
+		}
+
+		if (isMockDev) {
+			const tunnels = await this.singboxListTunnels();
+			const found = tunnels.find((t) => t.tag === tag) ?? tunnels[0];
+			if (found) {
+				return { tag: found.tag, outbound: this.buildMockOutboundFromTunnel(found) };
+			}
+		}
+		throw new Error('Туннель не найден');
+	}
+
+	private buildMockOutboundFromTunnel(t: SingboxTunnel): Record<string, unknown> {
+		const outbound: Record<string, unknown> = {
+			type: t.protocol,
+			tag: t.tag,
+			server: t.server,
+			server_port: t.port,
+		};
+
+		if (t.protocol === 'vless') {
+			const tls: Record<string, unknown> = {};
+			if (t.sni) tls.server_name = t.sni;
+			if (t.fingerprint) tls.utls = { enabled: true, fingerprint: t.fingerprint };
+			if (t.security === 'reality') {
+				tls.enabled = true;
+				tls.reality = { enabled: true, public_key: 'EXAMPLE_PUBLIC_KEY', short_id: 'abcd1234' };
+			} else if (t.security === 'tls') {
+				tls.enabled = true;
+			}
+			outbound.transport = { type: t.transport || 'tcp' };
+			if (Object.keys(tls).length > 0) outbound.tls = tls;
+		}
+
+		return outbound;
 	}
 
 	async singboxUpdateTunnel(tag: string, outbound: unknown): Promise<SingboxTunnel[]> {
@@ -1246,8 +1427,10 @@ class ApiClient {
 		onResult: (data: { phase: string; bandwidth: number; bytes: number; duration: number }) => void,
 		onDone: () => void,
 		onError: (error: string) => void,
+		iface?: string,
 	): EventSource {
-		const url = `${this.baseUrl}/singbox/tunnels/test/speed/stream?tag=${encodeURIComponent(tag)}&server=${encodeURIComponent(server)}&port=${port}`;
+		const ifaceParam = iface ? `&iface=${encodeURIComponent(iface)}` : '';
+		const url = `${this.baseUrl}/singbox/tunnels/test/speed/stream?tag=${encodeURIComponent(tag)}&server=${encodeURIComponent(server)}&port=${port}${ifaceParam}`;
 		const es = new EventSource(url);
 		es.addEventListener('phase', (e) => {
 			try { onPhase(JSON.parse((e as MessageEvent).data).phase); } catch { /* ignore */ }
@@ -1311,14 +1494,68 @@ class ApiClient {
 		return this.request('/proxy/listen-choices');
 	}
 
+	// ─────────────────────────────────────────────
+	// #region Device Proxy — multi-instance
+	// ─────────────────────────────────────────────
+
+	async listDeviceProxyInstances(): Promise<DeviceProxyInstance[]> {
+		return this.request<DeviceProxyInstance[]>('/proxy/instances');
+	}
+
+	async getDeviceProxyInstance(id: string): Promise<DeviceProxyInstance> {
+		return this.request<DeviceProxyInstance>(`/proxy/instance?id=${encodeURIComponent(id)}`);
+	}
+
+	async saveDeviceProxyInstance(instance: DeviceProxyInstance): Promise<DeviceProxyInstance> {
+		return this.request<DeviceProxyInstance>('/proxy/instance', {
+			method: 'PUT',
+			body: JSON.stringify(instance)
+		});
+	}
+
+	async deleteDeviceProxyInstance(id: string): Promise<{ deleted: boolean }> {
+		return this.request<{ deleted: boolean }>(`/proxy/instance?id=${encodeURIComponent(id)}`, {
+			method: 'DELETE'
+		});
+	}
+
+	async applyDeviceProxyInstances(): Promise<{ applied: boolean }> {
+		return this.request<{ applied: boolean }>('/proxy/instances/apply', {
+			method: 'POST'
+		});
+	}
+
+	async getDeviceProxyInstanceRuntime(id: string): Promise<DeviceProxyRuntime> {
+		return this.request<DeviceProxyRuntime>(`/proxy/instance/runtime?id=${encodeURIComponent(id)}`);
+	}
+
+	async selectDeviceProxyInstanceRuntime(id: string, tag: string): Promise<{ active: string }> {
+		return this.request<{ active: string }>(`/proxy/instance/runtime/select?id=${encodeURIComponent(id)}`, {
+			method: 'POST',
+			body: JSON.stringify({ tag })
+		});
+	}
+
+	async checkDeviceProxyInstanceExternalIP(
+		id: string,
+		serviceURL?: string
+	): Promise<DeviceProxyInstanceIPCheckResult> {
+		let endpoint = `/proxy/instance/check-ip?id=${encodeURIComponent(id)}`;
+		if (serviceURL) endpoint += `&service=${encodeURIComponent(serviceURL)}`;
+		return this.request<DeviceProxyInstanceIPCheckResult>(endpoint);
+	}
+
+	// #endregion
+
 	// #endregion
 
 	// ─────────────────────────────────────────────
 	// #region Monitoring (Phase 3)
 	// ─────────────────────────────────────────────
 
-	async getMonitoringMatrix(): Promise<MonitoringSnapshot> {
-		return this.request<MonitoringSnapshot>('/monitoring/matrix');
+	async getMonitoringMatrix(opts?: { force?: boolean }): Promise<MonitoringSnapshot> {
+		const path = opts?.force ? '/monitoring/matrix?force=1' : '/monitoring/matrix';
+		return this.request<MonitoringSnapshot>(path);
 	}
 
 	async getMonitoringHistory(params: {
@@ -1406,6 +1643,13 @@ class ApiClient {
 		});
 	}
 
+	async singboxRouterUpdateRuleSet(tag: string, rs: SingboxRouterRuleSet): Promise<void> {
+		await this.request('/singbox/router/rulesets/update', {
+			method: 'POST',
+			body: JSON.stringify({ tag, ruleSet: rs }),
+		});
+	}
+
 	async singboxRouterDeleteRuleSet(tag: string, force = false): Promise<void> {
 		await this.request('/singbox/router/rulesets/delete', {
 			method: 'POST',
@@ -1445,6 +1689,24 @@ class ApiClient {
 		});
 	}
 
+	async singboxRouterListProxies(): Promise<SingboxProxiesListResponse> {
+		return this.request<SingboxProxiesListResponse>('/singbox/router/proxies/list');
+	}
+
+	async singboxRouterSelectProxy(req: SingboxProxiesSelectRequest): Promise<void> {
+		await this.request<unknown>('/singbox/router/proxies/select', {
+			method: 'POST',
+			body: JSON.stringify(req),
+		});
+	}
+
+	async singboxRouterTestProxy(req: SingboxProxiesTestRequest): Promise<SingboxProxiesTestResponse> {
+		return this.request<SingboxProxiesTestResponse>('/singbox/router/proxies/test', {
+			method: 'POST',
+			body: JSON.stringify(req),
+		});
+	}
+
 	async singboxRouterListPresets(): Promise<SingboxRouterPreset[]> {
 		return this.request('/singbox/router/presets/list');
 	}
@@ -1464,26 +1726,6 @@ class ApiClient {
 		return this.request<RouterPolicy>('/singbox/router/policies', {
 			method: 'POST',
 			body: JSON.stringify({ description: description ?? 'awgm-router' }),
-		});
-	}
-
-	async singboxRouterPolicyDevices(policyName: string): Promise<RouterPolicyDevice[]> {
-		return this.request<RouterPolicyDevice[]>(
-			`/singbox/router/policy-devices?name=${encodeURIComponent(policyName)}`
-		);
-	}
-
-	async singboxRouterPolicyBind(mac: string, policyName: string): Promise<void> {
-		await this.request('/singbox/router/policy-devices/bind', {
-			method: 'POST',
-			body: JSON.stringify({ mac, policyName }),
-		});
-	}
-
-	async singboxRouterPolicyUnbind(mac: string): Promise<void> {
-		await this.request('/singbox/router/policy-devices/unbind', {
-			method: 'POST',
-			body: JSON.stringify({ mac }),
 		});
 	}
 
@@ -1553,6 +1795,135 @@ class ApiClient {
 			method: 'PUT',
 			body: JSON.stringify(globals),
 		});
+	}
+
+	async singboxRouterPutRouteFinal(final: string): Promise<void> {
+		await this.request('/singbox/router/route/final', {
+			method: 'POST',
+			body: JSON.stringify({ final }),
+		});
+	}
+
+	async singboxRouterInspectRoute(
+		req: SingboxRouterInspectRequest,
+	): Promise<SingboxRouterInspectResult> {
+		return this.request('/singbox/router/inspect', {
+			method: 'POST',
+			body: JSON.stringify(req),
+		});
+	}
+
+	async singboxRouterStagingStatus(): Promise<RouterStagingStatusResponse> {
+		return this.request('/singbox/router/staging');
+	}
+
+	async singboxRouterStagingApply(): Promise<void> {
+		await this.request('/singbox/router/staging/apply', {
+			method: 'POST',
+		});
+	}
+
+	async singboxRouterStagingDiscard(): Promise<void> {
+		await this.request('/singbox/router/staging/discard', {
+			method: 'POST',
+		});
+	}
+
+	// #endregion
+
+	// #region Subscriptions
+
+	async listSubscriptions(): Promise<Subscription[]> {
+		const subs = await this.request<Subscription[]>('/singbox/subscriptions');
+		return this.isMockDevMode() ? subs.map((s) => this.ensureMockSubscriptionMembers(s)) : subs;
+	}
+
+	async createSubscription(in_: CreateSubscriptionInput): Promise<Subscription> {
+		return this.request<Subscription>('/singbox/subscriptions/create', {
+			method: 'POST',
+			body: JSON.stringify(in_),
+		});
+	}
+
+	async getSubscription(id: string): Promise<Subscription> {
+		const sub = await this.request<Subscription>(
+			`/singbox/subscriptions/get?id=${encodeURIComponent(id)}`,
+		);
+		return this.ensureMockSubscriptionMembers(sub);
+	}
+
+	async updateSubscription(
+		id: string,
+		patch: UpdateSubscriptionInput,
+	): Promise<Subscription> {
+		return this.request<Subscription>(
+			`/singbox/subscriptions/update?id=${encodeURIComponent(id)}`,
+			{
+				method: 'PUT',
+				body: JSON.stringify(patch),
+			},
+		);
+	}
+
+	async deleteSubscription(id: string): Promise<void> {
+		const url = `/singbox/subscriptions/delete?id=${encodeURIComponent(id)}`;
+		await this.request(url, { method: 'DELETE' });
+	}
+
+	async refreshSubscription(id: string): Promise<SubscriptionRefreshResult> {
+		return this.request<SubscriptionRefreshResult>(
+			`/singbox/subscriptions/refresh?id=${encodeURIComponent(id)}`,
+			{ method: 'POST' },
+		);
+	}
+
+	async getSubscriptionActiveNow(id: string): Promise<SubscriptionActiveNowResponse> {
+		return this.request<SubscriptionActiveNowResponse>(
+			`/singbox/subscriptions/active-now?id=${encodeURIComponent(id)}`,
+		);
+	}
+
+	async setSubscriptionActiveMember(id: string, memberTag: string): Promise<void> {
+		await this.request(
+			`/singbox/subscriptions/active-member?id=${encodeURIComponent(id)}`,
+			{
+				method: 'POST',
+				body: JSON.stringify({ memberTag }),
+			},
+		);
+	}
+
+	async deleteSubscriptionOrphans(id: string): Promise<void> {
+		await this.request(
+			`/singbox/subscriptions/orphans/delete?id=${encodeURIComponent(id)}`,
+			{ method: 'POST' },
+		);
+	}
+
+	async addSubscriptionMember(id: string, shareLink: string): Promise<Subscription> {
+		return this.request<Subscription>(
+			`/singbox/subscriptions/members/add?id=${encodeURIComponent(id)}`,
+			{
+				method: 'POST',
+				body: JSON.stringify({ shareLink }),
+			},
+		);
+	}
+
+	/**
+	 * Remove one member from an inline subscription. Returns the updated
+	 * subscription, or null when removing the last member tore down the
+	 * whole subscription (the caller should navigate away in that case).
+	 */
+	async removeSubscriptionMember(id: string, memberTag: string): Promise<Subscription | null> {
+		const data = await this.request<{ deleted: boolean; subscription?: Subscription }>(
+			`/singbox/subscriptions/members/remove?id=${encodeURIComponent(id)}`,
+			{
+				method: 'POST',
+				body: JSON.stringify({ memberTag }),
+			},
+		);
+		return data.deleted ? null : (data.subscription ?? null);
 	}
 
 	// #endregion

@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { formatBitRate } from '$lib/utils/format';
+	import type { TrafficPeriod } from '$lib/api/client';
+	import { formatBitRate, formatBytes } from '$lib/utils/format';
 	import { fetchTrafficDetail, subscribeTraffic, getTrafficRates } from '$lib/stores/traffic';
 	import Modal from './Modal.svelte';
 
@@ -11,14 +12,63 @@
 		onclose: () => void;
 	}
 
+	type TrafficModalStats = {
+		points: number;
+		peakRate: number;
+		avgRx: number;
+		avgTx: number;
+		currentRx: number;
+		currentTx: number;
+		volumeRx?: number;
+		volumeTx?: number;
+	};
+
 	let { open, tunnelId, tunnelName = '', ifaceName = '', onclose }: Props = $props();
+
+	const PERIOD_OPTIONS: { value: TrafficPeriod; label: string }[] = [
+		{ value: '5m', label: '5 мин' },
+		{ value: '10m', label: '10 мин' },
+		{ value: '30m', label: '30 мин' },
+		{ value: '1h', label: '1 ч' },
+		{ value: '3h', label: '3 ч' },
+		{ value: '6h', label: '6 ч' },
+		{ value: '12h', label: '12 ч' },
+		{ value: '24h', label: '24 ч' },
+		{ value: '48h', label: '48 ч' }
+	];
+
+	const PERIOD_LABELS: Record<TrafficPeriod, string> = {
+		'5m': 'последние 5 минут',
+		'10m': 'последние 10 минут',
+		'30m': 'последние 30 минут',
+		'1h': 'последний час',
+		'3h': 'последние 3 часа',
+		'6h': 'последние 6 часов',
+		'12h': 'последние 12 часов',
+		'24h': 'последние сутки',
+		'48h': 'последние 2 дня'
+	};
+
+	/** Длительность выбранного окна (сек) — для оценки объёма по средним скоростям из API. */
+	const PERIOD_SECONDS: Record<TrafficPeriod, number> = {
+		'5m': 5 * 60,
+		'10m': 10 * 60,
+		'30m': 30 * 60,
+		'1h': 3600,
+		'3h': 3 * 3600,
+		'6h': 6 * 3600,
+		'12h': 12 * 3600,
+		'24h': 24 * 3600,
+		'48h': 48 * 3600
+	};
 
 	let loading = $state(true);
 	let error = $state<string | null>(null);
+	let selectedPeriod = $state<TrafficPeriod>('24h');
 	let timestamps = $state<number[]>([]);
 	let rxRates = $state<number[]>([]);
 	let txRates = $state<number[]>([]);
-	let stats = $state({
+	let stats = $state<TrafficModalStats>({
 		points: 0,
 		peakRate: 0,
 		avgRx: 0,
@@ -32,34 +82,45 @@
 	// from the shared traffic store so the KPI doesn't stay frozen.
 	let liveCurrentRx = $state(0);
 	let liveCurrentTx = $state(0);
+	let lastLoadToken = 0;
 
-	async function load(id: string) {
+	function periodLabel(period: TrafficPeriod): string {
+		return PERIOD_LABELS[period];
+	}
+
+	async function load(id: string, period: TrafficPeriod) {
+		const token = ++lastLoadToken;
 		loading = true;
 		error = null;
+		hoverIndex = null;
 		try {
-			const d = await fetchTrafficDetail(id);
+			const d = await fetchTrafficDetail(id, period);
+			if (token !== lastLoadToken) return;
 			timestamps = d.timestamps;
 			rxRates = d.rxRates;
 			txRates = d.txRates;
-			stats = d.stats;
+			stats = d.stats as TrafficModalStats;
 			liveCurrentRx = d.stats.currentRx;
 			liveCurrentTx = d.stats.currentTx;
 		} catch (e) {
+			if (token !== lastLoadToken) return;
 			error = e instanceof Error ? e.message : 'Не удалось загрузить историю';
 		} finally {
+			if (token !== lastLoadToken) return;
 			loading = false;
 		}
 	}
 
-	// Re-fetch whenever the modal opens or the tunnel id changes while open.
+	// Re-fetch whenever the modal opens, the tunnel id changes, or the
+	// selected period changes while open.
 	$effect(() => {
 		if (open && tunnelId) {
-			load(tunnelId);
+			load(tunnelId, selectedPeriod);
 		}
 	});
 
-	// Subscribe to SSE traffic updates while the modal is open. Both the
-	// legend KPIs and the chart itself advance in real time — the live
+	// Subscribe to SSE traffic updates while the modal is open. The chart
+	// footer legend and the right edge advance in real time — the live
 	// buffer in the shared store is small, so a full swap is cheap.
 	$effect(() => {
 		if (!open || !tunnelId) return;
@@ -160,18 +221,23 @@
 	let rxArea = $derived(buildArea(rxLine));
 	let txArea = $derived(buildArea(txLine));
 
-	// Two timestamps at bottom corners (first + last point).
-	function fmtTime(t: number): string {
+	function fmtTime(t: number, withDate = false): string {
 		const d = new Date(t * 1000);
+		const dd = d.getDate().toString().padStart(2, '0');
+		const mon = (d.getMonth() + 1).toString().padStart(2, '0');
 		const hh = d.getHours().toString().padStart(2, '0');
 		const mm = d.getMinutes().toString().padStart(2, '0');
 		const ss = d.getSeconds().toString().padStart(2, '0');
-		return `${hh}:${mm}:${ss}`;
+		return withDate ? `${dd}.${mon} ${hh}:${mm}` : `${hh}:${mm}:${ss}`;
 	}
 
-	let timeStart = $derived(timestamps.length >= 2 ? fmtTime(timestamps[0]) : '');
+	let showDateInLabels = $derived(selectedPeriod === '12h' || selectedPeriod === '24h');
+
+	let timeStart = $derived(
+		timestamps.length >= 2 ? fmtTime(timestamps[0], showDateInLabels) : ''
+	);
 	let timeEnd = $derived(
-		timestamps.length >= 2 ? fmtTime(timestamps[timestamps.length - 1]) : ''
+		timestamps.length >= 2 ? fmtTime(timestamps[timestamps.length - 1], showDateInLabels) : ''
 	);
 
 	// ---- Hover crosshair + tooltip ---------------------------------------
@@ -201,7 +267,7 @@
 
 	let hoverTime = $derived.by(() => {
 		if (hoverIndex === null || timestamps.length === 0) return '';
-		return fmtTime(timestamps[Math.min(hoverIndex, timestamps.length - 1)]);
+		return fmtTime(timestamps[Math.min(hoverIndex, timestamps.length - 1)], showDateInLabels);
 	});
 
 	// Tooltip placement: flip to left of cursor on the right 30% of the
@@ -214,23 +280,63 @@
 	let tooltipX = $derived(tooltipFlip ? hoverX - TOOLTIP_W - 8 : hoverX + 8);
 	let tooltipY = $derived(Math.min(hoverRxY, hoverTxY) - TOOLTIP_H - 6);
 	let tooltipYClamped = $derived(Math.max(PAD_TOP, tooltipY));
+	let showChart = $derived(hasData);
+	let showChartOverlay = $derived(loading && hasData);
+
+	let periodSeconds = $derived(PERIOD_SECONDS[selectedPeriod]);
+	let periodRxBytes = $derived.by(() => {
+		if (stats.points >= 2 && stats.volumeRx !== undefined && stats.volumeTx !== undefined) {
+			return stats.volumeRx;
+		}
+		return stats.avgRx * periodSeconds;
+	});
+	let periodTxBytes = $derived.by(() => {
+		if (stats.points >= 2 && stats.volumeRx !== undefined && stats.volumeTx !== undefined) {
+			return stats.volumeTx;
+		}
+		return stats.avgTx * periodSeconds;
+	});
+	let useServerVolume = $derived(
+		stats.points >= 2 && stats.volumeRx !== undefined && stats.volumeTx !== undefined
+	);
 </script>
 
 <Modal {open} title={tunnelName || tunnelId} size="xl" {onclose}>
 	<div class="meta-row">
-		{#if ifaceName}<span class="pill">{ifaceName}</span>{/if}
-		<span class="pill-muted">последние 24 часа</span>
+		<div class="meta-pills">
+			{#if ifaceName}<span class="pill">{ifaceName}</span>{/if}
+			<span class="pill-muted">{periodLabel(selectedPeriod)}</span>
+		</div>
+		<div class="period-switch" role="group" aria-label="Период графика трафика">
+			{#each PERIOD_OPTIONS as option (option.value)}
+				<button
+					type="button"
+					class="period-btn"
+					class:active={selectedPeriod === option.value}
+					aria-pressed={selectedPeriod === option.value}
+					onclick={() => (selectedPeriod = option.value)}
+				>
+					{option.label}
+				</button>
+			{/each}
+		</div>
 	</div>
 
 	<div class="stats-line">
-		<span class="stat">
-			<span class="label">Прием:</span>
-			<span class="val rx">{formatBitRate(liveCurrentRx)}</span>
-		</span>
-		<span class="sep">·</span>
-		<span class="stat">
-			<span class="label">Передача:</span>
-			<span class="val tx">{formatBitRate(liveCurrentTx)}</span>
+		<span
+			class="stat stat--period-est"
+			title={useServerVolume
+				? 'Объём за период на сервере: сумма (скорость×Δt) по сырым точкам истории между опросами.'
+				: 'Оценка: средняя скорость × длительность окна (мало точек или ответ API без полей volume).'}
+		>
+			<span class="label">Трафик:</span>
+			{#if !loading && stats.points > 0}
+				<span class="val rx">↓ {formatBytes(periodRxBytes)}</span>
+				<span class="sep">/</span>
+				<span class="val tx">↑ {formatBytes(periodTxBytes)}</span>
+			{:else}
+				<span class="val">—</span>
+			{/if}
 		</span>
 		<span class="sep">·</span>
 		<span class="stat">
@@ -239,164 +345,179 @@
 		</span>
 		<span class="sep">·</span>
 		<span class="stat">
-			<span class="label">Среднее</span>
+			<span class="label">Средняя:</span>
 			<span class="val rx">↓ {formatBitRate(stats.avgRx)}</span>
 			<span class="label">/</span>
 			<span class="val tx">↑ {formatBitRate(stats.avgTx)}</span>
 		</span>
 	</div>
 
-	{#if loading}
+	{#if showChart}
+		<div class="chart-panel" aria-busy={showChartOverlay}>
+			<div class="chart-wrap" class:chart-wrap--loading={showChartOverlay}>
+				<div class="chart-top">
+					<span class="max-rate">{formatBitRate(maxRate)}</span>
+				</div>
+				<!-- svelte-ignore a11y_no_static_element_interactions -->
+				<svg
+					bind:this={svgEl}
+					class="chart-svg"
+					viewBox={`0 0 ${CHART_W} ${CHART_H}`}
+					preserveAspectRatio="none"
+					role="img"
+					aria-label={`График трафика за период: ${periodLabel(selectedPeriod)}`}
+					onmousemove={handleMouseMove}
+					onmouseleave={handleMouseLeave}
+				>
+					<defs>
+						<linearGradient
+							id="rx-grad-modal"
+							x1="0"
+							y1={PAD_TOP}
+							x2="0"
+							y2={CHART_H - PAD_BOTTOM}
+							gradientUnits="userSpaceOnUse"
+						>
+							<stop offset="0%" stop-color="var(--accent, #60a5fa)" stop-opacity="0.55" />
+							<stop offset="100%" stop-color="var(--accent, #60a5fa)" stop-opacity="0" />
+						</linearGradient>
+						<linearGradient
+							id="tx-grad-modal"
+							x1="0"
+							y1={PAD_TOP}
+							x2="0"
+							y2={CHART_H - PAD_BOTTOM}
+							gradientUnits="userSpaceOnUse"
+						>
+							<stop offset="0%" stop-color="var(--success, #4ade80)" stop-opacity="0.55" />
+							<stop offset="100%" stop-color="var(--success, #4ade80)" stop-opacity="0" />
+						</linearGradient>
+					</defs>
+
+					<!-- RX first (background), TX on top so smaller series stays visible -->
+					<path d={rxArea} fill="url(#rx-grad-modal)" />
+					<path
+						d={rxLine}
+						fill="none"
+						stroke="var(--accent, #60a5fa)"
+						stroke-width="1.6"
+						stroke-linejoin="round"
+						stroke-linecap="round"
+					/>
+					<path d={txArea} fill="url(#tx-grad-modal)" />
+					<path
+						d={txLine}
+						fill="none"
+						stroke="var(--success, #4ade80)"
+						stroke-width="1.4"
+						stroke-linejoin="round"
+						stroke-linecap="round"
+						opacity="0.95"
+					/>
+
+					{#if hoverIndex !== null}
+						<g aria-hidden="true">
+							<!-- Vertical crosshair -->
+							<line
+								x1={hoverX}
+								y1={PAD_TOP}
+								x2={hoverX}
+								y2={CHART_H - PAD_BOTTOM}
+								stroke="var(--text-muted, #888)"
+								stroke-width="0.6"
+								stroke-dasharray="2,2"
+								opacity="0.8"
+							/>
+							<!-- Point dots -->
+							<circle
+								cx={hoverX}
+								cy={hoverRxY}
+								r="3.5"
+								fill="var(--accent, #60a5fa)"
+								stroke="var(--bg-primary, #1a1b26)"
+								stroke-width="1"
+							/>
+							<circle
+								cx={hoverX}
+								cy={hoverTxY}
+								r="3.5"
+								fill="var(--success, #4ade80)"
+								stroke="var(--bg-primary, #1a1b26)"
+								stroke-width="1"
+							/>
+							<!-- Tooltip -->
+							<g transform={`translate(${tooltipX}, ${tooltipYClamped})`}>
+								<rect
+									x="0"
+									y="0"
+									width={TOOLTIP_W}
+									height={TOOLTIP_H}
+									rx="4"
+									fill="var(--bg-secondary, #16161e)"
+									stroke="var(--border, #333)"
+									stroke-width="0.6"
+									opacity="0.96"
+								/>
+								<text
+									x="8"
+									y="16"
+									fill="var(--text-muted, #888)"
+									font-size="10"
+								>{hoverTime}</text>
+								<text
+									x="8"
+									y="32"
+									fill="var(--accent, #60a5fa)"
+									font-size="11"
+								>↓ {formatBitRate(rxRates[hoverIndex])}</text>
+								<text
+									x="8"
+									y="48"
+									fill="var(--success, #4ade80)"
+									font-size="11"
+								>↑ {formatBitRate(txRates[hoverIndex])}</text>
+							</g>
+						</g>
+					{/if}
+				</svg>
+				<div class="chart-bottom">
+					<span class="time">{timeStart}</span>
+					<span class="legend">
+						<span class="dot rx"></span>Прием: <span class="val rx">{formatBitRate(liveCurrentRx)}</span>
+						<span class="sep">·</span>
+						<span class="dot tx"></span>Передача: <span class="val tx">{formatBitRate(liveCurrentTx)}</span>
+					</span>
+					<span class="time">{timeEnd}</span>
+				</div>
+			</div>
+			{#if showChartOverlay}
+				<div class="chart-overlay">
+					<div class="chart-overlay-label">Обновляем график…</div>
+				</div>
+			{/if}
+		</div>
+	{:else if loading}
 		<div class="state-msg">Загрузка…</div>
 	{:else if error}
 		<div class="state-msg state-err">{error}</div>
 	{:else if !hasData}
-		<div class="state-msg">Недостаточно данных за 24 часа</div>
-	{:else}
-		<div class="chart-wrap">
-			<div class="chart-top">
-				<span class="max-rate">{formatBitRate(maxRate)}</span>
-			</div>
-			<!-- svelte-ignore a11y_no_static_element_interactions -->
-			<svg
-				bind:this={svgEl}
-				class="chart-svg"
-				viewBox={`0 0 ${CHART_W} ${CHART_H}`}
-				preserveAspectRatio="none"
-				role="img"
-				aria-label="График трафика за 24 часа"
-				onmousemove={handleMouseMove}
-				onmouseleave={handleMouseLeave}
-			>
-				<defs>
-					<linearGradient
-						id="rx-grad-modal"
-						x1="0"
-						y1={PAD_TOP}
-						x2="0"
-						y2={CHART_H - PAD_BOTTOM}
-						gradientUnits="userSpaceOnUse"
-					>
-						<stop offset="0%" stop-color="var(--accent, #60a5fa)" stop-opacity="0.55" />
-						<stop offset="100%" stop-color="var(--accent, #60a5fa)" stop-opacity="0" />
-					</linearGradient>
-					<linearGradient
-						id="tx-grad-modal"
-						x1="0"
-						y1={PAD_TOP}
-						x2="0"
-						y2={CHART_H - PAD_BOTTOM}
-						gradientUnits="userSpaceOnUse"
-					>
-						<stop offset="0%" stop-color="var(--success, #4ade80)" stop-opacity="0.55" />
-						<stop offset="100%" stop-color="var(--success, #4ade80)" stop-opacity="0" />
-					</linearGradient>
-				</defs>
-
-				<!-- RX first (background), TX on top so smaller series stays visible -->
-				<path d={rxArea} fill="url(#rx-grad-modal)" />
-				<path
-					d={rxLine}
-					fill="none"
-					stroke="var(--accent, #60a5fa)"
-					stroke-width="1.6"
-					stroke-linejoin="round"
-					stroke-linecap="round"
-				/>
-				<path d={txArea} fill="url(#tx-grad-modal)" />
-				<path
-					d={txLine}
-					fill="none"
-					stroke="var(--success, #4ade80)"
-					stroke-width="1.4"
-					stroke-linejoin="round"
-					stroke-linecap="round"
-					opacity="0.95"
-				/>
-
-				{#if hoverIndex !== null}
-					<g aria-hidden="true">
-						<!-- Vertical crosshair -->
-						<line
-							x1={hoverX}
-							y1={PAD_TOP}
-							x2={hoverX}
-							y2={CHART_H - PAD_BOTTOM}
-							stroke="var(--text-muted, #888)"
-							stroke-width="0.6"
-							stroke-dasharray="2,2"
-							opacity="0.8"
-						/>
-						<!-- Point dots -->
-						<circle
-							cx={hoverX}
-							cy={hoverRxY}
-							r="3.5"
-							fill="var(--accent, #60a5fa)"
-							stroke="var(--bg-primary, #1a1b26)"
-							stroke-width="1"
-						/>
-						<circle
-							cx={hoverX}
-							cy={hoverTxY}
-							r="3.5"
-							fill="var(--success, #4ade80)"
-							stroke="var(--bg-primary, #1a1b26)"
-							stroke-width="1"
-						/>
-						<!-- Tooltip -->
-						<g transform={`translate(${tooltipX}, ${tooltipYClamped})`}>
-							<rect
-								x="0"
-								y="0"
-								width={TOOLTIP_W}
-								height={TOOLTIP_H}
-								rx="4"
-								fill="var(--bg-secondary, #16161e)"
-								stroke="var(--border, #333)"
-								stroke-width="0.6"
-								opacity="0.96"
-							/>
-							<text
-								x="8"
-								y="16"
-								fill="var(--text-muted, #888)"
-								font-size="10"
-							>{hoverTime}</text>
-							<text
-								x="8"
-								y="32"
-								fill="var(--accent, #60a5fa)"
-								font-size="11"
-							>↓ {formatBitRate(rxRates[hoverIndex])}</text>
-							<text
-								x="8"
-								y="48"
-								fill="var(--success, #4ade80)"
-								font-size="11"
-							>↑ {formatBitRate(txRates[hoverIndex])}</text>
-						</g>
-					</g>
-				{/if}
-			</svg>
-			<div class="chart-bottom">
-				<span class="time">{timeStart}</span>
-				<span class="legend">
-					<span class="dot rx"></span>Прием: <span class="val rx">{formatBitRate(liveCurrentRx)}</span>
-					<span class="sep">·</span>
-					<span class="dot tx"></span>Передача: <span class="val tx">{formatBitRate(liveCurrentTx)}</span>
-				</span>
-				<span class="time">{timeEnd}</span>
-			</div>
-		</div>
+		<div class="state-msg">Недостаточно данных за выбранный период</div>
 	{/if}
 </Modal>
 
 <style>
 	.meta-row {
 		display: flex;
-		gap: 8px;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 12px;
+		flex-wrap: wrap;
 		margin-bottom: 12px;
+	}
+	.meta-pills {
+		display: flex;
+		gap: 8px;
+		flex-wrap: wrap;
 	}
 	.pill,
 	.pill-muted {
@@ -413,10 +534,51 @@
 		color: var(--text-muted, #888);
 	}
 
+	.period-switch {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: flex-end;
+		gap: 0.375rem;
+	}
+
+	.period-btn {
+		border: 1px solid var(--color-border);
+		background: var(--color-bg-tertiary);
+		color: var(--color-text-secondary);
+		border-radius: 999px;
+		padding: 0.3rem 0.625rem;
+		font: inherit;
+		font-size: 0.75rem;
+		line-height: 1.2;
+		cursor: pointer;
+		transition:
+			background var(--t-fast) ease,
+			border-color var(--t-fast) ease,
+			color var(--t-fast) ease;
+	}
+
+	.period-btn:hover {
+		border-color: var(--color-border-strong);
+		background: var(--color-bg-hover);
+		color: var(--color-text-primary);
+	}
+
+	.period-btn.active {
+		border-color: var(--color-accent);
+		background: var(--color-accent-tint);
+		color: var(--color-accent);
+	}
+
+	.period-btn:focus-visible {
+		outline: 2px solid var(--color-accent);
+		outline-offset: 2px;
+	}
+
 	.stats-line {
 		display: flex;
 		flex-wrap: wrap;
 		align-items: baseline;
+		justify-content: space-between;
 		gap: 6px 14px;
 		margin-bottom: 12px;
 		font-size: 0.8125rem;
@@ -428,6 +590,12 @@
 		align-items: baseline;
 		gap: 5px;
 		white-space: nowrap;
+	}
+
+	.stats-line .stat--period-est {
+		row-gap: 2px;
+		white-space: normal;
+		max-width: 100%;
 	}
 
 	.stats-line .label {
@@ -456,8 +624,17 @@
 		opacity: 0.4;
 	}
 
+	.chart-panel {
+		position: relative;
+	}
+
 	.chart-wrap {
 		border-radius: var(--radius);
+		transition: opacity var(--t-fast) ease;
+	}
+
+	.chart-wrap--loading {
+		opacity: 0.45;
 	}
 	.chart-svg {
 		display: block;
@@ -527,6 +704,25 @@
 		margin: 0 4px;
 	}
 
+	.chart-overlay {
+		position: absolute;
+		inset: 0;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		pointer-events: none;
+	}
+
+	.chart-overlay-label {
+		padding: 0.375rem 0.75rem;
+		border: 1px solid var(--color-border);
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--color-bg-secondary) 88%, transparent);
+		color: var(--color-text-secondary);
+		font-size: 0.75rem;
+		backdrop-filter: blur(6px);
+	}
+
 	.state-msg {
 		padding: 40px 0;
 		text-align: center;
@@ -535,5 +731,11 @@
 	}
 	.state-msg.state-err {
 		color: var(--error, #f52a65);
+	}
+
+	@media (max-width: 720px) {
+		.period-switch {
+			justify-content: flex-start;
+		}
 	}
 </style>

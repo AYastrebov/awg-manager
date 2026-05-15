@@ -10,6 +10,9 @@
 		Cpu,
 		EyeOff,
 		Lock,
+		BriefcaseBusiness,
+		ShieldOff,
+		GlobeLock,
 	} from 'lucide-svelte';
 	import { brandIcons } from '$lib/generated/brandIcons';
 
@@ -48,6 +51,9 @@
 		'lucide-cpu': { component: Cpu, bg: '#dc2626' },
 		'lucide-eye-off': { component: EyeOff, bg: '#dc2626' },
 		'lucide-lock': { component: Lock, bg: '#64748b' },
+		'lucide-briefcase-business': { component: BriefcaseBusiness, bg: '#0a66c2' },
+		'lucide-shield-off': { component: ShieldOff, bg: '#dc2626' },
+		'lucide-globe-lock': { component: GlobeLock, bg: '#64748b' },
 	};
 
 	const resolved = $derived.by((): ResolvedIcon => {

@@ -40,18 +40,6 @@ func (c *ClientImpl) Show(ctx context.Context, iface string) (*ShowResult, error
 	return parseShowOutput(result.Stdout), nil
 }
 
-// RemovePeer removes a peer from an interface.
-func (c *ClientImpl) RemovePeer(ctx context.Context, iface, publicKey string) error {
-	if publicKey == "" {
-		return nil // Nothing to remove
-	}
-	result, err := exec.Run(ctx, "/opt/sbin/awg", "set", iface, "peer", publicKey, "remove")
-	if err != nil {
-		return fmt.Errorf("awg remove peer %s: %w", iface, exec.FormatError(result, err))
-	}
-	return nil
-}
-
 // GetPeerPublicKey extracts the peer public key from interface state.
 func (c *ClientImpl) GetPeerPublicKey(ctx context.Context, iface string) (string, error) {
 	result, err := c.Show(ctx, iface)

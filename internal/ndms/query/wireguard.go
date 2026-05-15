@@ -18,12 +18,16 @@ import (
 
 const (
 	// wgServerListTTL — safety-net TTL for the full list; hooks invalidate
-	// on interface create/destroy.
-	wgServerListTTL = 30 * time.Minute
-	// wgServerItemTTL — per-name runtime snapshot TTL.
-	wgServerItemTTL = 5 * time.Minute
-	// wgServerRCTTL — RC-side config rarely changes.
-	wgServerRCTTL = 10 * time.Minute
+	// proactively so this rarely matters. Reduced from 30 min to 5 min so
+	// the safety-net never serves badly stale data.
+	wgServerListTTL = 5 * time.Minute
+	// wgServerItemTTL — per-name runtime snapshot TTL. Tight to keep the
+	// live UI fresh; mutations explicitly Invalidate(id) so this bound
+	// only matters for background traffic / handshake delta detection.
+	wgServerItemTTL = 30 * time.Second
+	// wgServerRCTTL — RC-side config rarely changes but should not lag
+	// the live view. Reduced from 10 min to 2 min.
+	wgServerRCTTL = 2 * time.Minute
 
 	// noHandshakeMarker: RCI sentinel for "no handshake ever".
 	noHandshakeMarker = int64(math.MaxInt32) // 2147483647

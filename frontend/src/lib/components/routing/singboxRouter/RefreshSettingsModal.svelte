@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { api } from '$lib/api/client';
 	import Modal from '$lib/components/ui/Modal.svelte';
+	import { Dropdown, type DropdownOption } from '$lib/components/ui';
 	import type { SingboxRouterSettings } from '$lib/types';
 
 	interface Props {
@@ -10,6 +11,11 @@
 	}
 	let { settings, onClose, onSaved }: Props = $props();
 
+	const REFRESH_MODE_OPTIONS: DropdownOption<'interval' | 'daily'>[] = [
+		{ value: 'interval', label: 'Каждые N часов' },
+		{ value: 'daily', label: 'Ежедневно в заданное время' },
+	];
+
 	// svelte-ignore state_referenced_locally
 	let refreshMode: 'interval' | 'daily' = $state((settings.refreshMode ?? 'interval') as 'interval' | 'daily');
 	// svelte-ignore state_referenced_locally
@@ -18,6 +24,31 @@
 	let refreshDailyTime = $state(settings.refreshDailyTime ?? '03:00');
 	let busy = $state(false);
 	let error = $state('');
+
+	// Snapshot initial state for isDirty detection. Capture ONCE per mount —
+	// the `settings` prop is SSE-store-derived and could re-emit while the
+	// modal is open, which would silently reset the snapshot to fresh server
+	// values and drop the dirty flag mid-edit, breaking confirm-on-close.
+	let initialRefreshMode: 'interval' | 'daily' = $state('interval');
+	let initialRefreshIntervalHours = $state(24);
+	let initialRefreshDailyTime = $state('03:00');
+	let snapshotTaken = $state(false);
+
+	$effect(() => {
+		if (snapshotTaken) return;
+		initialRefreshMode = (settings.refreshMode ?? 'interval') as 'interval' | 'daily';
+		initialRefreshIntervalHours = settings.refreshIntervalHours ?? 24;
+		initialRefreshDailyTime = settings.refreshDailyTime ?? '03:00';
+		snapshotTaken = true;
+	});
+
+	const isDirty = $derived.by(() => {
+		return (
+			refreshMode !== initialRefreshMode ||
+			refreshIntervalHours !== initialRefreshIntervalHours ||
+			refreshDailyTime !== initialRefreshDailyTime
+		);
+	});
 
 	async function save(): Promise<void> {
 		busy = true;
@@ -39,14 +70,11 @@
 	}
 </script>
 
-<Modal open onclose={onClose} title="Настройки автообновления">
+<Modal open onclose={onClose} title="Настройки автообновления" hasUnsavedChanges={() => isDirty}>
 	<div class="form">
 		<label class="field">
 			<div class="label">Режим</div>
-			<select bind:value={refreshMode}>
-				<option value="interval">Каждые N часов</option>
-				<option value="daily">Ежедневно в заданное время</option>
-			</select>
+			<Dropdown bind:value={refreshMode} options={REFRESH_MODE_OPTIONS} fullWidth />
 		</label>
 
 		{#if refreshMode === 'interval'}
@@ -74,7 +102,7 @@
 	.form {
 		display: grid;
 		gap: 0.75rem;
-		min-width: 320px;
+		min-width: 0;
 	}
 	.field {
 		display: grid;
@@ -84,7 +112,6 @@
 		font-size: 0.75rem;
 		color: var(--muted-text);
 	}
-	.field select,
 	.field input {
 		background: var(--bg);
 		border: 1px solid var(--border);

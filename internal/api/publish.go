@@ -12,6 +12,7 @@ const (
 	ResourceSysInfo                 = "sysInfo"
 	ResourcePingcheck               = "pingcheck"
 	ResourceSaveStatus              = "saveStatus"
+	ResourceSettings                = "settings"
 	ResourceRoutingDnsRoutes        = "routing.dnsRoutes"
 	ResourceRoutingStaticRoutes     = "routing.staticRoutes"
 	ResourceRoutingAccessPolicies   = "routing.accessPolicies"

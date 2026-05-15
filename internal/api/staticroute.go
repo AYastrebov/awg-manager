@@ -20,6 +20,7 @@ type StaticRouteDTO struct {
 	TunnelID  string   `json:"tunnelID" example:"tun_abc123"`
 	Subnets   []string `json:"subnets" example:"192.168.10.0/24"`
 	Fallback  string   `json:"fallback,omitempty" example:""`
+	IconURL   string   `json:"iconUrl,omitempty" example:"https://cdn.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Cloudflare.png"`
 	Enabled   bool     `json:"enabled" example:"true"`
 	CreatedAt string   `json:"createdAt" example:"2024-01-01T00:00:00Z"`
 	UpdatedAt string   `json:"updatedAt" example:"2024-01-15T12:00:00Z"`
@@ -199,7 +200,7 @@ func (h *StaticRouteHandler) Delete(w http.ResponseWriter, r *http.Request) {
 //	@Failure		500	{object}	APIErrorEnvelope
 //	@Router			/static-routes/set-enabled [post]
 func (h *StaticRouteHandler) SetEnabled(w http.ResponseWriter, r *http.Request) {
-	body, ok := parseJSON[enabledToggle](w, r, http.MethodPost)
+	body, ok := parseJSON[EnabledToggleRequest](w, r, http.MethodPost)
 	if !ok {
 		return
 	}

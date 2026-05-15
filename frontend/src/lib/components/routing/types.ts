@@ -8,6 +8,7 @@ export interface MatchedRule {
 	tunnelName: string;
 	domainCount: number;
 	sourceSummary: string;
+	iconUrl?: string;
 }
 
 export interface ResolveMatch {

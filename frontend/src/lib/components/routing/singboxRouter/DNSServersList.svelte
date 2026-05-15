@@ -228,13 +228,16 @@
 		font-size: 0.7rem;
 		font-weight: 600;
 		text-align: center;
-		color: white;
+		color: #ffffff;
 	}
 	.type-udp { background: var(--muted, #64748b); }
 	.type-tls,
 	.type-https,
 	.type-quic,
-	.type-h3 { background: var(--success, #22c55e); }
+	.type-h3 {
+		background: var(--success, #22c55e);
+		color: var(--color-success-contrast, #ffffff);
+	}
 	.server {
 		color: var(--text);
 		overflow: hidden;

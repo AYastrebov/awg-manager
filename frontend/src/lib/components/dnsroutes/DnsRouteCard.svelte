@@ -15,6 +15,7 @@
 		selected?: boolean;
 		onselect?: () => void;
 		hydrarouteInstalled?: boolean;
+		onicon?: () => void;
 	}
 
 	let {
@@ -28,7 +29,8 @@
 		selectable = false,
 		selected = false,
 		onselect,
-		hydrarouteInstalled = false
+		hydrarouteInstalled = false,
+		onicon
 	}: Props = $props();
 
 	let backendLabel = $derived.by(() => {
@@ -44,8 +46,14 @@
 			: 'badge-ndms'
 	);
 
-	let cidrCount = $derived((route.domains ?? []).filter(d => d.includes('/')).length);
-	let domainCount = $derived((route.domains?.length ?? 0) - cidrCount);
+	// Post-split data stores CIDRs in route.subnets; legacy lists created
+	// before commit a65b76f4 (2026-04-15) may still have CIDRs mixed into
+	// route.domains until the next save re-runs splitDomainsAndSubnets.
+	let cidrCount = $derived(
+		(route.subnets?.length ?? 0) +
+		(route.domains ?? []).filter(d => d.includes('/')).length
+	);
+	let domainCount = $derived((route.domains ?? []).filter(d => !d.includes('/')).length);
 	let subCount = $derived(route.subscriptions?.length ?? 0);
 	let manualCount = $derived(route.manualDomains?.length ?? 0);
 
@@ -92,7 +100,19 @@
 				onchange={() => onselect?.()}
 			/>
 		{/if}
-		<ServiceIcon name={route.name} size={36} />
+		{#if onicon && !selectable}
+			<button
+				class="icon-btn"
+				type="button"
+				onclick={() => onicon()}
+				aria-label="Сменить иконку"
+				title="Сменить иконку"
+			>
+				<ServiceIcon name={route.name} iconUrl={route.iconUrl} size={36} />
+			</button>
+		{:else}
+			<ServiceIcon name={route.name} iconUrl={route.iconUrl} size={36} />
+		{/if}
 		<div class="card-info">
 			<div class="card-title">
 				<span
@@ -223,6 +243,7 @@
 	.card-title h3 {
 		font-size: 0.875rem;
 		font-weight: 600;
+		color: var(--text-primary);
 		margin: 0;
 		white-space: nowrap;
 		overflow: hidden;
@@ -237,17 +258,18 @@
 
 	.card-source {
 		font-size: 0.625rem;
-		color: var(--border-hover);
+		color: var(--text-secondary);
 	}
 
 	.card-route {
 		font-size: 0.6875rem;
-		color: var(--border-hover);
+		color: var(--text-secondary);
 		margin-top: 3px;
 	}
 
 	.card-route code {
 		background: var(--bg-hover);
+		color: var(--text-primary);
 		padding: 1px 6px;
 		border-radius: 3px;
 		font-size: 0.625rem;
@@ -313,6 +335,28 @@
 		margin-top: 10px;
 	}
 
+	.icon-btn {
+		padding: 0;
+		background: none;
+		border: 1px solid transparent;
+		border-radius: 8px;
+		cursor: pointer;
+		transition: border-color 0.15s;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+	}
+
+	.icon-btn:hover {
+		border-color: var(--border-hover);
+	}
+
+	.icon-btn:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: 2px;
+	}
+
 	.backend-badge {
 		font-size: 0.5625rem;
 		font-weight: 600;
@@ -335,5 +379,15 @@
 	.badge-hr-warn {
 		background: rgba(245, 158, 11, 0.15);
 		color: var(--warning);
+	}
+
+	:global(html[data-theme-preset='neo']) .card-source,
+	:global(html[data-theme-preset='neo']) .card-route {
+		color: var(--text-primary);
+	}
+
+	:global(html[data-theme-preset='neo']) .card-route code {
+		background: color-mix(in srgb, var(--bg-hover) 80%, var(--accent) 20%);
+		color: var(--color-accent-contrast, #0b0b0b);
 	}
 </style>

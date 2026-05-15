@@ -14,6 +14,7 @@
 		selectable?: boolean;
 		selected?: boolean;
 		onselect?: () => void;
+		onicon?: () => void;
 	}
 
 	let {
@@ -25,7 +26,8 @@
 		toggleLoading = false,
 		selectable = false,
 		selected = false,
-		onselect
+		onselect,
+		onicon
 	}: Props = $props();
 
 	let subnetCount = $derived(route.subnets?.length ?? 0);
@@ -67,7 +69,19 @@
 				onchange={() => onselect?.()}
 			/>
 		{/if}
-		<ServiceIcon name={route.name} size={36} />
+		{#if onicon && !selectable}
+			<button
+				class="icon-btn"
+				type="button"
+				onclick={() => onicon()}
+				aria-label="Сменить иконку"
+				title="Сменить иконку"
+			>
+				<ServiceIcon name={route.name} iconUrl={route.iconUrl} size={36} />
+			</button>
+		{:else}
+			<ServiceIcon name={route.name} iconUrl={route.iconUrl} size={36} />
+		{/if}
 		<div class="card-info">
 			<div class="card-title">
 				<span
@@ -252,6 +266,28 @@
 		cursor: pointer;
 		flex-shrink: 0;
 		margin-top: 10px;
+	}
+
+	.icon-btn {
+		padding: 0;
+		background: none;
+		border: 1px solid transparent;
+		border-radius: 8px;
+		cursor: pointer;
+		transition: border-color 0.15s;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+	}
+
+	.icon-btn:hover {
+		border-color: var(--border-hover);
+	}
+
+	.icon-btn:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: 2px;
 	}
 
 	.comment-sep {

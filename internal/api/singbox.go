@@ -18,13 +18,16 @@ import (
 
 // SingboxStatusData mirrors frontend SingboxStatus.
 type SingboxStatusData struct {
-	Installed      bool     `json:"installed" example:"true"`
-	Version        string   `json:"version,omitempty" example:"1.9.3"`
-	Running        bool     `json:"running" example:"true"`
-	PID            int      `json:"pid,omitempty" example:"12345"`
-	TunnelCount    int      `json:"tunnelCount" example:"2"`
-	ProxyComponent bool     `json:"proxyComponent" example:"true"`
-	Features       []string `json:"features,omitempty" example:"with_quic"`
+	Installed       bool     `json:"installed" example:"true"`
+	Version         string   `json:"version,omitempty" example:"1.9.3"`
+	Running         bool     `json:"running" example:"true"`
+	PID             int      `json:"pid,omitempty" example:"12345"`
+	TunnelCount     int      `json:"tunnelCount" example:"2"`
+	ProxyComponent  bool     `json:"proxyComponent" example:"true"`
+	Features        []string `json:"features,omitempty" example:"with_quic"`
+	CurrentVersion  string   `json:"currentVersion,omitempty" example:"1.13.11"`
+	RequiredVersion string   `json:"requiredVersion" example:"1.13.11"`
+	UpdateAvailable bool     `json:"updateAvailable" example:"false"`
 }
 
 // SingboxStatusResponse is the envelope for GET /singbox/status.
@@ -59,6 +62,11 @@ type SingboxTunnelDTO struct {
 type SingboxTunnelsResponse struct {
 	Success bool               `json:"success" example:"true"`
 	Data    []SingboxTunnelDTO `json:"data"`
+}
+
+// SingboxControlRequest is the body for POST /singbox/control.
+type SingboxControlRequest struct {
+	Action string `json:"action" example:"start" enums:"start,stop,restart"`
 }
 
 // SingboxHandler serves /api/singbox/* routes.
@@ -158,6 +166,32 @@ func (h *SingboxHandler) Install(w http.ResponseWriter, r *http.Request) {
 	response.Success(w, s)
 }
 
+// Update handles POST /api/singbox/update.
+// Replaces the installed managed sing-box binary with the version this
+// awg-manager build is pinned to. No-op when versions match.
+//
+//	@Summary		Update managed sing-box binary
+//	@Description	Replaces the currently-installed managed sing-box with the version this awg-manager build is pinned to. No-op when versions match.
+//	@Tags			singbox
+//	@Produce		json
+//	@Security		CookieAuth
+//	@Success		200	{object}	OkResponse
+//	@Failure		405	{object}	APIErrorEnvelope
+//	@Failure		500	{object}	APIErrorEnvelope
+//	@Router			/singbox/update [post]
+func (h *SingboxHandler) Update(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.MethodNotAllowed(w)
+		return
+	}
+	if err := h.op.Update(r.Context()); err != nil {
+		response.InternalError(w, err.Error())
+		return
+	}
+	publishInvalidated(h.bus, ResourceSingboxStatus, "updated")
+	response.Success(w, map[string]bool{"updated": true})
+}
+
 // Control handles POST /api/singbox/control.
 // Body: {"action": "start"|"stop"|"restart"}.
 // Returns the fresh status so the client can update its cache. Mirrors the
@@ -169,19 +203,17 @@ func (h *SingboxHandler) Install(w http.ResponseWriter, r *http.Request) {
 //	@Accept			json
 //	@Produce		json
 //	@Security		CookieAuth
-//	@Param			body	body		map[string]interface{}	true	"{action: start|stop|restart}"
-//	@Success		200		{object}	map[string]interface{}
-//	@Failure		400		{object}	map[string]interface{}
-//	@Failure		500		{object}	map[string]interface{}
+//	@Param			body	body		SingboxControlRequest	true	"Action to perform"
+//	@Success		200		{object}	SingboxStatusResponse
+//	@Failure		400		{object}	APIErrorEnvelope
+//	@Failure		500		{object}	APIErrorEnvelope
 //	@Router			/singbox/control [post]
 func (h *SingboxHandler) Control(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		response.MethodNotAllowed(w)
 		return
 	}
-	var req struct {
-		Action string `json:"action"`
-	}
+	var req SingboxControlRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Error(w, "invalid request", "INVALID_REQUEST")
 		return
@@ -399,6 +431,7 @@ func (h *SingboxHandler) SpeedTestStream(w http.ResponseWriter, r *http.Request)
 	tag := r.URL.Query().Get("tag")
 	server := r.URL.Query().Get("server")
 	portStr := r.URL.Query().Get("port")
+	ifaceOverride := r.URL.Query().Get("iface")
 	if tag == "" || server == "" || portStr == "" {
 		response.BadRequest(w, "tag, server, port required")
 		return
@@ -417,22 +450,28 @@ func (h *SingboxHandler) SpeedTestStream(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Resolve tag -> kernel interface via sing-box tunnel list.
-	tunnels, err := h.op.ListTunnels(r.Context())
-	if err != nil {
-		response.InternalError(w, err.Error())
-		return
-	}
-	iface := ""
-	for _, t := range tunnels {
-		if t.Tag == tag {
-			iface = t.KernelInterface
-			break
-		}
-	}
+	// When iface is supplied, the caller already knows the kernel TUN
+	// (e.g. SubscriptionActiveCard derives it from sub.proxyIndex). Skip
+	// the tag-to-tunnel lookup in that case — selector outbounds (used by
+	// subscriptions) are filtered out of ListTunnels so a tag lookup
+	// would otherwise 404 on every subscription speedtest attempt.
+	iface := ifaceOverride
 	if iface == "" {
-		response.ErrorWithStatus(w, http.StatusNotFound, "tunnel tag not found or no kernel interface", "NOT_FOUND")
-		return
+		tunnels, err := h.op.ListTunnels(r.Context())
+		if err != nil {
+			response.InternalError(w, err.Error())
+			return
+		}
+		for _, t := range tunnels {
+			if t.Tag == tag {
+				iface = t.KernelInterface
+				break
+			}
+		}
+		if iface == "" {
+			response.ErrorWithStatus(w, http.StatusNotFound, "tunnel tag not found or no kernel interface", "NOT_FOUND")
+			return
+		}
 	}
 
 	flusher, ok := w.(http.Flusher)

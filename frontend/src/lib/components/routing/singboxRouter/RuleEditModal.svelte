@@ -1,15 +1,37 @@
 <script lang="ts">
 	import Modal from '$lib/components/ui/Modal.svelte';
-	import type { SingboxRouterRule } from '$lib/types';
+	import { Dropdown, ChipMultiSelect, type DropdownOption, type ChipOption } from '$lib/components/ui';
+	import type { SingboxRouterRule, SingboxRouterRuleSet } from '$lib/types';
 	import type { OutboundGroup } from './outboundOptions';
 
 	interface Props {
 		rule?: SingboxRouterRule;
 		outboundOptions: OutboundGroup[];
+		availableRuleSets: SingboxRouterRuleSet[];
+		/**
+		 * Pre-populated rule_set tags for the add-rule path (when `rule` is
+		 * undefined). Used by the deep-link prefill flow from rule set cards.
+		 * Ignored when `rule` is provided (edit mode reads rule.rule_set).
+		 */
+		initialRuleSetTags?: string[];
 		onClose: () => void;
 		onSave: (rule: SingboxRouterRule) => Promise<void> | void;
 	}
-	let { rule, outboundOptions, onClose, onSave }: Props = $props();
+	let {
+		rule,
+		outboundOptions,
+		availableRuleSets,
+		initialRuleSetTags,
+		onClose,
+		onSave,
+	}: Props = $props();
+
+	const outboundDropdownOptions = $derived<DropdownOption[]>([
+		{ value: '', label: '— выберите —' },
+		...outboundOptions.flatMap((g) =>
+			g.items.map((i) => ({ value: i.value, label: i.label, group: g.group })),
+		),
+	]);
 
 	// svelte-ignore state_referenced_locally
 	let domainSuffixStr = $state((rule?.domain_suffix ?? []).join('\n'));
@@ -18,7 +40,10 @@
 	// svelte-ignore state_referenced_locally
 	let sourceIpCidrStr = $state((rule?.source_ip_cidr ?? []).join('\n'));
 	// svelte-ignore state_referenced_locally
-	let ruleSetStr = $state((rule?.rule_set ?? []).join(', '));
+	let ruleSetTags = $state<string[]>(rule?.rule_set ?? initialRuleSetTags ?? []);
+	const ruleSetOptions = $derived<ChipOption[]>(
+		availableRuleSets.map((rs) => ({ value: rs.tag, label: rs.tag })),
+	);
 	// svelte-ignore state_referenced_locally
 	let portStr = $state((rule?.port ?? []).join(', '));
 
@@ -30,14 +55,64 @@
 	let busy = $state(false);
 	let error = $state('');
 
+	// Snapshot initial state for isDirty detection
+	let initialDomainSuffixStr = $state('');
+	let initialIpCidrStr = $state('');
+	let initialSourceIpCidrStr = $state('');
+	let initialRuleSetTagsSnapshot = $state<string[]>([]);
+	let initialPortStr = $state('');
+	let initialAction: 'route' | 'reject' = $state('route');
+	let initialOutbound = $state('');
+
+	// Initialize snapshot when modal opens
+	$effect(() => {
+		if (rule) {
+			initialDomainSuffixStr = (rule.domain_suffix ?? []).join('\n');
+			initialIpCidrStr = (rule.ip_cidr ?? []).join('\n');
+			initialSourceIpCidrStr = (rule.source_ip_cidr ?? []).join('\n');
+			initialRuleSetTagsSnapshot = [...(rule.rule_set ?? [])];
+			initialPortStr = (rule.port ?? []).join(', ');
+			initialAction = rule.action === 'reject' ? 'reject' : 'route';
+			initialOutbound = rule.outbound ?? '';
+		} else {
+			initialDomainSuffixStr = '';
+			initialIpCidrStr = '';
+			initialSourceIpCidrStr = '';
+			initialRuleSetTagsSnapshot = [...(initialRuleSetTags ?? [])];
+			initialPortStr = '';
+			initialAction = 'route';
+			initialOutbound = '';
+		}
+	});
+
+	const isDirty = $derived.by(() => {
+		return (
+			domainSuffixStr !== initialDomainSuffixStr ||
+			ipCidrStr !== initialIpCidrStr ||
+			sourceIpCidrStr !== initialSourceIpCidrStr ||
+			[...ruleSetTags].join(',') !== [...initialRuleSetTagsSnapshot].join(',') ||
+			portStr !== initialPortStr ||
+			action !== initialAction ||
+			outbound !== initialOutbound
+		);
+	});
+
+	function parseLines(text: string): string[] {
+		return text.split('\n').map((s) => s.trim()).filter(Boolean);
+	}
+
+	const domainsCount = $derived(parseLines(domainSuffixStr).length);
+	const ipsCount = $derived(parseLines(ipCidrStr).length);
+	const sourceIPsCount = $derived(parseLines(sourceIpCidrStr).length);
+
 	async function save(): Promise<void> {
 		busy = true;
 		error = '';
 		try {
-			const domain_suffix = domainSuffixStr.split('\n').map((s) => s.trim()).filter(Boolean);
-			const ip_cidr = ipCidrStr.split('\n').map((s) => s.trim()).filter(Boolean);
-			const source_ip_cidr = sourceIpCidrStr.split('\n').map((s) => s.trim()).filter(Boolean);
-			const rule_set = ruleSetStr.split(',').map((s) => s.trim()).filter(Boolean);
+			const domain_suffix = parseLines(domainSuffixStr);
+			const ip_cidr = parseLines(ipCidrStr);
+			const source_ip_cidr = parseLines(sourceIpCidrStr);
+			const rule_set = ruleSetTags;
 			const port = portStr
 				.split(',')
 				.map((s) => parseInt(s.trim(), 10))
@@ -79,33 +154,69 @@
 	}
 </script>
 
-<Modal open onclose={onClose} title={rule ? 'Редактировать правило' : 'Новое правило'}>
+<Modal open onclose={onClose} title={rule ? 'Редактировать правило' : 'Новое правило'} hasUnsavedChanges={() => isDirty}>
 	<div class="form">
 		<div class="section-label">Matchers (минимум один)</div>
 
 		<label class="field">
-			<div class="lbl">Domain suffix</div>
-			<textarea bind:value={domainSuffixStr} rows="3" placeholder="по одному на строке, например youtube.com"></textarea>
+			<div class="field-head">
+				<span class="lbl">Domain suffix</span>
+				{#if domainsCount > 0}
+					<span class="count-chip">
+						{domainsCount}
+						{domainsCount === 1 ? 'домен' : domainsCount < 5 ? 'домена' : 'доменов'}
+					</span>
+				{/if}
+			</div>
+			<textarea bind:value={domainSuffixStr} rows="6" placeholder="по одному на строке, например youtube.com"></textarea>
 		</label>
 
 		<label class="field">
-			<div class="lbl">IP CIDR</div>
-			<textarea bind:value={ipCidrStr} rows="2" placeholder="142.250.0.0/15"></textarea>
+			<div class="field-head">
+				<span class="lbl">IP CIDR</span>
+				{#if ipsCount > 0}
+					<span class="count-chip">
+						{ipsCount}
+						{ipsCount === 1 ? 'подсеть' : ipsCount < 5 ? 'подсети' : 'подсетей'}
+					</span>
+				{/if}
+			</div>
+			<textarea bind:value={ipCidrStr} rows="6" placeholder="142.250.0.0/15"></textarea>
 		</label>
 
 		<label class="field">
-			<div class="lbl">Source IP CIDR</div>
-			<textarea bind:value={sourceIpCidrStr} rows="2" placeholder="192.168.1.50"></textarea>
+			<div class="field-head">
+				<span class="lbl">Source IP CIDR</span>
+				{#if sourceIPsCount > 0}
+					<span class="count-chip">
+						{sourceIPsCount}
+						{sourceIPsCount === 1 ? 'источник' : sourceIPsCount < 5 ? 'источника' : 'источников'}
+					</span>
+				{/if}
+			</div>
+			<textarea bind:value={sourceIpCidrStr} rows="6" placeholder="192.168.1.50"></textarea>
 		</label>
 
-		<label class="field">
-			<div class="lbl">Rule sets (через запятую)</div>
-			<input bind:value={ruleSetStr} placeholder="geosite-youtube, geoip-ru" />
-		</label>
+		<div class="field">
+			<div class="lbl">Rule sets</div>
+			<ChipMultiSelect
+				values={ruleSetTags}
+				options={ruleSetOptions}
+				onchange={(next) => (ruleSetTags = next)}
+				placeholder="не выбрано"
+				allowOrphans
+			/>
+			<div class="hint">
+				Готовые наборы (geosite/geoip). Для своих доменов и подсетей используйте поля выше.
+			</div>
+		</div>
 
 		<label class="field">
 			<div class="lbl">Порты (через запятую)</div>
 			<input bind:value={portStr} placeholder="443, 80" />
+			<div class="hint">
+				Необязательно. Дополнительно ограничивает правило конкретными портами.
+			</div>
 		</label>
 
 		<div class="action-section">
@@ -118,16 +229,7 @@
 			{#if action === 'route'}
 				<label class="field">
 					<div class="lbl">Куда направить</div>
-					<select bind:value={outbound}>
-						<option value="">— выберите —</option>
-						{#each outboundOptions as group}
-							<optgroup label={group.group}>
-								{#each group.items as item}
-									<option value={item.value}>{item.label}</option>
-								{/each}
-							</optgroup>
-						{/each}
-					</select>
+					<Dropdown bind:value={outbound} options={outboundDropdownOptions} fullWidth />
 				</label>
 			{/if}
 		</div>
@@ -145,7 +247,7 @@
 	.form {
 		display: grid;
 		gap: 0.6rem;
-		min-width: 420px;
+		min-width: 0;
 	}
 	.section-label {
 		font-size: 0.7rem;
@@ -162,9 +264,29 @@
 		font-size: 0.75rem;
 		color: var(--muted-text);
 	}
+	.field-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.5rem;
+	}
+	.count-chip {
+		font-size: 0.7rem;
+		color: var(--muted-text);
+		padding: 0.1rem 0.45rem;
+		border: 1px solid var(--border);
+		border-radius: 999px;
+		font-family: ui-monospace, monospace;
+		white-space: nowrap;
+	}
+	.hint {
+		font-size: 0.72rem;
+		color: var(--muted-text);
+		line-height: 1.4;
+		margin-top: 0.15rem;
+	}
 	.field textarea,
-	.field input,
-	.field select {
+	.field input {
 		background: var(--bg);
 		border: 1px solid var(--border);
 		padding: 0.4rem 0.6rem;
@@ -203,7 +325,7 @@
 	}
 	.segment button.active {
 		background: var(--accent, #3b82f6);
-		color: white;
+		color: var(--color-accent-contrast, #ffffff);
 		font-weight: 600;
 	}
 	.error {

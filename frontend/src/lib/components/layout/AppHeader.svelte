@@ -1,18 +1,74 @@
 <script lang="ts">
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
-	import { LegacyTabs, LegacyTab, IconButton, SaveStatusIndicator } from '$lib/components/ui';
+	import { LegacyTabs, LegacyTab, IconButton } from '$lib/components/ui';
+	import BrandLogoMark from './BrandLogoMark.svelte';
+	import { usageLevel } from '$lib/stores/settings';
+	import type { ThemeState } from '$lib/stores/theme';
+	import { isSectionVisible, type Section } from '$lib/types/usageLevel';
+
+	type NavItem = {
+		section: Section;
+		href: string;
+		label: string;
+		matches: (path: string) => boolean;
+	};
+
+	const NAV_ITEMS: NavItem[] = [
+		{
+			section: 'tunnels',
+			href: '/',
+			label: 'ТУННЕЛИ',
+			matches: (p) =>
+				p === '/' || p.startsWith('/tunnels') || p.startsWith('/system-tunnels'),
+		},
+		{
+			section: 'servers',
+			href: '/servers',
+			label: 'СЕРВЕРЫ',
+			matches: (p) => p.startsWith('/servers'),
+		},
+		{
+			section: 'routing',
+			href: '/routing',
+			label: 'МАРШРУТИЗАЦИЯ',
+			matches: (p) => p.startsWith('/routing'),
+		},
+		{
+			section: 'monitoring',
+			href: '/monitoring',
+			label: 'МОНИТОРИНГ',
+			matches: (p) =>
+				p.startsWith('/monitoring') ||
+				p.startsWith('/pingcheck') ||
+				p.startsWith('/connections'),
+		},
+		{
+			section: 'diagnostics',
+			href: '/diagnostics',
+			label: 'ДИАГНОСТИКА',
+			matches: (p) => p.startsWith('/diagnostics') || p.startsWith('/logs'),
+		},
+		{
+			section: 'settings',
+			href: '/settings',
+			label: 'НАСТРОЙКИ',
+			matches: (p) => p.startsWith('/settings'),
+		},
+	];
 
 	interface Props {
 		authenticated: boolean;
 		authDisabled?: boolean;
 		username?: string | null;
-		theme?: 'dark' | 'light';
+		theme?: ThemeState;
 		currentVersion?: string;
+		/** Первый запрос версии ещё идёт — показываем плейсхолдер вместо пустоты. */
+		versionPending?: boolean;
 		hasUpdate?: boolean;
 		isPreRelease?: boolean;
 		mobileMenuOpen?: boolean;
-		onToggleTheme: () => void;
+		onToggleThemeMode: () => void;
 		onLogout: () => void;
 		onOpenDonate: () => void;
 	}
@@ -21,30 +77,36 @@
 		authenticated,
 		authDisabled = false,
 		username = null,
-		theme = 'dark',
+		theme = {
+			preset: 'legacy',
+			mode: 'dark',
+			legacyMode: 'dark',
+			custom: {
+				accent: '#8b5cf6',
+				background: '#111827',
+				text: '#f8fafc',
+			},
+			label: 'AWGM - Legacy',
+			summary: '',
+			supportsModeToggle: true,
+		},
 		currentVersion = '',
+		versionPending = false,
 		hasUpdate = false,
 		isPreRelease = false,
 		mobileMenuOpen = $bindable(false),
-		onToggleTheme,
+		onToggleThemeMode,
 		onLogout,
 		onOpenDonate,
 	}: Props = $props();
 
+	const visibleItems = $derived(
+		NAV_ITEMS.filter((item) => isSectionVisible($usageLevel, item.section)),
+	);
+
 	const currentRoute = $derived.by(() => {
 		const path = $page.url.pathname;
-		if (path === '/' || path.startsWith('/tunnels') || path.startsWith('/system-tunnels')) return '/';
-		if (path.startsWith('/servers')) return '/servers';
-		if (path.startsWith('/routing')) return '/routing';
-		if (
-			path.startsWith('/monitoring') ||
-			path.startsWith('/pingcheck') ||
-			path.startsWith('/connections')
-		)
-			return '/monitoring';
-		if (path.startsWith('/diagnostics') || path.startsWith('/logs')) return '/diagnostics';
-		if (path.startsWith('/settings')) return '/settings';
-		return '';
+		return visibleItems.find((item) => item.matches(path))?.href ?? '';
 	});
 
 	function navigate(value: string) {
@@ -60,62 +122,73 @@
 	function toggleMobileMenu() {
 		mobileMenuOpen = !mobileMenuOpen;
 	}
+
+	function prettyMobileLabel(upperLabel: string): string {
+		const map: Record<string, string> = {
+			ТУННЕЛИ: 'Туннели',
+			СЕРВЕРЫ: 'Серверы',
+			МАРШРУТИЗАЦИЯ: 'Маршрутизация',
+			МОНИТОРИНГ: 'Мониторинг',
+			ДИАГНОСТИКА: 'Диагностика',
+			НАСТРОЙКИ: 'Настройки',
+		};
+		return map[upperLabel] ?? upperLabel;
+	}
+
+	/** Для Neo вторая ветка визуально тёмная, но `mode` остаётся dark ради color-scheme — в шапке показываем legacyMode */
+	const themeDisplayMode = $derived(theme.preset === 'neo' ? theme.legacyMode : theme.mode);
+
+	const themeButtonLabel = $derived.by(() => {
+		const currentModeLabel = themeDisplayMode === 'light' ? 'светлая' : 'тёмная';
+		const nextModeLabel = themeDisplayMode === 'light' ? 'тёмную' : 'светлую';
+		return `Переключить ${theme.label} на ${nextModeLabel} тему. Сейчас ${currentModeLabel}.`;
+	});
 </script>
 
-<header class="app-header">
+<header class="app-header" class:unauthenticated={!authenticated}>
 	<div class="header-inner">
 		<div class="brand-group">
 			<a href="/" class="brand" aria-label="AWG Manager" onclick={closeMobileMenu}>
-				<svg
-					class="logo"
-					viewBox="0 0 24 24"
-					fill="none"
-					stroke="currentColor"
-					stroke-width="2"
-					stroke-linecap="round"
-					stroke-linejoin="round"
-					aria-hidden="true"
-				>
-					<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
-				</svg>
-				<span class="wordmark">AWG/MANAGER</span>
+				<BrandLogoMark />
+				<span class="wordmark">AWG⋅Manager</span>
 			</a>
 
-			{#if currentVersion}
-				{#if hasUpdate && authenticated}
-					<a
-						href="/settings"
-						class="version-badge version-clickable"
-						class:version-update-stable={!isPreRelease}
-						class:version-update-prerelease={isPreRelease}
-					>
-						v{currentVersion} ↑
-					</a>
-				{:else}
-					<span
-						class="version-badge"
-						class:version-stable={!isPreRelease}
-						class:version-prerelease={isPreRelease}
-					>
-						v{currentVersion}
-					</span>
-				{/if}
-			{/if}
-
-			{#if authenticated}
-				<SaveStatusIndicator />
+			{#if currentVersion || (versionPending && authenticated)}
+				<span class="version-slot">
+					{#if currentVersion}
+						{#if hasUpdate && authenticated}
+							<a
+								href="/settings"
+								class="version-badge version-clickable"
+								class:version-update-stable={!isPreRelease}
+								class:version-update-prerelease={isPreRelease}
+							>
+								v{currentVersion} ↑
+							</a>
+						{:else}
+							<span
+								class="version-badge"
+								class:version-stable={!isPreRelease}
+								class:version-prerelease={isPreRelease}
+							>
+								v{currentVersion}
+							</span>
+						{/if}
+					{:else}
+						<span class="version-badge version-pending" aria-busy="true" title="Проверка версии…">
+							<span class="version-pending-dots">···</span>
+						</span>
+					{/if}
+				</span>
 			{/if}
 		</div>
 
 		{#if authenticated}
 			<nav class="nav" aria-label="Главная навигация">
 				<LegacyTabs value={currentRoute} onChange={navigate} variant="underline">
-					<LegacyTab value="/">ТУННЕЛИ</LegacyTab>
-					<LegacyTab value="/servers">СЕРВЕРЫ</LegacyTab>
-					<LegacyTab value="/routing">МАРШРУТИЗАЦИЯ</LegacyTab>
-					<LegacyTab value="/monitoring">МОНИТОРИНГ</LegacyTab>
-					<LegacyTab value="/diagnostics">ДИАГНОСТИКА</LegacyTab>
-					<LegacyTab value="/settings">НАСТРОЙКИ</LegacyTab>
+					{#each visibleItems as item (item.section)}
+						<LegacyTab value={item.href}>{item.label}</LegacyTab>
+					{/each}
 				</LegacyTabs>
 			</nav>
 		{:else}
@@ -127,7 +200,7 @@
 				<span class="user-chip">{username}</span>
 			{/if}
 
-			{#if authenticated}
+			{#if authenticated && isSectionVisible($usageLevel, 'terminal')}
 				<IconButton ariaLabel="Терминал" href="/terminal">
 					<svg
 						viewBox="0 0 24 24"
@@ -144,41 +217,43 @@
 				</IconButton>
 			{/if}
 
-			<IconButton ariaLabel="Переключить тему" onclick={onToggleTheme}>
-				{#if theme === 'dark'}
-					<svg
-						viewBox="0 0 24 24"
-						fill="none"
-						stroke="currentColor"
-						stroke-width="2"
-						stroke-linecap="round"
-						stroke-linejoin="round"
-						aria-hidden="true"
-					>
-						<circle cx="12" cy="12" r="5" />
-						<line x1="12" y1="1" x2="12" y2="3" />
-						<line x1="12" y1="21" x2="12" y2="23" />
-						<line x1="4.22" y1="4.22" x2="5.64" y2="5.64" />
-						<line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
-						<line x1="1" y1="12" x2="3" y2="12" />
-						<line x1="21" y1="12" x2="23" y2="12" />
-						<line x1="4.22" y1="19.78" x2="5.64" y2="18.36" />
-						<line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
-					</svg>
-				{:else}
-					<svg
-						viewBox="0 0 24 24"
-						fill="none"
-						stroke="currentColor"
-						stroke-width="2"
-						stroke-linecap="round"
-						stroke-linejoin="round"
-						aria-hidden="true"
-					>
-						<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
-					</svg>
-				{/if}
-			</IconButton>
+			{#if theme.preset !== 'custom'}
+				<IconButton ariaLabel={themeButtonLabel} onclick={onToggleThemeMode}>
+					{#if themeDisplayMode === 'dark'}
+						<svg
+							viewBox="0 0 24 24"
+							fill="none"
+							stroke="currentColor"
+							stroke-width="2"
+							stroke-linecap="round"
+							stroke-linejoin="round"
+							aria-hidden="true"
+						>
+							<circle cx="12" cy="12" r="5" />
+							<line x1="12" y1="1" x2="12" y2="3" />
+							<line x1="12" y1="21" x2="12" y2="23" />
+							<line x1="4.22" y1="4.22" x2="5.64" y2="5.64" />
+							<line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
+							<line x1="1" y1="12" x2="3" y2="12" />
+							<line x1="21" y1="12" x2="23" y2="12" />
+							<line x1="4.22" y1="19.78" x2="5.64" y2="18.36" />
+							<line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
+						</svg>
+					{:else}
+						<svg
+							viewBox="0 0 24 24"
+							fill="none"
+							stroke="currentColor"
+							stroke-width="2"
+							stroke-linecap="round"
+							stroke-linejoin="round"
+							aria-hidden="true"
+						>
+							<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+						</svg>
+					{/if}
+				</IconButton>
+			{/if}
 
 			{#if authenticated}
 				<IconButton variant="warm" ariaLabel="Поддержать проект" onclick={onOpenDonate}>
@@ -265,59 +340,14 @@
 			aria-label="Закрыть меню"
 		></button>
 		<nav class="mobile-nav" aria-label="Мобильная навигация">
-			<a
-				href="/"
-				class="mobile-nav-link"
-				class:active={$page.url.pathname === '/' ||
-					$page.url.pathname.startsWith('/tunnels') ||
-					$page.url.pathname.startsWith('/system-tunnels')}
-				onclick={closeMobileMenu}
-			>
-				Туннели
-			</a>
-			<a
-				href="/servers"
-				class="mobile-nav-link"
-				class:active={$page.url.pathname.startsWith('/servers')}
-				onclick={closeMobileMenu}
-			>
-				Серверы
-			</a>
-			<a
-				href="/routing"
-				class="mobile-nav-link"
-				class:active={$page.url.pathname.startsWith('/routing')}
-				onclick={closeMobileMenu}
-			>
-				Маршрутизация
-			</a>
-			<a
-				href="/monitoring"
-				class="mobile-nav-link"
-				class:active={$page.url.pathname.startsWith('/monitoring') ||
-					$page.url.pathname.startsWith('/pingcheck') ||
-					$page.url.pathname.startsWith('/connections')}
-				onclick={closeMobileMenu}
-			>
-				Мониторинг
-			</a>
-			<a
-				href="/diagnostics"
-				class="mobile-nav-link"
-				class:active={$page.url.pathname.startsWith('/diagnostics') ||
-					$page.url.pathname.startsWith('/logs')}
-				onclick={closeMobileMenu}
-			>
-				Диагностика
-			</a>
-			<a
-				href="/settings"
-				class="mobile-nav-link"
-				class:active={$page.url.pathname.startsWith('/settings')}
-				onclick={closeMobileMenu}
-			>
-				Настройки
-			</a>
+			{#each visibleItems as item (item.section)}
+				<a
+					href={item.href}
+					class="mobile-nav-link"
+					class:active={item.matches($page.url.pathname)}
+					onclick={closeMobileMenu}>{prettyMobileLabel(item.label)}</a
+				>
+			{/each}
 		</nav>
 	{/if}
 </header>
@@ -334,12 +364,12 @@
 	.header-inner {
 		max-width: 1120px;
 		margin: 0 auto;
-		padding: 0 1rem;
+		padding: 0 1.25rem;
 		height: 56px;
 		display: grid;
 		grid-template-columns: auto 1fr auto;
 		align-items: center;
-		gap: 1.5rem;
+		gap: 1rem;
 	}
 
 	.brand-group {
@@ -357,13 +387,6 @@
 		white-space: nowrap;
 	}
 
-	.logo {
-		width: 22px;
-		height: 22px;
-		color: var(--color-accent);
-		flex-shrink: 0;
-	}
-
 	.wordmark {
 		font-family: var(--font-mono);
 		font-weight: 700;
@@ -374,10 +397,11 @@
 
 	.nav {
 		min-width: 0;
+		display: flex;
 		overflow-x: auto;
 		scrollbar-width: none;
-		justify-self: center;
 	}
+
 	.nav::-webkit-scrollbar {
 		display: none;
 	}
@@ -386,6 +410,13 @@
 	.nav :global(.tabs.variant-underline) {
 		border-bottom: none;
 		gap: 1.25rem;
+		flex-shrink: 0;
+		margin-left: auto;
+		margin-right: auto;
+	}
+
+	.nav :global(.tab) {
+		white-space: nowrap;
 	}
 
 	.nav-spacer {
@@ -410,6 +441,16 @@
 		white-space: nowrap;
 	}
 
+	.version-slot {
+		display: inline-flex;
+		justify-content: flex-start;
+		align-items: center;
+		flex-shrink: 0;
+		width: 10ch;
+		min-width: 10ch;
+		overflow: visible;
+	}
+
 	.version-badge {
 		font-size: 9px;
 		font-weight: 600;
@@ -419,6 +460,22 @@
 		line-height: 1;
 		text-decoration: none;
 		white-space: nowrap;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		box-sizing: border-box;
+		font-family: var(--font-mono, monospace);
+		font-variant-numeric: tabular-nums;
+	}
+
+	.version-pending {
+		background: var(--color-bg-tertiary);
+		color: var(--color-text-muted);
+		letter-spacing: 0.12em;
+	}
+
+	.version-pending-dots {
+		opacity: 0.55;
 	}
 
 	.version-stable {
@@ -506,27 +563,17 @@
 		display: none;
 	}
 
-	@media (max-width: 768px) {
+	@media (max-width: 1050px) {
 		.nav {
-			display: none;
-		}
-	}
-
-	@media (max-width: 640px) {
-		.header-inner {
-			grid-template-columns: 1fr auto;
-		}
-
-		.wordmark {
-			display: none;
-		}
-
-		.user-chip {
 			display: none;
 		}
 
 		.hamburger {
 			display: inline-flex;
+		}
+
+		.header-inner {
+			grid-template-columns: 1fr auto;
 		}
 
 		.mobile-backdrop {
@@ -570,6 +617,20 @@
 			color: var(--color-accent);
 			background: var(--color-accent-tint);
 			border-left: 3px solid var(--color-accent);
+		}
+	}
+
+	@media (max-width: 640px) {
+		.app-header.unauthenticated .user-tools {
+			display: none;
+		}
+
+		.wordmark {
+			display: none;
+		}
+
+		.user-chip {
+			display: none;
 		}
 	}
 </style>

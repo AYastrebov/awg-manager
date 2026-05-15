@@ -4,15 +4,43 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/hoaxisr/awg-manager/internal/deviceproxy"
+	"github.com/hoaxisr/awg-manager/internal/monitoring"
 	"github.com/hoaxisr/awg-manager/internal/singbox"
 	"github.com/hoaxisr/awg-manager/internal/singbox/awgoutbounds"
 	"github.com/hoaxisr/awg-manager/internal/singbox/router"
+	"github.com/hoaxisr/awg-manager/internal/singbox/subscription"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 	"github.com/hoaxisr/awg-manager/internal/tunnel"
 	"github.com/hoaxisr/awg-manager/internal/tunnel/nwg"
 )
+
+// settingsManagedServersAdapter satisfies awgoutbounds.ManagedServersQuery
+// by reading from storage.SettingsStore. main.go wires it into Deps so
+// the awgoutbounds package stays free of storage imports.
+type settingsManagedServersAdapter struct {
+	store *storage.SettingsStore
+}
+
+func newSettingsManagedServersAdapter(s *storage.SettingsStore) *settingsManagedServersAdapter {
+	return &settingsManagedServersAdapter{store: s}
+}
+
+func (a *settingsManagedServersAdapter) ManagedServerInterfaceNames(ctx context.Context) []string {
+	if a.store == nil {
+		return nil
+	}
+	servers := a.store.GetManagedServers()
+	out := make([]string, 0, len(servers))
+	for _, s := range servers {
+		if s.InterfaceName != "" {
+			out = append(out, s.InterfaceName)
+		}
+	}
+	return out
+}
 
 // awgStoreAdapter wraps storage.AWGTunnelStore for awgoutbounds.
 // Resolves each tunnel's kernel iface using the same convention
@@ -113,7 +141,9 @@ func newAwgoutboundsSingboxAdapter(op *singbox.Operator) *awgoutboundsSingboxAda
 }
 
 func (a *awgoutboundsSingboxAdapter) ConfigDir() string { return a.op.ConfigDir() }
-func (a *awgoutboundsSingboxAdapter) Reload() error      { return a.op.Reload() }
+func (a *awgoutboundsSingboxAdapter) Reload() error {
+	return a.op.Process().Reload()
+}
 
 // deviceproxyAWGOutboundsAdapter projects awgoutbounds.TagInfo into
 // deviceproxy.AWGTagInfo. main.go owns this projection so neither
@@ -153,4 +183,136 @@ func (a *routerAWGTagAdapter) ListTags(ctx context.Context) ([]router.AWGTag, er
 		out = append(out, router.AWGTag{Tag: t.Tag})
 	}
 	return out, nil
+}
+
+// routerSingboxTunnelAdapter projects sing-box tunnels (10-tunnels.json)
+// into the simple []string the router needs for cross-slot outbound
+// validation. Mirrors routerAWGTagAdapter so router stays decoupled
+// from internal/singbox types.
+type routerSingboxTunnelAdapter struct {
+	src *singbox.Operator
+}
+
+func (a *routerSingboxTunnelAdapter) ListTunnelTags(ctx context.Context) ([]string, error) {
+	tunnels, err := a.src.ListTunnels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(tunnels))
+	for _, t := range tunnels {
+		if t.Tag != "" {
+			out = append(out, t.Tag)
+		}
+	}
+	return out, nil
+}
+
+// monitoringSingboxTunnelAdapter projects sing-box tunnels into the
+// shape monitoring.Scheduler expects. Lives here so the monitoring
+// package stays free of singbox imports.
+type monitoringSingboxTunnelAdapter struct {
+	op  *singbox.Operator
+	sub *subscription.Service
+}
+
+func (a *monitoringSingboxTunnelAdapter) List(ctx context.Context) ([]monitoring.SingboxTunnelInfo, error) {
+	tunnels, err := a.op.ListTunnels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]monitoring.SingboxTunnelInfo, 0, len(tunnels))
+	seen := make(map[string]bool, len(tunnels))
+	subLabelByActiveTag := make(map[string]string)
+	for _, t := range tunnels {
+		// Keep config-backed sing-box rows probeable by interface.
+		// Runtime-only subscription member tags are appended separately below.
+		if t.Tag == "" || t.KernelInterface == "" {
+			continue
+		}
+		seen[t.Tag] = true
+		out = append(out, monitoring.SingboxTunnelInfo{
+			Tag:           t.Tag,
+			Name:          t.Tag, // sing-box TunnelInfo doesn't carry a separate Name field
+			InterfaceName: t.KernelInterface,
+		})
+	}
+	if a.sub != nil {
+		for _, sub := range a.sub.List() {
+			if !sub.Enabled {
+				continue
+			}
+			label := strings.TrimSpace(sub.Label)
+			if label == "" {
+				label = strings.TrimSpace(sub.SelectorTag)
+			}
+			if label == "" {
+				label = strings.TrimSpace(sub.ActiveMember)
+			}
+			if sub.ActiveMember != "" {
+				subLabelByActiveTag[sub.ActiveMember] = label
+			}
+			for _, tag := range sub.MemberTags {
+				tag = strings.TrimSpace(tag)
+				if tag == "" {
+					continue
+				}
+				if _, exists := subLabelByActiveTag[tag]; !exists {
+					subLabelByActiveTag[tag] = label
+				}
+			}
+			for _, member := range sub.Members {
+				tag := strings.TrimSpace(member.Tag)
+				if tag == "" {
+					continue
+				}
+				if _, exists := subLabelByActiveTag[tag]; !exists {
+					subLabelByActiveTag[tag] = label
+				}
+			}
+		}
+	}
+	// Add active member tags from enabled subscriptions. These outbounds are
+	// often "runtime-only" (no dedicated inbound/listen_port), so they may not
+	// have a kernel interface in config-derived TunnelInfo, but they are still
+	// probeable via Clash /proxies/<tag>/delay and should appear in monitoring.
+	if a.sub != nil {
+		for _, tag := range a.sub.ListActiveMemberTags() {
+			if tag == "" || seen[tag] {
+				continue
+			}
+			seen[tag] = true
+			name := tag
+			if label := subLabelByActiveTag[tag]; label != "" {
+				name = label
+			}
+			out = append(out, monitoring.SingboxTunnelInfo{
+				Tag:           tag,
+				Name:          name,
+				InterfaceName: "",
+			})
+		}
+	}
+	return out, nil
+}
+
+// monitoringCompositesAdapter projects router composite outbounds
+// into the shape monitoring.Scheduler expects.
+type monitoringCompositesAdapter struct {
+	svc router.Service
+}
+
+func (a *monitoringCompositesAdapter) List(ctx context.Context) ([]monitoring.CompositeOutboundInfo, error) {
+	outs, err := a.svc.ListCompositeOutbounds(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]monitoring.CompositeOutboundInfo, 0, len(outs))
+	for _, o := range outs {
+		result = append(result, monitoring.CompositeOutboundInfo{
+			Tag:     o.Tag,
+			Type:    o.Type,
+			Members: o.Outbounds, // router.Outbound's member-tags slice
+		})
+	}
+	return result, nil
 }

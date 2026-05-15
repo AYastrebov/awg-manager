@@ -8,12 +8,95 @@
 		outbounds: DeviceProxyOutbound[];
 		runtime: DeviceProxyRuntime;
 		onSwitched: () => void;
+		onSelectRuntime?: (tag: string) => Promise<void>;
+		onApplyNow?: () => Promise<void>;
+		radioName?: string;
 	}
 
-	let { outbounds, runtime, onSwitched }: Props = $props();
+	let {
+		outbounds,
+		runtime,
+		onSwitched,
+		onSelectRuntime = async (tag: string) => { await api.selectDeviceProxyRuntime(tag); },
+		onApplyNow = async () => { await api.applyDeviceProxy(); },
+		radioName = 'device-proxy-active-tunnel'
+	}: Props = $props();
 
 	let switching = $state(false);
 	let applying = $state(false);
+	let revealedDetails = $state<Record<string, boolean>>({});
+
+	function isDetailRevealed(tag: string): boolean {
+		return !!revealedDetails[tag];
+	}
+
+	function toggleDetailReveal(event: MouseEvent, tag: string) {
+		event.preventDefault();
+		event.stopPropagation();
+		revealedDetails = { ...revealedDetails, [tag]: !revealedDetails[tag] };
+	}
+
+	function isSensitiveOutbound(ob: DeviceProxyOutbound): boolean {
+		return ob.kind === 'singbox' && hasEndpoint(ob.detail);
+	}
+
+	function hasEndpoint(detail: string): boolean {
+		return detail.split(' · ').some(isEndpointPart);
+	}
+
+	function maskDetail(detail: string): string {
+		if (!detail) return '';
+		return detail
+			.split(' · ')
+			.map((part) => (isEndpointPart(part) ? maskEndpoint(part) : part))
+			.join(' · ');
+	}
+
+	function isEndpointPart(part: string): boolean {
+		const trimmed = part.trim();
+		if (!trimmed) return false;
+
+		// host:port, domain:port, IPv4:port, [IPv6]:port
+		if (/^\[[0-9a-fA-F:]+\]:\d+$/.test(trimmed)) return true;
+		if (/^[a-zA-Z0-9.-]+\:\d+$/.test(trimmed)) return true;
+		if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(trimmed)) return true;
+
+		return false;
+	}
+
+	function maskEndpoint(endpoint: string): string {
+		const trimmed = endpoint.trim();
+
+		const ipv6 = trimmed.match(/^(\[[0-9a-fA-F:]+\])(:\d+)$/);
+		if (ipv6) {
+			return `[••••]${ipv6[2]}`;
+		}
+
+		const hostPort = trimmed.match(/^(.+?)(:\d+)$/);
+		if (!hostPort) return endpoint;
+
+		return `${maskHost(hostPort[1])}${hostPort[2]}`;
+	}
+
+	function maskHost(host: string): string {
+		if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+			const parts = host.split('.');
+			return `${parts[0]}.•••.•••.${parts[3]}`;
+		}
+
+		const parts = host.split('.');
+		if (parts.length < 2) {
+			return maskHostLabel(host);
+		}
+
+		const tld = parts.pop();
+		return `${parts.map(maskHostLabel).join('.')}.${tld}`;
+	}
+
+	function maskHostLabel(label: string): string {
+		if (label.length <= 2) return '••';
+		return `${label[0]}••${label[label.length - 1]}`;
+	}
 
 	async function handleSelect(tag: string) {
 		if (switching || !runtime.alive) return;
@@ -22,7 +105,7 @@
 
 		switching = true;
 		try {
-			await api.selectDeviceProxyRuntime(tag);
+			await onSelectRuntime(tag);
 			notifications.success(`Активный туннель: ${labelFor(tag)}`);
 			onSwitched();
 		} catch (e) {
@@ -36,7 +119,7 @@
 		if (applying) return;
 		applying = true;
 		try {
-			await api.applyDeviceProxy();
+			await onApplyNow();
 			notifications.success('Перезапуск выполнен, новая конфигурация активна');
 			onSwitched();
 		} catch (e) {
@@ -87,7 +170,7 @@
 				<label class="option" class:checked>
 					<input
 						type="radio"
-						name="device-proxy-active-tunnel"
+						name={radioName}
 						value={ob.tag}
 						checked={checked}
 						disabled={switching || !runtime.alive}
@@ -96,7 +179,35 @@
 					<span class="option-content">
 						<span class="option-name">{ob.label || ob.tag}</span>
 						{#if ob.detail || (ob.label && ob.label !== ob.tag)}
-							<span class="option-meta">{ob.tag}{ob.detail ? ' · ' + ob.detail : ''}</span>
+							{@const sensitive = isSensitiveOutbound(ob)}
+							<span class="option-meta">
+								<span class="option-meta-text">
+									{ob.tag}{ob.detail ? ' · ' + (sensitive && !isDetailRevealed(ob.tag) ? maskDetail(ob.detail) : ob.detail) : ''}
+								</span>
+								{#if sensitive}
+									<button
+										type="button"
+										class="detail-eye"
+										aria-label={isDetailRevealed(ob.tag) ? 'Скрыть адрес сервера' : 'Показать адрес сервера'}
+										title={isDetailRevealed(ob.tag) ? 'Скрыть адрес сервера' : 'Показать адрес сервера'}
+										onclick={(event) => toggleDetailReveal(event, ob.tag)}
+									>
+										{#if isDetailRevealed(ob.tag)}
+											<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+												<path d="M17.94 17.94A10.94 10.94 0 0 1 12 20C7 20 2.73 16.89 1 12a19.2 19.2 0 0 1 5.06-6.94"/>
+												<path d="M10.58 10.58A2 2 0 0 0 12 14a2 2 0 0 0 1.42-.58"/>
+												<path d="M9.9 4.24A10.75 10.75 0 0 1 12 4c5 0 9.27 3.11 11 8a19.2 19.2 0 0 1-2.22 3.59"/>
+												<line x1="1" y1="1" x2="23" y2="23"/>
+											</svg>
+										{:else}
+											<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+												<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+												<circle cx="12" cy="12" r="3"/>
+											</svg>
+										{/if}
+									</button>
+								{/if}
+							</span>
 						{/if}
 					</span>
 					<span class="option-check" aria-hidden="true">
@@ -201,6 +312,7 @@
 		gap: 0.125rem;
 		flex: 1;
 		min-width: 0;
+		overflow: hidden;
 	}
 
 	.option-name {
@@ -213,12 +325,40 @@
 	}
 
 	.option-meta {
+		display: flex;
+		align-items: center;
+		gap: 0.375rem;
+		min-width: 0;
 		font-family: var(--font-mono);
 		font-size: 0.6875rem;
 		color: var(--color-text-muted);
+	}
+
+	.option-meta-text {
+		min-width: 0;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+
+	.detail-eye {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 18px;
+		height: 18px;
+		padding: 0;
+		border: none;
+		background: transparent;
+		color: var(--color-text-muted);
+		cursor: pointer;
+		flex-shrink: 0;
+		border-radius: 4px;
+	}
+
+	.detail-eye:hover {
+		color: var(--color-text-primary);
+		background: var(--color-bg-hover);
 	}
 
 	.option-check {
@@ -254,5 +394,79 @@
 	.badge-muted {
 		background: rgba(107, 114, 128, 0.15);
 		color: var(--color-text-muted);
+	}
+
+	@media (max-width: 640px) {
+		.card {
+			padding: 0.75rem;
+		}
+
+		.card-header {
+			align-items: flex-start;
+			flex-direction: column;
+			gap: 0.5rem;
+		}
+
+		.section-title {
+			font-size: 0.9375rem;
+		}
+
+		.radio-list {
+			max-height: none;
+		}
+
+		.group-title {
+			font-size: 0.625rem;
+			padding-top: 0.375rem;
+		}
+
+		.option {
+			padding: 0.5rem 0.625rem;
+			gap: 0.5rem;
+			align-items: flex-start;
+		}
+
+		.option-name {
+			font-size: 0.8125rem;
+			white-space: normal;
+			overflow-wrap: anywhere;
+		}
+
+		.option-meta {
+			font-size: 0.625rem;
+			gap: 0.25rem;
+			align-items: flex-start;
+		}
+
+		.option-meta-text {
+			white-space: normal;
+			overflow: visible;
+			text-overflow: initial;
+			overflow-wrap: anywhere;
+			word-break: break-word;
+			line-height: 1.25;
+		}
+
+		.option-check {
+			width: 16px;
+			height: 16px;
+			margin-top: 0.125rem;
+		}
+
+		.detail-eye {
+			width: 16px;
+			height: 16px;
+			margin-top: 0.125rem;
+		}
+
+		.hint-row {
+			flex-direction: column;
+			align-items: flex-start;
+			padding: 0.5rem;
+		}
+
+		.hint-text {
+			font-size: 0.75rem;
+		}
 	}
 </style>

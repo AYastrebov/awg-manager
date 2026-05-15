@@ -44,7 +44,7 @@
 
   .buffer-chip {
     background: var(--color-accent);
-    color: white;
+    color: var(--color-accent-contrast, #ffffff);
     border: none;
     border-radius: var(--radius-pill);
     padding: 0.125rem 0.625rem;

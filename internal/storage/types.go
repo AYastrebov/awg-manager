@@ -15,7 +15,7 @@ type Settings struct {
 	DisableMemorySaving bool              `json:"disableMemorySaving"` // false = auto, true = soft mode
 	Updates             UpdateSettings    `json:"updates"`
 	DNSRoute            DNSRouteSettings  `json:"dnsRoute"`
-	OnboardingCompleted    bool              `json:"onboardingCompleted"`
+	UsageLevel             string            `json:"usageLevel"`
 	ServerInterfaces       []string          `json:"serverInterfaces,omitempty"`
 	ManagedServers         []ManagedServer   `json:"managedServers,omitempty"`
 	// ManagedServer is retained for one release as the migration source.
@@ -24,6 +24,11 @@ type Settings struct {
 	ManagedServer          *ManagedServer    `json:"managedServer,omitempty"`
 	ManagedPolicies        []string          `json:"managedPolicies,omitempty"`
 	SingboxRouter          SingboxRouterSettings `json:"singboxRouter"`
+	// SingboxManuallyStopped is the sticky-stop intent: when true, the
+	// daemon stays down even though tunnels are configured. Watchdog
+	// reconciles only when this is false. Cleared by Control("start")
+	// and Control("restart"); set by Control("stop").
+	SingboxManuallyStopped bool                  `json:"singboxManuallyStopped,omitempty"`
 }
 
 type SingboxRouterSettings struct {
@@ -93,9 +98,11 @@ type PingCheckDefaults struct {
 
 // LoggingSettings contains application logging configuration.
 type LoggingSettings struct {
-	Enabled  bool   `json:"enabled"`  // default: false
-	MaxAge   int    `json:"maxAge"`   // hours, default: 2
-	LogLevel string `json:"logLevel"` // "warn", "info", "full", "debug"; default: "info"
+	Enabled           bool   `json:"enabled"`           // default: false
+	MaxAge            int    `json:"maxAge"`            // hours, default: 2 (shared by both buffers)
+	LogLevel          string `json:"logLevel"`          // "warn", "info", "full", "debug"; default: "info"
+	AppMaxEntries     int    `json:"appMaxEntries"`     // app-bucket buffer cap, default: 5000
+	SingboxMaxEntries int    `json:"singboxMaxEntries"` // singbox-bucket buffer cap, default: 5000
 }
 
 // UpdateSettings contains auto-update configuration.

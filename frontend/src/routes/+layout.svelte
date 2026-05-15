@@ -2,16 +2,19 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { get } from 'svelte/store';
 	import type { Snippet } from 'svelte';
+	import { goto } from '$app/navigation';
+	import { page } from '$app/stores';
 	import { theme } from '$lib/stores/theme';
 	import { auth, isAuthenticated, isLoading } from '$lib/stores/auth';
 	import { notifications } from '$lib/stores/notifications';
 	import { api } from '$lib/api/client';
 	import { connectSSE } from '$lib/api/events';
 	import { geoDownloadProgress } from '$lib/stores/geoDownload';
+	import { singboxInstallProgress } from '$lib/stores/singboxInstall';
 	import { serverOnline } from '$lib/stores/events';
 	import { healthMonitor } from '$lib/stores/health';
 	import { tunnels } from '$lib/stores/tunnels';
-	import { logEntries } from '$lib/stores/logs';
+	import { appLogEntries, singboxLogEntries, logStoreFor, type LogBucket } from '$lib/stores/logs';
 	import { monitoringStore } from '$lib/stores/monitoring';
 	import { appendPingLog } from '$lib/stores/pingcheck';
 	import { systemInfo } from '$lib/stores/system';
@@ -20,6 +23,13 @@
 	import { singboxRouter } from '$lib/stores/singboxRouter';
 	import { invalidateResource, invalidateAll } from '$lib/stores/storeRegistry';
 	import { setDeviceProxyMissingTarget, clearDeviceProxyMissingTarget } from '$lib/stores/deviceproxy';
+	import { settings as settingsStore, reloadSettings, usageLevel } from '$lib/stores/settings';
+	import {
+		isSectionVisible,
+		pathToSection,
+		SECTION_LABELS,
+		USAGE_LEVEL_LABELS,
+	} from '$lib/types/usageLevel';
 	import type { UpdateInfo } from '$lib/types';
 	import LoginForm from '$lib/components/LoginForm.svelte';
 	import { Modal } from '$lib/components/ui';
@@ -35,6 +45,8 @@
 	let backendOffline = $derived(!$serverOnline);
 
 	let updateInfo = $state<UpdateInfo | null>(null);
+	/** idle | loading | done — чтобы в шапке не мигал бейдж при первом checkUpdate. */
+	let updateFetchState = $state<'idle' | 'loading' | 'done'>('idle');
 	const currentVersion = $derived(updateInfo?.currentVersion ?? '');
 	const isPreRelease = $derived(
 		currentVersion.includes('-rc') ||
@@ -62,25 +74,33 @@
 				tunnels.invalidate();
 
 				// Log catch-up: fetch entries we missed during the outage so the
-				// terminal feed has no gap. Use lastSeenTs - 1s for safe overlap
-				// (appendMany dedupes by composite key).
-				const lastTs = get(logEntries.lastSeenTs);
-				if (lastTs > 0) {
-					const sinceUnix = Math.floor((lastTs - 1000) / 1000);
-					api.getLogs({ since: sinceUnix, limit: 1000 })
-						.then((resp) => {
-							if (resp.logs.length > 0) {
-								logEntries.appendMany(resp.logs);
-							}
-						})
-						.catch(() => {
-							// silent — next SSE event will resume the stream
-						});
+				// terminal feed has no gap. Per-bucket — each store keeps its
+				// own lastSeenTs and gets only its own entries.
+				for (const bucket of ['app', 'singbox'] as const) {
+					const store = logStoreFor(bucket);
+					const lastTs = get(store.lastSeenTs);
+					if (lastTs > 0) {
+						const sinceUnix = Math.floor((lastTs - 1000) / 1000);
+						api.getLogs({ bucket, since: sinceUnix, limit: 1000 })
+							.then((resp) => {
+								if (resp.logs.length > 0) {
+									store.appendMany(resp.logs);
+								}
+							})
+							.catch(() => {
+								// silent — next SSE event will resume the stream
+							});
+					}
 				}
 			},
 			onDisconnected: () => {
 				// Phase C: serverOnline.set() is gone (derived from healthMonitor);
 				// nothing else needs to happen on disconnect — health monitor owns the overlay.
+				// Clear in-flight singbox install progress: if SSE drops between
+				// the start of an install/update and its terminal event, the
+				// store would otherwise stay non-null forever and keep the
+				// install button hidden behind the progress widget.
+				singboxInstallProgress.clear();
 			},
 
 			// System events
@@ -116,8 +136,13 @@
 			// applyMatrixSnapshot below; the manual recheck button still
 			// flows through api.checkConnectivity → updateConnectivity.
 
-			// Logs & ping-check streams
-			onLogEntry: (data) => logEntries.append(data),
+			// Logs & ping-check streams — route by bucket to the correct store.
+			// Old backends (pre-2.9.10) didn't include bucket; default to "app"
+			// so the terminal still fills until the user upgrades.
+			onLogEntry: (data) => {
+				const bucket: LogBucket = data.bucket === 'singbox' ? 'singbox' : 'app';
+				logStoreFor(bucket).append(data);
+			},
 			onMonitoringMatrixUpdate: (data) => {
 				monitoringStore.setSnapshot(data);
 				tunnels.applyMatrixSnapshot(data);
@@ -136,6 +161,7 @@
 
 			// HydraRoute geo download progress
 			onHydraRouteGeoProgress: (data) => geoDownloadProgress.ingest(data),
+			onSingboxInstallProgress: (data) => singboxInstallProgress.ingest(data),
 
 			// DNS-route failover — user-visible notification, not a state stream
 			onDnsRouteFailover: (data) => {
@@ -157,6 +183,20 @@
 				if (data.resource === 'deviceproxy.config') {
 					clearDeviceProxyMissingTarget();
 				}
+				// Settings is not a PollingStore — explicit reload.
+				if (data.resource === 'settings') {
+					void reloadSettings();
+				}
+				// Staging banner: emitted by emitStagingEvent after draft save/apply/discard.
+				// singboxRouter is not a PollingStore, so we call loadStaging() directly.
+				if (data.resource === 'singbox.router.staging') {
+					void singboxRouter.loadStaging();
+				}
+				// Rules snapshot: emitted by emitRulesEvent after staging apply/discard
+				// flips the live config. Reloads rules + rule-sets + outbounds + status.
+				if (data.resource === 'singbox.router.rules') {
+					void singboxRouter.loadRulesSnapshot();
+				}
 			},
 
 			// Device-proxy: selected outbound was deleted — show a banner in the tab.
@@ -164,7 +204,8 @@
 				setDeviceProxyMissingTarget(data.wasTag);
 			},
 
-			// Sing-box Router state streams (rules, rule-sets, outbounds, status)
+			// Sing-box Router state streams (rules, rule-sets, outbounds, status).
+			// Staging updates arrive via resource:invalidated → onResourceInvalidated above.
 			onSingboxRouterStatus: singboxRouter.applyStatus,
 			onSingboxRouterRules: singboxRouter.applyRules,
 			onSingboxRouterRuleSets: singboxRouter.applyRuleSets,
@@ -211,13 +252,60 @@
 		}
 	});
 
-	// Fetch update info when authenticated
+	// Fetch update info when authenticated (placeholder in header until done)
 	$effect(() => {
-		if ($isAuthenticated) {
-			api.checkUpdate().then(info => updateInfo = info).catch(() => null);
-		} else {
+		if (!$isAuthenticated) {
 			updateInfo = null;
+			updateFetchState = 'idle';
+			return;
 		}
+		updateFetchState = 'loading';
+		let cancelled = false;
+		api.checkUpdate()
+			.then((info) => {
+				if (!cancelled) updateInfo = info;
+			})
+			.catch(() => {
+				if (!cancelled) updateInfo = null;
+			})
+			.finally(() => {
+				if (!cancelled) updateFetchState = 'done';
+			});
+		return () => {
+			cancelled = true;
+		};
+	});
+
+	// Load settings store on first authentication (not a PollingStore).
+	$effect(() => {
+		if ($isAuthenticated && get(settingsStore) === null) {
+			void reloadSettings();
+		}
+	});
+
+	// Route guard: redirect away from sections hidden at the current usage level.
+	let lastWarnedPath = $state<string | null>(null);
+
+	$effect(() => {
+		if (!$isAuthenticated) {
+			lastWarnedPath = null;
+			return;
+		}
+		if ($settingsStore === null) return;
+		const path = $page.url.pathname;
+		const section = pathToSection(path);
+		if (!section || isSectionVisible($usageLevel, section)) {
+			lastWarnedPath = null;
+			return;
+		}
+		if (lastWarnedPath === path) return;
+		lastWarnedPath = path;
+
+		notifications.warning(
+			`Раздел «${SECTION_LABELS[section]}» недоступен в режиме «${USAGE_LEVEL_LABELS[$usageLevel]}». Изменить уровень в Настройках.`,
+			{ action: { label: 'Настройки', href: '/settings' } },
+		);
+		void goto('/', { replaceState: true });
 	});
 
 	onMount(async () => {
@@ -261,15 +349,16 @@
 		username={$auth.login}
 		theme={$theme}
 		{currentVersion}
+		versionPending={$isAuthenticated && updateFetchState === 'loading'}
 		{hasUpdate}
 		{isPreRelease}
 		bind:mobileMenuOpen
-		onToggleTheme={() => theme.toggle()}
+		onToggleThemeMode={() => theme.toggleMode()}
 		onLogout={() => auth.logout()}
 		onOpenDonate={() => (donateModalOpen = true)}
 	/>
 
-	{#if !$isAuthenticated}
+	{#if !$isAuthenticated && $page.url.pathname !== '/terms'}
 		<LoginForm />
 	{:else}
 		<main class="main">
@@ -283,9 +372,21 @@
 				</button>
 			{/if}
 			{#each $notifications as notification (notification.id)}
-				<button class="toast toast-{notification.type}" onclick={() => notifications.remove(notification.id)}>
-					{notification.message}
-				</button>
+				<div class="toast toast-{notification.type}">
+					<button
+						type="button"
+						class="toast-message"
+						onclick={() => notifications.remove(notification.id)}
+						aria-label="Закрыть уведомление"
+					>{notification.message}</button>
+					{#if notification.action}
+						<a
+							class="toast-action"
+							href={notification.action.href}
+							onclick={() => notifications.remove(notification.id)}
+						>{notification.action.label}</a>
+					{/if}
+				</div>
 			{/each}
 		</div>
 

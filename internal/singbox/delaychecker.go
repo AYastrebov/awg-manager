@@ -19,12 +19,18 @@ type clashAPI interface {
 // tunnelLister returns current tunnel tags.
 type tunnelLister interface {
 	ListTunnels(ctx context.Context) ([]TunnelInfo, error)
+	// ListSubActiveTags returns active outbound tags of enabled
+	// subscriptions. The DelayChecker treats each tag identically
+	// to a tunnel tag for the purpose of periodic latency tests.
+	// Empty slice is fine if no subscriptions are configured.
+	ListSubActiveTags() []string
 }
 
 const (
 	defaultDelayInterval = 60 * time.Second
 	defaultDelayTimeout  = 5 * time.Second
 	defaultDelayTestURL  = "http://www.gstatic.com/generate_204"
+	defaultRetryDelay    = 150 * time.Millisecond
 	eventSingboxDelay    = "singbox:delay"
 )
 
@@ -74,9 +80,23 @@ func (d *DelayChecker) CheckOne(ctx context.Context, tag string) (int, error) {
 		d.mu.Unlock()
 	}()
 
-	delay, err := d.clash.TestDelay(tag, d.testURL, d.timeout)
-	if err != nil {
-		delay = 0
+	delay := 0
+	if firstDelay, firstErr := d.clash.TestDelay(tag, d.testURL, d.timeout); firstErr == nil && firstDelay > 0 {
+		delay = firstDelay
+	} else {
+		// Anti-flap: one transient Clash timeout/spike should not immediately
+		// mark the card as failed. Retry once with a short backoff.
+		timer := time.NewTimer(defaultRetryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return 0, ctx.Err()
+		case <-timer.C:
+			retryDelay, retryErr := d.clash.TestDelay(tag, d.testURL, d.timeout)
+			if retryErr == nil && retryDelay > 0 {
+				delay = retryDelay
+			}
+		}
 	}
 	if d.publisher != nil {
 		d.publisher.Publish(eventSingboxDelay, map[string]any{
@@ -88,16 +108,31 @@ func (d *DelayChecker) CheckOne(ctx context.Context, tag string) (int, error) {
 	return delay, nil
 }
 
-// Check runs a delay test against every known tunnel tag, concurrently.
-// Non-blocking per-tag: slow tunnels do not delay others.
+// Check runs a delay test against every known tunnel tag and every active
+// subscription outbound tag, concurrently. Non-blocking per-tag: slow
+// tunnels do not delay others.
 func (d *DelayChecker) Check(ctx context.Context) {
 	tunnels, err := d.lister.ListTunnels(ctx)
 	if err != nil {
 		return
 	}
-	var wg sync.WaitGroup
+	tags := make([]string, 0, len(tunnels)+8)
+	seen := make(map[string]bool, len(tunnels)+8)
 	for _, t := range tunnels {
-		tag := t.Tag
+		if t.Tag != "" && !seen[t.Tag] {
+			seen[t.Tag] = true
+			tags = append(tags, t.Tag)
+		}
+	}
+	for _, tag := range d.lister.ListSubActiveTags() {
+		if tag != "" && !seen[tag] {
+			seen[tag] = true
+			tags = append(tags, tag)
+		}
+	}
+	var wg sync.WaitGroup
+	for _, tag := range tags {
+		tag := tag
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

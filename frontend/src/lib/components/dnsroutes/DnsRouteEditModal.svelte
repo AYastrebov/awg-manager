@@ -3,6 +3,8 @@
 	import { Modal, Button, Dropdown, type DropdownOption } from '$lib/components/ui';
 	import { formatRelativeTime } from '$lib/utils/format';
 	import DnsRouteDomainEditor from './DnsRouteDomainEditor.svelte';
+	import ServiceIcon from './ServiceIcon.svelte';
+	import IconPickerModal from './IconPickerModal.svelte';
 
 	interface Props {
 		open: boolean;
@@ -20,6 +22,8 @@
 
 	// Form state
 	let name = $state('');
+	let iconUrl = $state<string | undefined>(undefined);
+	let iconPickerOpen = $state(false);
 	let manualDomains = $state<string[]>([]);
 	let subscriptions = $state<DnsRouteSubscription[]>([]);
 	let routes = $state<DnsRouteTarget[]>([]);
@@ -44,6 +48,18 @@
 	let isInitialized = $state(false);
 	let attempted = $state(false);
 
+	// Snapshot initial state for isDirty detection
+	let initialName = $state('');
+	let initialManualDomains = $state<string[]>([]);
+	let initialSubscriptions = $state<DnsRouteSubscription[]>([]);
+	let initialRoutes = $state<DnsRouteTarget[]>([]);
+	let initialBackend = $state<'ndms' | 'hydraroute'>('ndms');
+	let initialHrRouteMode = $state<'interface' | 'policy'>('interface');
+	let initialHrPolicyName = $state('');
+	let initialExcludesText = $state('');
+	let initialHrInterfaceId = $state('');
+	let initialIconUrl = $state<string | undefined>(undefined);
+
 	let nameError = $derived(attempted && name.trim() === '');
 	let routeError = $derived(attempted && routes.length === 0);
 
@@ -62,6 +78,18 @@
 					hrPolicyName = route.hrPolicyName || '';
 					excludesText = (route.excludes ?? []).join('\n');
 					hrInterfaceId = (isHR && route.routes?.[0]?.tunnelId) || tunnels[0]?.id || '';
+					iconUrl = route.iconUrl;
+					// Capture snapshot for isDirty
+					initialName = route.name;
+					initialManualDomains = [...(route.manualDomains ?? [])];
+					initialSubscriptions = (route.subscriptions ?? []).map((s) => ({ ...s }));
+					initialRoutes = (route.routes ?? []).map((r) => ({ ...r }));
+					initialBackend = backend;
+					initialHrRouteMode = hrRouteMode;
+					initialHrPolicyName = hrPolicyName;
+					initialExcludesText = excludesText;
+					initialHrInterfaceId = hrInterfaceId;
+					initialIconUrl = iconUrl;
 				} else {
 					name = '';
 					manualDomains = [];
@@ -72,6 +100,18 @@
 					hrPolicyName = '';
 					excludesText = '';
 					hrInterfaceId = tunnels[0]?.id || '';
+					iconUrl = undefined;
+					// Capture snapshot for isDirty (create mode defaults)
+					initialName = '';
+					initialManualDomains = [];
+					initialSubscriptions = [];
+					initialRoutes = [];
+					initialBackend = backend;
+					initialHrRouteMode = 'interface';
+					initialHrPolicyName = '';
+					initialExcludesText = '';
+					initialHrInterfaceId = hrInterfaceId;
+					initialIconUrl = undefined;
 				}
 				newSubUrl = '';
 				newRouteTunnelId = '';
@@ -98,6 +138,37 @@
 	let groupCount = $derived(Math.ceil(totalDomains / 300) || 0);
 
 	let canSave = $derived(name.trim() !== '' && (isInterfaceMode ? !!hrInterfaceId : routes.length > 0));
+
+	// isDirty: deep comparison with snapshot (edit mode) or with defaults (create mode)
+	let isDirty = $derived.by(() => {
+		const compareRoutes = (a: DnsRouteTarget[], b: DnsRouteTarget[]) => {
+			if (a.length !== b.length) return true;
+			return a.some((aRoute, i) => {
+				const bRoute = b[i];
+				return aRoute.tunnelId !== bRoute.tunnelId || aRoute.fallback !== bRoute.fallback;
+			});
+		};
+		const compareSubscriptions = (a: DnsRouteSubscription[], b: DnsRouteSubscription[]) => {
+			if (a.length !== b.length) return true;
+			return a.some((aSub, i) => b[i]?.url !== aSub.url);
+		};
+		const compareDomains = (a: string[], b: string[]) => {
+			if (a.length !== b.length) return true;
+			return a.some((val, i) => b[i] !== val);
+		};
+		return (
+			name !== initialName ||
+			compareDomains(manualDomains, initialManualDomains) ||
+			compareSubscriptions(subscriptions, initialSubscriptions) ||
+			compareRoutes(routes, initialRoutes) ||
+			backend !== initialBackend ||
+			hrRouteMode !== initialHrRouteMode ||
+			hrPolicyName !== initialHrPolicyName ||
+			excludesText !== initialExcludesText ||
+			hrInterfaceId !== initialHrInterfaceId ||
+			iconUrl !== initialIconUrl
+		);
+	});
 
 	// Handlers
 	function handleDomainsChange(domains: string[]) {
@@ -203,6 +274,7 @@
 			excludes: isNDMS ? parsedExcludes : undefined,
 			hrRouteMode: isHR ? hrRouteMode : undefined,
 			hrPolicyName: isPolicyMode ? (hrPolicyName || `AWG_${name.trim().replace(/\s+/g, '_')}`) : undefined,
+			iconUrl: iconUrl || undefined,
 		};
 		onsave(data);
 	}
@@ -215,7 +287,7 @@
 	}
 </script>
 
-<Modal {open} {title} size="lg" onclose={onclose}>
+<Modal {open} {title} size="lg" onclose={onclose} hasUnsavedChanges={() => isDirty}>
 	<!-- Name -->
 	<div class="form-group" class:field-error={nameError}>
 		<!-- svelte-ignore a11y_label_has_associated_control -->
@@ -228,6 +300,29 @@
 			oninput={(e) => { name = (e.target as HTMLInputElement).value; }}
 		/>
 		<div class="error-text" class:visible={nameError}>Введите название</div>
+	</div>
+
+	<!-- Icon -->
+	<div class="form-group">
+		<!-- svelte-ignore a11y_label_has_associated_control -->
+		<label class="field-label">Иконка</label>
+		<div class="icon-row">
+			<ServiceIcon {iconUrl} name={name || 'rule'} size={36} />
+			<div class="icon-meta">
+				{#if iconUrl}
+					<div class="icon-src">Кастомная иконка</div>
+					<div class="icon-hint" title={iconUrl}>{iconUrl}</div>
+				{:else}
+					<div class="icon-src">Авто-определение по имени</div>
+					<div class="icon-hint">
+						{name ? `Подбирается по «${name}»` : 'Введите имя — иконка подберётся автоматически'}
+					</div>
+				{/if}
+			</div>
+			<Button variant="ghost" size="sm" onclick={() => (iconPickerOpen = true)}>
+				{iconUrl ? 'Сменить' : 'Выбрать'}
+			</Button>
+		</div>
 	</div>
 
 	<!-- Backend selector -->
@@ -400,7 +495,7 @@
 					<span class="policy-label">Имя политики:</span>
 					<input class="policy-input" value={hrPolicyName} oninput={(e) => hrPolicyName = (e.target as HTMLInputElement).value} placeholder="HydraRoute">
 				</div>
-				<span class="field-hint">Порядок = приоритет. Политика создаётся автоматически в Keenetic.</span>
+				<span class="field-hint">Порядок = приоритет. Политика создаётся автоматически на роутере.</span>
 			{/if}
 		</div>
 	{/if}
@@ -458,6 +553,17 @@
 		</Button>
 	{/snippet}
 </Modal>
+
+<IconPickerModal
+	open={iconPickerOpen}
+	{iconUrl}
+	ruleName={name}
+	onclose={() => (iconPickerOpen = false)}
+	onapply={(newUrl) => {
+		iconUrl = newUrl ?? undefined;
+		iconPickerOpen = false;
+	}}
+/>
 
 <style>
 	.form-group {
@@ -817,4 +923,5 @@
 		outline: none;
 		border-color: var(--color-accent);
 	}
+
 </style>

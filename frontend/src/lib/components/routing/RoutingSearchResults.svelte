@@ -31,7 +31,7 @@
             <div class="results-group-title">DNS-правила</div>
             {#each dnsResults as rule}
                 <button class="result-card" onclick={() => onRuleClick?.(rule.id, rule.type)}>
-                    <ServiceIcon name={rule.name} size={32} />
+                    <ServiceIcon name={rule.name} iconUrl={rule.iconUrl} size={32} />
                     <div class="result-body">
                         <div class="result-title">
                             <span class="result-led" class:led-on={rule.enabled} class:led-off={!rule.enabled}></span>
@@ -66,12 +66,7 @@
             <div class="results-group-title">IP-правила</div>
             {#each ipResults as rule}
                 <button class="result-card" onclick={() => onRuleClick?.(rule.id, rule.type)}>
-                    <div class="result-icon-box result-icon-ip">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
-                            <rect x="2" y="2" width="20" height="20" rx="2"/>
-                            <path d="M7 8h10M7 12h10M7 16h6"/>
-                        </svg>
-                    </div>
+                    <ServiceIcon name={rule.name} iconUrl={rule.iconUrl} size={32} />
                     <div class="result-body">
                         <div class="result-title">
                             <span class="result-led" class:led-on={rule.enabled} class:led-off={!rule.enabled}></span>
@@ -115,16 +110,7 @@
             {#if resolveMatch.rules.length > 0}
                 {#each resolveMatch.rules as rule}
                     <button class="result-card" onclick={() => onRuleClick?.(rule.id, rule.type)}>
-                        {#if rule.type === 'dns'}
-                            <ServiceIcon name={rule.name} size={32} />
-                        {:else}
-                            <div class="result-icon-box result-icon-ip">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
-                                    <rect x="2" y="2" width="20" height="20" rx="2"/>
-                                    <path d="M7 8h10M7 12h10M7 16h6"/>
-                                </svg>
-                            </div>
-                        {/if}
+                        <ServiceIcon name={rule.name} iconUrl={rule.iconUrl} size={32} />
                         <div class="result-body">
                             <div class="result-title">
                                 <span class="result-led" class:led-on={rule.enabled} class:led-off={!rule.enabled}></span>
@@ -164,18 +150,15 @@
 
 <style>
     .search-results {
-        position: absolute;
-        left: 0;
-        right: 0;
-        top: 100%;
-        z-index: 50;
         background: var(--bg-secondary);
         border: 1px solid var(--border);
-        border-radius: 0 0 8px 8px;
-        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
-        max-height: 450px;
-        overflow-y: auto;
+        border-radius: 8px;
         padding: 6px;
+        margin-top: 0.5rem;
+        /* Modal-body owns the outer scroll; no inner max-height cap or
+           absolute positioning here — used to be a popup overlay when
+           the search lived inline at the top of /routing, but it now
+           always renders inside the search modal as a normal block. */
     }
 
     .results-close {
@@ -257,21 +240,6 @@
     .result-card:focus-visible {
         outline: 2px solid var(--accent);
         outline-offset: -2px;
-    }
-
-    .result-icon-box {
-        width: 32px;
-        height: 32px;
-        border-radius: 6px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        flex-shrink: 0;
-    }
-
-    .result-icon-ip {
-        background: rgba(34,197,94,0.12);
-        color: var(--success, #22c55e);
     }
 
     .result-body {

@@ -167,7 +167,7 @@
 			<span class="field-hint">1–10</span>
 		</div>
 	</div>
-	<p class="limits-note">Пределы заданы компонентом ping-check Keenetic NDMS.</p>
+	<p class="limits-note">Пределы заданы компонентом ping-check NDMS на роутере.</p>
 
 	<div class="restart-row">
 		<div class="restart-info">
@@ -214,7 +214,7 @@
 	.preset-btn:hover:not(:disabled) {
 		background: var(--color-accent);
 		border-color: var(--color-accent);
-		color: white;
+		color: var(--color-accent-contrast, #ffffff);
 	}
 
 	.preset-btn:disabled {

@@ -14,8 +14,8 @@ import (
 
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/ndms"
+	"github.com/hoaxisr/awg-manager/internal/ndms/types"
 	"github.com/hoaxisr/awg-manager/internal/pingcheck"
-	"github.com/hoaxisr/awg-manager/internal/rci"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 	"github.com/hoaxisr/awg-manager/internal/sys/exec"
 	"github.com/hoaxisr/awg-manager/internal/sys/osdetect"
@@ -247,7 +247,7 @@ func (r *Runner) collectNativeWGConnection(ti *TunnelInfo, ndmsJSON string) {
 		return
 	}
 
-	var wg rci.WGInterface
+	var wg types.WGInterface
 	if err := json.Unmarshal([]byte(ndmsJSON), &wg); err != nil {
 		return
 	}
@@ -256,7 +256,7 @@ func (r *Runner) collectNativeWGConnection(ti *TunnelInfo, ndmsJSON string) {
 		peer := wg.WireGuard.Peer[0]
 
 		ts := peer.LastHandshake
-		if ts > 0 && ts < rci.NeverHandshake {
+		if ts > 0 && ts < types.NeverHandshake {
 			hsTime := time.Unix(ts, 0)
 			ago := time.Since(hsTime).Round(time.Second)
 			ti.Connection.LatestHandshake = fmt.Sprintf("%s ago", ago)
@@ -579,4 +579,146 @@ func sanitizeConfig(stored *storage.AWGTunnel) string {
 		sb.WriteString(fmt.Sprintf("PersistentKeepalive = %d\n", stored.Peer.PersistentKeepalive))
 	}
 	return sb.String()
+}
+
+// collectAWGProxyModule reads kmod awg-proxy state and greps dmesg.
+// Never panics on missing /proc files (kernel-backend without proxy);
+// returns Loaded=false in that case. dmesg is grepped without a time
+// window because the kernel does not expose reliable timestamps in our
+// environment, and the support team wants the complete error history.
+func (r *Runner) collectAWGProxyModule(ctx context.Context) AWGProxyModule {
+	mod := AWGProxyModule{}
+
+	// /proc/awg_proxy/version → Loaded + Version
+	if versionData, err := os.ReadFile("/proc/awg_proxy/version"); err == nil {
+		mod.Loaded = true
+		mod.Version = strings.TrimSpace(string(versionData))
+	}
+
+	// /proc/awg_proxy/list → RawList + EndpointCount
+	if listData, err := os.ReadFile("/proc/awg_proxy/list"); err == nil {
+		mod.RawList = string(listData)
+		count := 0
+		for _, line := range strings.Split(mod.RawList, "\n") {
+			if strings.TrimSpace(line) != "" {
+				count++
+			}
+		}
+		mod.EndpointCount = count
+	}
+
+	// dmesg | grep -i awg_proxy — every matched line. No tail, no time
+	// window: the kernel does not expose reliable timestamps in our
+	// environment, and support wants full error history.
+	if result, err := exec.Shell(ctx, "dmesg | grep -i awg_proxy"); err == nil {
+		raw := strings.TrimSpace(result.Stdout)
+		if raw != "" {
+			for _, line := range strings.Split(raw, "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" {
+					mod.DmesgLines = append(mod.DmesgLines, line)
+				}
+			}
+		}
+	}
+
+	return mod
+}
+
+// bootHealthInput is the per-tunnel slice needed by computeBootHealth.
+// Extracted from awgStore + stateMgr; isolated into its own struct so
+// computeBootHealth can be tested without mocks.
+type bootHealthInput struct {
+	ID              string
+	Name            string
+	Backend         string
+	Enabled         bool
+	AutoStart       bool
+	Status          string // "running" | "stopped" | etc.
+	StoredStartedAt string // RFC3339, may be empty
+}
+
+// bootHealthGracePeriod is how many seconds after daemon start we wait
+// before considering an enabled tunnel "not started".
+const bootHealthGracePeriod = 120
+
+// computeBootHealth is a pure function that computes BootHealth from inputs.
+// No I/O — all required data is passed in bootHealthInput.
+// This allows logic to be tested in isolation.
+func computeBootHealth(inputs []bootHealthInput) BootHealth {
+	now := time.Now()
+	uptimeSec := int(now.Sub(processStartedAt).Seconds())
+
+	bh := BootHealth{
+		DaemonStartedAt: processStartedAt,
+		DaemonUptimeSec: uptimeSec,
+		GracePeriodSec:  bootHealthGracePeriod,
+	}
+
+	expectedSet := make(map[string]bootHealthInput)
+	for _, in := range inputs {
+		if in.Enabled && in.AutoStart {
+			bh.ExpectedRunning = append(bh.ExpectedRunning, in.ID)
+			expectedSet[in.ID] = in
+		}
+		if in.Status == "running" {
+			bh.ActualRunning = append(bh.ActualRunning, in.ID)
+		}
+	}
+
+	if uptimeSec < bootHealthGracePeriod {
+		// grace period not yet elapsed — do not draw conclusions
+		return bh
+	}
+
+	actualSet := make(map[string]bool)
+	for _, id := range bh.ActualRunning {
+		actualSet[id] = true
+	}
+
+	for id, in := range expectedSet {
+		if actualSet[id] {
+			continue
+		}
+		bh.NotStartedOnBoot = append(bh.NotStartedOnBoot, TunnelBootIssue{
+			TunnelID:        in.ID,
+			TunnelName:      in.Name,
+			Backend:         in.Backend,
+			Enabled:         in.Enabled,
+			AutoStart:       in.AutoStart,
+			StoredStartedAt: in.StoredStartedAt,
+			Reason:          "never_started",
+		})
+	}
+
+	return bh
+}
+
+// collectBootHealth assembles a per-tunnel snapshot and computes BootHealth.
+// Uses TunnelService.List for state + TunnelStore for StartedAt.
+func (r *Runner) collectBootHealth(ctx context.Context) BootHealth {
+	tunnels, err := r.deps.TunnelService.List(ctx)
+	if err != nil {
+		// service unavailable — return minimally populated BootHealth
+		return computeBootHealth(nil)
+	}
+
+	inputs := make([]bootHealthInput, 0, len(tunnels))
+	for _, t := range tunnels {
+		var startedAt string
+		if stored, _ := r.deps.TunnelStore.Get(t.ID); stored != nil {
+			startedAt = stored.StartedAt
+		}
+		inputs = append(inputs, bootHealthInput{
+			ID:              t.ID,
+			Name:            t.Name,
+			Backend:         t.Backend,
+			Enabled:         t.Enabled,
+			AutoStart:       t.AutoStart,
+			Status:          t.State.String(),
+			StoredStartedAt: startedAt,
+		})
+	}
+
+	return computeBootHealth(inputs)
 }

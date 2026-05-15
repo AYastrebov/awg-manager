@@ -104,6 +104,7 @@
                     tunnelName: resolveTunnelName(route.routes ?? []),
                     domainCount: route.domains?.length ?? 0,
                     sourceSummary,
+                    iconUrl: route.iconUrl,
                 });
             }
         }
@@ -148,6 +149,7 @@
                     tunnelName: ipTunnel?.name ?? route.tunnelID ?? '',
                     domainCount: 0,
                     sourceSummary: `${route.subnets?.length ?? 0} подсетей`,
+                    iconUrl: route.iconUrl,
                 });
             }
         }
@@ -182,6 +184,7 @@
                     tunnelName: ipTunnel?.name ?? route.tunnelID ?? '',
                     domainCount: 0,
                     sourceSummary: `${route.subnets?.length ?? 0} подсетей`,
+                    iconUrl: route.iconUrl,
                 });
             }
         }
@@ -211,6 +214,7 @@
                     tunnelName: resolveTunnelName(route.routes ?? []),
                     domainCount: route.domains?.length ?? 0,
                     sourceSummary: '',
+                    iconUrl: route.iconUrl,
                 });
             }
         }

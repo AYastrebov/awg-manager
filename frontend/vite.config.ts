@@ -1,5 +1,7 @@
 import { sveltekit } from '@sveltejs/kit/vite';
 import tailwindcss from '@tailwindcss/vite';
+import { svelteTesting } from '@testing-library/svelte/vite';
+import { fileURLToPath, URL } from 'node:url';
 import { defineConfig, loadEnv, type Plugin } from 'vite';
 
 /**
@@ -38,16 +40,33 @@ const stubDevRoutes = (): Plugin => ({
 
 export default defineConfig(({ mode }) => {
 	const env = loadEnv(mode, process.cwd(), '');
-	const apiTarget = env.VITE_API_TARGET || 'http://127.0.0.1:8080';
-	const useMockRewrite = env.VITE_API_STRIP_PREFIX === '1';
+	const envValue = (key: string) => env[key] ?? process.env[key] ?? '';
+	const isTruthy = (value: string) => ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+	const apiTarget = envValue('VITE_API_TARGET') || 'http://127.0.0.1:8080';
+	const useMockRewrite = isTruthy(envValue('VITE_API_STRIP_PREFIX'));
 
 	return {
-		plugins: [stubDevRoutes(), tailwindcss(), sveltekit()],
+		plugins: [stubDevRoutes(), tailwindcss(), sveltekit(), svelteTesting()],
+		test: {
+			environment: 'jsdom',
+			include: ['src/**/*.test.ts'],
+		},
+		resolve: {
+			alias: {
+				// Filesystem-absolute paths so esbuild's optimize-deps can
+				// resolve the shim during pre-bundle. The previous "/src/..."
+				// pseudo-root only works through Vite's own resolver and
+				// crashed esbuild with "Cannot read file: /src/...".
+				'node:dns/promises': fileURLToPath(new URL('./src/lib/shims/node-dns-promises.ts', import.meta.url)),
+				'dns/promises': fileURLToPath(new URL('./src/lib/shims/node-dns-promises.ts', import.meta.url))
+			}
+		},
 		server: {
 			proxy: {
 				'/api': {
 					target: apiTarget,
 					changeOrigin: true,
+					ws: true,
 					rewrite: useMockRewrite ? (p) => p.replace(/^\/api/, '') : undefined
 				}
 			}

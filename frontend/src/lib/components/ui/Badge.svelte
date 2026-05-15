@@ -10,6 +10,8 @@
     size?: BadgeSize;
     uppercase?: boolean;
     mono?: boolean;
+    /** Optional native tooltip; rendered as the span's title attribute. */
+    title?: string;
     children: Snippet;
   }
 
@@ -18,6 +20,7 @@
     size = 'sm',
     uppercase = false,
     mono = false,
+    title,
     children,
   }: Props = $props();
 </script>
@@ -35,6 +38,7 @@
   class:size-md={size === 'md'}
   class:is-uppercase={uppercase}
   class:is-mono={mono}
+  {title}
 >
   {@render children()}
 </span>

@@ -25,6 +25,22 @@
 	let systemInfo = $state<SystemInfo | null>(null);
 	let selectedBackend = $state<'nativewg' | 'kernel'>('nativewg');
 
+	// Sync activeTab → URL (?tab=). Mirrors what canonical Tabs urlParam
+	// does — kept inline because this page uses a custom div-based tab UI.
+	$effect(() => {
+		const t = activeTab;
+		const sp = new URLSearchParams($page.url.search);
+		if (t === 'file') {
+			sp.delete('tab');
+		} else {
+			sp.set('tab', t);
+		}
+		const nextSearch = sp.toString();
+		if (nextSearch === $page.url.searchParams.toString()) return;
+		const target = $page.url.pathname + (nextSearch ? `?${nextSearch}` : '') + $page.url.hash;
+		void goto(target, { replaceState: true, keepFocus: true, noScroll: true });
+	});
+
 	$effect(() => {
 		api.getSystemInfo().then(info => {
 			systemInfo = info;

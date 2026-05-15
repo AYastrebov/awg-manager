@@ -125,8 +125,16 @@
         width: 20px;
         height: 20px;
         background: var(--color-text-muted);
+        border: 1px solid color-mix(in srgb, var(--color-text-primary) 10%, transparent);
         border-radius: 50%;
-        transition: transform 0.2s ease, background 0.2s ease;
+        box-shadow:
+            0 1px 2px rgba(0, 0, 0, 0.28),
+            inset 0 1px 0 rgba(255, 255, 255, 0.08);
+        transition:
+            transform 0.2s ease,
+            background 0.2s ease,
+            border-color 0.2s ease,
+            box-shadow 0.2s ease;
     }
 
     .toggle-container input:checked ~ .toggle-slider {
@@ -135,7 +143,22 @@
 
     .toggle-container input:checked ~ .toggle-slider::before {
         transform: translateX(20px);
-        background: white;
+        background: color-mix(in srgb, #fffdf2 92%, var(--color-bg-primary) 8%);
+        border-color: color-mix(in srgb, var(--color-text-primary) 20%, transparent);
+        box-shadow:
+            0 1px 3px rgba(0, 0, 0, 0.34),
+            0 0 0 1px color-mix(in srgb, var(--color-text-primary) 8%, transparent),
+            inset 0 1px 0 rgba(255, 255, 255, 0.45);
+    }
+
+    /* Neo: жёлтый трек — почти белый бегунок теряется; затемняем в обеих ветках пресета */
+    :global(html[data-theme-preset='neo']) .toggle-container input:checked ~ .toggle-slider::before {
+        background: color-mix(in srgb, #8a8000 48%, var(--color-bg-primary) 52%);
+        border-color: color-mix(in srgb, var(--color-text-primary) 32%, transparent);
+        box-shadow:
+            0 1px 3px rgba(0, 0, 0, 0.42),
+            0 0 0 1px color-mix(in srgb, var(--color-text-primary) 14%, transparent),
+            inset 0 1px 0 rgba(255, 255, 255, 0.22);
     }
 
     .toggle-container:hover .toggle-slider {
@@ -235,6 +258,10 @@
         background: rgba(255, 255, 255, 0.3);
     }
 
+    .toggle-container.flip.loading .flip-lever::before {
+        display: none;
+    }
+
     /* Hover */
     .toggle-container.flip:hover .flip-lever {
         filter: brightness(1.15);
@@ -259,6 +286,7 @@
     .flip-spinner {
         width: 10px;
         height: 10px;
+        box-sizing: border-box;
         border: 2px solid rgba(255, 255, 255, 0.3);
         border-top-color: rgba(255, 255, 255, 0.8);
         border-radius: 50%;

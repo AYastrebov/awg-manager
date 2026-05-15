@@ -74,8 +74,16 @@
         width: 20px;
         height: 20px;
         background: var(--text-muted);
+        border: 1px solid color-mix(in srgb, var(--text-primary) 10%, transparent);
         border-radius: 50%;
-        transition: transform 0.2s ease, background 0.2s ease;
+        box-shadow:
+            0 1px 2px rgba(0, 0, 0, 0.28),
+            inset 0 1px 0 rgba(255, 255, 255, 0.08);
+        transition:
+            transform 0.2s ease,
+            background 0.2s ease,
+            border-color 0.2s ease,
+            box-shadow 0.2s ease;
     }
 
     .toggle-container input:checked + .toggle-slider {
@@ -84,7 +92,12 @@
 
     .toggle-container input:checked + .toggle-slider::before {
         transform: translateX(20px);
-        background: white;
+        background: color-mix(in srgb, #fffdf2 92%, var(--bg-primary) 8%);
+        border-color: color-mix(in srgb, var(--text-primary) 20%, transparent);
+        box-shadow:
+            0 1px 3px rgba(0, 0, 0, 0.34),
+            0 0 0 1px color-mix(in srgb, var(--text-primary) 8%, transparent),
+            inset 0 1px 0 rgba(255, 255, 255, 0.45);
     }
 
     .toggle-container:hover .toggle-slider {

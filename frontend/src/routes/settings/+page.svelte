@@ -1,9 +1,10 @@
 <script lang="ts">
-	import { onMount } from "svelte";
+	import { onDestroy, onMount } from "svelte";
+	import { afterNavigate } from "$app/navigation";
 	import { api } from "$lib/api/client";
 	import { notifications } from "$lib/stores/notifications";
 	import { singboxStatus } from "$lib/stores/singbox";
-	import { PageContainer, LoadingSpinner } from "$lib/components/layout";
+	import { PageContainer, PageHeader, LoadingSpinner } from "$lib/components/layout";
 	import { Toggle, Modal, Button } from "$lib/components/ui";
 	import {
 		SystemInfoGrid,
@@ -11,34 +12,75 @@
 		UpdateSection,
 		DnsRouteSettings,
 		IntegrationsCard,
+		ThemeSchemeCard,
 		SettingsFooter,
+		UsageLevelCard,
 	} from "$lib/components/settings";
+	import { setSettings as setGlobalSettings } from "$lib/stores/settings";
 	import type {
 		SystemInfo,
 		Settings,
 		UpdateInfo,
 		HydraRouteStatus,
 	} from "$lib/types";
+	import {
+		USAGE_LEVEL_LABELS,
+		isSectionVisible,
+		isRoutingSubTabVisible,
+		type UsageLevel,
+	} from "$lib/types/usageLevel";
+	import { usageLevel } from "$lib/stores/settings";
 
 	let systemInfo: SystemInfo | null = $state(null);
 	let settings = $state<Settings | null>(null);
 	let loading = $state(true);
 	let saving = $state(false);
 	const origin = $derived(typeof window !== "undefined" ? window.location.origin : "");
+	const showSingboxIntegration = $derived(isSectionVisible($usageLevel, "singboxTunnels"));
+	const showHydraIntegration = $derived(isRoutingSubTabVisible($usageLevel, "hrNeo"));
+	const showDnsRouteCard = $derived(isRoutingSubTabVisible($usageLevel, "dnsRoutes"));
 	let updateInfo: UpdateInfo | null = $state(null);
 	let restarting = $state(false);
 	let restartConfirmOpen = $state(false);
 	let hydraStatus = $state<HydraRouteStatus | null>(null);
+	let hydraStatusLoading = $state(true);
+	let hydraProbeNote = $state<string | null>(null);
 	let hydraBusy = $state(false);
 	let singboxInstalling = $state(false);
 	let singboxInstallError = $state<string | null>(null);
 	let singboxBusy = $state(false);
+	let hydraProbeNoteTimer: ReturnType<typeof setTimeout> | null = null;
+	let systemInfoRefreshing = $state(false);
+	let systemInfoUpdatedAt = $state<string | null>(null);
+	let systemInfoInFlight: Promise<void> | null = null;
 
 	const singboxStatusValue = $derived($singboxStatus.data ?? null);
+	const singboxStatusLoading = $derived(
+		$singboxStatus.lastFetchedAt === 0 &&
+		($singboxStatus.status === 'idle' || $singboxStatus.status === 'loading')
+	);
 	const singboxInstalled = $derived(singboxStatusValue?.installed ?? false);
 	const singboxRunning = $derived(singboxStatusValue?.running ?? false);
 	const hydraInstalled = $derived(hydraStatus?.installed ?? false);
 	const hydraRunning = $derived(hydraStatus?.running ?? false);
+
+	function setHydraProbeNote(note: string) {
+		hydraProbeNote = note;
+		if (hydraProbeNoteTimer) {
+			clearTimeout(hydraProbeNoteTimer);
+		}
+		hydraProbeNoteTimer = setTimeout(() => {
+			hydraProbeNote = null;
+			hydraProbeNoteTimer = null;
+		}, 4000);
+	}
+
+	onDestroy(() => {
+		if (hydraProbeNoteTimer) {
+			clearTimeout(hydraProbeNoteTimer);
+			hydraProbeNoteTimer = null;
+		}
+	});
 
 	async function controlSingbox(action: 'start' | 'stop' | 'restart') {
 		singboxBusy = true;
@@ -85,30 +127,87 @@
 		}
 	}
 
-	onMount(async () => {
+	async function fetchSystemInfo(silent = true) {
+		if (systemInfoInFlight) {
+			return systemInfoInFlight;
+		}
+		systemInfoRefreshing = true;
+		systemInfoInFlight = (async () => {
+			try {
+				systemInfo = await api.getSystemInfo();
+				systemInfoUpdatedAt = new Date().toISOString();
+				if (!silent) {
+					notifications.success("Информация о роутере обновлена");
+				}
+			} catch (e) {
+				if (!silent) {
+					notifications.error(e instanceof Error ? e.message : "Не удалось обновить системную информацию");
+				}
+			} finally {
+				systemInfoRefreshing = false;
+				systemInfoInFlight = null;
+			}
+		})();
+		return systemInfoInFlight;
+	}
+
+onMount(() => {
+	const timer = setInterval(() => {
+		void fetchSystemInfo(true);
+	}, 30000);
+
+	void (async () => {
 		try {
-			[systemInfo, settings, updateInfo] = await Promise.all([
-				api.getSystemInfo(),
+			const [_, appSettings] = await Promise.all([
+				fetchSystemInfo(true),
 				api.getSettings(),
-				api.checkUpdate(),
 			]);
+			settings = appSettings;
 		} catch (e) {
 			notifications.error(e instanceof Error ? e.message : "Не удалось загрузить настройки");
 		} finally {
 			loading = false;
 		}
+
+		// Non-critical for first paint: load update state in background.
+		api.checkUpdate()
+			.then((info) => {
+				updateInfo = info;
+			})
+			.catch(() => {
+				// Keep the page interactive; update widget can stay empty on transient errors.
+			});
+
 		try {
+			const hydraLoadStartedAt = Date.now();
 			hydraStatus = await api.getHydraRouteStatus();
+			setHydraProbeNote("данные получены");
+			// Keep a tiny visible loading phase so users can perceive that
+			// the probe actually happened, even on very fast responses.
+			const elapsed = Date.now() - hydraLoadStartedAt;
+			const minLoadingMs = 350;
+			if (elapsed < minLoadingMs) {
+				await new Promise((resolve) => setTimeout(resolve, minLoadingMs - elapsed));
+			}
 		} catch {
+			setHydraProbeNote("нет ответа");
 			/* ignore - HR may not be available */
+		} finally {
+			hydraStatusLoading = false;
 		}
-	});
+	})();
+
+	return () => {
+		clearInterval(timer);
+	};
+});
 
 	async function toggleAuth(enabled: boolean) {
 		if (!settings) return;
 		saving = true;
 		try {
 			settings = await api.updateSettings({ ...settings, authEnabled: enabled });
+			setGlobalSettings(settings);
 			notifications.success(enabled ? "Авторизация включена" : "Авторизация отключена");
 		} catch {
 			notifications.error("Ошибка сохранения настроек");
@@ -125,11 +224,61 @@
 			// over plain HTTP (router LAN context), so the backend produces
 			// the UUID via crypto/rand and persists it in one round-trip.
 			settings = await api.regenerateApiKey();
+			setGlobalSettings(settings);
 			notifications.success("API ключ сгенерирован");
 		} catch {
 			notifications.error("Ошибка генерации ключа");
 		} finally {
 			saving = false;
+		}
+	}
+
+	async function copyApiKey() {
+		if (!settings) return;
+		const key = (settings.apiKey ?? "").trim();
+		if (!key) {
+			notifications.info("Сначала сгенерируйте API ключ");
+			return;
+		}
+		const fallbackCopy = (text: string): boolean => {
+			try {
+				const textarea = document.createElement("textarea");
+				textarea.value = text;
+				textarea.setAttribute("readonly", "");
+				textarea.style.position = "fixed";
+				textarea.style.top = "-1000px";
+				textarea.style.left = "-1000px";
+				textarea.style.opacity = "0";
+				document.body.appendChild(textarea);
+				textarea.focus();
+				textarea.select();
+				textarea.setSelectionRange(0, textarea.value.length);
+				const copied = document.execCommand("copy");
+				document.body.removeChild(textarea);
+				return copied;
+			} catch {
+				return false;
+			}
+		};
+
+		let copied = false;
+		try {
+			if (navigator.clipboard?.writeText) {
+				await navigator.clipboard.writeText(key);
+				copied = true;
+			}
+		} catch {
+			copied = false;
+		}
+
+		if (!copied) {
+			copied = fallbackCopy(key);
+		}
+
+		if (copied) {
+			notifications.success("API ключ скопирован в буфер обмена");
+		} else {
+			notifications.error("Не удалось скопировать API ключ");
 		}
 	}
 
@@ -141,6 +290,7 @@
 				...settings,
 				logging: { ...settings.logging, enabled },
 			});
+			setGlobalSettings(settings);
 			notifications.success(enabled ? "Логирование включено" : "Логирование отключено");
 		} catch {
 			notifications.error("Ошибка сохранения настроек");
@@ -154,6 +304,7 @@
 		saving = true;
 		try {
 			settings = await api.updateSettings(settings);
+			setGlobalSettings(settings);
 			notifications.success("Настройки логирования сохранены");
 		} catch {
 			notifications.error("Ошибка сохранения настроек");
@@ -178,6 +329,7 @@
 					refreshMode: settings.dnsRoute.refreshMode || "interval",
 				},
 			});
+			setGlobalSettings(settings);
 			notifications.success(enabled ? "Автообновление подписок включено" : "Автообновление подписок отключено");
 		} catch {
 			notifications.error("Ошибка сохранения настроек");
@@ -191,6 +343,7 @@
 		saving = true;
 		try {
 			settings = await api.updateSettings(settings);
+			setGlobalSettings(settings);
 			notifications.success("Настройки автообновления сохранены");
 		} catch {
 			notifications.error("Ошибка сохранения настроек");
@@ -207,9 +360,24 @@
 				...settings,
 				updates: { ...settings.updates, checkEnabled: enabled },
 			});
+			setGlobalSettings(settings);
 			notifications.success(enabled ? "Автопроверка обновлений включена" : "Автопроверка обновлений отключена");
 		} catch {
 			notifications.error("Ошибка сохранения настроек");
+		} finally {
+			saving = false;
+		}
+	}
+
+	async function selectUsageLevel(level: UsageLevel) {
+		if (!settings) return;
+		saving = true;
+		try {
+			settings = await api.updateSettings({ ...settings, usageLevel: level });
+			setGlobalSettings(settings);
+			notifications.success(`Уровень: ${USAGE_LEVEL_LABELS[level]}`);
+		} catch {
+			notifications.error("Не удалось сохранить уровень");
 		} finally {
 			saving = false;
 		}
@@ -226,21 +394,41 @@
 			restarting = false;
 		}
 	}
+
+	async function refreshSystemInfo() {
+		await fetchSystemInfo(false);
+	}
+
+	afterNavigate(async ({ to, from }) => {
+		if (!to || to.url.pathname !== "/settings") return;
+		if (!from || from.url.pathname !== "/settings") {
+			await fetchSystemInfo(true);
+		}
+	});
 </script>
 
 <svelte:head>
 	<title>Настройки - AWG Manager</title>
 </svelte:head>
 
-<PageContainer>
+<PageContainer width="full">
+	<PageHeader title="Настройки" />
 	{#if loading}
 		<div class="flex justify-center py-8">
 			<LoadingSpinner size="md" />
 		</div>
 	{:else if settings && systemInfo}
+		<div class="settings-layout">
 		<div class="settings-grid">
 			<aside class="settings-left">
-				<SystemInfoGrid {systemInfo} />
+				<SystemInfoGrid
+					{systemInfo}
+					usageLevel={settings.usageLevel}
+					onrefresh={refreshSystemInfo}
+					refreshing={systemInfoRefreshing}
+					lastUpdated={systemInfoUpdatedAt}
+					autoRefreshMs={30000}
+				/>
 
 				<div class="card">
 					<div class="section-label">Обновление</div>
@@ -249,21 +437,36 @@
 
 				<IntegrationsCard
 					singboxStatus={singboxStatusValue}
+					{singboxStatusLoading}
 					{hydraStatus}
+					{hydraStatusLoading}
+					{hydraProbeNote}
 					{singboxInstalling}
 					{singboxInstallError}
 					oninstallSingbox={installSingbox}
+					showSingbox={showSingboxIntegration}
+					showHydra={showHydraIntegration}
 				/>
 			</aside>
 
 			<main class="settings-right">
+				<UsageLevelCard
+					value={settings.usageLevel}
+					{saving}
+					onSelect={selectUsageLevel}
+				/>
+
+				{#if $usageLevel === "expert"}
+					<ThemeSchemeCard />
+				{/if}
+
 				<div class="card">
 					<div class="section-label">Доступ</div>
-					<div class="setting-row">
+					<div class="setting-row toggle-inline-row">
 						<div class="flex flex-col gap-1">
 							<span class="font-medium">Авторизация</span>
 							<span class="setting-description">
-								Требовать вход через учётную запись Keenetic для доступа к панели управления
+								Требовать вход через учётную запись роутера для доступа к панели управления
 							</span>
 						</div>
 						<Toggle checked={settings.authEnabled} onchange={toggleAuth} disabled={saving} />
@@ -272,7 +475,7 @@
 
 				<div class="card">
 					<div class="section-label">Обновления</div>
-					<div class="setting-row">
+					<div class="setting-row toggle-inline-row">
 						<div class="flex flex-col gap-1">
 							<span class="font-medium">Автопроверка обновлений</span>
 							<span class="setting-description">Проверять наличие новых версий раз в сутки</span>
@@ -295,7 +498,7 @@
 					/>
 				</div>
 
-				{#if systemInfo.isOS5}
+				{#if systemInfo.isOS5 && showDnsRouteCard}
 					<div class="card">
 						<div class="section-label">DNS-маршрутизация</div>
 						<DnsRouteSettings
@@ -307,29 +510,37 @@
 					</div>
 				{/if}
 
+				{#if $usageLevel === "expert"}
 				<div class="card">
 					<div class="section-label">Расширенные</div>
-					<div class="setting-row">
+					<div class="setting-row api-key-setting">
 						<div class="flex flex-col gap-1">
 							<span class="font-medium">API Key</span>
 							<span class="setting-description">
 								API ключ для доступа к&nbsp;<code>{origin}/api/</code>, если включена авторизация. Передавайте в заголовке <code>Authorization: Bearer &lt;ключ&gt;</code>.
 							</span>
 						</div>
-						<div class="api-key-row">
+						<div class="api-key-controls">
 							<input
 								type="text"
 								class="api-key-input"
 								value={settings.apiKey ?? ""}
 								readonly
 								placeholder="не сгенерирован"
+								onclick={copyApiKey}
+								title={settings.apiKey?.trim()
+									? "Нажмите, чтобы скопировать в буфер обмена"
+									: "Сначала нажмите «Сгенерировать»"}
 							/>
-							<Button variant="ghost" size="sm" onclick={generateApiKey} disabled={saving}>
-								Сгенерировать
-							</Button>
+							<div class="api-key-action">
+								<Button variant="secondary" size="sm" onclick={generateApiKey} disabled={saving}>
+									Сгенерировать
+								</Button>
+							</div>
 						</div>
 					</div>
 				</div>
+				{/if}
 			</main>
 		</div>
 
@@ -341,7 +552,7 @@
 					<span class="setting-description">Туннели продолжат работать</span>
 				</div>
 				<Button
-					variant="ghost"
+					variant="secondary"
 					size="sm"
 					onclick={() => (restartConfirmOpen = true)}
 					loading={restarting}
@@ -350,7 +561,7 @@
 				</Button>
 			</div>
 
-			{#if singboxInstalled}
+			{#if singboxInstalled && showSingboxIntegration}
 				<div class="setting-row">
 					<div class="flex flex-col gap-1">
 						<span class="font-medium">Sing-box</span>
@@ -360,16 +571,26 @@
 					</div>
 					<div class="action-buttons">
 						{#if singboxRunning}
-							<Button variant="ghost" size="sm" onclick={() => controlSingbox('restart')} loading={singboxBusy}>Перезапустить</Button>
-							<Button variant="ghost" size="sm" onclick={() => controlSingbox('stop')} loading={singboxBusy}>Остановить</Button>
+							<span title={singboxStatusValue?.updateAvailable ? `Сначала обновите sing-box до ${singboxStatusValue.requiredVersion}` : ''}>
+								<Button
+									variant="secondary"
+									size="sm"
+									onclick={() => controlSingbox('restart')}
+									loading={singboxBusy}
+									disabled={singboxStatusValue?.updateAvailable ?? false}
+								>
+									Перезапустить
+								</Button>
+							</span>
+							<Button variant="danger" size="sm" onclick={() => controlSingbox('stop')} loading={singboxBusy}>Остановить</Button>
 						{:else}
-							<Button variant="ghost" size="sm" onclick={() => controlSingbox('start')} loading={singboxBusy}>Запустить</Button>
+							<Button variant="success" size="sm" onclick={() => controlSingbox('start')} loading={singboxBusy}>Запустить</Button>
 						{/if}
 					</div>
 				</div>
 			{/if}
 
-			{#if hydraInstalled}
+			{#if hydraInstalled && showHydraIntegration}
 				<div class="setting-row">
 					<div class="flex flex-col gap-1">
 						<span class="font-medium">HydraRoute Neo</span>
@@ -379,17 +600,20 @@
 					</div>
 					<div class="action-buttons">
 						{#if hydraRunning}
-							<Button variant="ghost" size="sm" onclick={() => controlHydra('restart')} loading={hydraBusy}>Перезапустить</Button>
-							<Button variant="ghost" size="sm" onclick={() => controlHydra('stop')} loading={hydraBusy}>Остановить</Button>
+							<Button variant="secondary" size="sm" onclick={() => controlHydra('restart')} loading={hydraBusy}>Перезапустить</Button>
+							<Button variant="danger" size="sm" onclick={() => controlHydra('stop')} loading={hydraBusy}>Остановить</Button>
 						{:else}
-							<Button variant="ghost" size="sm" onclick={() => controlHydra('start')} loading={hydraBusy}>Запустить</Button>
+							<Button variant="success" size="sm" onclick={() => controlHydra('start')} loading={hydraBusy}>Запустить</Button>
 						{/if}
 					</div>
 				</div>
 			{/if}
 		</div>
 
-		<SettingsFooter />
+		<div class="settings-doc-block">
+			<SettingsFooter />
+		</div>
+		</div>
 	{/if}
 
 	<Modal
@@ -409,10 +633,19 @@
 </PageContainer>
 
 <style>
+	/* Единый шаг сетки страницы настроек: колонки, стеки, до «Действий», до блока документации, шаг между строками там */
+	.settings-layout {
+		--settings-gap: 0.765rem;
+	}
+
+	.settings-doc-block {
+		margin-top: var(--settings-gap);
+	}
+
 	.settings-grid {
 		display: grid;
 		grid-template-columns: 360px 1fr;
-		gap: 1rem;
+		gap: var(--settings-gap);
 		align-items: start;
 	}
 
@@ -420,7 +653,7 @@
 	.settings-right {
 		display: flex;
 		flex-direction: column;
-		gap: 0.75rem;
+		gap: var(--settings-gap);
 	}
 
 	.settings-left {
@@ -436,25 +669,38 @@
 	}
 
 	.actions-card {
-		margin-top: 0.75rem;
+		margin-top: var(--settings-gap);
+	}
+
+	/* Между строками — тот же шаг, что и между карточками (сумма половин padding) */
+	.actions-card > .setting-row {
+		padding-block: calc(var(--settings-gap) * 0.5);
+		align-items: center;
+	}
+
+	.actions-card > .setting-row:last-of-type {
+		padding-bottom: 0;
 	}
 
 	.action-buttons {
 		display: inline-flex;
 		gap: 0.375rem;
 		flex-shrink: 0;
+		align-items: center;
 	}
 
-	.api-key-row {
-		display: inline-flex;
-		gap: 0.5rem;
+	.api-key-controls {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto;
 		align-items: center;
-		flex-shrink: 0;
+		gap: 0.5rem;
+		width: 100%;
+		min-width: 0;
 	}
 
 	.api-key-input {
-		width: 22rem;
-		max-width: 100%;
+		width: 100%;
+		max-width: none;
 		padding: 0.375rem 0.5rem;
 		font-family: var(--font-mono, ui-monospace, monospace);
 		font-size: 0.8rem;
@@ -462,10 +708,64 @@
 		border: 1px solid var(--border, var(--color-border));
 		border-radius: 4px;
 		color: var(--text, var(--color-text));
+		cursor: pointer;
 	}
 	.api-key-input:read-only {
 		opacity: 0.85;
 		cursor: text;
+	}
+	.api-key-action {
+		align-self: auto;
+		white-space: nowrap;
+	}
+
+	.api-key-setting {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) minmax(0, min(50%, 34rem));
+		gap: 1rem;
+		align-items: start;
+	}
+	.api-key-setting > *:first-child {
+		min-width: 0;
+	}
+
+	@media (max-width: 640px) {
+		.api-key-controls {
+			grid-template-columns: minmax(0, 1fr) auto;
+		}
+
+		.api-key-setting {
+			grid-template-columns: 1fr;
+		}
+
+		.toggle-inline-row {
+			flex-direction: row;
+			align-items: center;
+			flex-wrap: nowrap;
+			gap: 0.75rem;
+		}
+
+		.toggle-inline-row > *:first-child {
+			flex: 1 1 auto;
+			min-width: 0;
+		}
+
+		.actions-card > .setting-row {
+			flex-direction: row;
+			align-items: center;
+			flex-wrap: nowrap;
+			gap: 0.75rem;
+		}
+
+		.actions-card > .setting-row > *:first-child {
+			flex: 1 1 auto;
+			min-width: 0;
+		}
+
+		.action-buttons {
+			justify-content: flex-end;
+			flex-wrap: nowrap;
+		}
 	}
 
 	@media (max-width: 900px) {

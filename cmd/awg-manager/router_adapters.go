@@ -58,6 +58,13 @@ func (a *routerAccessPolicyAdapter) ListPolicies(ctx context.Context) ([]router.
 	}
 	out := make([]router.PolicyInfo, 0, len(policies))
 	for _, p := range policies {
+		// Drop NDMS policies that don't belong to the built-in
+		// Policy0..PolicyN pool (e.g. HR-NEO creates user-named ones).
+		// They share NDMS storage but use a different policy model and
+		// must not appear in the singbox-router policy picker.
+		if !accesspolicy.IsStandardPolicyName(p.Name) {
+			continue
+		}
 		mark, _ := a.svc.GetPolicyMark(ctx, p.Name) // best-effort; empty is fine
 		out = append(out, router.PolicyInfo{
 			Name:         p.Name,

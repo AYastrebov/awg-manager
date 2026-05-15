@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 func NewEmptyConfig() *RouterConfig {
@@ -19,6 +21,7 @@ func NewEmptyConfig() *RouterConfig {
 		Route: Route{
 			RuleSet: []RuleSet{},
 			Rules:   []Rule{},
+			Final:   "direct",
 		},
 	}
 }
@@ -79,6 +82,25 @@ func (c *RouterConfig) AddRuleSet(rs RuleSet) error {
 	}
 	c.Route.RuleSet = append(c.Route.RuleSet, rs)
 	return nil
+}
+
+func (c *RouterConfig) UpdateRuleSet(tag string, next RuleSet) error {
+	if next.Tag == "" {
+		next.Tag = tag
+	}
+	if next.Tag != tag {
+		return fmt.Errorf("rule_set %q: changing tag is not supported", tag)
+	}
+	if err := validateRuleSet(next); err != nil {
+		return err
+	}
+	for i, existing := range c.Route.RuleSet {
+		if existing.Tag == tag {
+			c.Route.RuleSet[i] = next
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %q", ErrRuleSetNotFound, tag)
 }
 
 func (c *RouterConfig) DeleteRuleSet(tag string, force bool) error {
@@ -161,6 +183,9 @@ func (c *RouterConfig) MoveRule(from, to int) error {
 }
 
 func (c *RouterConfig) EnsureSystemRules() {
+	if c.Route.Final == "" {
+		c.Route.Final = "direct"
+	}
 	hasSniff := false
 	hasHijack := false
 	for _, r := range c.Route.Rules {
@@ -183,7 +208,21 @@ func (c *RouterConfig) EnsureSystemRules() {
 	}
 }
 
+// SetRouteFinal updates route.final. Caller must validate the tag refers
+// to a known outbound (or sing-box built-in: "direct", "block").
+// Setting to "" is rejected — use "direct" for default fallback.
+func (c *RouterConfig) SetRouteFinal(tag string) error {
+	if tag == "" {
+		return fmt.Errorf("route final cannot be empty (use 'direct' for default)")
+	}
+	c.Route.Final = tag
+	return nil
+}
+
 func (c *RouterConfig) AddCompositeOutbound(o Outbound) error {
+	if err := validateCompositeOutbound(o); err != nil {
+		return err
+	}
 	for _, existing := range c.Outbounds {
 		if existing.Tag == o.Tag {
 			return fmt.Errorf("%w: %q", ErrOutboundTagConflict, o.Tag)
@@ -194,6 +233,9 @@ func (c *RouterConfig) AddCompositeOutbound(o Outbound) error {
 }
 
 func (c *RouterConfig) UpdateCompositeOutbound(tag string, o Outbound) error {
+	if err := validateCompositeOutbound(o); err != nil {
+		return err
+	}
 	for i, existing := range c.Outbounds {
 		if existing.Tag == tag {
 			c.Outbounds[i] = o
@@ -201,6 +243,29 @@ func (c *RouterConfig) UpdateCompositeOutbound(tag string, o Outbound) error {
 		}
 	}
 	return fmt.Errorf("%w: %q not found", ErrOutboundTagConflict, tag)
+}
+
+// validateCompositeOutbound rejects shapes that compile but produce
+// surprising behavior at runtime. In particular `direct` as a member of
+// a selector/urltest/loadbalance group lets traffic bypass the proxy
+// silently — almost never what the user wants, and a known footgun in
+// sing-box composite groups. Same for `default: "direct"`.
+func validateCompositeOutbound(o Outbound) error {
+	if strings.TrimSpace(o.Tag) == "" {
+		return fmt.Errorf("outbound tag is required")
+	}
+	if len(o.Outbounds) == 0 {
+		return fmt.Errorf("outbound %q: at least one member is required", o.Tag)
+	}
+	for _, m := range o.Outbounds {
+		if strings.EqualFold(strings.TrimSpace(m), "direct") {
+			return fmt.Errorf("outbound %q: member %q is not allowed in composite groups (would bypass proxy silently)", o.Tag, m)
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(o.Default), "direct") {
+		return fmt.Errorf("outbound %q: default %q is not allowed in composite groups", o.Tag, o.Default)
+	}
+	return nil
 }
 
 func (c *RouterConfig) DeleteCompositeOutbound(tag string, force bool) error {
@@ -286,9 +351,28 @@ func validateRuleSet(rs RuleSet) error {
 		return fmt.Errorf("rule_set tag is required")
 	}
 	switch rs.Type {
+	case "inline":
+		if len(rs.Rules) == 0 {
+			return fmt.Errorf("rule_set %q: rules required for type=inline", rs.Tag)
+		}
+		for i, rule := range rs.Rules {
+			if len(rule) == 0 {
+				return fmt.Errorf("rule_set %q: inline rule at index %d is empty", rs.Tag, i)
+			}
+			if !inlineRuleHasKnownField(rule) {
+				return fmt.Errorf("rule_set %q: inline rule at index %d has no known matcher/action fields", rs.Tag, i)
+			}
+		}
 	case "remote":
 		if rs.URL == "" {
 			return fmt.Errorf("rule_set %q: url required for type=remote", rs.Tag)
+		}
+		u, err := url.Parse(rs.URL)
+		if err != nil || u == nil || u.Host == "" {
+			return fmt.Errorf("rule_set %q: invalid url %q", rs.Tag, rs.URL)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("rule_set %q: url scheme must be http or https, got %q", rs.Tag, u.Scheme)
 		}
 	case "local":
 		if rs.Path == "" {
@@ -301,4 +385,42 @@ func validateRuleSet(rs RuleSet) error {
 		return fmt.Errorf("rule_set %q: unknown type %q", rs.Tag, rs.Type)
 	}
 	return nil
+}
+
+// inlineRuleHasKnownField reports whether an inline rule_set rule has at
+// least one recognised matcher/action key with a non-empty value. Mirrors
+// sing-box's headline-rule schema (subset; extend if sing-box adds more).
+func inlineRuleHasKnownField(rule map[string]any) bool {
+	known := []string{
+		"domain", "domain_suffix", "domain_keyword", "domain_regex",
+		"ip_cidr", "source_ip_cidr", "port", "source_port",
+		"process_name", "process_path", "package_name",
+		"protocol", "network", "rule_set",
+	}
+	for _, k := range known {
+		v, ok := rule[k]
+		if !ok {
+			continue
+		}
+		if inlineRuleValueNonEmpty(v) {
+			return true
+		}
+	}
+	return false
+}
+
+func inlineRuleValueNonEmpty(v any) bool {
+	switch t := v.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(t) != ""
+	case []any:
+		return len(t) > 0
+	case []string:
+		return len(t) > 0
+	case map[string]any:
+		return len(t) > 0
+	}
+	return true
 }

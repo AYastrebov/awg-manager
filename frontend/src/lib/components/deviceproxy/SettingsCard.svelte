@@ -10,9 +10,21 @@
 		bridgeInterfaces: { id: string; label: string }[];
 		onSaved: (cfg: DeviceProxyConfig) => void;
 		onCancel?: () => void;
+		onSaveConfig?: (cfg: DeviceProxyConfig) => Promise<DeviceProxyConfig>;
+		title?: string;
+		description?: string;
 	}
 
-	let { config, outbounds, bridgeInterfaces, onSaved, onCancel }: Props = $props();
+	let {
+		config,
+		outbounds,
+		bridgeInterfaces,
+		onSaved,
+		onCancel,
+		onSaveConfig = api.saveDeviceProxyConfig.bind(api),
+		title = 'Настройки прокси-сервера',
+		description = 'Эти значения сохраняются в конфигурации и применяются при каждом запуске sing-box.'
+	}: Props = $props();
 
 	// Draft is a one-time snapshot of the prop. Edits survive store
 	// refreshes — reset() is the explicit resync affordance.
@@ -51,7 +63,7 @@
 	async function save() {
 		saving = true;
 		try {
-			const saved = await api.saveDeviceProxyConfig(draft);
+			const saved = await onSaveConfig(draft);
 			onSaved(saved);
 			notifications.success('Настройки сохранены');
 		} catch (e) {
@@ -74,7 +86,7 @@
 		// don't sneak into this save.
 		const payload = { ...config, enabled: next };
 		try {
-			const saved = await api.saveDeviceProxyConfig(payload);
+			const saved = await onSaveConfig(payload);
 			// Mirror into the draft so the toggle control reflects the
 			// new state immediately and the "Отменить" snapshot is
 			// aligned with what's persisted.
@@ -108,8 +120,8 @@
 </script>
 
 <section class="card">
-	<h2 class="section-title">Настройки прокси-сервера</h2>
-	<p class="section-desc">Эти значения сохраняются в конфигурации и применяются при каждом запуске sing-box.</p>
+	<h2 class="section-title">{title}</h2>
+	<p class="section-desc">{description}</p>
 
 	<div class="settings-stack">
 		<div class="setting-row">

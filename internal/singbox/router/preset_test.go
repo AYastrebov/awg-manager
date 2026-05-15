@@ -83,3 +83,39 @@ func isSubstring(s, sub string) bool {
 	}
 	return false
 }
+
+func TestApplyPresetToConfig_IdempotentOnRules(t *testing.T) {
+	cfg := &RouterConfig{}
+	if err := ApplyPresetToConfig(cfg, "youtube", "awg-vpn0"); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	rulesAfterFirst := len(cfg.Route.Rules)
+	ruleSetsAfterFirst := len(cfg.Route.RuleSet)
+
+	if err := ApplyPresetToConfig(cfg, "youtube", "awg-vpn0"); err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+
+	if got := len(cfg.Route.Rules); got != rulesAfterFirst {
+		t.Errorf("Rules duplicated on second apply: %d -> %d", rulesAfterFirst, got)
+	}
+	if got := len(cfg.Route.RuleSet); got != ruleSetsAfterFirst {
+		t.Errorf("RuleSets duplicated on second apply: %d -> %d", ruleSetsAfterFirst, got)
+	}
+}
+
+func TestApplyPresetToConfig_DifferentOutboundCreatesSeparateRule(t *testing.T) {
+	cfg := &RouterConfig{}
+	if err := ApplyPresetToConfig(cfg, "youtube", "awg-vpn0"); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	rulesAfterFirst := len(cfg.Route.Rules)
+
+	if err := ApplyPresetToConfig(cfg, "youtube", "awg-vpn1"); err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+
+	if got := len(cfg.Route.Rules); got != rulesAfterFirst+1 {
+		t.Errorf("expected new rule for different outbound: %d -> %d", rulesAfterFirst, got)
+	}
+}

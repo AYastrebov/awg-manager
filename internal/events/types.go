@@ -37,7 +37,10 @@ type PingCheckStateEvent struct {
 	RestartDetected bool   `json:"restartDetected,omitempty"`
 }
 
-// LogEntryEvent is sent for each new log entry.
+// LogEntryEvent is sent for each new log entry. Bucket selects which
+// frontend store consumes the event — sing-box logs are isolated from
+// app logs so a noisy sing-box stream cannot evict tunnel/routing
+// history from the same ring buffer.
 type LogEntryEvent struct {
 	Timestamp string `json:"timestamp"`
 	Level     string `json:"level"`
@@ -46,6 +49,7 @@ type LogEntryEvent struct {
 	Action    string `json:"action"`
 	Target    string `json:"target"`
 	Message   string `json:"message"`
+	Bucket    string `json:"bucket"` // "app" | "singbox"
 }
 
 // Traffic update payload (sent by Traffic Collector).
@@ -105,6 +109,18 @@ type GeoDownloadProgressEvent struct {
 	Downloaded int64  `json:"downloaded"` // bytes received so far
 	Total      int64  `json:"total"`      // 0 when unknown
 	Phase      string `json:"phase"`      // "download" | "validate" | "done" | "error"
+	Error      string `json:"error,omitempty"`
+}
+
+// SingboxInstallProgressEvent reports lifecycle of an Install or Update
+// flow for the managed sing-box binary. Total may be 0 when the server
+// didn't send Content-Length. Byte counters are populated only for the
+// "download" phase; later phases report progress purely by name.
+type SingboxInstallProgressEvent struct {
+	Op         string `json:"op"`         // "install" | "update"
+	Phase      string `json:"phase"`      // "download"|"activate"|"stop"|"start"|"done"|"error"
+	Downloaded int64  `json:"downloaded"` // bytes received so far (download phase only)
+	Total      int64  `json:"total"`      // 0 when unknown
 	Error      string `json:"error,omitempty"`
 }
 

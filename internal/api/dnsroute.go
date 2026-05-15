@@ -39,6 +39,7 @@ type DnsRouteDTO struct {
 	CreatedAt     string                    `json:"createdAt" example:"2024-01-01T00:00:00Z"`
 	UpdatedAt     string                    `json:"updatedAt" example:"2024-01-15T12:00:00Z"`
 	Backend       string                    `json:"backend,omitempty" example:"ndms"`
+	IconURL       string                    `json:"iconUrl,omitempty" example:"https://cdn.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Telegram.png"`
 }
 
 // DnsRoutesListResponse is the envelope for GET /dns-routes/list.
@@ -350,7 +351,7 @@ func (h *DNSRouteHandler) CreateBatch(w http.ResponseWriter, r *http.Request) {
 //	@Failure		500	{object}	APIErrorEnvelope
 //	@Router			/dns-routes/set-enabled [post]
 func (h *DNSRouteHandler) SetEnabled(w http.ResponseWriter, r *http.Request) {
-	body, ok := parseJSON[enabledToggle](w, r, http.MethodPost)
+	body, ok := parseJSON[EnabledToggleRequest](w, r, http.MethodPost)
 	if !ok {
 		return
 	}
@@ -476,4 +477,3 @@ func (h *DNSRouteHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 	response.Success(w, list)
 	h.publishDnsUpdated("refresh-subscriptions")
 }
-

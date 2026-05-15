@@ -566,5 +566,27 @@ func policyIndex(name string) int {
 	return 1000 // custom policies sort after standard PolicyN
 }
 
+// IsStandardPolicyName reports whether name is a built-in NDMS access
+// policy (Policy0..PolicyN). Custom NDMS policies created by other
+// subsystems (e.g. HR-NEO under user-chosen names like "germany-vpn")
+// return false. Callers that should only operate on the built-in
+// rotating-mark pool — such as the sing-box router policy picker —
+// use this to exclude foreign policies from their dropdowns.
+//
+// The suffix must be one or more ASCII digits with no sign or padding;
+// "Policy-1" or "Policy+1" are rejected. NDMS only emits Policy0..Policy63.
+func IsStandardPolicyName(name string) bool {
+	suffix, ok := strings.CutPrefix(name, "Policy")
+	if !ok || suffix == "" {
+		return false
+	}
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // Ensure ServiceImpl implements Service.
 var _ Service = (*ServiceImpl)(nil)

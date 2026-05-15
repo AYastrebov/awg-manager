@@ -1,25 +1,51 @@
 <script lang="ts">
-	import { api } from '$lib/api/client';
-	import type { SingboxRouterPreset } from '$lib/types';
-	import type { OutboundGroup } from './outboundOptions';
+	import { Square, SquareCheckBig } from 'lucide-svelte';
+	import type { SingboxRouterPreset, SingboxRouterPresetCategory } from '$lib/types';
 	import PresetIcon from './PresetIcon.svelte';
-	import PresetApplyModal from './PresetApplyModal.svelte';
 
 	interface Props {
 		presets: SingboxRouterPreset[];
-		outboundOptions: OutboundGroup[];
-		onApplied: () => Promise<void> | void;
+		selectedIds: Set<string>;
+		onToggleSelect: (id: string) => void;
+		onPresetClick: (p: SingboxRouterPreset) => void;
 	}
-	let { presets, outboundOptions, onApplied }: Props = $props();
+	let {
+		presets,
+		selectedIds,
+		onToggleSelect,
+		onPresetClick,
+	}: Props = $props();
 
-	let selected = $state<SingboxRouterPreset | null>(null);
+	type CategoryFilter = 'all' | SingboxRouterPresetCategory;
+
+	const CATEGORY_LABELS: Record<SingboxRouterPresetCategory, string> = {
+		social: 'Соцсети',
+		media: 'Медиа',
+		ai: 'AI',
+		developer: 'Разработка',
+		cloud: 'Облако',
+		gaming: 'Игры',
+		block: 'Блок',
+	};
+	const CATEGORY_ORDER: SingboxRouterPresetCategory[] = [
+		'social',
+		'media',
+		'ai',
+		'developer',
+		'cloud',
+		'gaming',
+		'block',
+	];
+
 	let showSensitive = $state(false);
+	let activeCategory = $state<CategoryFilter>('all');
 
 	function cardClass(p: SingboxRouterPreset): string {
 		const classes = ['card'];
 		if (p.featured) classes.push('card-featured');
 		if (p.rules.every((r) => r.actionTarget === 'reject')) classes.push('card-reject');
 		else if (p.rules.every((r) => r.actionTarget === 'direct')) classes.push('card-direct');
+		if (selectedIds.has(p.id)) classes.push('card-selected');
 		return classes.join(' ');
 	}
 
@@ -38,40 +64,126 @@
 	const featured = $derived(presets.filter((p) => p.featured));
 	const normal = $derived(presets.filter((p) => !p.featured && !p.sensitive));
 	const sensitive = $derived(presets.filter((p) => p.sensitive));
+
+	const categoryCounts = $derived(
+		CATEGORY_ORDER.reduce<Record<SingboxRouterPresetCategory, number>>(
+			(acc, key) => {
+				acc[key] = normal.filter((p) => p.category === key).length;
+				return acc;
+			},
+			{ social: 0, media: 0, ai: 0, developer: 0, cloud: 0, gaming: 0, block: 0 },
+		),
+	);
+
+	const visibleCategories = $derived(
+		CATEGORY_ORDER.filter((k) => categoryCounts[k] > 0),
+	);
+
+	const filtered = $derived(
+		activeCategory === 'all' ? normal : normal.filter((p) => p.category === activeCategory),
+	);
 </script>
 
-<div class="hint">Готовые наборы из SagerNet. Клик — добавить rule_set и правило в движок.</div>
+<div class="hint">Готовые наборы правил. Клик — добавить rule_set и правило в движок.</div>
 
 {#if featured.length > 0}
 	<div class="section-label">Рекомендуемые</div>
 	<div class="gallery">
 		{#each featured as p (p.id)}
-			<button class={cardClass(p)} onclick={() => (selected = p)} type="button">
-				<PresetIcon slug={p.iconSlug} size={44} />
-				<div class="card-body">
-					<div class="name">{p.name}</div>
-					{#if p.notice}<div class="featured-notice">{p.notice}</div>{/if}
-					<div class={`card-hint ${cardHintClass(p)}`}>{cardHint(p)}</div>
-				</div>
-			</button>
+			<div class={cardClass(p)}>
+				<button
+					type="button"
+					class="card-select"
+					aria-label={selectedIds.has(p.id) ? 'Снять выбор' : 'Выбрать'}
+					onclick={(e) => {
+						e.stopPropagation();
+						onToggleSelect(p.id);
+					}}
+				>
+					<span class="checkbox" class:checked={selectedIds.has(p.id)} aria-hidden="true">
+						{#if selectedIds.has(p.id)}
+							<SquareCheckBig size={20} />
+						{:else}
+							<Square size={20} />
+						{/if}
+					</span>
+				</button>
+				<button type="button" class="card-body-btn" onclick={() => onPresetClick(p)}>
+					<PresetIcon slug={p.iconSlug} size={44} />
+					<div class="card-body">
+						<div class="name">{p.name}</div>
+						{#if p.notice}<div class="featured-notice">{p.notice}</div>{/if}
+						<div class={`card-hint ${cardHintClass(p)}`}>{cardHint(p)}</div>
+					</div>
+				</button>
+			</div>
 		{/each}
 	</div>
 {/if}
 
 {#if normal.length > 0}
 	<div class="section-label">Сервисы и сайты</div>
-	<div class="gallery">
-		{#each normal as p (p.id)}
-			<button class={cardClass(p)} onclick={() => (selected = p)} type="button">
-				<PresetIcon slug={p.iconSlug} />
-				<div class="card-body">
-					<div class="name">{p.name}</div>
-					<div class="rs mono">{p.ruleSets[0]?.tag ?? ''}</div>
-					<div class={`card-hint ${cardHintClass(p)}`}>{cardHint(p)}</div>
-				</div>
+	{#if visibleCategories.length > 0}
+		<div class="chip-row" role="tablist" aria-label="Категории пресетов">
+			<button
+				type="button"
+				role="tab"
+				class="chip"
+				class:chip-active={activeCategory === 'all'}
+				aria-selected={activeCategory === 'all'}
+				onclick={() => (activeCategory = 'all')}
+			>
+				Все <span class="chip-count">{normal.length}</span>
 			</button>
-		{/each}
-	</div>
+			{#each visibleCategories as key (key)}
+				<button
+					type="button"
+					role="tab"
+					class="chip"
+					class:chip-active={activeCategory === key}
+					aria-selected={activeCategory === key}
+					onclick={() => (activeCategory = key)}
+				>
+					{CATEGORY_LABELS[key]} <span class="chip-count">{categoryCounts[key]}</span>
+				</button>
+			{/each}
+		</div>
+	{/if}
+	{#if filtered.length > 0}
+		<div class="gallery">
+			{#each filtered as p (p.id)}
+				<div class={cardClass(p)}>
+					<button
+						type="button"
+						class="card-select"
+						aria-label={selectedIds.has(p.id) ? 'Снять выбор' : 'Выбрать'}
+						onclick={(e) => {
+							e.stopPropagation();
+							onToggleSelect(p.id);
+						}}
+					>
+						<span class="checkbox" class:checked={selectedIds.has(p.id)} aria-hidden="true">
+							{#if selectedIds.has(p.id)}
+								<SquareCheckBig size={20} />
+							{:else}
+								<Square size={20} />
+							{/if}
+						</span>
+					</button>
+					<button type="button" class="card-body-btn" onclick={() => onPresetClick(p)}>
+						<PresetIcon slug={p.iconSlug} />
+						<div class="card-body">
+							<div class="name">{p.name}</div>
+							<div class="rs mono">{p.ruleSets[0]?.tag ?? ''}</div>
+							<div class={`card-hint ${cardHintClass(p)}`}>{cardHint(p)}</div>
+						</div>
+					</button>
+				</div>
+			{/each}
+		</div>
+	{:else}
+		<div class="empty">В этой категории пресетов нет.</div>
+	{/if}
 {/if}
 
 {#if sensitive.length > 0}
@@ -84,30 +196,36 @@
 	{#if showSensitive}
 		<div class="gallery">
 			{#each sensitive as p (p.id)}
-				<button class={cardClass(p)} onclick={() => (selected = p)} type="button">
-					<PresetIcon slug={p.iconSlug} />
-					<div class="card-body">
-						<div class="name">{p.name}</div>
-						<div class="rs mono">{p.ruleSets[0]?.tag ?? ''}</div>
-						<div class={`card-hint ${cardHintClass(p)}`}>{cardHint(p)}</div>
-					</div>
-				</button>
+				<div class={cardClass(p)}>
+					<button
+						type="button"
+						class="card-select"
+						aria-label={selectedIds.has(p.id) ? 'Снять выбор' : 'Выбрать'}
+						onclick={(e) => {
+							e.stopPropagation();
+							onToggleSelect(p.id);
+						}}
+					>
+						<span class="checkbox" class:checked={selectedIds.has(p.id)} aria-hidden="true">
+							{#if selectedIds.has(p.id)}
+								<SquareCheckBig size={20} />
+							{:else}
+								<Square size={20} />
+							{/if}
+						</span>
+					</button>
+					<button type="button" class="card-body-btn" onclick={() => onPresetClick(p)}>
+						<PresetIcon slug={p.iconSlug} />
+						<div class="card-body">
+							<div class="name">{p.name}</div>
+							<div class="rs mono">{p.ruleSets[0]?.tag ?? ''}</div>
+							<div class={`card-hint ${cardHintClass(p)}`}>{cardHint(p)}</div>
+						</div>
+					</button>
+				</div>
 			{/each}
 		</div>
 	{/if}
-{/if}
-
-{#if selected}
-	<PresetApplyModal
-		preset={selected}
-		{outboundOptions}
-		onClose={() => (selected = null)}
-		onApply={async (id, outbound) => {
-			await api.singboxRouterApplyPreset(id, outbound);
-			selected = null;
-			await onApplied();
-		}}
-	/>
 {/if}
 
 <style>
@@ -129,17 +247,10 @@
 		gap: 0.5rem;
 	}
 	.card {
-		display: flex;
-		align-items: center;
-		gap: 0.75rem;
-		padding: 0.75rem;
+		position: relative;
 		background: var(--surface-bg);
 		border: 1px solid transparent;
 		border-radius: 6px;
-		cursor: pointer;
-		text-align: left;
-		font: inherit;
-		color: inherit;
 		transition: border-color 0.1s, background 0.1s;
 	}
 	.card:hover {
@@ -155,6 +266,45 @@
 	}
 	.card-direct {
 		border-color: var(--success, #22c55e);
+	}
+	.card-selected {
+		border-color: var(--accent, #3b82f6) !important;
+		background: rgba(59, 130, 246, 0.10);
+	}
+	.card-select {
+		all: unset;
+		position: absolute;
+		top: 4px;
+		right: 4px;
+		padding: 6px;
+		cursor: pointer;
+		color: var(--muted-text);
+		z-index: 1;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		border-radius: 4px;
+		line-height: 0;
+	}
+	.card-select:hover { color: var(--text); }
+	.checkbox {
+		display: inline-flex;
+		color: inherit;
+	}
+	.checkbox.checked {
+		color: var(--accent, #3b82f6);
+	}
+	.card-body-btn {
+		all: unset;
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		padding: 0.75rem;
+		width: 100%;
+		text-align: left;
+		color: inherit;
+		font: inherit;
 	}
 	.card-body {
 		flex: 1;
@@ -208,5 +358,42 @@
 		align-items: center;
 		gap: 0.4rem;
 		cursor: pointer;
+	}
+	.chip-row {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.4rem;
+		margin: 0 0 0.6rem;
+	}
+	.chip {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+		padding: 0.3rem 0.7rem;
+		font: inherit;
+		font-size: 0.8rem;
+		color: var(--muted-text);
+		background: var(--surface-bg);
+		border: 1px solid transparent;
+		border-radius: 999px;
+		cursor: pointer;
+		transition: border-color 0.1s, color 0.1s, background 0.1s;
+	}
+	.chip:hover {
+		border-color: var(--accent, #3b82f6);
+	}
+	.chip-active {
+		color: var(--text);
+		border-color: var(--accent, #3b82f6);
+		background: rgba(59, 130, 246, 0.12);
+	}
+	.chip-count {
+		font-size: 0.7rem;
+		opacity: 0.7;
+	}
+	.empty {
+		color: var(--muted-text);
+		font-size: 0.85rem;
+		padding: 0.75rem 0;
 	}
 </style>

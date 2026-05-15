@@ -42,6 +42,16 @@ func ApplyPresetToConfig(cfg *RouterConfig, presetID, outboundTag string) error 
 		} else if pr.ActionTarget == "direct" {
 			rule.Outbound = "direct"
 		}
+		dup := false
+		for _, existing := range cfg.Route.Rules {
+			if ruleEqual(existing, rule) {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			continue
+		}
 		if err := cfg.AddRule(rule); err != nil {
 			return err
 		}
@@ -65,6 +75,24 @@ func hasRuleSet(existing []RuleSet, tag string) bool {
 		}
 	}
 	return false
+}
+
+func ruleEqual(a, b Rule) bool {
+	if a.Action != b.Action {
+		return false
+	}
+	if a.Outbound != b.Outbound {
+		return false
+	}
+	if len(a.RuleSet) != len(b.RuleSet) {
+		return false
+	}
+	for i := range a.RuleSet {
+		if a.RuleSet[i] != b.RuleSet[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func actionFor(target string) string {

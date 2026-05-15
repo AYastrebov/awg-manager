@@ -16,13 +16,23 @@ dist/
 Thumbs.db
 
 # Frontend
-frontend/node_modules/
+node_modules/
 frontend/build/
 frontend/.svelte-kit/
+frontend/static/openapi.yaml
+yarn.lock
 
 # Planning & docs (internal only)
 docs/
 .planning/
+debug.md
+tree.md
+pub.md
+diff.md
+build.log
+
+# Windows-only helper scripts (personal tooling — never commit)
+*.bat
 
 # Claude (all internal)
 .claude/
@@ -31,6 +41,9 @@ screenshots/
 
 # Worktrees
 .worktrees/
+
+# Reference/external projects cloned for analysis (e.g. SKeen).
+reference/
 
 # Not needed in remote
 CHANGELOG.md
@@ -48,4 +61,5 @@ test-results/
 scripts/release.sh
 scripts/backfill-changelog.sh
 scripts/build-singbox-naive.sh
+scripts/build-singbox-binaries.sh
 scripts/publish-github-release.sh

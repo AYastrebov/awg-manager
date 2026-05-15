@@ -11,7 +11,7 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/ndms/query"
 	"github.com/hoaxisr/awg-manager/internal/ndms/transport"
 	"github.com/hoaxisr/awg-manager/internal/pingcheck"
-	"github.com/hoaxisr/awg-manager/internal/rci"
+	"github.com/hoaxisr/awg-manager/internal/singbox"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 	"github.com/hoaxisr/awg-manager/internal/sys/kmod"
 	"github.com/hoaxisr/awg-manager/internal/tunnel/backend"
@@ -22,21 +22,15 @@ import (
 // Report is the top-level diagnostics report.
 type Report struct {
 	Version     string             `json:"version"`
-	GeneratedAt time.Time          `json:"generatedAt"`
-	DurationMs  int64              `json:"durationMs"`
-	Route       RouteInfoMeta      `json:"route"`
-	System      SystemInfo         `json:"system"`
-	WAN         WANInfo            `json:"wan"`
-	Tunnels     []TunnelInfo       `json:"tunnels"`
-	Tests       []TestResult       `json:"tests"`
-	Logs        []logging.LogEntry `json:"logs"`
-}
-
-// RouteInfoMeta captures diagnostics route selection used for network tests.
-type RouteInfoMeta struct {
-	Mode       RouteMode `json:"mode"`
-	TunnelID   string    `json:"tunnelId,omitempty"`
-	TunnelName string    `json:"tunnelName,omitempty"`
+	GeneratedAt    time.Time          `json:"generatedAt"`
+	DurationMs     int64              `json:"durationMs"`
+	System         SystemInfo         `json:"system"`
+	WAN            WANInfo            `json:"wan"`
+	BootHealth     BootHealth         `json:"bootHealth"`
+	AWGProxyModule AWGProxyModule     `json:"awgProxyModule"`
+	Tunnels        []TunnelInfo       `json:"tunnels"`
+	Tests          []TestResult       `json:"tests"`
+	Logs           []logging.LogEntry `json:"logs"`
 }
 
 // SystemInfo contains system-level diagnostics.
@@ -70,6 +64,37 @@ type WANInfo struct {
 type WANIfaceInfo struct {
 	Up    bool   `json:"up"`
 	Label string `json:"label"`
+}
+
+// BootHealth детектит регрессию "enabled-туннели не были перезапущены
+// при старте демона". Заполняется collectBootHealth.
+type BootHealth struct {
+	DaemonStartedAt  time.Time         `json:"daemonStartedAt"`
+	DaemonUptimeSec  int               `json:"daemonUptimeSec"`
+	GracePeriodSec   int               `json:"gracePeriodSec"`
+	ExpectedRunning  []string          `json:"expectedRunning"`
+	ActualRunning    []string          `json:"actualRunning"`
+	NotStartedOnBoot []TunnelBootIssue `json:"notStartedOnBoot,omitempty"`
+}
+
+type TunnelBootIssue struct {
+	TunnelID        string `json:"tunnelId"`
+	TunnelName      string `json:"tunnelName"`
+	Backend         string `json:"backend"`
+	Enabled         bool   `json:"enabled"`
+	AutoStart       bool   `json:"autoStart"`
+	StoredStartedAt string `json:"storedStartedAt,omitempty"`
+	Reason          string `json:"reason"` // "never_started"
+}
+
+// AWGProxyModule — состояние kmod awg-proxy (включая dmesg-сигналы).
+// Заполняется collectAWGProxyModule. Всё в этой секции anonymized.
+type AWGProxyModule struct {
+	Loaded        bool     `json:"loaded"`
+	Version       string   `json:"version,omitempty"`
+	EndpointCount int      `json:"endpointCount"`
+	RawList       string   `json:"rawList,omitempty"`
+	DmesgLines    []string `json:"dmesgLines,omitempty"`
 }
 
 // TunnelInfo contains per-tunnel diagnostics.
@@ -208,28 +233,22 @@ type RunStatus struct {
 	Error    string `json:"error,omitempty"`
 }
 
-// RunMode determines what the diagnostic run does.
-type RunMode string
+// processStartedAt записывает момент старта процесса демона. Используется
+// collectBootHealth чтобы понимать прошёл ли grace-период с boot.
+// По умолчанию инициализируется временем импорта пакета (это близко к
+// старту демона, потому что main.go импортирует пакет рано). Чтобы зафиксировать
+// точный момент старта main, вызови SetProcessStartedAt(time.Now()) из main.go.
+var processStartedAt = time.Now()
 
-const (
-	ModeQuick RunMode = "quick"
-	ModeFull  RunMode = "full"
-)
-
-// RouteMode controls how outbound network checks are routed during diagnostics.
-type RouteMode string
-
-const (
-	RouteDirect RouteMode = "direct"
-	RouteTunnel RouteMode = "tunnel"
-)
+// SetProcessStartedAt позволяет main установить точное время старта.
+// Тесты могут вызывать с фиксированным временем для детерминированности.
+func SetProcessStartedAt(t time.Time) {
+	processStartedAt = t
+}
 
 // RunOptions configures a diagnostic run.
 type RunOptions struct {
-	Mode           RunMode
 	IncludeRestart bool
-	RouteMode      RouteMode
-	RouteTunnelID  string
 }
 
 // DiagEvent is a single event emitted during a diagnostic run.
@@ -294,6 +313,10 @@ var testLevels = map[string]string{
 	"dns_leak_check":              LevelDetailed,
 	"proxy_health":                LevelBasic,
 	"pingcheck_health":            LevelBasic,
+	"direct_connectivity":         LevelBasic,
+	"singbox_runtime":             LevelBasic,
+	"singbox_tunnel_state":        LevelBasic,
+	"singbox_tunnel_connectivity": LevelBasic,
 }
 
 func testLevel(name string) string {
@@ -322,23 +345,48 @@ type PingCheckForDiag interface {
 	GetStatus() []pingcheck.TunnelStatus
 }
 
+// SingboxForDiag is the subset of singbox.Operator used by diagnostics.
+type SingboxForDiag interface {
+	GetStatus(ctx context.Context) singbox.Status
+	ListTunnels(ctx context.Context) ([]singbox.TunnelInfo, error)
+}
+
+// SingboxSubMember is a subscription member view used by diagnostics.
+// Only active+enabled members are probed; the rest surface as Skip so
+// the UI can explain why no test ran. ActiveKnown=false signals that
+// active-member detection itself failed and diagnostics must not guess.
+type SingboxSubMember struct {
+	Tag string
+	// ListenPort is the subscription's mixed-inbound port (one per
+	// subscription, shared by all members via the selector). Same value
+	// is propagated to every SingboxSubMember of the same subscription;
+	// only meaningful for probing the currently-active member.
+	ListenPort  int
+	Enabled     bool
+	Active      bool
+	ActiveKnown bool
+}
+
 // Deps holds all dependencies needed by the diagnostics runner.
 type Deps struct {
-	TunnelService   TunnelServiceForDiag
-	RCI             *rci.Client
-	NDMSQueries     *query.Queries
-	NDMSTransport   *transport.Client
-	Backend         backend.Backend
-	KmodLoader      *kmod.Loader
-	TunnelStore     *storage.AWGTunnelStore
-	LogService      LogServiceForDiag
-	AppVersion      string
-	PingCheckFacade PingCheckForDiag
+	TunnelService     TunnelServiceForDiag
+	NDMSQueries       *query.Queries
+	NDMSTransport     *transport.Client
+	Backend           backend.Backend
+	KmodLoader        *kmod.Loader
+	TunnelStore       *storage.AWGTunnelStore
+	LogService        LogServiceForDiag
+	AppVersion        string
+	PingCheckFacade   PingCheckForDiag
+	Singbox           SingboxForDiag
+	SingboxSubMembers func() []SingboxSubMember
+	AppLogger         logging.AppLogger
 }
 
 // Runner executes diagnostic runs.
 type Runner struct {
-	deps Deps
+	deps   Deps
+	appLog *logging.ScopedLogger
 
 	mu          sync.Mutex
 	status      RunStatus
@@ -351,6 +399,7 @@ type Runner struct {
 func NewRunner(deps Deps) *Runner {
 	return &Runner{
 		deps:   deps,
+		appLog: logging.NewScopedLogger(deps.AppLogger, logging.GroupSystem, logging.SubDiagnostics),
 		status: RunStatus{Status: "idle"},
 	}
 }
@@ -477,22 +526,17 @@ func (r *Runner) RunWithStream(ctx context.Context, opts RunOptions) (<-chan Dia
 
 func (r *Runner) execute(ctx context.Context) {
 	r.opts = RunOptions{
-		Mode:           ModeFull,
 		IncludeRestart: true,
-		RouteMode:      RouteDirect,
 	}
 	r.executeStream(ctx)
 }
 
 func (r *Runner) executeStream(ctx context.Context) {
 	start := time.Now()
+	r.appLog.Info("run", "", "Diagnostics started")
 	report := &Report{
 		Version:     "1.0",
 		GeneratedAt: start,
-		Route: RouteInfoMeta{
-			Mode:     r.opts.RouteMode,
-			TunnelID: r.opts.RouteTunnelID,
-		},
 	}
 
 	var allResults []TestResult
@@ -500,6 +544,7 @@ func (r *Runner) executeStream(ctx context.Context) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			r.emit(DiagEvent{Type: "error", Message: fmt.Sprintf("panic: %v", rec)})
+			r.appLog.Error("run", "", fmt.Sprintf("Diagnostics panicked: %v", rec))
 			r.mu.Lock()
 			r.status = RunStatus{Status: "error", Error: fmt.Sprintf("panic: %v", rec)}
 			r.mu.Unlock()
@@ -509,6 +554,7 @@ func (r *Runner) executeStream(ctx context.Context) {
 
 		report.DurationMs = time.Since(start).Milliseconds()
 		report.Tests = allResults
+		r.appLog.Info("run", "", fmt.Sprintf("Diagnostics complete in %dms (%d tests)", report.DurationMs, len(allResults)))
 
 		summary := &DoneSummary{Total: len(allResults)}
 		for _, tr := range allResults {
@@ -522,13 +568,11 @@ func (r *Runner) executeStream(ctx context.Context) {
 			}
 		}
 
-		if r.opts.Mode == ModeFull {
-			anonymize(report)
-			r.mu.Lock()
-			r.result = report
-			r.mu.Unlock()
-			summary.HasReport = true
-		}
+		anonymize(report)
+		r.mu.Lock()
+		r.result = report
+		r.mu.Unlock()
+		summary.HasReport = true
 
 		r.emit(DiagEvent{Type: "done", Summary: summary})
 
@@ -539,36 +583,23 @@ func (r *Runner) executeStream(ctx context.Context) {
 		r.closeSubscribers()
 	}()
 
-	if r.opts.Mode == ModeFull {
-		r.emitPhase("collect_system", "Сбор информации о системе...")
-		report.System = r.collectSystem(ctx)
+	r.emitPhase("collect_system", "Сбор информации о системе...")
+	report.System = r.collectSystem(ctx)
 
-		r.emitPhase("collect_wan", "Сбор информации о WAN...")
-		report.WAN = r.collectWAN(ctx)
+	r.emitPhase("collect_wan", "Сбор информации о WAN...")
+	report.WAN = r.collectWAN(ctx)
 
-		r.emitPhase("collect_tunnels", "Сбор информации о туннелях...")
-		report.Tunnels = r.collectTunnels(ctx)
-		report.Route.TunnelName = resolveRouteTunnelName(report.Tunnels, report.Route.TunnelID)
+	r.emitPhase("collect_boot_health", "Проверка boot-состояния...")
+	report.BootHealth = r.collectBootHealth(ctx)
 
-		r.emitPhase("collect_logs", "Сбор логов...")
-		report.Logs = r.collectLogs()
-	} else {
-		r.emitPhase("collect_tunnels", "Получение списка туннелей...")
-		report.Tunnels = r.collectTunnels(ctx)
-		report.Route.TunnelName = resolveRouteTunnelName(report.Tunnels, report.Route.TunnelID)
-	}
+	r.emitPhase("collect_proxy_module", "Состояние awg-proxy...")
+	report.AWGProxyModule = r.collectAWGProxyModule(ctx)
+
+	r.emitPhase("collect_tunnels", "Сбор информации о туннелях...")
+	report.Tunnels = r.collectTunnels(ctx)
+
+	r.emitPhase("collect_logs", "Сбор логов...")
+	report.Logs = r.collectLogs()
 
 	allResults = r.runTestsWithEvents(ctx, report)
-}
-
-func resolveRouteTunnelName(tunnels []TunnelInfo, tunnelID string) string {
-	if tunnelID == "" {
-		return ""
-	}
-	for _, t := range tunnels {
-		if t.ID == tunnelID {
-			return t.Name
-		}
-	}
-	return ""
 }

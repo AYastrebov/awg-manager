@@ -184,6 +184,35 @@ html.light, [data-theme="light"] {
   --text-tertiary: var(--color-text-muted);
   --border: var(--color-border);
   --border-hover: var(--color-border-hover);
+
+  /* Log subgroup family palette — fg/bg/border per family. */
+  --family-routing-fg:           #5b8def;
+  --family-routing-bg:           rgba(91, 141, 239, 0.12);
+  --family-routing-bd:           rgba(91, 141, 239, 0.32);
+
+  --family-lifecycle-fg:         #e89243;
+  --family-lifecycle-bg:         rgba(232, 146, 67, 0.12);
+  --family-lifecycle-bd:         rgba(232, 146, 67, 0.32);
+
+  --family-network-fg:           #4caf78;
+  --family-network-bg:           rgba(76, 175, 120, 0.12);
+  --family-network-bd:           rgba(76, 175, 120, 0.32);
+
+  --family-policy-fg:            #a874e0;
+  --family-policy-bg:            rgba(168, 116, 224, 0.12);
+  --family-policy-bd:            rgba(168, 116, 224, 0.32);
+
+  --family-system-fg:            #8a9099;
+  --family-system-bg:            rgba(138, 144, 153, 0.12);
+  --family-system-bd:            rgba(138, 144, 153, 0.32);
+
+  --family-feature-fg:           #2dbdb6;
+  --family-feature-bg:           rgba(45, 189, 182, 0.12);
+  --family-feature-bd:           rgba(45, 189, 182, 0.32);
+
+  --family-singbox-runtime-fg:   #c46b8a;
+  --family-singbox-runtime-bg:   rgba(196, 107, 138, 0.12);
+  --family-singbox-runtime-bd:   rgba(196, 107, 138, 0.32);
 }
 
 /* ─── Reset ─── */
@@ -200,6 +229,11 @@ html, body {
   line-height: 1.5;
   background: var(--color-bg-primary);
   color: var(--color-text-primary);
+  overflow-x: hidden;
+}
+
+.setting-description {
+  overflow-wrap: anywhere;
 }
 
 #app {
@@ -230,7 +264,11 @@ a:hover {
 }
 
 /* Form elements */
-input, textarea, select {
+/* Form-control reset for text-shaped inputs only. Checkbox/radio keep
+ * their native rendering — applying width:100% / padding / bg here
+ * stretched checkboxes to fill the parent flex row and broke layouts
+ * that mix a checkbox with text content (e.g. import preview rows). */
+input:not([type="checkbox"]):not([type="radio"]), textarea, select {
 	width: 100%;
 	padding: 0.5rem 0.75rem;
 	background: var(--bg-secondary);
@@ -241,7 +279,7 @@ input, textarea, select {
 	transition: border-color 0.15s ease;
 }
 
-input:focus, textarea:focus, select:focus {
+input:not([type="checkbox"]):not([type="radio"]):focus, textarea:focus, select:focus {
 	outline: none;
 	border-color: var(--accent);
 }
@@ -365,6 +403,13 @@ label {
 	to { transform: rotate(360deg); }
 }
 
+/* Loading-centered wrapper (used by tab-loading panels and full-page loaders) */
+.loading-centered {
+	min-height: 220px;
+	display: grid;
+	place-items: center;
+}
+
 /* Page layout */
 .page {
 	flex: 1;
@@ -381,6 +426,22 @@ label {
 .page-title {
 	font-size: 1.5rem;
 	font-weight: 600;
+}
+
+.back-link {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	color: var(--text-secondary);
+	font-size: 13px;
+	padding: 6px 10px;
+	border-radius: 6px;
+	transition: all 0.15s;
+}
+
+.back-link:hover {
+	background: var(--bg-tertiary);
+	color: var(--text-primary);
 }
 
 /* Empty state */
@@ -417,10 +478,33 @@ label {
 	min-width: 280px;
 	max-width: 400px;
 	animation: slideIn 0.2s ease;
-	cursor: pointer;
 	font: inherit;
 	color: inherit;
 	text-align: left;
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+}
+
+.toast-message {
+	flex: 1;
+	background: transparent;
+	border: 0;
+	color: inherit;
+	text-align: left;
+	cursor: pointer;
+	padding: 0;
+	font: inherit;
+}
+
+.toast-action {
+	color: var(--accent);
+	text-decoration: none;
+	white-space: nowrap;
+}
+
+.toast-action:hover {
+	text-decoration: underline;
 }
 
 .toast-dismiss-all {
@@ -517,6 +601,12 @@ label {
 	justify-content: space-between;
 	gap: 1rem;
 	padding: 0.875rem 0;
+	flex-wrap: wrap;
+}
+
+.setting-row > *:first-child {
+	min-width: 0;
+	flex: 1 1 0;
 }
 
 .setting-row:first-child {
@@ -894,7 +984,7 @@ label {
 
 .route-grid {
 	display: grid;
-	grid-template-columns: repeat(2, minmax(0, 1fr));
+	grid-template-columns: repeat(3, minmax(0, 1fr));
 	gap: 12px;
 }
 
@@ -926,6 +1016,12 @@ label {
 	margin-top: 4px;
 }
 
+@media (max-width: 1024px) {
+	.route-grid {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+	}
+}
+
 @media (max-width: 768px) {
 	.route-grid {
 		grid-template-columns: 1fr;
@@ -934,6 +1030,17 @@ label {
 		flex-direction: column;
 		align-items: flex-start;
 		gap: 0.5rem;
+	}
+}
+
+@media (max-width: 640px) {
+	.setting-row {
+		flex-direction: column;
+		align-items: stretch;
+		gap: 0.5rem;
+	}
+	.setting-row > *:first-child {
+		flex: initial;
 	}
 }
 
@@ -950,11 +1057,14 @@ label {
 .proto-udp { background: rgba(34,197,94,0.15); color: var(--success, #22c55e); }
 .proto-icmp { background: rgba(245,158,11,0.15); color: var(--warning, #f59e0b); }
 
-/* ─── Tunnel/server card grid (auto-fill 360px min) ─── */
+/* ─── Tunnel/server card grid (responsive: column shrinks to 100% on narrow viewports) ─── */
 .tunnel-grid {
 	display: grid;
-	grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+	grid-template-columns: repeat(auto-fill, minmax(min(100%, 360px), 1fr));
 	gap: 14px;
+}
+.tunnel-grid > * {
+	min-width: 0;
 }
 
 /* ─── Bare form-control primitives (for inline grid contexts where the Input/Select
@@ -1083,6 +1193,15 @@ label {
 	cursor: not-allowed;
 }
 
+/* Base active state for any .chip without a -level-* / -group-* modifier.
+   Specializations below match this rule's specificity (0,2,0); they win by
+   source order — keep this rule above the .chip-level-* / .chip-group-* blocks. */
+.chip.chip-active {
+	background: var(--color-accent);
+	color: var(--color-accent-contrast, #ffffff);
+	border-color: var(--color-accent);
+}
+
 .chip-level-error.chip-active {
 	background: var(--color-error-tint);
 	color: var(--color-error);
@@ -1115,7 +1234,63 @@ label {
 	border-color: var(--color-text-muted);
 }
 
+.chip-group-singbox.chip-active {
+	background: var(--color-info-tint, var(--color-bg-tertiary));
+	color: var(--color-info, var(--color-accent));
+	border-color: var(--color-info, var(--color-accent));
+}
+
 .chip-danger:hover:not(:disabled) {
 	color: var(--color-error);
 	border-color: var(--color-error-border);
+}
+
+/* Subgroup pill — colored badge keyed by family via [data-family]. */
+.subgroup-pill {
+	display: inline-block;
+	padding: 0.0625rem 0.375rem;
+	font-size: 10px;
+	font-weight: 600;
+	line-height: 1.4;
+	border-radius: var(--radius-pill);
+	font-variant-numeric: tabular-nums;
+	border: 1px solid transparent;
+	/* default for unknown family: muted */
+	color: var(--color-text-muted);
+	background: var(--color-bg-secondary);
+	white-space: nowrap;
+}
+.subgroup-pill[data-family="routing"]         { color: var(--family-routing-fg);         background: var(--family-routing-bg);         border-color: var(--family-routing-bd); }
+.subgroup-pill[data-family="lifecycle"]       { color: var(--family-lifecycle-fg);       background: var(--family-lifecycle-bg);       border-color: var(--family-lifecycle-bd); }
+.subgroup-pill[data-family="network"]         { color: var(--family-network-fg);         background: var(--family-network-bg);         border-color: var(--family-network-bd); }
+.subgroup-pill[data-family="policy"]          { color: var(--family-policy-fg);          background: var(--family-policy-bg);          border-color: var(--family-policy-bd); }
+.subgroup-pill[data-family="system"]          { color: var(--family-system-fg);          background: var(--family-system-bg);          border-color: var(--family-system-bd); }
+.subgroup-pill[data-family="feature"]         { color: var(--family-feature-fg);         background: var(--family-feature-bg);         border-color: var(--family-feature-bd); }
+.subgroup-pill[data-family="singbox-runtime"] { color: var(--family-singbox-runtime-fg); background: var(--family-singbox-runtime-bg); border-color: var(--family-singbox-runtime-bd); }
+
+/* Shared icon-row field (used in DnsRouteEditModal, IpRouteEditModal). */
+.icon-row {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	padding: 10px;
+	background: var(--bg-primary);
+	border: 1px solid var(--border);
+	border-radius: 6px;
+}
+.icon-meta {
+	flex: 1;
+	min-width: 0;
+}
+.icon-src {
+	font-size: 0.8125rem;
+	color: var(--text-primary);
+}
+.icon-hint {
+	font-size: 0.6875rem;
+	color: var(--text-muted);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	margin-top: 2px;
 }

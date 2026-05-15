@@ -1,6 +1,9 @@
 package singbox
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // TunnelInfo is the UI-facing summary of one sing-box tunnel.
 // Derived from config.json: outbound + matching inbound + route rule.
@@ -37,6 +40,17 @@ type ParsedOutbound struct {
 	Outbound json.RawMessage // sing-box outbound JSON, ready to splice into config
 }
 
+// BatchError records which input failed to parse or apply.
+type BatchError struct {
+	Line  int
+	Input string
+	Err   error
+}
+
+func (e BatchError) Error() string {
+	return fmt.Sprintf("line %d: %v", e.Line, e.Err)
+}
+
 // Status is the top-level process + install state.
 type Status struct {
 	Installed   bool   `json:"installed"`
@@ -60,6 +74,12 @@ type Status struct {
 	// Process.OnExit. Cleared on successful start. UI surfaces this when
 	// Running=false to explain why sing-box is down.
 	LastError string `json:"lastError,omitempty"`
+	// CurrentVersion is the version of the binary on disk ("" when not installed).
+	CurrentVersion string `json:"currentVersion,omitempty"`
+	// RequiredVersion is the version this awg-manager build is pinned to.
+	RequiredVersion string `json:"requiredVersion"`
+	// UpdateAvailable is true when CurrentVersion != "" and differs from RequiredVersion.
+	UpdateAvailable bool `json:"updateAvailable"`
 }
 
 // ProcessState is the internal lifecycle state.

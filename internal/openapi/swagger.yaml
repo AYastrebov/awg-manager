@@ -23,6 +23,14 @@ definitions:
         example: invalid request
         type: string
     type: object
+  api.ASCParamsResponse:
+    properties:
+      data:
+        type: object
+      success:
+        example: true
+        type: boolean
+    type: object
   api.AWGInterfaceDTO:
     properties:
       address:
@@ -70,6 +78,31 @@ definitions:
       s4:
         example: 0
         type: integer
+    type: object
+  api.AWGOutboundTagDTO:
+    properties:
+      iface:
+        example: t2s0
+        type: string
+      kind:
+        example: managed
+        type: string
+      label:
+        example: My VPN
+        type: string
+      tag:
+        example: awg-vpn0
+        type: string
+    type: object
+  api.AWGOutboundTagsResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/api.AWGOutboundTagDTO'
+        type: array
+      success:
+        example: true
+        type: boolean
     type: object
   api.AWGPeerDTO:
     properties:
@@ -169,6 +202,35 @@ definitions:
         example: 1
         type: integer
     type: object
+  api.AccessPolicyResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.AccessPolicyDTO'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.ActiveNowResponse:
+    properties:
+      now:
+        example: sub-abc-aaaa
+        type: string
+    type: object
+  api.AddGeoFileRequest:
+    properties:
+      type:
+        example: geosite
+        type: string
+      url:
+        example: https://cdn.example.com/geosite.db
+        type: string
+    type: object
+  api.AddMemberRequest:
+    properties:
+      shareLink:
+        example: vless://...@h.example:443?security=tls&sni=h
+        type: string
+    type: object
   api.AddPeerRequestDTO:
     properties:
       description:
@@ -197,6 +259,15 @@ definitions:
       success:
         example: true
         type: boolean
+    type: object
+  api.AssignDeviceRequest:
+    properties:
+      mac:
+        example: aa:bb:cc:dd:ee:ff
+        type: string
+      policy:
+        example: Policy0
+        type: string
     type: object
   api.AuthStatusResponse:
     properties:
@@ -339,6 +410,10 @@ definitions:
       stats:
         $ref: '#/definitions/api.ConnectionStatsDTO'
       tunnels:
+        additionalProperties:
+          $ref: '#/definitions/api.TunnelConnectionInfoDTO'
+        description: 'Tunnels: per-tunnel counts; key "" is direct traffic (same as
+          query tunnel=direct / UI Direct chip).'
         type: object
     type: object
   api.ConnectionsPaginationDTO:
@@ -426,6 +501,12 @@ definitions:
         example: My VPN
         type: string
     type: object
+  api.CreateAccessPolicyRequest:
+    properties:
+      description:
+        example: My VPN policy
+        type: string
+    type: object
   api.CreateServerRequestDTO:
     properties:
       address:
@@ -495,6 +576,55 @@ definitions:
         type: integer
       selectedOutbound:
         example: proxy-01
+        type: string
+    type: object
+  api.DeviceProxyInstanceData:
+    properties:
+      auth:
+        $ref: '#/definitions/api.DeviceProxyAuthDTO'
+      enabled:
+        example: false
+        type: boolean
+      id:
+        example: default
+        type: string
+      listenAll:
+        example: true
+        type: boolean
+      listenInterface:
+        example: br0
+        type: string
+      name:
+        example: Прокси
+        type: string
+      port:
+        example: 1099
+        type: integer
+      selectedOutbound:
+        example: proxy-01
+        type: string
+    type: object
+  api.DeviceProxyInstanceIPCheckResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.DeviceProxyInstanceIPCheckResultDTO'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.DeviceProxyInstanceIPCheckResultDTO:
+    properties:
+      directIp:
+        example: 203.0.113.1
+        type: string
+      ipChanged:
+        example: false
+        type: boolean
+      proxyIp:
+        example: 198.51.100.42
+        type: string
+      service:
+        example: https://api.ipify.org
         type: string
     type: object
   api.DeviceProxyOutboundDTO:
@@ -597,6 +727,9 @@ definitions:
       enabled:
         example: true
         type: boolean
+      iconUrl:
+        example: https://cdn.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Telegram.png
+        type: string
       id:
         example: dns_xyz789
         type: string
@@ -666,6 +799,12 @@ definitions:
         example: true
         type: boolean
     type: object
+  api.EnabledToggleRequest:
+    properties:
+      enabled:
+        example: true
+        type: boolean
+    type: object
   api.ExternalTunnelDTO:
     properties:
       endpoint:
@@ -695,6 +834,59 @@ definitions:
       data:
         items:
           $ref: '#/definitions/api.ExternalTunnelDTO'
+        type: array
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.GeoFileEntryDTO:
+    properties:
+      path:
+        example: /opt/etc/hrneo/geosite.db
+        type: string
+      size:
+        example: 3145728
+        type: integer
+      tagCount:
+        example: 420
+        type: integer
+      type:
+        example: geosite
+        type: string
+      updated:
+        example: "2024-01-15T02:00:00Z"
+        type: string
+      url:
+        example: https://cdn.example.com/geosite.db
+        type: string
+    type: object
+  api.GeoFileResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.GeoFileEntryDTO'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.GeoFileUpdatedData:
+    properties:
+      updated:
+        example: 1
+        type: integer
+    type: object
+  api.GeoFileUpdatedResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.GeoFileUpdatedData'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.GeoFilesResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/api.GeoFileEntryDTO'
         type: array
       success:
         example: true
@@ -841,6 +1033,24 @@ definitions:
         example: true
         type: boolean
     type: object
+  api.IpsetUsageData:
+    properties:
+      maxElem:
+        example: 65536
+        type: integer
+      usage:
+        additionalProperties:
+          type: integer
+        type: object
+    type: object
+  api.IpsetUsageResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.IpsetUsageData'
+      success:
+        example: true
+        type: boolean
+    type: object
   api.LogEntryDTO:
     properties:
       action:
@@ -867,6 +1077,9 @@ definitions:
     type: object
   api.LoggingSettingsDTO:
     properties:
+      appMaxEntries:
+        example: 5000
+        type: integer
       enabled:
         example: true
         type: boolean
@@ -874,7 +1087,10 @@ definitions:
         example: info
         type: string
       maxAge:
-        example: 7
+        example: 2
+        type: integer
+      singboxMaxEntries:
+        example: 5000
         type: integer
     type: object
   api.LoginRequest:
@@ -895,6 +1111,15 @@ definitions:
     type: object
   api.LogsData:
     properties:
+      bucket:
+        example: app
+        type: string
+      bufferCapacity:
+        example: 5000
+        type: integer
+      bufferSize:
+        example: 123
+        type: integer
       enabled:
         example: true
         type: boolean
@@ -902,6 +1127,9 @@ definitions:
         items:
           $ref: '#/definitions/api.LogEntryDTO'
         type: array
+      oldestTimestamp:
+        example: "2024-01-15T08:00:00Z"
+        type: string
       total:
         example: 42
         type: integer
@@ -910,6 +1138,38 @@ definitions:
     properties:
       data:
         $ref: '#/definitions/api.LogsData'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.ManagedPeerDTO:
+    properties:
+      description:
+        example: My Phone
+        type: string
+      dns:
+        example: 8.8.8.8
+        type: string
+      enabled:
+        example: true
+        type: boolean
+      presharedKey:
+        example: JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ=
+        type: string
+      privateKey:
+        example: IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII=
+        type: string
+      publicKey:
+        example: HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH=
+        type: string
+      tunnelIP:
+        example: 10.10.0.2
+        type: string
+    type: object
+  api.ManagedPeerResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.ManagedPeerDTO'
       success:
         example: true
         type: boolean
@@ -935,6 +1195,48 @@ definitions:
         example: 1048576
         type: integer
     type: object
+  api.ManagedServerDTO:
+    properties:
+      address:
+        example: 10.10.0.1
+        type: string
+      dns:
+        example: 8.8.8.8
+        type: string
+      endpoint:
+        example: 203.0.113.42:51821
+        type: string
+      interfaceName:
+        example: Wireguard1
+        type: string
+      listenPort:
+        example: 51821
+        type: integer
+      mask:
+        example: 255.255.255.0
+        type: string
+      mtu:
+        example: 1420
+        type: integer
+      natEnabled:
+        example: true
+        type: boolean
+      peers:
+        items:
+          $ref: '#/definitions/api.ManagedPeerDTO'
+        type: array
+      policy:
+        example: default
+        type: string
+    type: object
+  api.ManagedServerResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.ManagedServerDTO'
+      success:
+        example: true
+        type: boolean
+    type: object
   api.ManagedServerStatsDTO:
     properties:
       peers:
@@ -944,6 +1246,24 @@ definitions:
       status:
         example: up
         type: string
+    type: object
+  api.ManagedServerStatsResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.ManagedServerStatsDTO'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.ManagedServersListResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/api.ManagedServerDTO'
+        type: array
+      success:
+        example: true
+        type: boolean
     type: object
   api.MonitoringCellDTO:
     properties:
@@ -1097,6 +1417,81 @@ definitions:
         example: true
         type: boolean
     type: object
+  api.OkData:
+    properties:
+      ok:
+        example: true
+        type: boolean
+    type: object
+  api.OkResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.OkData'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.OversizedTagDTO:
+    properties:
+      count:
+        example: 82000
+        type: integer
+      file:
+        example: /opt/etc/hrneo/geosite.db
+        type: string
+      name:
+        example: netflix
+        type: string
+    type: object
+  api.OversizedTagsData:
+    properties:
+      installed:
+        example: true
+        type: boolean
+      maxelem:
+        example: 65536
+        type: integer
+      tags:
+        items:
+          $ref: '#/definitions/api.OversizedTagDTO'
+        type: array
+    type: object
+  api.OversizedTagsResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.OversizedTagsData'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.PeerConfData:
+    properties:
+      conf:
+        example: |-
+          [Interface]
+          PrivateKey = ...
+        type: string
+    type: object
+  api.PeerConfResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.PeerConfData'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.PermitInterfaceRequest:
+    properties:
+      interface:
+        example: Wireguard0
+        type: string
+      name:
+        example: Policy0
+        type: string
+      order:
+        example: 0
+        type: integer
+    type: object
   api.PingCheckDefaultsDTO:
     properties:
       deadInterval:
@@ -1181,6 +1576,50 @@ definitions:
         example: true
         type: boolean
     type: object
+  api.PoliciesListResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/api.PolicyOptionDTO'
+        type: array
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.PolicyDeviceDTO:
+    properties:
+      active:
+        example: true
+        type: boolean
+      hostname:
+        example: my-phone
+        type: string
+      ip:
+        example: 192.168.1.100
+        type: string
+      link:
+        example: WiFi
+        type: string
+      mac:
+        example: aa:bb:cc:dd:ee:ff
+        type: string
+      name:
+        example: My Phone
+        type: string
+      policy:
+        example: default
+        type: string
+    type: object
+  api.PolicyDevicesListResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/api.PolicyDeviceDTO'
+        type: array
+      success:
+        example: true
+        type: boolean
+    type: object
   api.PolicyGlobalInterfaceDTO:
     properties:
       label:
@@ -1203,10 +1642,54 @@ definitions:
         example: true
         type: boolean
     type: object
+  api.PolicyOptionDTO:
+    properties:
+      description:
+        example: Default policy
+        type: string
+      id:
+        example: Policy0
+        type: string
+    type: object
+  api.PolicyOrderData:
+    properties:
+      order:
+        example:
+        - default
+        items:
+          type: string
+        type: array
+    type: object
+  api.PolicyOrderResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.PolicyOrderData'
+      success:
+        example: true
+        type: boolean
+    type: object
   api.ProxyConfigResponse:
     properties:
       data:
         $ref: '#/definitions/api.DeviceProxyConfigData'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.ProxyInstanceResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.DeviceProxyInstanceData'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.ProxyInstancesResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/api.DeviceProxyInstanceData'
+        type: array
       success:
         example: true
         type: boolean
@@ -1246,6 +1729,11 @@ definitions:
         example: true
         type: boolean
     type: object
+  api.RemoveMemberRequest:
+    properties:
+      memberTag:
+        type: string
+    type: object
   api.ResolveResponse:
     properties:
       domain:
@@ -1256,6 +1744,67 @@ definitions:
         items:
           type: string
         type: array
+    type: object
+  api.RouterDetails:
+    properties:
+      architecture:
+        type: string
+      bootSlot:
+        type: string
+      cpuModel:
+        type: string
+      cpuTempC:
+        type: integer
+      featureComponents:
+        items:
+          type: string
+        type: array
+      firmwareBuildDate:
+        type: string
+      firmwareRelease:
+        type: string
+      firmwareSandbox:
+        type: string
+      firmwareTitle:
+        type: string
+      hardwareId:
+        type: string
+      loadAverage:
+        type: string
+      memoryTotalMB:
+        type: integer
+      memoryUsedMB:
+        type: integer
+      memoryUsedPercent:
+        type: integer
+      meshMembers:
+        items:
+          type: string
+        type: array
+      model:
+        type: string
+      modelDisplay:
+        type: string
+      opkgStorage:
+        type: string
+      portedBuild:
+        type: boolean
+      region:
+        type: string
+      storageComponents:
+        items:
+          type: string
+        type: array
+      uptimeHuman:
+        type: string
+      vpnComponents:
+        items:
+          type: string
+        type: array
+      wifi5TempC:
+        type: integer
+      wifi24TempC:
+        type: integer
     type: object
   api.RouterInterfaceDTO:
     properties:
@@ -1268,6 +1817,42 @@ definitions:
       up:
         example: true
         type: boolean
+    type: object
+  api.RouterStagingStatusResponse:
+    properties:
+      draftedAt:
+        type: string
+      hasDraft:
+        type: boolean
+      validation:
+        $ref: '#/definitions/api.RouterValidationDTO'
+    type: object
+  api.RouterStagingValidationError:
+    properties:
+      sbCheck:
+        type: string
+      validation:
+        $ref: '#/definitions/api.RouterValidationDTO'
+    type: object
+  api.RouterValidationDTO:
+    properties:
+      errors:
+        items:
+          $ref: '#/definitions/api.RouterValidationErrorDTO'
+        type: array
+    type: object
+  api.RouterValidationErrorDTO:
+    properties:
+      inRule:
+        type: string
+      kind:
+        type: string
+      message:
+        type: string
+      slot:
+        type: string
+      tag:
+        type: string
     type: object
   api.RoutingRefreshData:
     properties:
@@ -1326,6 +1911,48 @@ definitions:
         example: true
         type: boolean
     type: object
+  api.SetDescriptionRequest:
+    properties:
+      description:
+        example: My VPN policy
+        type: string
+      name:
+        example: Policy0
+        type: string
+    type: object
+  api.SetInterfaceUpRequest:
+    properties:
+      name:
+        example: Wireguard0
+        type: string
+      up:
+        example: true
+        type: boolean
+    type: object
+  api.SetPolicyOrderRequest:
+    properties:
+      order:
+        example:
+        - default
+        items:
+          type: string
+        type: array
+    type: object
+  api.SetServerPolicyRequest:
+    properties:
+      policy:
+        example: Policy0
+        type: string
+    type: object
+  api.SetStandaloneRequest:
+    properties:
+      enabled:
+        example: true
+        type: boolean
+      name:
+        example: Policy0
+        type: string
+    type: object
   api.SettingsData:
     properties:
       authEnabled:
@@ -1341,12 +1968,26 @@ definitions:
       pingCheck:
         $ref: '#/definitions/api.PingCheckSettingsDTO'
       schemaVersion:
-        example: 3
+        example: 16
         type: integer
       server:
         $ref: '#/definitions/api.ServerSettingsDTO'
       updates:
         $ref: '#/definitions/api.UpdateSettingsDTO'
+      usageLevel:
+        description: |-
+          UsageLevel controls which UI sections are visible to the user.
+          Filtering is frontend-only — the API does not enforce it.
+          enums: expert,advanced,basic
+          First enum is the prism mock default (prism picks the first
+          enum value over the example tag); putting `expert` first means
+          dev:mock surfaces all advanced UI without manual toggling.
+        enum:
+        - expert
+        - advanced
+        - basic
+        example: expert
+        type: string
     type: object
   api.SettingsResponse:
     properties:
@@ -1396,8 +2037,779 @@ definitions:
         example: 6e7f8a9b
         type: string
     type: object
+  api.SingboxConfigPreviewResponse:
+    properties:
+      json:
+        type: string
+    type: object
+  api.SingboxConnectionsClientsData:
+    properties:
+      clientsByIP:
+        additionalProperties:
+          type: string
+        type: object
+    type: object
+  api.SingboxConnectionsClientsResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.SingboxConnectionsClientsData'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.SingboxControlRequest:
+    properties:
+      action:
+        enum:
+        - start
+        - stop
+        - restart
+        example: start
+        type: string
+    type: object
+  api.SingboxDNSGlobalsData:
+    properties:
+      final:
+        example: cloudflare
+        type: string
+      strategy:
+        example: prefer_ipv4
+        type: string
+    type: object
+  api.SingboxDNSGlobalsResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.SingboxDNSGlobalsData'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.SingboxDNSRuleDTO:
+    properties:
+      action:
+        example: route
+        type: string
+      domain:
+        example:
+        - example.com
+        items:
+          type: string
+        type: array
+      domain_keyword:
+        example:
+        - google
+        items:
+          type: string
+        type: array
+      domain_suffix:
+        example:
+        - .example.com
+        items:
+          type: string
+        type: array
+      query_type:
+        example:
+        - A
+        items:
+          type: string
+        type: array
+      rule_set:
+        example:
+        - geosite-cn
+        items:
+          type: string
+        type: array
+      server:
+        example: cloudflare
+        type: string
+    type: object
+  api.SingboxDNSRuleDeleteRequest:
+    properties:
+      index:
+        example: 0
+        type: integer
+    type: object
+  api.SingboxDNSRuleMoveRequest:
+    properties:
+      from:
+        example: 3
+        type: integer
+      to:
+        example: 0
+        type: integer
+    type: object
+  api.SingboxDNSRuleUpdateRequest:
+    properties:
+      index:
+        example: 0
+        type: integer
+      rule:
+        $ref: '#/definitions/api.SingboxDNSRuleDTO'
+    type: object
+  api.SingboxDNSRulesListResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/api.SingboxDNSRuleDTO'
+        type: array
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.SingboxDNSServerDTO:
+    properties:
+      detour:
+        example: direct
+        type: string
+      domain_resolver:
+        $ref: '#/definitions/api.SingboxDomainResolverDTO'
+      domain_strategy:
+        example: prefer_ipv4
+        type: string
+      path:
+        example: /dns-query
+        type: string
+      server:
+        example: 1.1.1.1
+        type: string
+      server_port:
+        example: 53
+        type: integer
+      tag:
+        example: cloudflare
+        type: string
+      type:
+        example: udp
+        type: string
+    type: object
+  api.SingboxDNSServerDeleteRequest:
+    properties:
+      force:
+        example: false
+        type: boolean
+      tag:
+        example: cloudflare
+        type: string
+    type: object
+  api.SingboxDNSServerUpdateRequest:
+    properties:
+      server:
+        $ref: '#/definitions/api.SingboxDNSServerDTO'
+      tag:
+        example: cloudflare
+        type: string
+    type: object
+  api.SingboxDNSServersListResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/api.SingboxDNSServerDTO'
+        type: array
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.SingboxDomainResolverDTO:
+    properties:
+      server:
+        example: local
+        type: string
+      strategy:
+        example: ipv4_only
+        type: string
+    type: object
+  api.SingboxProxiesListResponse:
+    properties:
+      groups:
+        items:
+          $ref: '#/definitions/api.SingboxProxyGroup'
+        type: array
+    type: object
+  api.SingboxProxiesSelectRequest:
+    properties:
+      group:
+        example: veesp-fast
+        type: string
+      member:
+        example: vless-1
+        type: string
+    type: object
+  api.SingboxProxiesTestRequest:
+    properties:
+      group:
+        type: string
+      timeout:
+        type: integer
+      url:
+        type: string
+    type: object
+  api.SingboxProxiesTestResponse:
+    properties:
+      delays:
+        additionalProperties:
+          type: integer
+        type: object
+    type: object
+  api.SingboxProxyGroup:
+    properties:
+      members:
+        items:
+          $ref: '#/definitions/api.SingboxProxyMember'
+        type: array
+      now:
+        type: string
+      tag:
+        type: string
+      type:
+        type: string
+    type: object
+  api.SingboxProxyMember:
+    properties:
+      lastDelay:
+        type: integer
+      tag:
+        type: string
+      type:
+        type: string
+    type: object
+  api.SingboxRouterApplyPresetRequest:
+    properties:
+      id:
+        example: china-direct
+        type: string
+      outbound:
+        example: awg-vpn0
+        type: string
+    type: object
+  api.SingboxRouterBindDeviceRequest:
+    properties:
+      mac:
+        example: aa:bb:cc:dd:ee:ff
+        type: string
+      policyName:
+        example: Policy0
+        type: string
+    type: object
+  api.SingboxRouterCreatePolicyRequest:
+    properties:
+      description:
+        example: My VPN policy
+        type: string
+    type: object
+  api.SingboxRouterInspectData:
+    properties:
+      destination:
+        example: vpn
+        type: string
+      final:
+        example: direct
+        type: string
+      input:
+        example: google.com
+        type: string
+      inputType:
+        example: domain
+        type: string
+      matchedRule:
+        example: 0
+        type: integer
+      matches:
+        items:
+          $ref: '#/definitions/api.SingboxRouterInspectMatchDTO'
+        type: array
+      note:
+        type: string
+    type: object
+  api.SingboxRouterInspectMatchDTO:
+    properties:
+      action:
+        example: route
+        type: string
+      conditions:
+        items:
+          type: string
+        type: array
+      index:
+        example: 0
+        type: integer
+      matched:
+        example: true
+        type: boolean
+      outbound:
+        example: vpn
+        type: string
+      reason:
+        example: 'совпало по: domain_suffix'
+        type: string
+    type: object
+  api.SingboxRouterInspectRequest:
+    properties:
+      domain:
+        example: google.com
+        type: string
+      port:
+        example: 443
+        type: integer
+      protocol:
+        example: tcp
+        type: string
+    type: object
+  api.SingboxRouterInspectResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.SingboxRouterInspectData'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.SingboxRouterIssueDTO:
+    properties:
+      kind:
+        example: missing-outbound
+        type: string
+      message:
+        example: outbound 'selector' is referenced but does not exist
+        type: string
+      ruleIndex:
+        example: 0
+        type: integer
+      severity:
+        example: warning
+        type: string
+      tag:
+        example: selector
+        type: string
+    type: object
+  api.SingboxRouterOutboundDTO:
+    properties:
+      bind_interface:
+        example: awg-vpn0
+        type: string
+      default:
+        example: awg-vpn0
+        type: string
+      interval:
+        example: 3m
+        type: string
+      outbounds:
+        example:
+        - awg-vpn0
+        items:
+          type: string
+        type: array
+      source:
+        enum:
+        - router
+        - subscription
+        example: router
+        type: string
+      strategy:
+        example: prefer_ipv4
+        type: string
+      tag:
+        example: my-selector
+        type: string
+      tolerance:
+        example: 50
+        type: integer
+      type:
+        example: selector
+        type: string
+      url:
+        example: https://www.gstatic.com/generate_204
+        type: string
+    type: object
+  api.SingboxRouterOutboundDeleteRequest:
+    properties:
+      force:
+        example: false
+        type: boolean
+      tag:
+        example: my-selector
+        type: string
+    type: object
+  api.SingboxRouterOutboundUpdateRequest:
+    properties:
+      outbound:
+        $ref: '#/definitions/api.SingboxRouterOutboundDTO'
+      tag:
+        example: my-selector
+        type: string
+    type: object
+  api.SingboxRouterOutboundsListResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/api.SingboxRouterOutboundDTO'
+        type: array
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.SingboxRouterPoliciesListResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/api.SingboxRouterPolicyInfoDTO'
+        type: array
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.SingboxRouterPolicyDeviceDTO:
+    properties:
+      bound:
+        example: true
+        type: boolean
+      ip:
+        example: 192.168.1.100
+        type: string
+      mac:
+        example: aa:bb:cc:dd:ee:ff
+        type: string
+      name:
+        example: My Phone
+        type: string
+    type: object
+  api.SingboxRouterPolicyDevicesListResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/api.SingboxRouterPolicyDeviceDTO'
+        type: array
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.SingboxRouterPolicyInfoDTO:
+    properties:
+      description:
+        example: Default policy
+        type: string
+      deviceCount:
+        example: 3
+        type: integer
+      isOurDefault:
+        example: false
+        type: boolean
+      mark:
+        example: "0xffffaaa"
+        type: string
+      name:
+        example: Policy0
+        type: string
+    type: object
+  api.SingboxRouterPolicyResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.SingboxRouterPolicyInfoDTO'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.SingboxRouterPresetDTO:
+    properties:
+      category:
+        example: social
+        type: string
+      featured:
+        example: true
+        type: boolean
+      iconSlug:
+        example: china
+        type: string
+      id:
+        example: china-direct
+        type: string
+      name:
+        example: China Direct
+        type: string
+      notice:
+        example: Routes mainland China traffic via the direct outbound.
+        type: string
+      ruleSets:
+        items:
+          $ref: '#/definitions/api.SingboxRouterPresetRuleRefDTO'
+        type: array
+      rules:
+        items:
+          $ref: '#/definitions/api.SingboxRouterPresetRuleLinkDTO'
+        type: array
+      sensitive:
+        example: false
+        type: boolean
+    type: object
+  api.SingboxRouterPresetRuleLinkDTO:
+    properties:
+      action:
+        example: route
+        type: string
+      domain_suffix:
+        example:
+        - .cn
+        items:
+          type: string
+        type: array
+      rule_set:
+        example:
+        - geosite-cn
+        items:
+          type: string
+        type: array
+    type: object
+  api.SingboxRouterPresetRuleRefDTO:
+    properties:
+      tag:
+        example: geosite-cn
+        type: string
+    type: object
+  api.SingboxRouterPresetsListResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/api.SingboxRouterPresetDTO'
+        type: array
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.SingboxRouterRouteFinalRequest:
+    properties:
+      final:
+        example: direct
+        type: string
+    type: object
+  api.SingboxRouterRuleDTO:
+    properties:
+      action:
+        example: route
+        type: string
+      domain_suffix:
+        example:
+        - .example.com
+        items:
+          type: string
+        type: array
+      ip_cidr:
+        example:
+        - 10.0.0.0/8
+        items:
+          type: string
+        type: array
+      outbound:
+        example: selector
+        type: string
+      port:
+        example:
+        - 443
+        items:
+          type: integer
+        type: array
+      protocol:
+        example: tcp
+        type: string
+      rule_set:
+        example:
+        - geosite-cn
+        items:
+          type: string
+        type: array
+      source_ip_cidr:
+        example:
+        - 192.168.1.100/32
+        items:
+          type: string
+        type: array
+    type: object
+  api.SingboxRouterRuleDeleteRequest:
+    properties:
+      index:
+        example: 0
+        type: integer
+    type: object
+  api.SingboxRouterRuleMoveRequest:
+    properties:
+      from:
+        example: 3
+        type: integer
+      to:
+        example: 0
+        type: integer
+    type: object
+  api.SingboxRouterRuleSetDTO:
+    properties:
+      download_detour:
+        example: direct
+        type: string
+      format:
+        example: binary
+        type: string
+      path:
+        example: /opt/etc/singbox/rulesets/geosite-cn.srs
+        type: string
+      rules:
+        items:
+          additionalProperties: {}
+          type: object
+        type: array
+      tag:
+        example: geosite-cn
+        type: string
+      type:
+        example: remote
+        type: string
+      update_interval:
+        example: 24h
+        type: string
+      url:
+        example: https://cdn.example.com/geosite-cn.srs
+        type: string
+    type: object
+  api.SingboxRouterRuleSetDeleteRequest:
+    properties:
+      force:
+        example: false
+        type: boolean
+      tag:
+        example: geosite-cn
+        type: string
+    type: object
+  api.SingboxRouterRuleSetRefreshRequest:
+    properties:
+      tag:
+        example: geosite-cn
+        type: string
+    type: object
+  api.SingboxRouterRuleSetUpdateRequest:
+    properties:
+      ruleSet:
+        $ref: '#/definitions/api.SingboxRouterRuleSetDTO'
+      tag:
+        example: geosite-cn
+        type: string
+    type: object
+  api.SingboxRouterRuleSetsListResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/api.SingboxRouterRuleSetDTO'
+        type: array
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.SingboxRouterRuleUpdateRequest:
+    properties:
+      index:
+        example: 0
+        type: integer
+      rule:
+        $ref: '#/definitions/api.SingboxRouterRuleDTO'
+    type: object
+  api.SingboxRouterRulesListResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/api.SingboxRouterRuleDTO'
+        type: array
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.SingboxRouterSettingsData:
+    properties:
+      enabled:
+        example: true
+        type: boolean
+      policyName:
+        example: awgm-router
+        type: string
+      refreshDailyTime:
+        example: "03:00"
+        type: string
+      refreshIntervalHours:
+        example: 24
+        type: integer
+      refreshMode:
+        example: interval
+        type: string
+    type: object
+  api.SingboxRouterSettingsResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.SingboxRouterSettingsData'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.SingboxRouterStatusData:
+    properties:
+      deviceCount:
+        example: 3
+        type: integer
+      enabled:
+        example: true
+        type: boolean
+      final:
+        example: direct
+        type: string
+      installed:
+        example: true
+        type: boolean
+      issues:
+        items:
+          $ref: '#/definitions/api.SingboxRouterIssueDTO'
+        type: array
+      netfilterAvailable:
+        example: true
+        type: boolean
+      netfilterComponentName:
+        example: iptables-mod-tproxy
+        type: string
+      outboundAwgCount:
+        example: 2
+        type: integer
+      outboundCompositeCount:
+        example: 1
+        type: integer
+      policyExists:
+        example: true
+        type: boolean
+      policyMark:
+        example: "0xffffaaa"
+        type: string
+      policyName:
+        example: awgm-router
+        type: string
+      ruleCount:
+        example: 12
+        type: integer
+      ruleSetCount:
+        example: 4
+        type: integer
+      tproxyTargetAvailable:
+        example: true
+        type: boolean
+    type: object
+  api.SingboxRouterStatusResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.SingboxRouterStatusData'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.SingboxRouterUnbindDeviceRequest:
+    properties:
+      mac:
+        example: aa:bb:cc:dd:ee:ff
+        type: string
+    type: object
   api.SingboxStatusData:
     properties:
+      currentVersion:
+        example: 1.13.11
+        type: string
       features:
         example:
         - with_quic
@@ -1413,12 +2825,18 @@ definitions:
       proxyComponent:
         example: true
         type: boolean
+      requiredVersion:
+        example: 1.13.11
+        type: string
       running:
         example: true
         type: boolean
       tunnelCount:
         example: 2
         type: integer
+      updateAvailable:
+        example: false
+        type: boolean
       version:
         example: 1.9.3
         type: string
@@ -1558,6 +2976,9 @@ definitions:
       fallback:
         example: ""
         type: string
+      iconUrl:
+        example: https://cdn.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Cloudflare.png
+        type: string
       id:
         example: sr_001
         type: string
@@ -1583,6 +3004,156 @@ definitions:
         items:
           $ref: '#/definitions/api.StaticRouteDTO'
         type: array
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.SubgroupsData:
+    properties:
+      group:
+        example: routing
+        type: string
+      subgroups:
+        items:
+          type: string
+        type: array
+    type: object
+  api.SubgroupsResponseEnvelope:
+    properties:
+      data:
+        $ref: '#/definitions/api.SubgroupsData'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.SubscriptionDTO:
+    properties:
+      activeMember:
+        example: sub-abc-aaaa
+        type: string
+      enabled:
+        type: boolean
+      headers:
+        items:
+          $ref: '#/definitions/api.SubscriptionHeader'
+        type: array
+      id:
+        example: abc123
+        type: string
+      inboundTag:
+        example: sub-abc12345-in
+        type: string
+      isInline:
+        example: false
+        type: boolean
+      label:
+        example: Provider X
+        type: string
+      lastError:
+        type: string
+      lastFetched:
+        type: string
+      listenPort:
+        example: 11080
+        type: integer
+      memberTags:
+        items:
+          type: string
+        type: array
+      members:
+        items:
+          $ref: '#/definitions/api.SubscriptionMemberDTO'
+        type: array
+      mode:
+        example: selector
+        type: string
+      orphanTags:
+        items:
+          type: string
+        type: array
+      proxyIndex:
+        example: 3
+        type: integer
+      refreshHours:
+        example: 24
+        type: integer
+      selectorTag:
+        example: sub-abc12345
+        type: string
+      url:
+        example: https://prov.example/sub/a
+        type: string
+      urlTest:
+        $ref: '#/definitions/api.SubscriptionURLTestDTO'
+    type: object
+  api.SubscriptionHeader:
+    properties:
+      name:
+        example: User-Agent
+        type: string
+      value:
+        example: Happ/4.6.0
+        type: string
+    type: object
+  api.SubscriptionMemberDTO:
+    properties:
+      label:
+        example: "\U0001F1FA\U0001F1F8 LA-1"
+        type: string
+      port:
+        example: 443
+        type: integer
+      protocol:
+        example: vless
+        type: string
+      security:
+        example: tls
+        type: string
+      server:
+        example: de01.example.com
+        type: string
+      sni:
+        example: de01.example.com
+        type: string
+      tag:
+        example: sub-abc12345-aabbccdd
+        type: string
+      transport:
+        example: ws
+        type: string
+    type: object
+  api.SubscriptionResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.SubscriptionDTO'
+      success:
+        type: boolean
+    type: object
+  api.SubscriptionURLTestDTO:
+    properties:
+      intervalSec:
+        example: 60
+        type: integer
+      toleranceMs:
+        example: 50
+        type: integer
+      url:
+        example: https://www.gstatic.com/generate_204
+        type: string
+    type: object
+  api.SuggestAddressData:
+    properties:
+      address:
+        example: 10.10.0.1
+        type: string
+      mask:
+        example: 255.255.255.0
+        type: string
+    type: object
+  api.SuggestAddressResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.SuggestAddressData'
       success:
         example: true
         type: boolean
@@ -1651,6 +3222,8 @@ definitions:
       kernelModuleVersion:
         example: ""
         type: string
+      routerDetails:
+        $ref: '#/definitions/api.RouterDetails'
       routerIP:
         example: 192.168.1.1
         type: string
@@ -1768,6 +3341,18 @@ definitions:
       sessionActive:
         example: false
         type: boolean
+    type: object
+  api.TunnelConnectionInfoDTO:
+    properties:
+      count:
+        example: 12
+        type: integer
+      interface:
+        example: nwg0
+        type: string
+      name:
+        example: My VPN
+        type: string
     type: object
   api.TunnelControlData:
     properties:
@@ -2032,6 +3617,16 @@ definitions:
       points:
         example: 60
         type: integer
+      volumeRx:
+        description: VolumeRx is estimated bytes received over the selected window
+          (Σ rxRate×Δt on raw history samples).
+        example: 1073741824
+        type: integer
+      volumeTx:
+        description: VolumeTx is estimated bytes sent over the selected window (Σ
+          txRate×Δt on raw history samples).
+        example: 536870912
+        type: integer
     type: object
   api.TunnelsAllResponse:
     properties:
@@ -2077,6 +3672,12 @@ definitions:
       success:
         example: true
         type: boolean
+    type: object
+  api.UpdateGeoFileRequest:
+    properties:
+      path:
+        example: /opt/etc/hrneo/geosite.db
+        type: string
     type: object
   api.UpdateInfoData:
     properties:
@@ -2265,16 +3866,22 @@ paths:
   /access-policies:
     get:
       description: KeeneticOS 5 only when route is registered.
+      parameters:
+      - description: Pass 'true' to bypass NDMS cache
+        in: query
+        name: refresh
+        type: string
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            items:
-              additionalProperties: true
-              type: object
-            type: array
+            $ref: '#/definitions/api.AccessPoliciesListResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: List access policies
@@ -2296,71 +3903,78 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Unassign device from policy
       tags:
-      - access-policies
+      - access-policy
     post:
       consumes:
       - application/json
       description: Binds the LAN device identified by MAC to the named policy. Replaces
         any existing assignment.
       parameters:
-      - description: '{mac, policy}'
+      - description: Device MAC + target policy name
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.AssignDeviceRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Assign device to policy
       tags:
-      - access-policies
+      - access-policy
   /access-policies/create:
     post:
       consumes:
       - application/json
+      parameters:
+      - description: Policy description
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.CreateAccessPolicyRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.AccessPolicyResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Create access policy
@@ -2382,35 +3996,46 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Delete access policy
       tags:
-      - access-policies
+      - access-policy
   /access-policies/description:
     post:
       consumes:
       - application/json
+      parameters:
+      - description: Policy name + new description
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.SetDescriptionRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Set access policy description
@@ -2418,16 +4043,22 @@ paths:
       - access-policy
   /access-policies/devices:
     get:
+      parameters:
+      - description: Pass 'true' to bypass NDMS cache
+        in: query
+        name: refresh
+        type: string
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            items:
-              additionalProperties: true
-              type: object
-            type: array
+            $ref: '#/definitions/api.PolicyDevicesListResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: List policy devices
@@ -2437,14 +4068,28 @@ paths:
     post:
       consumes:
       - application/json
+      parameters:
+      - description: Interface name + admin up flag
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.SetInterfaceUpRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Set interface admin up
@@ -2458,10 +4103,11 @@ paths:
         "200":
           description: OK
           schema:
-            items:
-              additionalProperties: true
-              type: object
-            type: array
+            $ref: '#/definitions/api.PolicyInterfacesListResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: List global policy interfaces
@@ -2487,71 +4133,78 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Deny interface for policy
       tags:
-      - access-policies
+      - access-policy
     post:
       consumes:
       - application/json
       description: Adds the named interface to the policy at the given order (lower
         = higher priority).
       parameters:
-      - description: '{name, interface, order}'
+      - description: Policy name, interface name, priority order
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.PermitInterfaceRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Permit interface for policy
       tags:
-      - access-policies
+      - access-policy
   /access-policies/standalone:
     post:
       consumes:
       - application/json
+      parameters:
+      - description: Policy name + enabled flag
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.SetStandaloneRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Set access policy standalone mode
@@ -3549,10 +5202,11 @@ paths:
         "200":
           description: OK
           schema:
-            items:
-              additionalProperties: true
-              type: object
-            type: array
+            $ref: '#/definitions/api.GeoFilesResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: List HydraRoute geo files
@@ -3562,14 +5216,28 @@ paths:
     post:
       consumes:
       - application/json
+      parameters:
+      - description: Geo file source descriptor
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.AddGeoFileRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.GeoFileResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Add HydraRoute geo file
@@ -3591,18 +5259,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Delete HydraRoute geo file
@@ -3612,14 +5277,31 @@ paths:
     post:
       consumes:
       - application/json
+      description: Empty path triggers a bulk refresh of every tracked geo file. Single
+        path refreshes one file. Both branches return an updated count for caller-side
+        feedback; the frontend refetches the list afterwards.
+      parameters:
+      - description: Path to refresh, or empty to refresh all
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.UpdateGeoFileRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.GeoFileUpdatedResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Refresh HydraRoute geo file(s)
@@ -3655,8 +5337,11 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.IpsetUsageResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: HydraRoute ipset usage
@@ -3670,8 +5355,11 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OversizedTagsResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: HydraRoute oversized geo tags
@@ -3681,14 +5369,28 @@ paths:
     post:
       consumes:
       - application/json
+      parameters:
+      - description: Ordered list of policy names
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.SetPolicyOrderRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.PolicyOrderResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Set HydraRoute policy order
@@ -3720,6 +5422,41 @@ paths:
       - import
   /logs:
     get:
+      description: Returns log entries from the selected bucket. `bucket=app` (default)
+        covers tunnel/routing/server/system events; `bucket=singbox` covers sing-box
+        forwarder events isolated from app history.
+      parameters:
+      - description: Bucket selector
+        enum:
+        - app
+        - singbox
+        in: query
+        name: bucket
+        type: string
+      - description: Filter by group
+        in: query
+        name: group
+        type: string
+      - description: Filter by subgroup
+        in: query
+        name: subgroup
+        type: string
+      - description: Filter by level
+        in: query
+        name: level
+        type: string
+      - description: Max entries to return (default 200)
+        in: query
+        name: limit
+        type: integer
+      - description: Skip first N matching entries
+        in: query
+        name: offset
+        type: integer
+      - description: Unix seconds — return only entries strictly after this
+        in: query
+        name: since
+        type: integer
       produces:
       - application/json
       responses:
@@ -3742,6 +5479,18 @@ paths:
       - logs
   /logs/clear:
     post:
+      description: Clears all entries from the requested bucket. `bucket` is required
+        — there is no implicit "clear everything" since app and sing-box logs serve
+        different audiences.
+      parameters:
+      - description: Bucket to clear
+        enum:
+        - app
+        - singbox
+        in: query
+        name: bucket
+        required: true
+        type: string
       produces:
       - application/json
       responses:
@@ -3762,6 +5511,38 @@ paths:
       summary: Clear logs
       tags:
       - logs
+  /logs/subgroups:
+    get:
+      description: Returns the static subgroup catalog from internal/logging.KnownSubgroups.
+        Order is presentation-stable. Empty group returns 400.
+      parameters:
+      - description: Group name
+        enum:
+        - tunnel
+        - routing
+        - server
+        - system
+        - singbox
+        in: query
+        name: group
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.SubgroupsResponseEnvelope'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: List known subgroups for a group
+      tags:
+      - logs
   /managed-servers:
     get:
       description: Returns every managed server (id, address, listen port, peers,
@@ -3772,13 +5553,11 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ManagedServersListResponse'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: List managed servers
@@ -3802,18 +5581,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ManagedServerResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Create managed server
@@ -3835,18 +5611,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ServersAllResponse'
         "404":
           description: Not Found
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Delete managed server
@@ -3866,18 +5639,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ManagedServerResponse'
         "404":
           description: Not Found
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Get managed server
@@ -3906,23 +5676,19 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ServersAllResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "404":
           description: Not Found
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Update managed server
@@ -3932,19 +5698,19 @@ paths:
     get:
       consumes:
       - application/json
-      description: GET reads, PUT writes the AWG signature/obfuscation params for
-        the named managed server. PUT body is the raw ASC JSON object.
+      description: GET returns ASCParamsResponse with the current AWG signature/obfuscation
+        params object. PUT writes new params (raw object whose shape depends on the
+        active signature preset) and returns the fresh ServersSnapshot.
       parameters:
       - description: Server id
         in: path
         name: id
         required: true
         type: string
-      - description: ASC params (PUT only)
+      - description: ASC params object (PUT only)
         in: body
         name: body
         schema:
-          additionalProperties: true
           type: object
       produces:
       - application/json
@@ -3952,18 +5718,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ASCParamsResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Get/set managed-server ASC params
@@ -3972,19 +5735,19 @@ paths:
     put:
       consumes:
       - application/json
-      description: GET reads, PUT writes the AWG signature/obfuscation params for
-        the named managed server. PUT body is the raw ASC JSON object.
+      description: GET returns ASCParamsResponse with the current AWG signature/obfuscation
+        params object. PUT writes new params (raw object whose shape depends on the
+        active signature preset) and returns the fresh ServersSnapshot.
       parameters:
       - description: Server id
         in: path
         name: id
         required: true
         type: string
-      - description: ASC params (PUT only)
+      - description: ASC params object (PUT only)
         in: body
         name: body
         schema:
-          additionalProperties: true
           type: object
       produces:
       - application/json
@@ -3992,18 +5755,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ASCParamsResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Get/set managed-server ASC params
@@ -4021,31 +5781,27 @@ paths:
         name: id
         required: true
         type: string
-      - description: '{enabled: bool}'
+      - description: Enabled flag
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.EnabledToggleRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ServersAllResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Toggle managed-server enabled
@@ -4063,31 +5819,27 @@ paths:
         name: id
         required: true
         type: string
-      - description: '{enabled: bool}'
+      - description: Enabled flag
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.EnabledToggleRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ServersAllResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Toggle managed-server NAT
@@ -4117,18 +5869,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ManagedPeerResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Add managed-server peer
@@ -4154,18 +5903,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ServersAllResponse'
         "404":
           description: Not Found
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Delete managed-server peer
@@ -4199,23 +5945,19 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ServersAllResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "404":
           description: Not Found
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Update managed-server peer
@@ -4242,18 +5984,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.PeerConfResponse'
         "404":
           description: Not Found
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Generate peer .conf
@@ -4276,31 +6015,27 @@ paths:
         name: pubkey
         required: true
         type: string
-      - description: '{enabled: bool}'
+      - description: Enabled flag
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.EnabledToggleRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ServersAllResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Toggle managed-server peer enabled
@@ -4318,31 +6053,27 @@ paths:
         name: id
         required: true
         type: string
-      - description: '{policy: string}'
+      - description: Policy id (router-side)
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SetServerPolicyRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ServersAllResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Set managed-server IP policy
@@ -4364,18 +6095,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ManagedServerStatsResponse'
         "404":
           description: Not Found
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Get managed-server peer stats
@@ -4391,18 +6119,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.PoliciesListResponse'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: List IP Policy profiles
@@ -4418,18 +6143,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.SuggestAddressResponse'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Suggest managed-server address
@@ -4482,6 +6204,13 @@ paths:
     get:
       description: Returns the latest cross-tunnel × cross-target latency/loss matrix
         snapshot. Responds 503 until the monitoring service has finished bootstrap.
+        Pass `?force=1` to invalidate the Clash cache and run a fresh probing tick
+        before returning.
+      parameters:
+      - description: Set to 1 to force-refresh ICMP/Clash data before snapshot read
+        in: query
+        name: force
+        type: integer
       produces:
       - application/json
       responses:
@@ -4684,6 +6413,214 @@ paths:
       summary: Save device proxy config
       tags:
       - device-proxy
+  /proxy/instance:
+    delete:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.APIEnvelope'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Delete one device proxy instance
+      tags:
+      - device-proxy
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.ProxyInstanceResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Get one device proxy instance
+      tags:
+      - device-proxy
+    put:
+      consumes:
+      - application/json
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.ProxyInstanceResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Save one device proxy instance
+      tags:
+      - device-proxy
+  /proxy/instance/check-ip:
+    get:
+      parameters:
+      - description: Instance ID
+        in: query
+        name: id
+        required: true
+        type: string
+      - description: Specific IP service URL
+        in: query
+        name: service
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.DeviceProxyInstanceIPCheckResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Check external IP through one device proxy instance
+      tags:
+      - device-proxy
+  /proxy/instance/runtime:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.ProxyRuntimeResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Get device proxy instance runtime state
+      tags:
+      - device-proxy
+  /proxy/instance/runtime/select:
+    post:
+      consumes:
+      - application/json
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.ProxyRuntimeResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Select device proxy instance outbound
+      tags:
+      - device-proxy
+  /proxy/instances:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.ProxyInstancesResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: List device proxy instances
+      tags:
+      - device-proxy
+  /proxy/instances/apply:
+    post:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.APIEnvelope'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Apply all device proxy instances
+      tags:
+      - device-proxy
   /proxy/listen-choices:
     get:
       produces:
@@ -4843,16 +6780,22 @@ paths:
       - dns-routes
   /routing/policy-devices:
     get:
+      parameters:
+      - description: Pass 'true' to bypass NDMS cache
+        in: query
+        name: refresh
+        type: string
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            items:
-              additionalProperties: true
-              type: object
-            type: array
+            $ref: '#/definitions/api.PolicyDevicesListResponse'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: List policy devices
@@ -5014,18 +6957,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ServersAllResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Mark/unmark interface as server
@@ -5047,18 +6987,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ServersAllResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Mark/unmark interface as server
@@ -5155,18 +7092,17 @@ paths:
     post:
       consumes:
       - application/json
-      description: Persists Settings. Sub-structs (server, pingCheck, logging, dnsRoute,
-        managedServers, ...) preserved when zero/nil. ApiKey preserved when empty
-        (rotate via /settings/regenerate-api-key). Top-level bool flags (authEnabled,
-        disableMemorySaving, onboardingCompleted) MUST be sent on every save.
+      description: 'Persists Settings via patch semantics: any field omitted from
+        the payload is preserved, including top-level bool flags. Send only the fields
+        you want to change, or send the full Settings object to update everything
+        atomically. ApiKey preserved when omitted (rotate via /settings/regenerate-api-key).'
       parameters:
-      - description: Settings
+      - description: Settings patch — any subset of fields
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SettingsData'
       produces:
       - application/json
       responses:
@@ -5226,21 +7162,73 @@ paths:
         "200":
           description: OK
           schema:
-            items:
-              additionalProperties: true
-              type: object
-            type: array
+            $ref: '#/definitions/api.AWGOutboundTagsResponse'
         "405":
           description: Method Not Allowed
           schema:
-            type: string
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            type: string
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: List AWG outbound tags
+      tags:
+      - singbox
+  /singbox/config-preview:
+    get:
+      description: Returns the read-only pretty-printed JSON that sing-box loads when
+        started with `-C config.d/` — every active slot file concatenated in lexicographic
+        order, with arrays merged and tag collisions surfaced as errors.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/api.OkResponse'
+            - properties:
+                data:
+                  $ref: '#/definitions/api.SingboxConfigPreviewResponse'
+              type: object
+        "405":
+          description: Method Not Allowed
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Get merged sing-box configuration preview
+      tags:
+      - singbox
+  /singbox/connections/clients:
+    get:
+      description: Returns the current NDMS hotspot mapping of source IPs to device
+        display names. Cached upstream (TTL 30s). On any error returns 200 with an
+        empty map (best-effort) so the UI keeps working with raw IPs.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.SingboxConnectionsClientsResponse'
+        "405":
+          description: Method Not Allowed
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "503":
+          description: Service Unavailable
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: IP → display-name map for sing-box connections
       tags:
       - singbox
   /singbox/control:
@@ -5250,31 +7238,27 @@ paths:
       description: Starts, stops, or restarts the sing-box engine. Returns the fresh
         status snapshot. Mirrors /system/hydraroute-control.
       parameters:
-      - description: '{action: start|stop|restart}'
+      - description: Action to perform
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxControlRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.SingboxStatusResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Control sing-box process
@@ -5312,18 +7296,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Disable singbox-router
@@ -5339,18 +7320,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.SingboxDNSGlobalsResponse'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Get singbox-router DNS globals
@@ -5362,36 +7340,31 @@ paths:
       description: 'Persists the global DNS settings: `final` (default server tag)
         and `strategy` (ipv4_only / prefer_ipv4 / etc.).'
       parameters:
-      - description: '{final, strategy}'
+      - description: final + strategy
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxDNSGlobalsData'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Update singbox-router DNS globals
@@ -5403,36 +7376,31 @@ paths:
       description: 'Persists the global DNS settings: `final` (default server tag)
         and `strategy` (ipv4_only / prefer_ipv4 / etc.).'
       parameters:
-      - description: '{final, strategy}'
+      - description: final + strategy
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxDNSGlobalsData'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Update singbox-router DNS globals
@@ -5445,31 +7413,27 @@ paths:
       description: Appends a new DNS routing rule. The rule's server tag must already
         exist.
       parameters:
-      - description: router.DNSRule
+      - description: DNS routing rule
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxDNSRuleDTO'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Add singbox-router DNS rule
@@ -5481,31 +7445,27 @@ paths:
       - application/json
       description: Removes the DNS rule at the given index (0-based priority slot).
       parameters:
-      - description: '{index}'
+      - description: Index of the rule to remove
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxDNSRuleDeleteRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Delete singbox-router DNS rule
@@ -5521,18 +7481,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.SingboxDNSRulesListResponse'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: List singbox-router DNS rules
@@ -5544,31 +7501,27 @@ paths:
       - application/json
       description: Moves the DNS rule from index `from` to index `to` (both 0-based).
       parameters:
-      - description: '{from, to}'
+      - description: From-index and to-index
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxDNSRuleMoveRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Move singbox-router DNS rule
@@ -5581,31 +7534,27 @@ paths:
       description: Replaces the DNS rule at the given index (0-based priority slot)
         with the provided one.
       parameters:
-      - description: '{index, rule}'
+      - description: Index + replacement rule
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxDNSRuleUpdateRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Update singbox-router DNS rule
@@ -5617,31 +7566,27 @@ paths:
       - application/json
       description: Registers a new DNS upstream (tag must be unique).
       parameters:
-      - description: router.DNSServer
+      - description: DNS server descriptor
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxDNSServerDTO'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Add singbox-router DNS server
@@ -5654,36 +7599,31 @@ paths:
       description: Removes the DNS upstream identified by tag. Refuses if any DNS
         rule references it; pass force=true to override.
       parameters:
-      - description: '{tag, force}'
+      - description: Tag + optional force flag
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxDNSServerDeleteRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "409":
           description: Conflict
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Delete singbox-router DNS server
@@ -5699,18 +7639,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.SingboxDNSServersListResponse'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: List singbox-router DNS servers
@@ -5722,31 +7659,27 @@ paths:
       - application/json
       description: Replaces the DNS upstream identified by tag with the provided one.
       parameters:
-      - description: '{tag, server}'
+      - description: Tag + replacement server
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxDNSServerUpdateRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Update singbox-router DNS server
@@ -5763,26 +7696,56 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Enable singbox-router
+      tags:
+      - singbox-router
+  /singbox/router/inspect:
+    post:
+      consumes:
+      - application/json
+      description: Simulates which router rule would match the given domain or IP,
+        returning the would-be outbound. Pure simulator — does not invoke sing-box.
+        rule_set matchers are NOT evaluated in this version.
+      parameters:
+      - description: Domain or IP to test, plus optional port/protocol
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.SingboxRouterInspectRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.SingboxRouterInspectResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Inspect router routing decision
       tags:
       - singbox-router
   /singbox/router/outbounds/add:
@@ -5792,31 +7755,27 @@ paths:
       description: Creates a new composite outbound. The base outbounds it references
         must already exist.
       parameters:
-      - description: router.Outbound
+      - description: Composite outbound payload
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxRouterOutboundDTO'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Add singbox-router outbound
@@ -5829,36 +7788,31 @@ paths:
       description: Removes the composite outbound identified by tag. Refuses if any
         rule references it; pass force=true to override.
       parameters:
-      - description: '{tag, force}'
+      - description: Tag + optional force flag
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxRouterOutboundDeleteRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "409":
           description: Conflict
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Delete singbox-router outbound
@@ -5874,18 +7828,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.SingboxRouterOutboundsListResponse'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: List singbox-router outbounds
@@ -5898,31 +7849,27 @@ paths:
       description: Replaces the composite outbound identified by tag with the provided
         one.
       parameters:
-      - description: '{tag, outbound}'
+      - description: Tag + replacement outbound
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxRouterOutboundUpdateRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Update singbox-router outbound
@@ -5938,13 +7885,11 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.SingboxRouterPoliciesListResponse'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: List singbox-router policies
@@ -5956,31 +7901,27 @@ paths:
       description: Creates a new NDMS policy with the given description. Returns the
         created policy.
       parameters:
-      - description: '{description}'
+      - description: Policy description
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxRouterCreatePolicyRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.SingboxRouterPolicyResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Create singbox-router policy
@@ -6002,18 +7943,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.SingboxRouterPolicyDevicesListResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: List singbox-router policy devices
@@ -6026,31 +7964,27 @@ paths:
       description: Binds the LAN device (MAC) to the named policy. Replaces any existing
         binding.
       parameters:
-      - description: '{mac, policyName}'
+      - description: Device MAC + target policy name
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxRouterBindDeviceRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Bind device to singbox-router policy
@@ -6062,31 +7996,27 @@ paths:
       - application/json
       description: Removes any policy binding for the LAN device identified by MAC.
       parameters:
-      - description: '{mac}'
+      - description: Device MAC
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxRouterUnbindDeviceRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Unbind device from singbox-router policy
@@ -6099,31 +8029,27 @@ paths:
       description: Materialises the preset (id) into rules + rulesets, routing matched
         traffic via the selected outbound. Existing rules with the same tag are overwritten.
       parameters:
-      - description: '{id, outbound}'
+      - description: Preset id + target outbound
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxRouterApplyPresetRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Apply singbox-router preset
@@ -6139,16 +8065,162 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.SingboxRouterPresetsListResponse'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: List singbox-router presets
+      tags:
+      - singbox-router
+  /singbox/router/proxies/list:
+    get:
+      description: Returns selector/urltest/loadbalance groups managed by this router
+        with their currently active member and per-member last latency. Filtered to
+        groups defined in 20-router.json — Clash builtins (DIRECT, GLOBAL, REJECT)
+        are excluded.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/api.OkResponse'
+            - properties:
+                data:
+                  $ref: '#/definitions/api.SingboxProxiesListResponse'
+              type: object
+        "405":
+          description: Method Not Allowed
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: List sing-box composite proxy groups with live state
+      tags:
+      - singbox-router
+  /singbox/router/proxies/select:
+    post:
+      consumes:
+      - application/json
+      description: Sets the active member of a Clash-managed `selector` outbound.
+        URLTest / loadbalance groups are read-only and return 400.
+      parameters:
+      - description: Group and member tags
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.SingboxProxiesSelectRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.OkResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "405":
+          description: Method Not Allowed
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "502":
+          description: Bad Gateway
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Switch active member of a sing-box selector group
+      tags:
+      - singbox-router
+  /singbox/router/proxies/test:
+    post:
+      consumes:
+      - application/json
+      description: Calls Clash `/group/<name>/delay`, returning the per-member delay
+        map. Members that timed out come back with 0.
+      parameters:
+      - description: Group and optional URL/timeout
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.SingboxProxiesTestRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/api.OkResponse'
+            - properties:
+                data:
+                  $ref: '#/definitions/api.SingboxProxiesTestResponse'
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "405":
+          description: Method Not Allowed
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "502":
+          description: Bad Gateway
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Force latency test for all members of a composite group
+      tags:
+      - singbox-router
+  /singbox/router/route/final:
+    post:
+      consumes:
+      - application/json
+      description: Updates the route.final fallback outbound. Use "direct" for default
+        sing-box direct, or the tag of any existing outbound (composite, AWG, sing-box
+        tunnel).
+      parameters:
+      - description: New final outbound tag
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.SingboxRouterRouteFinalRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.OkResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "405":
+          description: Method Not Allowed
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Set route.final outbound
       tags:
       - singbox-router
   /singbox/router/rules/add:
@@ -6158,31 +8230,27 @@ paths:
       description: Appends a new routing rule. Rule conditions reference rulesets/outbounds
         that must already exist.
       parameters:
-      - description: router.Rule
+      - description: Routing rule payload
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxRouterRuleDTO'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Add singbox-router rule
@@ -6194,31 +8262,27 @@ paths:
       - application/json
       description: Removes the rule at the given index (0-based priority slot).
       parameters:
-      - description: '{index}'
+      - description: Index of the rule to remove
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxRouterRuleDeleteRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Delete singbox-router rule
@@ -6233,18 +8297,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.SingboxRouterRulesListResponse'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: List singbox-router rules
@@ -6257,31 +8318,27 @@ paths:
       description: Moves the rule from index `from` to index `to` (both 0-based).
         Adjusts other rules' indices accordingly.
       parameters:
-      - description: '{from, to}'
+      - description: From-index and to-index
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxRouterRuleMoveRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Move singbox-router rule
@@ -6294,31 +8351,27 @@ paths:
       description: Replaces the rule at index with the provided one. Index is the
         priority slot (0-based).
       parameters:
-      - description: '{index, rule}'
+      - description: Index + replacement rule
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxRouterRuleUpdateRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Update singbox-router rule
@@ -6331,31 +8384,27 @@ paths:
       description: Registers a new ruleset. For remote rulesets the file is downloaded
         synchronously.
       parameters:
-      - description: router.RuleSet
+      - description: RuleSet payload
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxRouterRuleSetDTO'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Add singbox-router ruleset
@@ -6368,36 +8417,31 @@ paths:
       description: Removes the ruleset identified by tag. Refuses if any rule references
         it; pass force=true to ignore references.
       parameters:
-      - description: '{tag, force}'
+      - description: Tag + optional force flag
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxRouterRuleSetDeleteRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "409":
           description: Conflict
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Delete singbox-router ruleset
@@ -6413,18 +8457,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.SingboxRouterRuleSetsListResponse'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: List singbox-router rulesets
@@ -6437,34 +8478,67 @@ paths:
       description: Re-downloads the remote ruleset identified by tag and updates its
         content/timestamp.
       parameters:
-      - description: '{tag}'
+      - description: Ruleset tag to re-download
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxRouterRuleSetRefreshRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Refresh singbox-router ruleset
+      tags:
+      - singbox-router
+  /singbox/router/rulesets/update:
+    post:
+      consumes:
+      - application/json
+      description: Replaces the ruleset identified by tag with new content. Tag rename
+        is not supported.
+      parameters:
+      - description: Tag + new RuleSet payload
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.SingboxRouterRuleSetUpdateRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.OkResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Update singbox-router ruleset
       tags:
       - singbox-router
   /singbox/router/settings:
@@ -6477,18 +8551,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.SingboxRouterSettingsResponse'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Get singbox-router settings
@@ -6500,36 +8571,31 @@ paths:
       description: Persists singbox-router settings. The router is restarted only
         when fields that affect the running config change.
       parameters:
-      - description: storage.SingboxRouterSettings
+      - description: Singbox-router settings payload
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxRouterSettingsData'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Update singbox-router settings
@@ -6541,39 +8607,113 @@ paths:
       description: Persists singbox-router settings. The router is restarted only
         when fields that affect the running config change.
       parameters:
-      - description: storage.SingboxRouterSettings
+      - description: Singbox-router settings payload
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
-          type: object
+          $ref: '#/definitions/api.SingboxRouterSettingsData'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Update singbox-router settings
+      tags:
+      - singbox-router
+  /singbox/router/staging:
+    get:
+      description: Returns whether a pending draft exists for the router slot and,
+        if so, its draft timestamp and a preview of the cross-slot validation result.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.RouterStagingStatusResponse'
+        "405":
+          description: Method Not Allowed
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Get router staging status
+      tags:
+      - singbox-router
+  /singbox/router/staging/apply:
+    post:
+      description: Validates the pending draft (cross-slot + sing-box check) then
+        atomically swaps pending → active and arms a reload.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.OkResponse'
+        "405":
+          description: Method Not Allowed
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "409":
+          description: no draft to apply
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/api.RouterStagingValidationError'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Apply router staging draft
+      tags:
+      - singbox-router
+  /singbox/router/staging/discard:
+    post:
+      description: Removes pending/20-router.json. Idempotent.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.OkResponse'
+        "405":
+          description: Method Not Allowed
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Discard router staging draft
       tags:
       - singbox-router
   /singbox/router/status:
@@ -6586,18 +8726,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.SingboxRouterStatusResponse'
         "405":
           description: Method Not Allowed
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Get sing-box router status
@@ -6626,6 +8763,167 @@ paths:
       summary: Sing-box status
       tags:
       - singbox
+  /singbox/subscriptions/active-now:
+    get:
+      description: Returns the currently-active member tag as reported by the running
+        sing-box Clash API. For urltest mode this reflects the auto-selected fastest
+        member. Empty `now` means Clash is unreachable or no member selected yet.
+      parameters:
+      - description: Subscription id
+        in: query
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/api.OkResponse'
+            - properties:
+                data:
+                  $ref: '#/definitions/api.ActiveNowResponse'
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "405":
+          description: Method Not Allowed
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Live active member from Clash
+      tags:
+      - subscriptions
+  /singbox/subscriptions/get-stream:
+    get:
+      description: 'Streams a subscription as Server-Sent Events: one `meta` event
+        with subscription header (incl. total member count), then one `member` event
+        per server member, then a `done` event with finalisation (orphans, active
+        member). Frontend uses this to show a progress bar and render cards as they
+        arrive instead of waiting for the full payload. Service.Get is itself sync;
+        the streaming is the handler''s contract — it writes events with Flush() between,
+        so TCP + browser deliver progressively.'
+      parameters:
+      - description: Subscription id
+        in: query
+        name: id
+        required: true
+        type: string
+      produces:
+      - text/event-stream
+      responses:
+        "200":
+          description: 'Stream of SSE events: meta, member×N, done'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "405":
+          description: Method Not Allowed
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Stream subscription details progressively (SSE)
+      tags:
+      - subscriptions
+  /singbox/subscriptions/members/add:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Subscription ID
+        in: query
+        name: id
+        required: true
+        type: string
+      - description: Share-link
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.AddMemberRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.SubscriptionResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Add a manual member to an inline subscription
+      tags:
+      - subscriptions
+  /singbox/subscriptions/members/remove:
+    post:
+      consumes:
+      - application/json
+      description: |-
+        Removing the last member tears the whole subscription
+        down. The response indicates whether the subscription
+        itself was deleted via deleted=true.
+      parameters:
+      - description: Subscription ID
+        in: query
+        name: id
+        required: true
+        type: string
+      - description: Member tag
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.RemoveMemberRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.APIEnvelope'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Remove a member from an inline subscription
+      tags:
+      - subscriptions
   /singbox/tunnels:
     delete:
       produces:
@@ -6768,6 +9066,30 @@ paths:
       security:
       - CookieAuth: []
       summary: Sing-box tunnel speed test stream
+      tags:
+      - singbox
+  /singbox/update:
+    post:
+      description: Replaces the currently-installed managed sing-box with the version
+        this awg-manager build is pinned to. No-op when versions match.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.OkResponse'
+        "405":
+          description: Method Not Allowed
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Update managed sing-box binary
       tags:
       - singbox
   /static-routes/create:
@@ -6994,7 +9316,8 @@ paths:
   /system-tunnels/asc:
     get:
       description: Reads AWG signature/obfuscation parameters for the named system
-        (NativeWG / kernel-WG) tunnel.
+        (NativeWG / kernel-WG) tunnel. Data is the raw signature preset object whose
+        shape depends on the active preset.
       parameters:
       - description: Tunnel name
         in: query
@@ -7007,18 +9330,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.ASCParamsResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Get system tunnel ASC params
@@ -7028,19 +9348,19 @@ paths:
       consumes:
       - application/json
       description: Persists AWG signature/obfuscation parameters for the named system
-        tunnel. Body is the raw ASC JSON object.
+        tunnel. Body is the raw ASC JSON object whose shape depends on the active
+        signature preset.
       parameters:
       - description: Tunnel name
         in: query
         name: name
         required: true
         type: string
-      - description: ASC params
+      - description: ASC params object
         in: body
         name: body
         required: true
         schema:
-          additionalProperties: true
           type: object
       produces:
       - application/json
@@ -7048,18 +9368,15 @@ paths:
         "200":
           description: OK
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.OkResponse'
         "400":
           description: Bad Request
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
         "500":
           description: Internal Server Error
           schema:
-            additionalProperties: true
-            type: object
+            $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Set system tunnel ASC params
@@ -7839,7 +10156,7 @@ paths:
         name: id
         required: true
         type: string
-      - description: 1h or 24h
+      - description: 5m, 10m, 30m, 1h, 3h, 6h, 12h, 24h, or 48h
         in: query
         name: period
         required: true

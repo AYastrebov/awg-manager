@@ -49,9 +49,10 @@ type Poller struct {
 	prev        map[string]peerDigest
 	// emptyUntil holds per-interface cooldown timestamps. Once an
 	// interface is observed with zero peers, we skip polling it for
-	// emptyCooldown — no point hitting NDMS every 10s for an empty
+	// emptyCooldown — no point hitting NDMS every 5s for an empty
 	// server (e.g. one freshly created with no clients added yet).
-	// Invalidate<All>() clears this map whenever the list of peers is refreshed.
+	// Cooldown is self-clearing: when it elapses we re-probe, and
+	// any non-empty result removes the marker.
 	emptyUntil  map[string]time.Time
 	snapshotPub ServerSnapshotPublisher
 	history     HistoryFeeder
@@ -63,9 +64,12 @@ type Poller struct {
 }
 
 // emptyCooldown is how long an interface observed with zero peers is
-// skipped before being polled again. One minute is short enough for
-// the UI to discover a newly-added peer without feeling laggy, and
-// long enough to slash RCI load for servers sitting idle.
+// skipped before being polled again. One minute keeps RCI load low
+// for idle servers (NDMS responds 404 on /wireguard/peer when empty
+// and logs Core::Scgi::ThreadPool: not found on every hit) while
+// still bounding how long a freshly-added peer waits to appear in
+// metrics. Newly-added peers also surface via SSE on mutation, so
+// fast polling here is not what drives UI freshness.
 const emptyCooldown = 60 * time.Second
 
 // InterfaceRef names one interface to poll metrics for, plus its role.
@@ -108,7 +112,7 @@ type HistoryFeeder interface {
 	Feed(tunnelID string, rxBytes, txBytes int64)
 }
 
-const defaultInterval = 10 * time.Second
+const defaultInterval = 5 * time.Second
 
 // New wires a Poller with production defaults.
 func New(peers *query.PeerStore, pub Publisher, running RunningInterfacesProvider, subs SubscriberCounter, log Logger) *Poller {
@@ -202,7 +206,7 @@ func (p *Poller) tick() {
 	// Drop interfaces that are within their known-empty cooldown. For
 	// a server with zero peers there's nothing useful to poll — the
 	// narrow /wireguard/peer endpoint just 404s or returns [] and we
-	// don't want to hammer NDMS every 10s for each idle server.
+	// don't want to hammer NDMS every 5s for each idle server.
 	now := time.Now()
 	p.mu.Lock()
 	pollRefs := make([]InterfaceRef, 0, len(refs))

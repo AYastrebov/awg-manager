@@ -17,7 +17,8 @@ import (
 
 // Process manages the sing-box process lifecycle (single-process model).
 //
-// stdout is /dev/null'd. stderr is scanned line-by-line for the entire
+// stdout is scanned line-by-line and forwarded to OnStdoutLine (nil =
+// silently consumed). stderr is scanned line-by-line for the entire
 // process lifetime — each line is forwarded to OnStderrLine (so FATAL
 // messages from sing-box reach the app log even after the startup
 // grace period passes) AND retained in a bounded buffer so a startup
@@ -34,15 +35,25 @@ type Process struct {
 	// just not forwarded). Set by Operator construction.
 	OnStderrLine func(string)
 
+	// OnStdoutLine is invoked once per line written to sing-box's stdout.
+	// Nil = stdout is silently consumed. Set by Operator construction.
+	OnStdoutLine func(string)
+
 	// OnExit is invoked when cmd.Wait returns AFTER the startup grace
 	// period — i.e., a "successful start that died later". The error is
 	// the result of cmd.Wait (typically *exec.ExitError). The captured
 	// stderr buffer (last ~16KB) is passed as the second argument.
 	OnExit func(err error, stderrTail string)
 
+	// startMu serialises Start and Stop so concurrent callers (watchdog tick
+	// + manual UI Restart) cannot both pass the IsRunning gate and spawn two
+	// processes. IsRunning is intentionally NOT guarded — it is called by the
+	// watchdog while a Start is in flight and must never block.
+	startMu sync.Mutex
+
 	// stderrMu protects lastStderr so OnExit / GetLastStderr concurrent.
-	stderrMu    sync.RWMutex
-	lastStderr  string
+	stderrMu   sync.RWMutex
+	lastStderr string
 
 	// For tests
 	startCmd func(bin string, args ...string) (*exec.Cmd, error)
@@ -75,7 +86,17 @@ const (
 // rule-set fetch), p.OnExit is invoked in a background goroutine and the
 // PID file is cleaned up — callers must rely on OnExit / IsRunning to
 // observe these late deaths.
+//
+// Start acquires startMu so concurrent callers cannot both pass the IsRunning
+// gate and spawn duplicate processes. IsRunning is intentionally lock-free.
 func (p *Process) Start() error {
+	p.startMu.Lock()
+	defer p.startMu.Unlock()
+	return p.startLocked()
+}
+
+// startLocked is the lock-free body of Start. Must be called with startMu held.
+func (p *Process) startLocked() error {
 	if running, _ := p.IsRunning(); running {
 		return nil
 	}
@@ -88,9 +109,19 @@ func (p *Process) Start() error {
 	}
 	pr, pw := io.Pipe()
 	cmd.Stderr = pw
-	if devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0); err == nil {
-		cmd.Stdout = devnull
-	}
+
+	stdoutR, stdoutW := io.Pipe()
+	cmd.Stdout = stdoutW
+
+	go func() {
+		sc := bufio.NewScanner(stdoutR)
+		sc.Buffer(make([]byte, 0, 4096), 64*1024)
+		for sc.Scan() {
+			if p.OnStdoutLine != nil {
+				p.OnStdoutLine(sc.Text())
+			}
+		}
+	}()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	stderr := newLimitedBuffer(stderrBufferSize)
@@ -111,6 +142,7 @@ func (p *Process) Start() error {
 
 	if err := cmd.Start(); err != nil {
 		_ = pw.Close()
+		_ = stdoutW.Close()
 		<-scannerDone
 		return fmt.Errorf("start sing-box: %w", err)
 	}
@@ -118,6 +150,7 @@ func (p *Process) Start() error {
 		_ = syscall.Kill(cmd.Process.Pid, syscall.SIGTERM)
 		_ = cmd.Wait()
 		_ = pw.Close()
+		_ = stdoutW.Close()
 		<-scannerDone
 		return err
 	}
@@ -125,12 +158,13 @@ func (p *Process) Start() error {
 	go func() {
 		err := cmd.Wait()
 		_ = pw.Close()
+		_ = stdoutW.Close()
 		<-scannerDone
 		errCh <- err
 	}()
 	select {
 	case waitErr := <-errCh:
-		_ = os.Remove(p.pidPath)
+		p.cleanupPidIfOurs(cmd.Process.Pid)
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			if waitErr != nil {
@@ -142,9 +176,10 @@ func (p *Process) Start() error {
 		p.setLastStderr(msg)
 		return fmt.Errorf("sing-box exited during startup: %s", msg)
 	case <-time.After(startupGracePeriod):
+		myPid := cmd.Process.Pid
 		go func() {
 			waitErr := <-errCh
-			_ = os.Remove(p.pidPath)
+			p.cleanupPidIfOurs(myPid)
 			tail := strings.TrimSpace(stderr.String())
 			p.setLastStderr(tail)
 			if p.OnExit != nil {
@@ -153,6 +188,12 @@ func (p *Process) Start() error {
 		}()
 		return nil
 	}
+}
+
+// Binary returns the path to the sing-box executable used by this
+// process. Inspector and other tools shell out to it for rule-set match.
+func (p *Process) Binary() string {
+	return p.binary
 }
 
 // LastStderr returns the most recent captured stderr tail (~16KB) from the
@@ -170,7 +211,15 @@ func (p *Process) setLastStderr(s string) {
 }
 
 // Stop sends SIGTERM, then SIGKILL after grace period.
+// Stop acquires startMu so it cannot interleave with an in-flight Start.
 func (p *Process) Stop() error {
+	p.startMu.Lock()
+	defer p.startMu.Unlock()
+	return p.stopLocked()
+}
+
+// stopLocked is the lock-free body of Stop. Must be called with startMu held.
+func (p *Process) stopLocked() error {
 	pid, err := p.readPID()
 	if err != nil {
 		return nil // nothing to stop
@@ -186,25 +235,48 @@ func (p *Process) Stop() error {
 	}
 	if isAlive(pid) {
 		_ = p.signalFn(pid, syscall.SIGKILL)
+		// Brief poll for the kernel to reap the SIGKILL'd process before
+		// removing the pid record. Without this, a follow-up Start that
+		// sees a missing pidfile could spawn a second process alongside
+		// a not-yet-dead-but-being-killed one.
+		killDeadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(killDeadline) {
+			if !isAlive(pid) {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
 	_ = os.Remove(p.pidPath)
 	return nil
 }
 
+// Reload acquires startMu for the entire stop+start sequence so callers
+// to concurrent Start/Stop see a single atomic transition. Worst-case
+// hold time is ~3.65s on the SIGHUP-failure path (3s SIGTERM poll +
+// 500ms startup grace + overhead). Callers waiting on the mutex during
+// a stuck Reload may appear hung — that is the price of "Reload is
+// atomic w.r.t. concurrent restarts".
+//
 // Reload sends SIGHUP; on failure, falls back to stop + start.
+// The lock-free helpers startLocked/stopLocked are used internally to
+// avoid a reentrant-lock deadlock.
 func (p *Process) Reload() error {
+	p.startMu.Lock()
+	defer p.startMu.Unlock()
+
 	pid, err := p.readPID()
 	if err != nil {
-		return p.Start() // no process, start fresh
+		return p.startLocked() // no process, start fresh
 	}
 	if err := p.signalFn(pid, syscall.SIGHUP); err != nil {
 		// SIGHUP failed; full restart
-		_ = p.Stop()
-		return p.Start()
+		_ = p.stopLocked()
+		return p.startLocked()
 	}
 	time.Sleep(150 * time.Millisecond)
 	if !isAlive(pid) {
-		return p.Start()
+		return p.startLocked()
 	}
 	return nil
 }
@@ -219,6 +291,22 @@ func (p *Process) IsRunning() (bool, int) {
 		return false, pid
 	}
 	return true, pid
+}
+
+// cleanupPidIfOurs removes the pid file ONLY if it currently contains the
+// given pid. Best-effort ownership check: a successor Start can still race
+// in between the readPID and os.Remove below, but the window is now
+// microseconds rather than seconds — small enough that issue #40 process
+// accumulation no longer reproduces in practice.
+func (p *Process) cleanupPidIfOurs(myPid int) {
+	curPid, err := p.readPID()
+	if err != nil {
+		return
+	}
+	if curPid != myPid {
+		return
+	}
+	_ = os.Remove(p.pidPath)
 }
 
 // readPID parses the PID file.

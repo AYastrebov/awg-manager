@@ -2,9 +2,11 @@
 package awgoutbounds
 
 import (
+	"context"
 	"sync"
 
 	"github.com/hoaxisr/awg-manager/internal/events"
+	"github.com/hoaxisr/awg-manager/internal/singbox/orchestrator"
 )
 
 // TagInfo is the public projection of one AWG outbound that downstream
@@ -29,12 +31,28 @@ type AWGEntry struct {
 }
 
 // Deps groups the external collaborators Service needs.
+// ManagedServersQuery returns the InterfaceName of every awg-manager
+// managed WireGuard server. enumerate() uses this list to skip those
+// names in the system-tunnel branch — our servers must not become
+// sing-box outbounds (clients connect TO them, traffic does not exit
+// through them).
+type ManagedServersQuery interface {
+	ManagedServerInterfaceNames(ctx context.Context) []string
+}
+
 type Deps struct {
-	AWGTunnels    AWGTunnelStore
-	SystemTunnels SystemTunnelQuery
-	Singbox       SingboxController // nil ok — Sync skips both file write and Reload
-	AppLog        AppLogger         // nil ok — degrades to silent
-	Bus           *events.Bus       // nil ok — SubscribeBus becomes no-op
+	AWGTunnels     AWGTunnelStore
+	SystemTunnels  SystemTunnelQuery
+	ManagedServers ManagedServersQuery // optional; nil = no filter applied
+	Singbox        SingboxController   // nil ok — Sync skips both file write and Reload
+	AppLog         AppLogger           // nil ok — degrades to silent
+	Bus            *events.Bus         // nil ok — SubscribeBus becomes no-op
+	// Orch is the config.d orchestrator. When non-nil (production),
+	// writeFile hands the JSON to SlotAwg — orchestrator drives both
+	// the atomic write and the debounced reload, so deps.Singbox.Reload
+	// is skipped. When nil (tests), falls back to direct write +
+	// Singbox.Reload.
+	Orch *orchestrator.Orchestrator
 }
 
 // SingboxController is the narrow contract Service needs from

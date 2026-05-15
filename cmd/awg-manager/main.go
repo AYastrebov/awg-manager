@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -17,14 +18,16 @@ import (
 	"time"
 
 	"log/slog"
+	"runtime"
 
 	"github.com/hoaxisr/awg-manager/internal/accesspolicy"
 	"github.com/hoaxisr/awg-manager/internal/api"
-	"github.com/hoaxisr/awg-manager/internal/deviceproxy"
 	"github.com/hoaxisr/awg-manager/internal/auth"
 	"github.com/hoaxisr/awg-manager/internal/cleanup"
 	"github.com/hoaxisr/awg-manager/internal/clientroute"
 	"github.com/hoaxisr/awg-manager/internal/connectivity"
+	"github.com/hoaxisr/awg-manager/internal/deviceproxy"
+	"github.com/hoaxisr/awg-manager/internal/diagnostics"
 	"github.com/hoaxisr/awg-manager/internal/dnscheck"
 	"github.com/hoaxisr/awg-manager/internal/dnsroute"
 	"github.com/hoaxisr/awg-manager/internal/events"
@@ -40,12 +43,14 @@ import (
 	ndmstransport "github.com/hoaxisr/awg-manager/internal/ndms/transport"
 	"github.com/hoaxisr/awg-manager/internal/orchestrator"
 	"github.com/hoaxisr/awg-manager/internal/pingcheck"
-	"github.com/hoaxisr/awg-manager/internal/rci"
 	"github.com/hoaxisr/awg-manager/internal/routing"
 	"github.com/hoaxisr/awg-manager/internal/server"
 	"github.com/hoaxisr/awg-manager/internal/singbox"
 	"github.com/hoaxisr/awg-manager/internal/singbox/awgoutbounds"
+	"github.com/hoaxisr/awg-manager/internal/singbox/installer"
+	singboxorch "github.com/hoaxisr/awg-manager/internal/singbox/orchestrator"
 	"github.com/hoaxisr/awg-manager/internal/singbox/router"
+	"github.com/hoaxisr/awg-manager/internal/singbox/subscription"
 	"github.com/hoaxisr/awg-manager/internal/staticroute"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 	"github.com/hoaxisr/awg-manager/internal/sys/kmod"
@@ -71,11 +76,103 @@ import (
 const (
 	defaultDataDir = "/opt/etc/awg-manager"
 	defaultWebRoot = "/opt/share/www/awg-manager"
-	pidFile        = "/opt/var/run/awg-manager.pid"
+	// pidFile lives on the system tmpfs (cleared on every boot) so an
+	// unclean reboot can never leave a stale PID pointing at whatever
+	// process eventually inherits that PID slot on the next uptime.
+	// /var/run is FHS-canonical and always tmpfs on Keenetic; /opt/var/run
+	// is Entware-persistent storage and was the source of the stale-PID
+	// startup-block bug.
+	pidFile = "/var/run/awg-manager.pid"
+	// legacyPidFile is the pre-move location; one-shot cleanup on startup
+	// removes it after an upgrade so the old file does not linger.
+	legacyPidFile = "/opt/var/run/awg-manager.pid"
 )
 
 // version is set via ldflags at build time
 var version = "dev"
+
+// buildArch is set via ldflags at build time to one of the awg-manager
+// architecture keys: "mipsel-3.4" | "mips-3.4" | "aarch64-3.10".
+// Empty when running `go run` / `go build ./cmd/awg-manager` directly —
+// detectArch() falls back to runtime.GOARCH-based mapping.
+var buildArch string
+
+// detectArch returns the awg-manager arch key for installer.EmbeddedBinaries.
+// Prefers the build-time -X main.buildArch override; falls back to
+// runtime.GOARCH for dev builds.
+func detectArch() string {
+	if buildArch != "" {
+		return buildArch
+	}
+	switch runtime.GOARCH {
+	case "mipsle":
+		return "mipsel-3.4"
+	case "mips":
+		return "mips-3.4"
+	case "arm64":
+		return "aarch64-3.10"
+	}
+	return ""
+}
+
+// deviceproxySubscriptionOutboundsAdapter adapts *subscription.Service to
+// the deviceproxy.SubscriptionOutboundsCatalog interface, exposing enabled
+// subscription selector/urltest outbounds as device-proxy targets without
+// creating a direct dependency from the subscription package on deviceproxy.
+type deviceproxySubscriptionOutboundsAdapter struct {
+	src *subscription.Service
+}
+
+func (a *deviceproxySubscriptionOutboundsAdapter) ListDeviceProxyOutbounds() []deviceproxy.SubscriptionOutboundInfo {
+	if a == nil || a.src == nil {
+		return nil
+	}
+	subs := a.src.List()
+	out := make([]deviceproxy.SubscriptionOutboundInfo, 0, len(subs))
+
+	for _, sub := range subs {
+		if !sub.Enabled || sub.SelectorTag == "" || len(sub.MemberTags) == 0 {
+			continue
+		}
+		label := strings.TrimSpace(sub.Label)
+		if label == "" {
+			label = sub.ID
+		}
+		active := sub.ActiveMember
+		if active == "" && len(sub.MemberTags) > 0 {
+			active = sub.MemberTags[0]
+		}
+		detail := active
+		for _, m := range sub.Members {
+			if m.Tag != active {
+				continue
+			}
+			parts := []string{}
+			if strings.TrimSpace(m.Label) != "" {
+				parts = append(parts, strings.TrimSpace(m.Label))
+			}
+			if m.Protocol != "" {
+				parts = append(parts, strings.ToUpper(m.Protocol))
+			}
+			if m.Server != "" {
+				parts = append(parts, fmt.Sprintf("%s:%d", m.Server, m.Port))
+			}
+			if len(parts) > 0 {
+				detail = strings.Join(parts, " · ")
+			}
+			break
+		}
+		out = append(out, deviceproxy.SubscriptionOutboundInfo{
+			Tag:    sub.SelectorTag,
+			Label:  label,
+			Detail: detail,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Label < out[j].Label
+	})
+	return out
+}
 
 func main() {
 	dataDir := flag.String("data-dir", defaultDataDir, "Data directory path")
@@ -112,6 +209,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// One-shot cleanup of the pre-move PID file. Older awgm wrote it to
+	// /opt/var/run/awg-manager.pid (persistent Entware storage); after
+	// the move to /var/run we never reference that path again, so remove
+	// it so a stale upgrade artifact does not linger.
+	_ = os.Remove(legacyPidFile)
+
+	// Record the exact moment main() enters the daemon path so BootHealth
+	// can compute uptime accurately. Must happen before any goroutines start.
+	diagnostics.SetProcessStartedAt(time.Now())
+
 	uptime := getUptime()
 
 	log := logger.New()
@@ -130,26 +237,6 @@ func main() {
 		log,
 	)
 
-	// Fetch NDMS version info via RCI (single HTTP call, cached for all consumers).
-	// At early boot, retry until NDMS responds (up to 30s).
-	ndmsTimeout := time.Second // normal restart: single attempt
-	if uptime > 0 && uptime < 120 {
-		ndmsTimeout = 30 * time.Second // boot: wait for NDMS
-	}
-	if err := ndmsinfo.Init(context.Background(), ndmsTimeout); err != nil {
-		log.Warn("NDMS version info not available", map[string]interface{}{"error": err.Error()})
-	}
-
-	// Load kernel module if available (before backend detection)
-	kmodLoader := kmod.New()
-
-	// Clean up old SoC-based module directories from previous IPK versions
-	kmodLoader.CleanupLegacyModules()
-	// EnsureModule: select bundled .ko if available → insmod
-	if err := kmodLoader.EnsureModule(context.Background()); err != nil {
-		log.Warn("Kernel module not available", map[string]interface{}{"error": err.Error()})
-	}
-
 	// Logging service (created early — injected into tunnel service, pingcheck, dnsroute, operator, state, firewall, nwg)
 	loggingService := logging.NewService(settingsStore)
 	defer loggingService.Stop()
@@ -161,6 +248,7 @@ func main() {
 	// orchestrator).
 	ndmsSem := ndmstransport.NewSemaphore(4)
 	ndmsTransportClient := ndmstransport.New(ndmsSem)
+	ndmsTransportClient.SetAppLogger(loggingService)
 
 	ndmsQueries := ndmsquery.NewQueries(ndmsquery.Deps{
 		Getter: ndmsTransportClient,
@@ -169,12 +257,27 @@ func main() {
 	})
 
 	// Initialize SystemInfoStore at boot — one-shot fetch of /show/version.
-	{
-		initCtx, initCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := ndmsQueries.SystemInfo.Init(initCtx); err != nil {
-			log.Warnf("ndms sysinfo init: %v", err)
-		}
-		initCancel()
+	// Compute timeout based on system uptime (wait longer at early boot).
+	ndmsTimeout := time.Second // normal restart: single attempt
+	if uptime > 0 && uptime < 120 {
+		ndmsTimeout = 30 * time.Second // boot: wait for NDMS
+	}
+	// Wire ndmsinfo to the SystemInfoStore, then initialize with retry.
+	// MUST run before kmod.New(): the kmod loader reads model/SoC from
+	// ndmsinfo.Get() at construction time.
+	if err := ndmsinfo.Init(context.Background(), ndmsQueries.SystemInfo, ndmsTimeout); err != nil {
+		log.Warn("NDMS version info not available", map[string]interface{}{"error": err.Error()})
+	}
+
+	// Load kernel module if available (before backend detection).
+	// kmod.New() reads model/SoC from ndmsinfo, so it must run after Init above.
+	kmodLoader := kmod.New()
+
+	// Clean up old SoC-based module directories from previous IPK versions
+	kmodLoader.CleanupLegacyModules()
+	// EnsureModule: select bundled .ko if available → insmod
+	if err := kmodLoader.EnsureModule(context.Background()); err != nil {
+		log.Warn("Kernel module not available", map[string]interface{}{"error": err.Error()})
 	}
 
 	// Warm NDMS list caches before accepting clients so the first SSE snapshot
@@ -225,8 +328,7 @@ func main() {
 	operator := ops.NewOperator(ndmsQueries, ndmsCommands, wgClient, backendImpl, firewallMgr, log)
 
 	// Create NativeWG operator
-	rciClient := rci.New()
-	nwgOp := nwg.NewOperator(log, ndmsQueries, ndmsCommands, ndmsTransportClient, rciClient, loggingService)
+	nwgOp := nwg.NewOperator(log, ndmsQueries, ndmsCommands, ndmsTransportClient, loggingService)
 
 	// Load awg_proxy.ko if firmware < 5.1 Alpha 4
 	if !ndmsinfo.SupportsWireguardASC() {
@@ -255,11 +357,13 @@ func main() {
 		&tunnelProviderAdapter{svc: tunnelService, store: awgStore},
 		ndmsQueries.Interfaces,
 		&storeAdapter{store: awgStore},
+		loggingService,
 	)
 
 	// HydraRoute Neo integration (optional — detected at startup)
-	hydraService := hydraroute.NewService(catalog, log)
+	hydraService := hydraroute.NewService(catalog, log, loggingService)
 	geoDataStore := hydraroute.NewGeoDataStore(*dataDir)
+	geoDataStore.SetAppLogger(loggingService)
 	hydraService.SetGeoDataStore(geoDataStore)
 	// Adopt any geo files already listed in hrneo.conf (e.g. added manually
 	// before awg-manager was installed) so they show up in the UI. Adoption
@@ -355,7 +459,7 @@ func main() {
 
 	operator.SetAppLogger(loggingService)
 
-	// Traffic history (in-memory, 24h)
+	// Traffic history (in-memory, 48h)
 	trafficHistory := traffic.New()
 	defer trafficHistory.Stop()
 
@@ -378,7 +482,6 @@ func main() {
 			log.Info("ttyd autostarted", map[string]interface{}{"port": port})
 		}
 	}
-
 
 	// Client route service (per-device VPN routing)
 	clientRouteStore := storage.NewClientRouteStore(*dataDir)
@@ -519,6 +622,7 @@ func main() {
 		trafficHistory,
 		eventBus,
 		metricsLogger(loggingService),
+		loggingService,
 	)
 	sysfsTrafficPoller.Start()
 
@@ -555,19 +659,151 @@ func main() {
 	// matrix tick so cards show fresh latency without waiting up to 60s.
 	// All actual probing happens inside monitoring.Scheduler.
 	connAdapter := connectivity.NewAdapter(tunnelService)
-	connMonitor := connectivity.NewMonitor(eventBus, monitoringService.Scheduler(), connAdapter)
+	connMonitor := connectivity.NewMonitor(eventBus, monitoringService.Scheduler(), connAdapter, loggingService)
 	connMonitor.Start()
 	defer connMonitor.Stop()
 
 	// Sing-box integration
 	singboxOp := singbox.NewOperator(singbox.OperatorDeps{
-		Log:      slog.Default().With("component", "singbox"),
-		Queries:  ndmsQueries,
-		Commands: ndmsCommands,
+		Log:       slog.Default().With("component", "singbox"),
+		Queries:   ndmsQueries,
+		Commands:  ndmsCommands,
+		AppLogger: loggingService,
+		// Seed the sticky-stop flag from disk so the watchdog respects
+		// a user-pressed Stop across awgm restarts. SetManuallyStopped
+		// writes the new intent back through a single-field updater so
+		// concurrent writers on other Settings fields (e.g. router
+		// service toggling SingboxRouter) cannot silently overwrite it.
+		InitialManuallyStopped: settings.SingboxManuallyStopped,
+		SetManuallyStopped:     settingsStore.SetSingboxManuallyStopped,
 	})
-	delayChecker := singbox.NewDelayChecker(singboxOp.Clash(), singboxOp, eventBus)
+
+	// config.d orchestrator — the single writer of slot files (00-base /
+	// 10-tunnels / 15-awg / 20-router / 30-deviceproxy). Producers route
+	// their writes through Save / SetEnabled so a "disabled" domain
+	// actually moves the file out of sing-box's view (config.d/disabled/)
+	// instead of leaving stale content behind.
+	singboxConfigDir := singboxOp.ConfigDir()
+	if err := singbox.MigrateDeviceProxyOutOfTunnels(singboxConfigDir); err != nil {
+		log.Warnf("singbox: deviceproxy migration: %v", err)
+	}
+	sbOrch := singboxorch.New(singboxConfigDir, singboxOp.Process())
+	sbOrch.SetLogger(func(level, msg string) {
+		switch level {
+		case "warn":
+			loggingService.AppLog(logging.LevelWarn, logging.GroupSingbox, logging.SubSBProcess, "orchestrator", "", msg)
+		case "error":
+			loggingService.AppLog(logging.LevelError, logging.GroupSingbox, logging.SubSBProcess, "orchestrator", "", msg)
+		default:
+			loggingService.AppLog(logging.LevelInfo, logging.GroupSingbox, logging.SubSBProcess, "orchestrator", "", msg)
+		}
+	})
+	sbOrch.SetValidator(&orchValidatorAdapter{v: singbox.NewValidator(installer.DefaultBinaryPath)})
+	// Propagate the sticky-stop intent so reload-triggered cold-starts
+	// (slot-file writes from router/deviceproxy/subscriptions) respect a
+	// user-pressed Stop in the same way the watchdog does.
+	sbOrch.SetShouldRun(func() bool { return !singboxOp.IsManuallyStopped() })
+	for _, meta := range singboxorch.KnownSlots() {
+		// SlotTunnels is AlwaysOn but only counts as "active work" when
+		// the user has defined sing-box tunnels — wire HasContent so
+		// the daemon stops running for an empty 10-tunnels.json.
+		if meta.Slot == singboxorch.SlotTunnels {
+			meta.HasContent = func() bool {
+				return singboxOp.HasUserTunnels()
+			}
+		}
+		if err := sbOrch.Register(meta); err != nil {
+			log.Errorf("singbox orchestrator register %s: %v", meta.Slot, err)
+		}
+	}
+	if err := sbOrch.Bootstrap(); err != nil {
+		log.Errorf("singbox orchestrator bootstrap: %v", err)
+	}
+	// Reflect Settings into orchestrator slot enabled-state. router /
+	// deviceproxy / subscriptions are content-driven; tunnels / awg
+	// are AlwaysOn (registered as such above) and cannot be toggled
+	// here — Register already marked them enabled. deviceproxy is
+	// reflected after deviceProxySvc is constructed below.
+	if curSettings, err := settingsStore.Load(); err == nil && curSettings != nil {
+		_ = sbOrch.SetEnabled(singboxorch.SlotRouter, curSettings.SingboxRouter.Enabled)
+	}
+
+	// Subscription service — owns 40-subscriptions.json in config.d.
+	// NewOperatorAdapter registers the slot into sbOrch (must happen before
+	// Bootstrap so Bootstrap can scan the file). LoadFromDisk reads any
+	// existing 40-subscriptions.json so the in-memory state is consistent.
+	subStorePath := filepath.Join(*dataDir, "subscriptions.json")
+	subStore, err := subscription.NewStore(subStorePath)
+	if err != nil {
+		log.Errorf("subscription store: %v", err)
+	}
+	subProxyMgr := singbox.NewProxyManager(ndmsQueries, ndmsCommands)
+	subAdapter := subscription.NewOperatorAdapter(sbOrch, subProxyMgr, singboxOp.Clash())
+	if err := subAdapter.LoadFromDisk(singboxConfigDir); err != nil {
+		log.Warnf("subscription adapter: load from disk: %v", err)
+	}
+	subSvc := subscription.NewService(subStore, subAdapter)
+	subSvc.SetAppLogger(loggingService)
+
+	// Wire orchestrator into Operator so ApplyConfig writes 10-tunnels.json
+	// through SlotTunnels rather than an in-place write that bypasses
+	// the orchestrator's validate / debounced reload.
+	singboxOp.SetOrch(sbOrch)
+
+	// Wire managed-binary installer into Operator. The installer is keyed
+	// by the build-time arch string (e.g. "mipsel-3.4") so it can resolve
+	// the correct download URL and SHA256 from EmbeddedBinaries.
+	arch := detectArch()
+	if arch == "" {
+		log.Warnf("could not derive arch (runtime.GOARCH=%s) — managed sing-box install/update disabled", runtime.GOARCH)
+	} else {
+		spec, ok := installer.EmbeddedBinaries[arch]
+		if !ok {
+			log.Warnf("no embedded sing-box BinarySpec for arch %q — managed sing-box install/update disabled", arch)
+		} else {
+			singboxInstaller := installer.New(installer.DefaultBinaryPath, arch, spec, loggingService)
+			singboxOp.SetInstaller(singboxInstaller)
+
+			// Stream sing-box install/update lifecycle over SSE so the UI
+			// can render a live progress bar instead of a blocking spinner.
+			singboxOp.SetInstallProgressReporter(func(op, phase string, downloaded, total int64, errMsg string) {
+				eventBus.Publish("singbox:install-progress", events.SingboxInstallProgressEvent{
+					Op:         op,
+					Phase:      phase,
+					Downloaded: downloaded,
+					Total:      total,
+					Error:      errMsg,
+				})
+			})
+
+			// Auto-migration goroutine: when legacy sing-box-naive opkg
+			// package is present but managed binary is missing, run the
+			// jump from opkg → managed in the background. Failures keep
+			// awg-manager on the legacy install — retry happens on next boot.
+			go func() {
+				ctx := context.Background()
+				if singboxInstaller.CurrentVersion(ctx) != "" {
+					return // managed binary already in place
+				}
+				if !singboxInstaller.IsLegacyOpkgInstalled(ctx) {
+					return // nothing to migrate
+				}
+				lc := &operatorLifecycle{op: singboxOp}
+				if err := singboxInstaller.Migrate(ctx, lc); err != nil {
+					log.Warnf("singbox auto-migration deferred: %v", err)
+				}
+			}()
+		}
+	}
+
+	delayChecker := singbox.NewDelayChecker(
+		singboxOp.Clash(),
+		&singboxAndSubLister{op: singboxOp, sub: subSvc},
+		eventBus,
+	)
 	singboxHandler := api.NewSingboxHandler(singboxOp, eventBus, delayChecker, testService)
 	clashProxy := api.NewClashProxy(singboxOp)
+	singboxConnsHandler := api.NewSingboxConnectionsHandler(ndmsQueries.Hotspot)
 
 	// Watchdog: runs an immediate reconcile (replacing the old one-shot
 	// startup reconcile) and keeps checking every 30s. If sing-box crashes
@@ -580,7 +816,7 @@ func main() {
 
 	trafficCtx, trafficCancel := context.WithCancel(context.Background())
 	defer trafficCancel()
-	go singbox.NewTrafficAggregator(singboxOp.Clash().Address(), eventBus).Run(trafficCtx)
+	go singbox.NewTrafficAggregator(singboxOp.Clash().Address(), eventBus, trafficHistory).Run(trafficCtx)
 
 	delayCtx, delayCancel := context.WithCancel(context.Background())
 	defer delayCancel()
@@ -622,36 +858,56 @@ func main() {
 			Version: version,
 			WebRoot: *webRoot,
 		},
-		log,
-		tunnelService,
-		externalService,
-		testService,
-		keeneticClient,
-		sessionStore,
-		settingsStore,
-		awgStore,
-		pingCheckFacade,
-		loggingService,
-		backendImpl,
-		kmodLoader,
-		updaterService,
-		ndmsQueries,
-		trafficHistory,
-		dnsRouteService,
-		staticRouteService,
-		systemTunnelSvc,
-		managedService,
-		nwgOp,
-		terminalManager,
-		accessPolicySvc,
-		clientRouteService,
-		catalog,
-		orch,
-		eventBus,
-		hydraService,
-		singboxHandler,
-		clashProxy,
-		monitoringService,
+		server.Deps{
+			Log:                 log,
+			TunnelService:       tunnelService,
+			ExternalService:     externalService,
+			TestingService:      testService,
+			Keenetic:            keeneticClient,
+			Sessions:            sessionStore,
+			Settings:            settingsStore,
+			Tunnels:             awgStore,
+			PingCheckService:    pingCheckFacade,
+			LoggingService:      loggingService,
+			ActiveBackend:       backendImpl,
+			KmodLoader:          kmodLoader,
+			UpdaterService:      updaterService,
+			NdmsQueries:         ndmsQueries,
+			TrafficHistory:      trafficHistory,
+			DnsRouteService:     dnsRouteService,
+			StaticRouteService:  staticRouteService,
+			SystemTunnelService: systemTunnelSvc,
+			ManagedService:      managedService,
+			NwgOp:               nwgOp,
+			TerminalManager:     terminalManager,
+			AccessPolicySvc:     accessPolicySvc,
+			ClientRouteSvc:      clientRouteService,
+			Catalog:             catalog,
+			Orch:                orch,
+			Bus:                 eventBus,
+			HydraService:        hydraService,
+			SingboxHandler:      singboxHandler,
+			ClashProxy:          clashProxy,
+			SingboxConnsHandler: singboxConnsHandler,
+			MonitoringService:   monitoringService,
+			SingboxSubMembers: func() []diagnostics.SingboxSubMember {
+				subs := subSvc.List()
+				out := make([]diagnostics.SingboxSubMember, 0, len(subs)*2)
+				for _, sub := range subs {
+					activeKnown := sub.ActiveMember != ""
+					for _, tag := range sub.MemberTags {
+						out = append(out, diagnostics.SingboxSubMember{
+							Tag:         tag,
+							ListenPort:  int(sub.ListenPort),
+							Enabled:     sub.Enabled,
+							Active:      activeKnown && sub.ActiveMember == tag,
+							ActiveKnown: activeKnown,
+						})
+					}
+				}
+				return out
+			},
+		},
 	)
 
 	srv.SetSingboxOperator(singboxOp)
@@ -668,11 +924,13 @@ func main() {
 	// Must be constructed before deviceProxySvc so we can pass it as
 	// AWGOutbounds dep (deviceproxy now queries tags instead of enumerating).
 	awgoutboundsSvc := awgoutbounds.NewService(awgoutbounds.Deps{
-		AWGTunnels:    newAWGStoreAdapter(awgStore),
-		SystemTunnels: newSystemTunnelStoreAdapter(systemTunnelDPAdapter),
-		Singbox:       newAwgoutboundsSingboxAdapter(singboxOp),
-		AppLog:        logging.NewScopedLogger(loggingService, logging.GroupRouting, logging.SubAWGOutbounds),
-		Bus:           eventBus,
+		AWGTunnels:     newAWGStoreAdapter(awgStore),
+		SystemTunnels:  newSystemTunnelStoreAdapter(systemTunnelDPAdapter),
+		ManagedServers: newSettingsManagedServersAdapter(settingsStore),
+		Singbox:        newAwgoutboundsSingboxAdapter(singboxOp),
+		AppLog:         logging.NewScopedLogger(loggingService, logging.GroupRouting, logging.SubAWGOutbounds),
+		Bus:            eventBus,
+		Orch:           sbOrch,
 	})
 	awgoutboundsUnsub := awgoutboundsSvc.SubscribeBus(context.Background())
 	defer awgoutboundsUnsub()
@@ -685,13 +943,24 @@ func main() {
 	// Device-proxy service — LAN-facing SOCKS/HTTP proxy managed through
 	// sing-box. See docs/superpowers/specs/2026-04-24-device-proxy-design.md.
 	deviceProxyStore := deviceproxy.NewStore(filepath.Join(*dataDir, "deviceproxy.json"))
+	deviceProxySingboxAdapter := deviceproxy.NewSingboxAdapter(singboxOp)
+	deviceProxySingboxAdapter.SetOrch(sbOrch)
+
+	subOutboundsAdapter := &deviceproxySubscriptionOutboundsAdapter{src: subSvc}
+
 	deviceProxySvc := deviceproxy.NewService(deviceproxy.Deps{
-		Store:        deviceProxyStore,
-		Singbox:      deviceproxy.NewSingboxAdapter(singboxOp),
-		NDMSQuery:    deviceproxy.NewNDMSAdapter(ndmsQueries),
-		Bus:          eventBus,
-		AWGOutbounds: &deviceproxyAWGOutboundsAdapter{src: awgoutboundsSvc},
+		Store:                 deviceProxyStore,
+		Singbox:               deviceProxySingboxAdapter,
+		SubscriptionOutbounds: subOutboundsAdapter,
+		NDMSQuery:             deviceproxy.NewNDMSAdapter(ndmsQueries),
+		Bus:                   eventBus,
+		AWGOutbounds:          &deviceproxyAWGOutboundsAdapter{src: awgoutboundsSvc},
+		AppLogger:             loggingService,
 	})
+	// Reflect deviceproxy storage state into the orchestrator slot so
+	// the saved Enabled flag matches the on-disk active/disabled
+	// location of 30-deviceproxy.json from boot.
+	_ = sbOrch.SetEnabled(singboxorch.SlotDeviceProxy, deviceProxyStore.Get().Enabled)
 	deviceProxySvc.SetTunnelInboundPorts(func() []int {
 		cfg, err := singboxOp.LoadCurrentConfig()
 		if err != nil {
@@ -730,12 +999,16 @@ func main() {
 	srv.SetMetricsPoller(ndmsMetricsPoller)
 
 	routerSvc := router.NewService(router.Deps{
-		Log:      log,
-		Settings: settingsStore,
-		Singbox:  singboxOp,
-		Policies: &routerAccessPolicyAdapter{svc: accessPolicySvc, wan: wanModel},
-		Events:   eventBus,
-		AWGTags:  &routerAWGTagAdapter{src: awgoutboundsSvc},
+		Log:                    log,
+		Settings:               settingsStore,
+		Singbox:                singboxOp,
+		Policies:               &routerAccessPolicyAdapter{svc: accessPolicySvc, wan: wanModel},
+		Events:                 eventBus,
+		Bus:                    eventBus,
+		AWGTags:                &routerAWGTagAdapter{src: awgoutboundsSvc},
+		SingboxTunnels:         &routerSingboxTunnelAdapter{src: singboxOp},
+		SubscriptionComposites: router.NewSubscriptionCompositesAdapter(subAdapter),
+		Orch:                   sbOrch,
 	})
 	tunnelService.SetAWGSyncer(awgoutboundsSvc)
 	tunnelService.SetDeviceProxyRefChecker(deviceProxySvc)
@@ -749,8 +1022,42 @@ func main() {
 	routerScheduler := router.NewScheduler(routerSvc, settingsStore, log)
 	routerScheduler.Start()
 
+	// Late-bind sing-box / router / Clash deps into the monitoring scheduler.
+	// monitoringService is constructed early (line ~421) so the matrix can
+	// include Keenetic-native tunnels; singboxOp + routerSvc + clashProxy
+	// are constructed later in the bootstrap, hence the deferred wiring.
+	monitoringService.SetSingboxTunnels(&monitoringSingboxTunnelAdapter{op: singboxOp, sub: subSvc})
+	monitoringService.SetComposites(&monitoringCompositesAdapter{svc: routerSvc})
+	monitoringService.SetClashState(monitoring.NewClashState(clashProxy.ClashBaseURL, nil))
+	monitoringService.SetSingboxDelay(singboxOp.Clash())
+
 	srv.SetSingboxRouterHandler(api.NewSingboxRouterHandler(routerSvc, loggingService))
 	srv.SetAWGOutboundsHandler(api.NewAWGOutboundsHandler(awgoutboundsSvc))
+	srv.SetSingboxConfigHandler(api.NewSingboxConfigHandler(sbOrch.ConfigDir))
+
+	proxiesHandler := api.NewSingboxProxiesHandler(
+		clashProxy.ClashBaseURL,
+		func() map[string]struct{} {
+			out, _ := routerSvc.ListCompositeOutbounds(context.Background())
+			set := make(map[string]struct{}, len(out))
+			for _, o := range out {
+				set[o.Tag] = struct{}{}
+			}
+			return set
+		},
+		nil,
+	)
+	srv.SetSingboxProxiesHandler(proxiesHandler)
+
+	// Wire subscription handler + start refresh scheduler.
+	// subSvc and subAdapter are constructed earlier (after sbOrch.Bootstrap).
+	subSched := subscription.NewScheduler(subStore, func(ctx context.Context, id string) error {
+		_, err := subSvc.Refresh(ctx, id)
+		return err
+	})
+	subSched.Start(context.Background())
+	srv.SetSubscriptionHandler(api.NewSubscriptionHandler(subSvc, singboxOp))
+	srv.AddShutdownHook(subSched.Stop)
 
 	// Boot status: 0 = booting, 1 = done. Used by /api/system/info.
 	var bootDone int32
@@ -796,6 +1103,7 @@ func main() {
 		&dnsRouteCountAdapter{store: dnsRouteStore},
 		&runningTunnelAdapter{svc: tunnelService},
 		log,
+		loggingService,
 	)
 	dnsCheckService.EnsureIPHost(context.Background())
 	srv.SetDnsCheckService(dnsCheckService)
@@ -862,18 +1170,15 @@ func main() {
 				}
 			}
 
-			// Clean up stale userspace PID files (kernel doesn't need cleanup —
-			// bootTunnels handles it via lifecycle-based Start).
-			if backendImpl.Type() != backend.TypeKernel {
-				cleanupStaleUserspaceState(log)
-			}
-
 			// Seed WAN model with current interface state from NDMS.
 			// Must happen before tunnel start so ISP resolution works.
 			populateWANModel(shutdownCtx, ndmsQueries, wanModel, log)
 
 			// Migrate legacy NDMS ID values to kernel names (one-time after model is populated).
 			tunnelService.MigrateISPInterfaceToKernel()
+			// Clear stored.ActiveWAN entries that don't name a real kernel iface
+			// (legacy garbage from the pre-hardened resolver, e.g. "ISP").
+			tunnelService.HealStaleActiveWAN()
 
 			// Detect actual WAN state.
 			if _, err := ndmsQueries.Routes.GetDefaultGatewayInterface(shutdownCtx); err != nil {
@@ -893,11 +1198,13 @@ func main() {
 		// syscall.Exec preserves child processes — amneziawg-go, TUN devices,
 		// iptables rules, routes, NDMS config all survive. Only in-memory
 		// operator maps (endpointRoutes, resolvedISP) need restoration.
-		// PID files are valid (not stale) — do NOT call cleanupStaleUserspaceState.
 		populateWANModel(context.Background(), ndmsQueries, wanModel, log)
 
 		// Migrate legacy NDMS ID values to kernel names (one-time after model is populated).
 		tunnelService.MigrateISPInterfaceToKernel()
+		// Clear stored.ActiveWAN entries that don't name a real kernel iface
+		// (legacy garbage from the pre-hardened resolver, e.g. "ISP").
+		tunnelService.HealStaleActiveWAN()
 
 		bootLog.Info("startup", "",
 			"Daemon restart detected — reconnecting to running tunnels")
@@ -1106,26 +1413,6 @@ func getUptime() float64 {
 	return uptime
 }
 
-// cleanupStaleUserspaceState removes stale PID files and sockets after router reboot.
-// After reboot, /tmp (tmpfs) is wiped but PID files in /opt/var/run persist,
-// and processes they reference no longer exist.
-func cleanupStaleUserspaceState(log *logger.Logger) {
-	pidDir := "/opt/var/run/awg-manager"
-
-	entries, err := os.ReadDir(pidDir)
-	if err != nil {
-		return // Directory doesn't exist yet — nothing to clean
-	}
-
-	for _, e := range entries {
-		if !e.IsDir() && filepath.Ext(e.Name()) == ".pid" {
-			pidPath := filepath.Join(pidDir, e.Name())
-			_ = os.Remove(pidPath)
-			log.Info("reboot cleanup: removed stale PID file", map[string]interface{}{"file": e.Name()})
-		}
-	}
-}
-
 // runService handles --service flag: start/stop/restart/status.
 // This replaces the shell logic that was previously in S99awg-manager.
 func runService(action, dataDir, webRoot string) {
@@ -1156,8 +1443,9 @@ func serviceStart(dataDir, webRoot string) {
 
 	fmt.Println("Starting AWG Manager...")
 
-	// Ensure directories
-	os.MkdirAll("/opt/var/run", 0755)
+	// Ensure directories. /var/run is system tmpfs and always exists,
+	// but MkdirAll is idempotent so harmless to call.
+	os.MkdirAll("/var/run", 0755)
 	os.MkdirAll("/opt/var/log", 0755)
 	os.MkdirAll(dataDir, 0755)
 
@@ -1278,14 +1566,22 @@ func readPIDFile() (int, bool) {
 	return pid, true
 }
 
-// isProcessRunning checks if a process with the given PID is an awg-manager instance.
-// Reading /proc/<pid>/cmdline avoids false positives from PID reuse after reboot.
+// isProcessRunning checks if a process with the given PID is an awg-manager
+// instance. /proc/<pid>/cmdline is the NUL-separated argv. We match on the
+// basename of argv[0] rather than on the whole buffer so an argument that
+// happens to contain "awg-manager" (e.g. "-data-dir /opt/etc/awg-manager")
+// for an unrelated process that inherited the recycled PID does not
+// produce a false positive.
 func isProcessRunning(pid int) bool {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	if err != nil {
 		return false
 	}
-	return strings.Contains(string(data), "awg-manager")
+	argv0 := string(data)
+	if i := strings.IndexByte(argv0, 0); i >= 0 {
+		argv0 = argv0[:i]
+	}
+	return filepath.Base(argv0) == "awg-manager"
 }
 
 // getServiceEndpoint reads settings to determine the service host:port for display.
@@ -1344,11 +1640,6 @@ func runCleanup(dataDir string) {
 	log := logger.New()
 	defer log.Close()
 
-	// Init NDMS info (needed for OS detection)
-	initCtx, initCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	_ = ndmsinfo.Init(initCtx, 10*time.Second)
-	initCancel()
-
 	settingsStore := storage.NewSettingsStore(dataDir)
 	settingsStore.Load()
 
@@ -1364,6 +1655,12 @@ func runCleanup(dataDir string) {
 		Logger: nil,
 		IsOS5:  osdetect.Is5,
 	})
+
+	// Init NDMS info (needed for OS detection). Wire ndmsinfo to the
+	// SystemInfoStore, then initialize with retry.
+	if err := ndmsinfo.Init(context.Background(), cleanupNDMSQueries.SystemInfo, 10*time.Second); err != nil {
+		log.Warnf("cleanup: NDMS version info not available: %v", err)
+	}
 
 	// Create service components
 	wgClient := wg.New()
@@ -1382,8 +1679,8 @@ func runCleanup(dataDir string) {
 	})
 
 	operator := ops.NewOperator(cleanupNDMSQueries, cleanupNDMSCommands, wgClient, backendImpl, firewallMgr, log)
-	cleanupRCI := rci.New()
-	nwgOp := nwg.NewOperator(log, cleanupNDMSQueries, cleanupNDMSCommands, cleanupNDMSTransport, cleanupRCI, nil)
+
+	nwgOp := nwg.NewOperator(log, cleanupNDMSQueries, cleanupNDMSCommands, cleanupNDMSTransport, nil)
 	tunnelService := service.New(awgStore, nwgOp, operator, stateMgr, log, wan.NewModel(), nil)
 
 	// Wire orchestrator for lifecycle operations (Delete needs it)
@@ -1428,6 +1725,27 @@ func runCleanup(dataDir string) {
 		Commands: cleanupNDMSCommands,
 	})
 
+	// Cleanup mode: bootstrap the orchestrator so any subsequent
+	// operator call that goes through ApplyConfig writes the slot
+	// file rather than the legacy in-place tunnels.json. Cleanup
+	// itself only invokes singboxOp.Cleanup, but we keep the wiring
+	// symmetrical to the daemon path so future cleanup steps have it
+	// available.
+	cleanupSingboxConfigDir := singboxOp.ConfigDir()
+	if err := singbox.MigrateDeviceProxyOutOfTunnels(cleanupSingboxConfigDir); err != nil {
+		log.Warnf("singbox: deviceproxy migration: %v", err)
+	}
+	cleanupSbOrch := singboxorch.New(cleanupSingboxConfigDir, singboxOp.Process())
+	for _, meta := range singboxorch.KnownSlots() {
+		if err := cleanupSbOrch.Register(meta); err != nil {
+			log.Errorf("singbox orchestrator register %s: %v", meta.Slot, err)
+		}
+	}
+	if err := cleanupSbOrch.Bootstrap(); err != nil {
+		log.Errorf("singbox orchestrator bootstrap: %v", err)
+	}
+	singboxOp.SetOrch(cleanupSbOrch)
+
 	accessPolicySvc := accesspolicy.New(cleanupNDMSCommands.Policies, cleanupNDMSCommands.Interfaces, cleanupNDMSQueries, settingsStore, log, nil, ndmsquery.NewPolicyMarkStore(cleanupNDMSTransport, log))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -1448,7 +1766,6 @@ func runCleanup(dataDir string) {
 	}
 	os.Remove(filepath.Join(dataDir, "port"))
 	os.Remove(filepath.Join(dataDir, "dns-routes.json"))
-	os.RemoveAll("/opt/var/run/awg-manager")
 
 	fmt.Println("Done.")
 }
@@ -1470,6 +1787,13 @@ func (s *monitoringSystemTunnelAdapter) List(ctx context.Context) ([]monitoring.
 	}
 	out := make([]monitoring.SystemTunnelInfo, 0, len(list))
 	for _, t := range list {
+		// Skip awg-manager's own server interface (tagged with the
+		// ManagedServerDescription prefix "AWGM ..."; see
+		// internal/managed/types.go::ManagedServerDescription). Server-side
+		// WG is not a client tunnel and must not appear in monitoring.
+		if strings.HasPrefix(t.Description, "AWGM") {
+			continue
+		}
 		out = append(out, monitoring.SystemTunnelInfo{
 			ID:            t.ID,
 			InterfaceName: t.InterfaceName,
@@ -1478,4 +1802,46 @@ func (s *monitoringSystemTunnelAdapter) List(ctx context.Context) ([]monitoring.
 		})
 	}
 	return out, nil
+}
+
+// operatorLifecycle adapts *singbox.Operator to installer.Lifecycle so
+// the installer can stop/start the daemon during migration without the
+// installer package taking a circular dependency on singbox.
+type operatorLifecycle struct {
+	op *singbox.Operator
+}
+
+func (l *operatorLifecycle) Stop(ctx context.Context) error {
+	return l.op.Control(ctx, "stop")
+}
+
+func (l *operatorLifecycle) Start(ctx context.Context) error {
+	return l.op.Control(ctx, "start")
+}
+
+// singboxAndSubLister satisfies singbox.tunnelLister by combining the regular
+// sing-box tunnel list with the active outbound tags of enabled subscriptions.
+// This lets DelayChecker probe subscription active members with the same
+// periodic clash latency test it runs for regular sing-box tunnels.
+type singboxAndSubLister struct {
+	op  *singbox.Operator
+	sub *subscription.Service
+}
+
+func (l *singboxAndSubLister) ListTunnels(ctx context.Context) ([]singbox.TunnelInfo, error) {
+	return l.op.ListTunnels(ctx)
+}
+
+func (l *singboxAndSubLister) ListSubActiveTags() []string {
+	return l.sub.ListActiveMemberTags()
+}
+
+// orchValidatorAdapter bridges singbox.Validator (no context) to the
+// singboxorch.DraftValidator interface (with context).
+type orchValidatorAdapter struct {
+	v *singbox.Validator
+}
+
+func (a *orchValidatorAdapter) Validate(ctx context.Context, configDir string) error {
+	return a.v.Validate(configDir)
 }

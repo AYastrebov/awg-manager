@@ -15,7 +15,12 @@
 		'@Clawa1984', '@beautiful_lion', '@Link_Sergey', '@Dannis_CH', '@vano_milah',
 		'@VylenSV', '@verbee09', '@EfimovYuriy', '@vumaximov', '@Maximus',
 		'@VlZlVlZ', '@sergeinesl', '@unclownartist', '@game47', '@A_Valerich',
-		'@Влад*** С***н', '@Space_Voyager_Telegram', '@Brown2Fox', '@Mr_SiB',
+		'@Влад*** С***н', '@Space_Voyager_Telegram', '@Brown2Fox', '@Mr_SiB', '@Anch665',
+		'@TorTik59', '@kdeveloper', '@genomedon', '@byVladimirB', '@Jona_home',
+		'@voveg', '@Vitaly', '@Dude_47', '@aleksandr_nurov', '@sincezver',
+		'@Novosat', '@Evgenii', '@ayastrebov', '@dany_massiv', '@Litvix',
+		'@Evko', '@gen****@m****u', '@Frinstall', '@ev**************y@g*******m', '@IARESI',
+		'@ig*****@g*******m', '@Да**** Т***в', '@vi*****@g*******.m', '@ku*******@g*******m',
 	];
 
 	let open = $state(false);
@@ -25,6 +30,8 @@
 	<div class="settings-footer-bar">
 		<span class="footer-link-group">
 			Документация: <a href="https://awgm.hoaxisr.ru" target="_blank" rel="noopener noreferrer">awgm.hoaxisr.ru</a>
+			<span class="footer-sep">·</span>
+			<a href="/terms">Пользовательское соглашение</a>
 		</span>
 		<button
 			type="button"
@@ -56,7 +63,6 @@
 		display: flex;
 		flex-direction: column;
 		gap: 0.5rem;
-		margin-top: 0.5rem;
 	}
 
 	.settings-footer-bar {
@@ -78,6 +84,11 @@
 
 	.footer-link-group a:hover {
 		text-decoration: underline;
+	}
+
+	.footer-sep {
+		margin: 0 0.375rem;
+		opacity: 0.4;
 	}
 
 	.footer-collapse {

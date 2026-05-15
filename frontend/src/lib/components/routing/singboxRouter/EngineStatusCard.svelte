@@ -12,7 +12,6 @@
 	import Modal from '$lib/components/ui/Modal.svelte';
 	import Button from '$lib/components/ui/Button.svelte';
 	import Input from '$lib/components/ui/Input.svelte';
-	import PolicyDevicePicker from './PolicyDevicePicker.svelte';
 
 	interface Props {
 		status: SingboxRouterStatus | null;
@@ -109,8 +108,11 @@
 		return '';
 	});
 
-	const policyMissingIssue = $derived(
-		(status?.issues ?? []).find((i) => i.kind === 'policy-missing'),
+	// True when settings reference a policy that no longer exists in NDMS
+	// (manual deletion, NDMS reset, etc.). Distinct from "never configured":
+	// here we have a stale name that needs an explicit recovery action.
+	const policyMissing = $derived(
+		!!settings?.policyName && status?.policyExists === false,
 	);
 
 	const policyOptions = $derived<DropdownOption[]>(
@@ -177,9 +179,20 @@
 			</div>
 		{/if}
 
-		{#if policyMissingIssue}
-			<div class="dep-warning issue-error">
-				<span>{policyMissingIssue.message}</span>
+		{#if policyMissing}
+			<div class="dep-warning issue-error policy-missing-row">
+				<span>
+					Policy <strong>«{settings?.policyName}»</strong> не найдена в NDMS —
+					возможно, удалена вручную. Маршрутизация не запустится без неё.
+				</span>
+				<Button
+					variant="primary"
+					size="sm"
+					onclick={openCreateModal}
+					disabled={creatingPolicy || busy}
+				>
+					Создать «awgm-router»
+				</Button>
 			</div>
 		{/if}
 
@@ -212,7 +225,16 @@
 				{/if}
 
 				{#if settings.policyName}
-					<PolicyDevicePicker policyName={settings.policyName} onChange={onChange} />
+					<div class="policy-link-row">
+						<span class="setting-description">
+							Привязка устройств к политике
+							<strong>«{settings.policyName}»</strong>
+							настраивается на отдельной странице.
+						</span>
+						<Button variant="ghost" size="sm" href="/routing?tab=policy">
+							Управление устройствами →
+						</Button>
+					</div>
 				{/if}
 			</div>
 		{/if}
@@ -323,6 +345,17 @@
 		border-radius: 3px;
 		font-size: 0.8rem;
 	}
+	.policy-missing-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.75rem;
+		flex-wrap: wrap;
+	}
+	.policy-missing-row > span {
+		flex: 1 1 auto;
+		min-width: 0;
+	}
 	.policy-block {
 		margin-top: 1rem;
 	}
@@ -363,6 +396,13 @@
 		background: var(--bg);
 		padding: 1px 6px;
 		border-radius: 3px;
+	}
+	.policy-link-row {
+		display: flex;
+		align-items: center;
+		gap: 0.75rem;
+		margin-top: 0.5rem;
+		flex-wrap: wrap;
 	}
 	.issues {
 		margin-top: 1rem;

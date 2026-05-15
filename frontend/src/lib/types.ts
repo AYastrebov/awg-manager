@@ -1,3 +1,5 @@
+import type { UsageLevel } from './types/usageLevel';
+
 // ─────────────────────────────────────────────
 // #region Tunnels — config, state, list items
 // ─────────────────────────────────────────────
@@ -259,6 +261,8 @@ export interface DnsRoute {
 	 * Absent for existing-policy and interface-mode flows.
 	 */
 	hrPolicyInterfaces?: string[];
+	/** Optional URL for a custom icon (e.g. Qure CDN PNG or user-supplied URL). */
+	iconUrl?: string;
 }
 
 export interface StaticRouteList {
@@ -270,6 +274,8 @@ export interface StaticRouteList {
 	enabled: boolean;
 	createdAt: string;
 	updatedAt: string;
+	/** Optional URL for a custom icon (e.g. Qure CDN PNG or user-supplied URL). */
+	iconUrl?: string;
 }
 
 export interface RoutingTunnel {
@@ -553,6 +559,33 @@ export interface SystemInfo {
 		installed: boolean;
 		version: string;
 	};
+	routerDetails?: {
+		model?: string;
+		modelDisplay?: string;
+		portedBuild?: boolean;
+		hardwareId?: string;
+		region?: string;
+		architecture?: string;
+		cpuModel?: string;
+		cpuTempC?: number;
+		wifi24TempC?: number;
+		wifi5TempC?: number;
+		memoryUsedMB?: number;
+		memoryTotalMB?: number;
+		memoryUsedPercent?: number;
+		firmwareTitle?: string;
+		firmwareRelease?: string;
+		firmwareSandbox?: string;
+		firmwareBuildDate?: string;
+		bootSlot?: string;
+		uptimeHuman?: string;
+		loadAverage?: string;
+		opkgStorage?: string;
+		vpnComponents?: string[];
+		storageComponents?: string[];
+		featureComponents?: string[];
+		meshMembers?: string[];
+	};
 }
 
 export interface WANInterface {
@@ -611,6 +644,8 @@ export interface LoggingSettings {
 	enabled: boolean;
 	maxAge: number;
 	logLevel: string;
+	appMaxEntries: number;
+	singboxMaxEntries: number;
 }
 
 export interface UpdateSettings {
@@ -634,6 +669,7 @@ export interface Settings {
 	disableMemorySaving: boolean;
 	updates: UpdateSettings;
 	dnsRoute: DNSRouteSettings;
+	usageLevel: UsageLevel;
 	hiddenSystemTunnels?: string[];
 }
 
@@ -771,6 +807,11 @@ export interface DeviceProxyConfig {
 	selectedOutbound: string;
 }
 
+export interface DeviceProxyInstance extends DeviceProxyConfig {
+	id: string;
+	name: string;
+}
+
 export type DeviceProxyOutboundKind = 'direct' | 'singbox' | 'awg';
 
 export interface DeviceProxyOutbound {
@@ -784,6 +825,13 @@ export interface DeviceProxyRuntime {
 	alive: boolean;
 	activeTag: string;
 	defaultTag: string;
+}
+
+export interface DeviceProxyInstanceIPCheckResult {
+	directIp: string;
+	proxyIp: string;
+	ipChanged: boolean;
+	service: string;
 }
 
 // #endregion
@@ -806,6 +854,10 @@ export interface LogsResponse {
 	enabled: boolean;
 	logs: LogEntry[];
 	total: number;
+	bucket: 'app' | 'singbox';
+	bufferSize: number;
+	bufferCapacity: number;
+	oldestTimestamp?: string;
 }
 
 // #endregion
@@ -883,6 +935,24 @@ export interface DiagDoneSummary {
 	hasReport: boolean;
 }
 
+export interface TargetSummary {
+	id: string; // '__global__' | tunnelId
+	name: string;
+	isGlobal: boolean;
+	tunnelStatus?: 'running' | 'stopped';
+	counts: {
+		pass: number;
+		warn: number;
+		fail: number;
+		error: number;
+		skip: number;
+		total: number;
+	};
+	overallLed: 'gray' | 'green' | 'yellow' | 'red';
+}
+
+export const GLOBAL_TARGET_ID = '__global__';
+
 export interface DiagEvent {
 	type: 'phase' | 'test' | 'done' | 'error';
 	phase?: string;
@@ -891,9 +961,6 @@ export interface DiagEvent {
 	summary?: DiagDoneSummary;
 	message?: string;
 }
-
-export type DiagMode = 'quick' | 'full';
-export type DiagRouteMode = 'direct' | 'tunnel';
 
 // #endregion
 
@@ -1040,12 +1107,27 @@ export interface SingboxStatus {
 	 * download failed.
 	 */
 	lastError?: string;
+	/** Version of the currently installed sing-box binary. Missing when not installed. */
+	currentVersion?: string;
+	/** Minimum required sing-box version for full functionality. */
+	requiredVersion: string;
+	/** True when installedVersion is below requiredVersion. */
+	updateAvailable: boolean;
 }
 
 export interface SingboxImportResponse {
 	imported: SingboxTunnel[];
 	errors: Array<{ line: number; input: string; error: string }>;
 	tunnels: SingboxTunnel[]; // fresh full list
+}
+
+/**
+ * Response envelope payload for GET /api/singbox/config-preview.
+ * `json` is the pretty-printed merged sing-box config produced by
+ * stitching all `01-*.json` fragments onto `00-base.json`.
+ */
+export interface SingboxConfigPreview {
+	json: string;
 }
 
 export interface SingboxTraffic {
@@ -1068,6 +1150,7 @@ export interface MonitoringTarget {
 	id: string;
 	host: string;
 	name: string;
+	url?: string;
 }
 
 export interface MonitoringTunnel {
@@ -1077,6 +1160,14 @@ export interface MonitoringTunnel {
 	pingcheckTarget: string;
 	selfTarget: string;
 	selfMethod: string;
+	/** "awg" | "system" | "singbox" — drives row visual hints. */
+	source?: 'awg' | 'system' | 'singbox';
+	/** Sing-box outbound tag; empty unless source==='singbox'. */
+	singboxTag?: string;
+	/** Last Clash urltest delay in ms; 0 = no urltest data. */
+	clashDelay?: number;
+	/** urltest group tag this sing-box tunnel belongs to. */
+	urltestGroup?: string;
 }
 
 export interface MonitoringCell {
@@ -1154,20 +1245,6 @@ export interface RouterPolicy {
 	isOurDefault: boolean;
 }
 
-/**
- * One LAN device known to NDMS hotspot, annotated with whether it's
- * currently bound to a specific policy. Distinct from the broader
- * PolicyDevice (accesspolicy domain, includes hostname/active/link/policy):
- * router only needs the bind decision + identifying fields.
- * Source: GET /api/singbox/router/policy-devices?name=X.
- */
-export interface RouterPolicyDevice {
-	mac: string;
-	ip: string;
-	name: string;
-	bound: boolean;
-}
-
 export interface SingboxRouterRule {
 	domain_suffix?: string[];
 	ip_cidr?: string[];
@@ -1179,14 +1256,45 @@ export interface SingboxRouterRule {
 	outbound?: string;
 }
 
+/**
+ * One per-rule decision from the route inspector. matchedRule == -1 in
+ * SingboxRouterInspectResult means no rule produced a final destination
+ * — the route.final outbound was used instead.
+ */
+export interface SingboxRouterInspectMatch {
+	index: number;
+	matched: boolean;
+	action: string;
+	outbound?: string;
+	conditions?: string[];
+	reason?: string;
+}
+
+export interface SingboxRouterInspectResult {
+	input: string;
+	inputType: 'domain' | 'ip';
+	matches: SingboxRouterInspectMatch[];
+	destination: string;
+	matchedRule: number;
+	final: string;
+	note?: string;
+}
+
+export interface SingboxRouterInspectRequest {
+	domain: string;
+	port?: number;
+	protocol?: string;
+}
+
 export interface SingboxRouterRuleSet {
 	tag: string;
-	type: 'remote' | 'local';
-	format: 'binary' | 'source';
+	type: 'remote' | 'local' | 'inline';
+	format?: 'binary' | 'source';
 	url?: string;
 	update_interval?: string;
 	download_detour?: string;
 	path?: string;
+	rules?: Record<string, unknown>[];
 }
 
 export interface SingboxRouterOutbound {
@@ -1199,6 +1307,50 @@ export interface SingboxRouterOutbound {
 	tolerance?: number;
 	default?: string;
 	strategy?: string;
+	/**
+	 * Which orchestrator slot owns this outbound. "router" entries are
+	 * editable from the UI; "subscription" entries are managed by the
+	 * subscription service and shown read-only.
+	 */
+	source?: 'router' | 'subscription';
+}
+
+/**
+ * Live state of one composite outbound (selector / urltest / loadbalance).
+ * Returned by GET /api/singbox/router/proxies/list.
+ */
+export interface SingboxProxyMember {
+	tag: string;
+	type: string;
+	/** Last latency in ms; 0 = not tested or unreachable. */
+	lastDelay?: number;
+}
+
+export interface SingboxProxyGroup {
+	tag: string;
+	type: 'selector' | 'urltest' | 'loadbalance';
+	now: string;
+	members: SingboxProxyMember[];
+}
+
+export interface SingboxProxiesListResponse {
+	groups: SingboxProxyGroup[];
+}
+
+export interface SingboxProxiesSelectRequest {
+	group: string;
+	member: string;
+}
+
+export interface SingboxProxiesTestRequest {
+	group: string;
+	url?: string;
+	timeout?: number;
+}
+
+export interface SingboxProxiesTestResponse {
+	/** memberTag → delay in ms; 0 = unreachable. */
+	delays: Record<string, number>;
 }
 
 export interface SingboxRouterPresetLink {
@@ -1206,9 +1358,19 @@ export interface SingboxRouterPresetLink {
 	actionTarget: 'tunnel' | 'reject' | 'direct';
 }
 
+export type SingboxRouterPresetCategory =
+	| 'social'
+	| 'media'
+	| 'ai'
+	| 'developer'
+	| 'cloud'
+	| 'gaming'
+	| 'block';
+
 export interface SingboxRouterPreset {
 	id: string;
 	name: string;
+	category?: SingboxRouterPresetCategory;
 	iconSlug?: string;
 	ruleSets: Array<{ tag: string; url: string }>;
 	rules: SingboxRouterPresetLink[];
@@ -1290,3 +1452,118 @@ export interface TunnelReferencedError {
 }
 
 // #endregion
+
+// === Subscriptions ===
+
+export interface SubscriptionHeader {
+	name: string;
+	value: string;
+}
+
+export interface SubscriptionMember {
+	tag: string;
+	label?: string;
+	protocol: string;
+	server: string;
+	port: number;
+	sni?: string;
+	transport?: string;
+	security?: string;
+}
+
+export type SubscriptionMode = 'selector' | 'urltest';
+
+export interface SubscriptionURLTest {
+	url: string;
+	intervalSec: number;
+	toleranceMs: number;
+}
+
+export const DEFAULT_SUBSCRIPTION_URLTEST: SubscriptionURLTest = {
+	url: 'https://www.gstatic.com/generate_204',
+	intervalSec: 60,
+	toleranceMs: 50,
+};
+
+export interface Subscription {
+	id: string;
+	label: string;
+	url: string;
+	isInline: boolean;
+	headers: SubscriptionHeader[];
+	refreshHours: number;
+	lastFetched: string; // RFC 3339, "" when never fetched
+	lastError?: string;
+	selectorTag: string;
+	inboundTag: string;
+	listenPort: number;
+	proxyIndex: number;
+	memberTags: string[];
+	members: SubscriptionMember[];
+	orphanTags: string[];
+	activeMember: string;
+	enabled: boolean;
+	mode: SubscriptionMode;
+	urlTest?: SubscriptionURLTest;
+}
+
+export interface SubscriptionRefreshResult {
+	when: string;
+	added: number;
+	updated: number;
+	orphaned: number;
+	skippedVmess: number;
+	skippedOther: number;
+	skippedDuplicate: number;
+	parseErrors?: string[];
+}
+
+export interface SubscriptionActiveNowResponse {
+	now: string;
+}
+
+export interface CreateSubscriptionInput {
+	label: string;
+	url?: string;
+	inline?: string;
+	headers: SubscriptionHeader[];
+	refreshHours: number;
+	enabled: boolean;
+	mode?: SubscriptionMode;
+	urlTest?: SubscriptionURLTest;
+}
+
+export interface UpdateSubscriptionInput {
+	label?: string;
+	url?: string;
+	headers?: SubscriptionHeader[];
+	refreshHours?: number;
+	enabled?: boolean;
+	mode?: SubscriptionMode;
+	urlTest?: SubscriptionURLTest;
+}
+
+// === Singbox Router Staging ===
+
+export interface RouterValidationErrorDTO {
+	slot: string;
+	kind: string;
+	tag?: string;
+	inRule?: string;
+	message: string;
+}
+
+export interface RouterValidationDTO {
+	errors: RouterValidationErrorDTO[];
+}
+
+export interface RouterStagingStatusResponse {
+	hasDraft: boolean;
+	draftedAt?: string;
+	validation?: RouterValidationDTO;
+}
+
+export interface RouterStagingValidationError {
+	validation?: RouterValidationDTO;
+	sbCheck?: string;
+}

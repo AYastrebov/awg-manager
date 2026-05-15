@@ -2,6 +2,7 @@ package diagnostics
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -10,21 +11,36 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hoaxisr/awg-manager/internal/singbox"
 	"github.com/hoaxisr/awg-manager/internal/sys/exec"
 	"github.com/hoaxisr/awg-manager/internal/sys/ndmsinfo"
 	"github.com/hoaxisr/awg-manager/internal/sys/osdetect"
 	"github.com/hoaxisr/awg-manager/internal/tunnel/netutil"
 )
 
-type diagEgress struct {
-	mode      RouteMode
-	ifaceName string
-	label     string
+// curlPath returns the absolute path to curl, preferring the Entware
+// /opt/bin/curl when available and falling back to PATH lookup.
+func curlPath() string {
+	if _, err := os.Stat("/opt/bin/curl"); err == nil {
+		return "/opt/bin/curl"
+	}
+	return "curl"
+}
+
+// ipPath returns the absolute path to the iproute2 `ip` binary,
+// preferring /opt/sbin/ip then standard locations and falling back to
+// PATH lookup.
+func ipPath() string {
+	for _, p := range []string{"/opt/sbin/ip", "/sbin/ip", "/bin/ip"} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "ip"
 }
 
 func (r *Runner) runTestsWithEvents(ctx context.Context, report *Report) []TestResult {
 	var results []TestResult
-	egress := r.resolveEgress(report)
 
 	run := func(tr TestResult) {
 		results = append(results, tr)
@@ -36,15 +52,20 @@ func (r *Runner) runTestsWithEvents(ctx context.Context, report *Report) []TestR
 	run(r.testNDMSHealth(ctx))
 	run(r.testKernelModule(ctx, report))
 	run(r.testClockSkew(ctx))
+	run(r.testDirectConnectivity(ctx))
+	run(r.testSingboxRuntime(ctx))
+	for _, tr := range r.testSingboxTunnelConnectivity(ctx) {
+		run(tr)
+	}
 
 	for _, t := range report.Tunnels {
 		r.emitPhase("tunnel_tests", fmt.Sprintf("Тестирование %s...", t.Name))
 
-		run(r.testDNSResolve(ctx, t, egress))
-		run(r.testEndpointReachable(ctx, t, egress))
+		run(r.testDNSResolve(t))
+		run(r.testEndpointReachable(ctx, t))
 		run(r.testEndpointRouteCheck(t))
 		run(r.testAWGHandshake(t))
-		run(r.testTunnelConnectivity(ctx, t, egress))
+		run(r.testTunnelConnectivity(ctx, t))
 		run(r.testFirewallRules(t))
 		run(r.testConfigParse(t))
 		run(r.testInterfaceStateConsistency(ctx, t))
@@ -59,7 +80,7 @@ func (r *Runner) runTestsWithEvents(ctx context.Context, report *Report) []TestR
 
 	for _, t := range report.Tunnels {
 		if t.Status == "running" {
-			run(r.testDNSLeak(ctx, t, egress))
+			run(r.testDNSLeak(ctx, t))
 		}
 	}
 
@@ -89,7 +110,7 @@ func (r *Runner) testWANConnectivity(ctx context.Context) TestResult {
 	}
 
 	// Check default route exists
-	result, err := exec.Run(ctx, "/opt/sbin/ip", "route", "show", "default")
+	result, err := exec.Run(ctx, ipPath(), "route", "show", "default")
 	if err != nil || result.Stdout == "" {
 		res.Status = StatusFail
 		res.Detail = "Нет default route"
@@ -104,10 +125,18 @@ func (r *Runner) testWANConnectivity(ctx context.Context) TestResult {
 func (r *Runner) testNDMSHealth(ctx context.Context) TestResult {
 	res := TestResult{Name: "ndms_health", Description: "NDMS отвечает"}
 
-	info, err := r.deps.RCI.ShowVersion(ctx)
+	raw, err := r.deps.NDMSTransport.GetRaw(ctx, "/show/version")
 	if err != nil {
 		res.Status = StatusFail
 		res.Detail = "NDMS не отвечает: " + err.Error()
+		return res
+	}
+	var info struct {
+		Title string `json:"title"`
+	}
+	if err := json.Unmarshal(raw, &info); err != nil {
+		res.Status = StatusFail
+		res.Detail = "NDMS вернул невалидный JSON: " + err.Error()
 		return res
 	}
 
@@ -256,9 +285,218 @@ func (r *Runner) testClockSkew(ctx context.Context) TestResult {
 	return res
 }
 
+// --- Sing-box / direct-egress global tests ---
+
+func (r *Runner) testDirectConnectivity(ctx context.Context) TestResult {
+	res := TestResult{Name: "direct_connectivity", Description: "Direct связность (без прокси/туннеля)"}
+
+	curl := curlPath()
+	result, err := exec.Run(ctx, curl, "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "6", "https://www.gstatic.com/generate_204")
+	if err != nil {
+		res.Status = StatusWarn
+		res.Detail = "Не удалось выполнить direct HTTP-проверку"
+		return res
+	}
+	code := strings.TrimSpace(result.Stdout)
+	if code == "204" || code == "200" {
+		res.Status = StatusPass
+		res.Detail = "Direct egress работает (HTTP " + code + ")"
+		return res
+	}
+	res.Status = StatusWarn
+	res.Detail = "Direct egress ответил неожиданным кодом: " + code
+	return res
+}
+
+func (r *Runner) testSingboxRuntime(ctx context.Context) TestResult {
+	res := TestResult{Name: "singbox_runtime", Description: "Sing-box runtime"}
+
+	if r.deps.Singbox == nil {
+		res.Status = StatusSkip
+		res.Detail = "Sing-box не подключён в diagnostics deps"
+		return res
+	}
+
+	st := r.deps.Singbox.GetStatus(ctx)
+	if !st.Installed {
+		res.Status = StatusSkip
+		res.Detail = "Sing-box не установлен"
+		return res
+	}
+	if !st.Running {
+		res.Status = StatusFail
+		if st.LastError != "" {
+			res.Detail = "Sing-box остановлен: " + st.LastError
+		} else {
+			res.Detail = "Sing-box остановлен"
+		}
+		return res
+	}
+
+	res.Status = StatusPass
+	res.Detail = fmt.Sprintf("Sing-box запущен (v%s), туннелей: %d", st.Version, st.TunnelCount)
+	return res
+}
+
+// testSingboxTunnelConnectivity exercises every active sing-box tunnel
+// (including subscription members marked active) by sending an HTTPS
+// HEAD request through the local proxy on 127.0.0.1:<listenPort>. ICMP
+// is intentionally not used: sing-box fakes ICMP replies inside the TUN,
+// so only HTTP through the local proxy gives an honest end-to-end probe.
+func (r *Runner) testSingboxTunnelConnectivity(ctx context.Context) []TestResult {
+	if r.deps.Singbox == nil {
+		return []TestResult{{
+			Name:        "singbox_tunnel_connectivity",
+			Description: "Sing-box туннели: связность",
+			Status:      StatusSkip,
+			Detail:      "Sing-box не подключён в diagnostics deps",
+		}}
+	}
+
+	st := r.deps.Singbox.GetStatus(ctx)
+	if !st.Installed {
+		return []TestResult{{
+			Name:        "singbox_tunnel_connectivity",
+			Description: "Sing-box туннели: связность",
+			Status:      StatusSkip,
+			Detail:      "Sing-box не установлен",
+		}}
+	}
+
+	tunnels, err := r.deps.Singbox.ListTunnels(ctx)
+	if err != nil {
+		return []TestResult{{
+			Name:        "singbox_tunnel_connectivity",
+			Description: "Sing-box туннели: связность",
+			Status:      StatusError,
+			Detail:      "Не удалось получить список sing-box туннелей: " + err.Error(),
+		}}
+	}
+	if tunnels == nil {
+		tunnels = []singbox.TunnelInfo{}
+	}
+
+	subByTag := map[string]SingboxSubMember{}
+	duplicateSubTags := map[string]bool{}
+	if r.deps.SingboxSubMembers != nil {
+		for _, m := range r.deps.SingboxSubMembers() {
+			if _, exists := subByTag[m.Tag]; exists {
+				duplicateSubTags[m.Tag] = true
+			}
+			subByTag[m.Tag] = m
+		}
+	}
+
+	seen := make(map[string]bool, len(tunnels)+len(subByTag))
+	for _, t := range tunnels {
+		seen[t.Tag] = true
+	}
+
+	// Add synthetic tunnel entries for active+enabled subscription
+	// members that aren't already in the regular tunnel list, so the
+	// active member of each subscription gets its own probe row.
+	for tag, m := range subByTag {
+		if seen[tag] {
+			continue
+		}
+		if m.ActiveKnown && m.Active && m.Enabled {
+			tunnels = append(tunnels, singbox.TunnelInfo{
+				Tag:        tag,
+				ListenPort: m.ListenPort,
+				Running:    st.Running && m.Enabled && m.Active,
+			})
+			seen[tag] = true
+		}
+	}
+
+	out := make([]TestResult, 0, len(tunnels)*2)
+	curl := curlPath()
+	for _, t := range tunnels {
+		tunnelID := "singbox:" + t.Tag
+		tunnelName := t.Tag
+
+		stateRes := TestResult{
+			Name:        "singbox_tunnel_state",
+			Description: "Sing-box туннель: " + t.Tag,
+			TunnelID:    tunnelID,
+			TunnelName:  tunnelName,
+		}
+
+		if duplicateSubTags[t.Tag] {
+			stateRes.Status = StatusWarn
+			stateRes.Detail = "Дублирующийся member tag в подписках, диагностика по tag неоднозначна"
+			out = append(out, stateRes)
+			continue
+		}
+
+		if m, ok := subByTag[t.Tag]; ok {
+			if !m.Enabled {
+				stateRes.Status = StatusSkip
+				stateRes.Detail = "Подписка отключена"
+				out = append(out, stateRes)
+				continue
+			}
+			if !m.ActiveKnown {
+				stateRes.Status = StatusWarn
+				stateRes.Detail = "Не удалось определить активный member подписки"
+				out = append(out, stateRes)
+				continue
+			}
+			if !m.Active {
+				stateRes.Status = StatusSkip
+				stateRes.Detail = "Member подписки не активен (проверяется только активный)"
+				out = append(out, stateRes)
+				continue
+			}
+		}
+
+		if !t.Running {
+			stateRes.Status = StatusFail
+			stateRes.Detail = "Туннель не в running state"
+			out = append(out, stateRes)
+			continue
+		}
+		if t.ListenPort <= 0 {
+			stateRes.Status = StatusWarn
+			stateRes.Detail = "Не задан listenPort для proxy-check"
+			out = append(out, stateRes)
+			continue
+		}
+
+		stateRes.Status = StatusPass
+		stateRes.Detail = fmt.Sprintf("running=true, local proxy 127.0.0.1:%d", t.ListenPort)
+		out = append(out, stateRes)
+
+		proxy := fmt.Sprintf("http://127.0.0.1:%d", t.ListenPort)
+		probe := TestResult{
+			Name:        "singbox_tunnel_connectivity",
+			Description: "Sing-box tunnel HTTP-check",
+			TunnelID:    tunnelID,
+			TunnelName:  tunnelName,
+		}
+		result, err := exec.Run(ctx, curl, "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "8", "-x", proxy, "https://www.gstatic.com/generate_204")
+		if err != nil {
+			probe.Status = StatusFail
+			probe.Detail = fmt.Sprintf("Proxy-check не удался (%s)", proxy)
+		} else {
+			code := strings.TrimSpace(result.Stdout)
+			if code == "204" || code == "200" {
+				probe.Status = StatusPass
+				probe.Detail = fmt.Sprintf("HTTP %s через %s", code, proxy)
+			} else {
+				probe.Status = StatusFail
+				probe.Detail = fmt.Sprintf("Неожиданный HTTP-код %q через %s", code, proxy)
+			}
+		}
+		out = append(out, probe)
+	}
+
+	return out
+}
+
 // --- Per-tunnel tests ---
 
-func (r *Runner) testDNSResolve(ctx context.Context, t TunnelInfo, egress diagEgress) TestResult {
+func (r *Runner) testDNSResolve(t TunnelInfo) TestResult {
 	res := TestResult{Name: "dns_resolve", Description: "Резолв endpoint", TunnelID: t.ID, TunnelName: t.Name}
 
 	endpoint := extractEndpointFromConfig(t.ConfigFile)
@@ -283,27 +521,12 @@ func (r *Runner) testDNSResolve(ctx context.Context, t TunnelInfo, egress diagEg
 		return res
 	}
 
-	if egress.mode == RouteTunnel && egress.ifaceName != "" && len(ips) > 0 {
-		routeResult, err := exec.Run(ctx, "/opt/sbin/ip", "route", "get", ips[0])
-		if err != nil {
-			res.Status = StatusError
-			res.Detail = fmt.Sprintf("Резолв %s OK, но маршрут до %s не проверен (%s)", host, ips[0], egress.label)
-			return res
-		}
-		routeDev := extractRouteGetDev(routeResult.Stdout)
-		if routeDev != egress.ifaceName {
-			res.Status = StatusFail
-			res.Detail = fmt.Sprintf("Резолв %s OK, но маршрут до %s идёт через %s, ожидался %s", host, ips[0], routeDev, egress.ifaceName)
-			return res
-		}
-	}
-
 	res.Status = StatusPass
-	res.Detail = fmt.Sprintf("%s -> %s (%s)", host, strings.Join(ips, ", "), egress.label)
+	res.Detail = fmt.Sprintf("%s -> %s", host, strings.Join(ips, ", "))
 	return res
 }
 
-func (r *Runner) testEndpointReachable(ctx context.Context, t TunnelInfo, egress diagEgress) TestResult {
+func (r *Runner) testEndpointReachable(ctx context.Context, t TunnelInfo) TestResult {
 	res := TestResult{Name: "endpoint_reachable", Description: "Ping endpoint", TunnelID: t.ID, TunnelName: t.Name}
 
 	if t.Status != "running" {
@@ -332,16 +555,10 @@ func (r *Runner) testEndpointReachable(ctx context.Context, t TunnelInfo, egress
 		ip = resolved
 	}
 
-	args := []string{"-c", "3"}
-	if egress.mode == RouteTunnel && egress.ifaceName != "" {
-		args = append(args, "-I", egress.ifaceName)
-	}
-	args = append(args, ip)
-
-	result, err := exec.Run(ctx, "ping", args...)
+	result, err := exec.Run(ctx, "ping", "-c", "3", ip)
 	if err != nil {
 		res.Status = StatusFail
-		res.Detail = fmt.Sprintf("Ping %s: недоступен (%s)", ip, egress.label)
+		res.Detail = fmt.Sprintf("Ping %s: недоступен", ip)
 		return res
 	}
 
@@ -354,9 +571,7 @@ func (r *Runner) testEndpointReachable(ctx context.Context, t TunnelInfo, egress
 	}
 	res.Status = StatusPass
 	if res.Detail == "" {
-		res.Detail = fmt.Sprintf("Ping %s: доступен (%s)", ip, egress.label)
-	} else {
-		res.Detail = fmt.Sprintf("%s [%s]", res.Detail, egress.label)
+		res.Detail = fmt.Sprintf("Ping %s: доступен", ip)
 	}
 	return res
 }
@@ -431,7 +646,7 @@ func (r *Runner) testAWGHandshake(t TunnelInfo) TestResult {
 	return res
 }
 
-func (r *Runner) testTunnelConnectivity(ctx context.Context, t TunnelInfo, egress diagEgress) TestResult {
+func (r *Runner) testTunnelConnectivity(ctx context.Context, t TunnelInfo) TestResult {
 	res := TestResult{Name: "tunnel_connectivity", Description: "Связность через туннель", TunnelID: t.ID, TunnelName: t.Name}
 
 	if t.Status != "running" {
@@ -440,26 +655,21 @@ func (r *Runner) testTunnelConnectivity(ctx context.Context, t TunnelInfo, egres
 		return res
 	}
 
-	// Try multiple IP check services
+	// Try multiple IP check services. Egress uses default route (WAN).
 	urls := []string{"https://ifconfig.me", "https://icanhazip.com", "https://ip.me"}
+	curl := curlPath()
 	for _, url := range urls {
-		args := []string{"-s", "--max-time", "5"}
-		if egress.mode == RouteTunnel && egress.ifaceName != "" {
-			args = append(args, "--interface", egress.ifaceName)
-		}
-		args = append(args, url)
-
-		result, err := exec.Run(ctx, "/opt/bin/curl", args...)
+		result, err := exec.Run(ctx, curl, "-s", "--max-time", "5", url)
 		if err == nil && strings.TrimSpace(result.Stdout) != "" {
 			ip := strings.TrimSpace(result.Stdout)
 			res.Status = StatusPass
-			res.Detail = fmt.Sprintf("IP: %s (via %s, %s)", ip, url, egress.label)
+			res.Detail = fmt.Sprintf("IP: %s (via %s)", ip, url)
 			return res
 		}
 	}
 
 	res.Status = StatusSkip
-	res.Detail = fmt.Sprintf("Все IP-сервисы недоступны (%s)", egress.label)
+	res.Detail = "Все IP-сервисы недоступны"
 	return res
 }
 
@@ -530,7 +740,7 @@ func (r *Runner) testInterfaceStateConsistency(ctx context.Context, t TunnelInfo
 	res := TestResult{Name: "interface_state_consistency", Description: "Консистентность state", TunnelID: t.ID, TunnelName: t.Name}
 
 	// Check kernel interface exists
-	result, err := exec.Run(ctx, "/opt/sbin/ip", "link", "show", t.InterfaceName)
+	result, err := exec.Run(ctx, ipPath(), "link", "show", t.InterfaceName)
 	kernelExists := err == nil && result.Stdout != ""
 
 	switch t.Status {
@@ -566,7 +776,7 @@ func (r *Runner) testMTUCheck(ctx context.Context, t TunnelInfo) TestResult {
 		return res
 	}
 
-	result, err := exec.Run(ctx, "/opt/sbin/ip", "link", "show", t.InterfaceName)
+	result, err := exec.Run(ctx, ipPath(), "link", "show", t.InterfaceName)
 	if err != nil {
 		res.Status = StatusError
 		res.Detail = "Не удалось получить link info"
@@ -589,7 +799,7 @@ func (r *Runner) testMTUCheck(ctx context.Context, t TunnelInfo) TestResult {
 func (r *Runner) testRouteLeak(ctx context.Context, report *Report) TestResult {
 	res := TestResult{Name: "route_leak_check", Description: "Осиротевшие маршруты"}
 
-	result, err := exec.Run(ctx, "/opt/sbin/ip", "route", "show")
+	result, err := exec.Run(ctx, ipPath(), "route", "show")
 	if err != nil {
 		res.Status = StatusError
 		res.Detail = "Не удалось получить routing table"
@@ -637,7 +847,7 @@ func (r *Runner) testRouteLeak(ctx context.Context, report *Report) TestResult {
 	return res
 }
 
-func (r *Runner) testDNSLeak(ctx context.Context, t TunnelInfo, egress diagEgress) TestResult {
+func (r *Runner) testDNSLeak(ctx context.Context, t TunnelInfo) TestResult {
 	res := TestResult{Name: "dns_leak_check", Description: "DNS leak проверка", TunnelID: t.ID, TunnelName: t.Name}
 
 	if t.Settings.DNS == "" {
@@ -656,118 +866,82 @@ func (r *Runner) testDNSLeak(ctx context.Context, t TunnelInfo, egress diagEgres
 		return res
 	}
 
-	// The DNS server sits inside the tunnel network and is only reachable
-	// through the tunnel.  Successful resolution proves no DNS leak.
-	routeNote := ""
-	if egress.mode == RouteTunnel && egress.ifaceName != "" {
-		routeResult, err := exec.Run(ctx, "/opt/sbin/ip", "route", "get", dnsServer)
-		if err != nil {
-			res.Status = StatusError
-			res.Detail = fmt.Sprintf("Не удалось проверить маршрут до DNS %s (%s)", dnsServer, egress.label)
+	// Guardrail: before resolving, verify where the OS routes packets to
+	// this DNS server. If route does not go via the tunnel interface,
+	// resolution alone would be misleading — request still leaks via WAN.
+	ip := ipPath()
+	routeResult, routeErr := exec.Run(ctx, ip, "route", "get", dnsServer)
+	if routeErr != nil || strings.TrimSpace(routeResult.Stdout) == "" {
+		res.Status = StatusError
+		res.Detail = fmt.Sprintf("Не удалось проверить маршрут до DNS %s", dnsServer)
+		return res
+	}
+	routeOut := strings.TrimSpace(routeResult.Stdout)
+	// `ip route get` for unreachable / blackhole / prohibit destinations
+	// returns the route type token without a `dev` field. Treat as fail —
+	// DNS server is positively unreachable, not a parsing edge case.
+	for _, kind := range []string{"blackhole", "prohibit", "unreachable"} {
+		if strings.HasPrefix(routeOut, kind+" ") {
+			res.Status = StatusFail
+			res.Detail = fmt.Sprintf("DNS %s недостижим: %s маршрут", dnsServer, kind)
 			return res
 		}
-		routeDev := extractRouteGetDev(routeResult.Stdout)
-		if routeDev != egress.ifaceName {
-			routeNote = fmt.Sprintf("route_get_dev=%s, expected=%s", routeDev, egress.ifaceName)
+	}
+	routeDev := routeDevFromIPRouteGet(routeOut)
+	if routeDev == "" {
+		res.Status = StatusWarn
+		res.Detail = fmt.Sprintf("Маршрут до DNS %s не содержит dev: %s", dnsServer, routeOut)
+		return res
+	}
+	if t.InterfaceName != "" && routeDev != t.InterfaceName {
+		// NativeWG on Keenetic policy-routes client LAN traffic through
+		// the tunnel while router-origin traffic (this diagnostics probe)
+		// can still go via WAN/main table. Treat as warning to avoid
+		// false hard-fail.
+		if t.Backend == "nativewg" {
+			res.Status = StatusWarn
+			res.Detail = fmt.Sprintf("DNS %s маршрутизируется через %s, ожидался %s (локальный трафик роутера может обходить policy NativeWG)", dnsServer, routeDev, t.InterfaceName)
+			return res
 		}
+		res.Status = StatusFail
+		res.Detail = fmt.Sprintf("DNS %s маршрутизируется через %s, ожидался %s", dnsServer, routeDev, t.InterfaceName)
+		return res
 	}
 
+	// The DNS server sits inside the tunnel network and is only reachable
+	// through the tunnel. Successful resolution proves no DNS leak.
 	result, err := exec.Run(ctx, "nslookup", "example.com", dnsServer)
 	if err != nil {
-		// NativeWG/policy-routing systems may not expose private tunnel DNS
-		// to router-originated nslookup even when tunnel egress works.
-		// Fallback to DoH and plain HTTPS over selected egress as a practical
-		// connectivity signal; otherwise report SKIP (not FAIL) to avoid
-		// false negatives on policy-routing setups.
-		if egress.mode == RouteTunnel && egress.ifaceName != "" {
-			doh, dohErr := exec.Run(ctx, "/opt/bin/curl", "-s", "--max-time", "5",
-				"--interface", egress.ifaceName,
-				"https://dns.google/resolve?name=example.com&type=A")
-			if dohErr == nil && strings.Contains(doh.Stdout, "\"Answer\"") {
-				res.Status = StatusPass
-				if routeNote != "" {
-					res.Detail = fmt.Sprintf("Туннельный DNS %s недоступен из контекста роутера, но DoH через %s работает (%s)",
-						dnsServer, egress.ifaceName, routeNote)
-				} else {
-					res.Detail = fmt.Sprintf("Туннельный DNS %s недоступен из контекста роутера, но DoH через %s работает",
-						dnsServer, egress.ifaceName)
-				}
-				return res
-			}
-
-			httpsProbe, httpsErr := exec.Run(ctx, "/opt/bin/curl", "-s", "--max-time", "5",
-				"--interface", egress.ifaceName, "https://ifconfig.me")
-			if httpsErr == nil && strings.TrimSpace(httpsProbe.Stdout) != "" {
-				res.Status = StatusSkip
-				if routeNote != "" {
-					res.Detail = fmt.Sprintf("Туннельный DNS %s недоступен из контекста роутера, но egress через %s работает (%s)",
-						dnsServer, egress.ifaceName, routeNote)
-				} else {
-					res.Detail = fmt.Sprintf("Туннельный DNS %s недоступен из контекста роутера, но egress через %s работает",
-						dnsServer, egress.ifaceName)
-				}
-				return res
-			}
-		}
-
 		res.Status = StatusFail
-		if routeNote != "" {
-			res.Detail = fmt.Sprintf("Туннельный DNS %s недоступен (%s, %s)", dnsServer, egress.label, routeNote)
-		} else {
-			res.Detail = fmt.Sprintf("Туннельный DNS %s недоступен (%s)", dnsServer, egress.label)
-		}
+		res.Detail = fmt.Sprintf("Туннельный DNS %s недоступен через %s", dnsServer, routeDev)
 		return res
 	}
 
 	output := result.Stdout + result.Stderr
-	if strings.Contains(output, "Address") && !strings.Contains(output, "server can't find") {
+	if strings.Contains(output, "Address") &&
+		!strings.Contains(output, "server can't find") &&
+		!strings.Contains(output, "Temporary failure") {
 		res.Status = StatusPass
-		if routeNote != "" {
-			res.Detail = fmt.Sprintf("Ответ получен через туннельный DNS %s (%s, %s)", dnsServer, egress.label, routeNote)
-		} else {
-			res.Detail = fmt.Sprintf("Ответ получен через туннельный DNS %s (%s)", dnsServer, egress.label)
-		}
+		res.Detail = fmt.Sprintf("Ответ получен через туннельный DNS %s (%s)", dnsServer, routeDev)
 	} else {
 		res.Status = StatusFail
-		if routeNote != "" {
-			res.Detail = fmt.Sprintf("Туннельный DNS %s не резолвит (%s, %s)", dnsServer, egress.label, routeNote)
-		} else {
-			res.Detail = fmt.Sprintf("Туннельный DNS %s не резолвит (%s)", dnsServer, egress.label)
-		}
+		res.Detail = fmt.Sprintf("Туннельный DNS %s не резолвит через %s", dnsServer, routeDev)
 	}
 	return res
 }
 
-func (r *Runner) resolveEgress(report *Report) diagEgress {
-	direct := diagEgress{
-		mode:  RouteDirect,
-		label: "маршрут по умолчанию",
-	}
-
-	if r.opts.RouteMode != RouteTunnel {
-		return direct
-	}
-
-	targetID := strings.TrimSpace(r.opts.RouteTunnelID)
-	if targetID == "" {
-		return direct
-	}
-
-	for _, t := range report.Tunnels {
-		if t.ID != targetID {
-			continue
-		}
-		if t.InterfaceName == "" {
-			return direct
-		}
-		return diagEgress{
-			mode:      RouteTunnel,
-			ifaceName: t.InterfaceName,
-			label:     fmt.Sprintf("через туннель %s (%s)", t.Name, t.InterfaceName),
+// routeDevFromIPRouteGet extracts the device name from `ip route get`
+// output. Returns "" when the output has no `dev <name>` token.
+func routeDevFromIPRouteGet(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		for i := 0; i < len(fields)-1; i++ {
+			if fields[i] == "dev" {
+				return fields[i+1]
+			}
 		}
 	}
-
-	return direct
+	return ""
 }
 
 // findTunnelDNS returns the first private/CGNAT DNS server from a
@@ -789,10 +963,16 @@ func findTunnelDNS(dnsList string) string {
 	return ""
 }
 
+// cgnatNet is the carrier-grade NAT range (RFC 6598). Pre-parsed once
+// at package init so isCGNAT calls don't re-parse the literal each time.
+var cgnatNet = func() *net.IPNet {
+	_, n, _ := net.ParseCIDR("100.64.0.0/10")
+	return n
+}()
+
 // isCGNAT checks if the IP is in the 100.64.0.0/10 range (RFC 6598).
 func isCGNAT(ip net.IP) bool {
-	_, cgnat, _ := net.ParseCIDR("100.64.0.0/10")
-	return cgnat.Contains(ip)
+	return cgnatNet.Contains(ip)
 }
 
 func (r *Runner) testRestartCycle(ctx context.Context, t TunnelInfo) TestResult {
@@ -825,16 +1005,22 @@ func (r *Runner) testRestartCycle(ctx context.Context, t TunnelInfo) TestResult 
 	}
 	startDuration := time.Since(startStart)
 
-	// Wait for handshake (up to 15s)
+	// Wait for handshake (up to 15s) — abort early on context cancellation
+	// so an HTTP timeout doesn't keep the loop spinning.
 	handshakeOK := false
+waitLoop:
 	for i := 0; i < 15; i++ {
-		time.Sleep(time.Second)
+		select {
+		case <-ctx.Done():
+			break waitLoop
+		case <-time.After(time.Second):
+		}
 		result, err := exec.Run(ctx, "/opt/sbin/awg", "show", t.InterfaceName)
 		if err == nil && strings.Contains(result.Stdout, "latest handshake:") {
 			hs := extractField(result.Stdout, "latest handshake:")
 			if hs != "" && hs != "(none)" {
 				handshakeOK = true
-				break
+				break waitLoop
 			}
 		}
 	}
@@ -898,10 +1084,19 @@ func (r *Runner) testProxyHealth(t TunnelInfo) TestResult {
 	}
 
 	var details []string
-	details = append(details, fmt.Sprintf("proxy 127.0.0.1:%d", t.Proxy.ListenPort))
 	if t.Proxy.Version != "" {
 		details = append(details, "v"+t.Proxy.Version)
 	}
+	if t.Proxy.RxBytes != "" {
+		details = append(details, "rx "+t.Proxy.RxBytes)
+	}
+	if t.Proxy.TxBytes != "" {
+		details = append(details, "tx "+t.Proxy.TxBytes)
+	}
+	if t.Proxy.BindIface != "" {
+		details = append(details, "bind="+t.Proxy.BindIface)
+	}
+	details = append(details, fmt.Sprintf("listen=127.0.0.1:%d", t.Proxy.ListenPort))
 
 	if !t.Proxy.RouteMatch && t.Proxy.WantedISP != "" {
 		details = append(details, fmt.Sprintf("WAN mismatch: actual=%s, wanted=%s", t.Proxy.ActualRouteIface, t.Proxy.WantedISP))

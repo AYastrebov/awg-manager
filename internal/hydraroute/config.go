@@ -8,8 +8,37 @@ import (
 	"strings"
 )
 
+// canonicalKey maps the lowercase form of each managed key to the
+// casing hr-neo itself writes in /opt/etc/HydraRoute/hrneo.conf.
+// Used only when appending a key that did not exist in the original
+// file — for in-place rewrites we preserve whatever case the existing
+// line used. Without this mapping our writer would invent a different
+// case for the few keys where the daemon's convention isn't
+// PascalCase (autoStart, clearIPSet, log, logfile), and the next
+// daemon write would create a case-mismatched duplicate that breaks
+// both reads and writes.
+var canonicalKey = map[string]string{
+	"autostart":          "autoStart",
+	"clearipset":         "clearIPSet",
+	"cidr":               "CIDR",
+	"ipsetenabletimeout": "IpsetEnableTimeout",
+	"ipsettimeout":       "IpsetTimeout",
+	"ipsetmaxelem":       "IpsetMaxElem",
+	"directrouteenabled": "DirectRouteEnabled",
+	"globalrouting":      "GlobalRouting",
+	"conntrackflush":     "ConntrackFlush",
+	"log":                "log",
+	"logfile":            "logfile",
+	"geoipfile":          "GeoIPFile",
+	"geositefile":        "GeoSiteFile",
+	"policyorder":        "PolicyOrder",
+}
+
 // ReadConfig parses hrneo.conf and returns the managed Config fields.
-// Unknown keys and comments are ignored; defaults are applied where needed.
+// Unknown keys and comments are ignored; defaults are applied where
+// needed. Key matching is case-insensitive — hr-neo's own writes mix
+// PascalCase, camelCase, mixedCase, and lowercase for different
+// fields, so we accept any casing and let WriteConfig dedupe.
 func ReadConfig() (*Config, error) {
 	f, err := os.Open(hrConfPath)
 	if err != nil {
@@ -40,38 +69,38 @@ func ReadConfig() (*Config, error) {
 		key = strings.TrimSpace(key)
 		val = strings.TrimSpace(val)
 
-		switch key {
-		case "AutoStart":
+		switch strings.ToLower(key) {
+		case "autostart":
 			cfg.AutoStart = parseBool(val)
-		case "ClearIPSet":
+		case "clearipset":
 			cfg.ClearIPSet = parseBool(val)
-		case "CIDR":
+		case "cidr":
 			cfg.CIDR = parseBool(val)
-		case "IpsetEnableTimeout":
+		case "ipsetenabletimeout":
 			cfg.IpsetEnableTimeout = parseBool(val)
-		case "IpsetTimeout":
+		case "ipsettimeout":
 			cfg.IpsetTimeout, _ = strconv.Atoi(val)
-		case "IpsetMaxElem":
+		case "ipsetmaxelem":
 			cfg.IpsetMaxElem, _ = strconv.Atoi(val)
-		case "DirectRouteEnabled":
+		case "directrouteenabled":
 			cfg.DirectRouteEnabled = parseBool(val)
-		case "GlobalRouting":
+		case "globalrouting":
 			cfg.GlobalRouting = parseBool(val)
-		case "ConntrackFlush":
+		case "conntrackflush":
 			cfg.ConntrackFlush = parseBool(val)
-		case "Log":
+		case "log":
 			cfg.Log = val
-		case "LogFile":
+		case "logfile":
 			cfg.LogFile = val
-		case "GeoIPFile":
+		case "geoipfile":
 			if val != "" {
 				cfg.GeoIPFiles = append(cfg.GeoIPFiles, val)
 			}
-		case "GeoSiteFile":
+		case "geositefile":
 			if val != "" {
 				cfg.GeoSiteFiles = append(cfg.GeoSiteFiles, val)
 			}
-		case "PolicyOrder":
+		case "policyorder":
 			cfg.PolicyOrder = nil
 			for _, s := range strings.Split(val, ",") {
 				s = strings.TrimSpace(s)
@@ -87,9 +116,14 @@ func ReadConfig() (*Config, error) {
 	return cfg, nil
 }
 
-// WriteConfig updates hrneo.conf with the managed Config fields, preserving
-// unknown keys and comments. Multi-value fields (GeoIPFile, GeoSiteFile) are
-// written in full on the first occurrence; subsequent original lines are dropped.
+// WriteConfig updates hrneo.conf with the managed Config fields,
+// preserving unknown keys, comments, and the EXACT casing each
+// existing managed key already uses on disk. Subsequent occurrences
+// of the same case-insensitive key are dropped, which heals files
+// previously corrupted by the older case-sensitive writer (it left
+// behind a daemon-cased line AND a PascalCase appended duplicate).
+// Multi-value fields (GeoIPFile, GeoSiteFile) are written in full on
+// the first occurrence; subsequent occurrences are dropped.
 func WriteConfig(cfg *Config) error {
 	if err := os.MkdirAll(hrDir, 0o755); err != nil {
 		return fmt.Errorf("hydraroute: create hrneo dir: %w", err)
@@ -100,25 +134,13 @@ func WriteConfig(cfg *Config) error {
 		return fmt.Errorf("hydraroute: read hrneo.conf: %w", err)
 	}
 
-	// Track which known keys have been written (for in-place replacement).
-	type knownKey struct {
-		written bool // first occurrence replaced, subsequent dropped
-	}
-	knownKeys := map[string]*knownKey{
-		"AutoStart":          {},
-		"ClearIPSet":         {},
-		"CIDR":               {},
-		"IpsetEnableTimeout": {},
-		"IpsetTimeout":       {},
-		"IpsetMaxElem":       {},
-		"DirectRouteEnabled": {},
-		"GlobalRouting":      {},
-		"ConntrackFlush":     {},
-		"Log":                {},
-		"LogFile":            {},
-		"GeoIPFile":          {},
-		"GeoSiteFile":        {},
-		"PolicyOrder":        {},
+	// keyState is keyed by lowercase key, so any casing in the file is
+	// recognised and the first occurrence (whatever its case) is the
+	// one that survives.
+	type keyState struct{ written bool }
+	known := make(map[string]*keyState, len(canonicalKey))
+	for k := range canonicalKey {
+		known[k] = &keyState{}
 	}
 
 	var out strings.Builder
@@ -128,19 +150,22 @@ func WriteConfig(cfg *Config) error {
 		for scanner.Scan() {
 			rawLine := scanner.Text()
 
-			// Determine the key (stripping comments for detection).
+			// Detect the key — strip comment for matching, but the
+			// in-place replacement preserves the original raw form
+			// when we write back.
 			stripped := rawLine
 			if idx := strings.Index(stripped, "#"); idx >= 0 {
 				stripped = stripped[:idx]
 			}
 			stripped = strings.TrimSpace(stripped)
 
-			key := ""
+			origKey := ""
 			if k, _, ok := strings.Cut(stripped, "="); ok {
-				key = strings.TrimSpace(k)
+				origKey = strings.TrimSpace(k)
 			}
 
-			state, isKnown := knownKeys[key]
+			lowerKey := strings.ToLower(origKey)
+			state, isKnown := known[lowerKey]
 			if !isKnown {
 				// Preserve unknown lines as-is.
 				out.WriteString(rawLine)
@@ -149,29 +174,32 @@ func WriteConfig(cfg *Config) error {
 			}
 
 			if state.written {
-				// Drop subsequent occurrences of multi-value keys.
+				// Drop case-insensitive duplicates (heals files
+				// where the old case-sensitive writer left both a
+				// daemon-cased and a PascalCase line for the same key).
 				continue
 			}
 			state.written = true
 
-			// Replace with new value(s).
-			switch key {
-			case "GeoIPFile":
+			// Replace with new value(s), preserving the original
+			// key casing observed in this line.
+			switch lowerKey {
+			case "geoipfile":
 				for _, v := range cfg.GeoIPFiles {
-					fmt.Fprintf(&out, "GeoIPFile=%s\n", v)
+					fmt.Fprintf(&out, "%s=%s\n", origKey, v)
 				}
 				if len(cfg.GeoIPFiles) == 0 {
-					out.WriteString("GeoIPFile=\n")
+					fmt.Fprintf(&out, "%s=\n", origKey)
 				}
-			case "GeoSiteFile":
+			case "geositefile":
 				for _, v := range cfg.GeoSiteFiles {
-					fmt.Fprintf(&out, "GeoSiteFile=%s\n", v)
+					fmt.Fprintf(&out, "%s=%s\n", origKey, v)
 				}
 				if len(cfg.GeoSiteFiles) == 0 {
-					out.WriteString("GeoSiteFile=\n")
+					fmt.Fprintf(&out, "%s=\n", origKey)
 				}
 			default:
-				fmt.Fprintf(&out, "%s=%s\n", key, configValue(key, cfg))
+				fmt.Fprintf(&out, "%s=%s\n", origKey, configValue(lowerKey, cfg))
 			}
 		}
 		if err := scanner.Err(); err != nil {
@@ -179,41 +207,44 @@ func WriteConfig(cfg *Config) error {
 		}
 	}
 
-	// Append any known keys that were not present in the original file.
-	appendIfMissing := func(key string, value string) {
-		if state := knownKeys[key]; !state.written {
-			fmt.Fprintf(&out, "%s=%s\n", key, value)
-			state.written = true
+	// Append any managed keys absent from the original file using
+	// canonicalKey to pick the casing hr-neo itself would have used.
+	appendIfMissing := func(lowerKey string, value string) {
+		state := known[lowerKey]
+		if state.written {
+			return
 		}
+		fmt.Fprintf(&out, "%s=%s\n", canonicalKey[lowerKey], value)
+		state.written = true
 	}
 
-	appendIfMissing("AutoStart", formatBool(cfg.AutoStart))
-	appendIfMissing("ClearIPSet", formatBool(cfg.ClearIPSet))
-	appendIfMissing("CIDR", formatBool(cfg.CIDR))
-	appendIfMissing("IpsetEnableTimeout", formatBool(cfg.IpsetEnableTimeout))
-	appendIfMissing("IpsetTimeout", strconv.Itoa(cfg.IpsetTimeout))
-	appendIfMissing("IpsetMaxElem", strconv.Itoa(cfg.IpsetMaxElem))
-	appendIfMissing("DirectRouteEnabled", formatBool(cfg.DirectRouteEnabled))
-	appendIfMissing("GlobalRouting", formatBool(cfg.GlobalRouting))
-	appendIfMissing("ConntrackFlush", formatBool(cfg.ConntrackFlush))
-	appendIfMissing("Log", cfg.Log)
-	appendIfMissing("LogFile", cfg.LogFile)
-	appendIfMissing("PolicyOrder", strings.Join(cfg.PolicyOrder, ","))
-	if state := knownKeys["GeoIPFile"]; !state.written {
+	appendIfMissing("autostart", formatBool(cfg.AutoStart))
+	appendIfMissing("clearipset", formatBool(cfg.ClearIPSet))
+	appendIfMissing("cidr", formatBool(cfg.CIDR))
+	appendIfMissing("ipsetenabletimeout", formatBool(cfg.IpsetEnableTimeout))
+	appendIfMissing("ipsettimeout", strconv.Itoa(cfg.IpsetTimeout))
+	appendIfMissing("ipsetmaxelem", strconv.Itoa(cfg.IpsetMaxElem))
+	appendIfMissing("directrouteenabled", formatBool(cfg.DirectRouteEnabled))
+	appendIfMissing("globalrouting", formatBool(cfg.GlobalRouting))
+	appendIfMissing("conntrackflush", formatBool(cfg.ConntrackFlush))
+	appendIfMissing("log", cfg.Log)
+	appendIfMissing("logfile", cfg.LogFile)
+	appendIfMissing("policyorder", strings.Join(cfg.PolicyOrder, ","))
+	if state := known["geoipfile"]; !state.written {
 		for _, v := range cfg.GeoIPFiles {
-			fmt.Fprintf(&out, "GeoIPFile=%s\n", v)
+			fmt.Fprintf(&out, "%s=%s\n", canonicalKey["geoipfile"], v)
 		}
 		if len(cfg.GeoIPFiles) == 0 {
-			out.WriteString("GeoIPFile=\n")
+			fmt.Fprintf(&out, "%s=\n", canonicalKey["geoipfile"])
 		}
 		state.written = true
 	}
-	if state := knownKeys["GeoSiteFile"]; !state.written {
+	if state := known["geositefile"]; !state.written {
 		for _, v := range cfg.GeoSiteFiles {
-			fmt.Fprintf(&out, "GeoSiteFile=%s\n", v)
+			fmt.Fprintf(&out, "%s=%s\n", canonicalKey["geositefile"], v)
 		}
 		if len(cfg.GeoSiteFiles) == 0 {
-			out.WriteString("GeoSiteFile=\n")
+			fmt.Fprintf(&out, "%s=\n", canonicalKey["geositefile"])
 		}
 		state.written = true
 	}
@@ -221,32 +252,33 @@ func WriteConfig(cfg *Config) error {
 	return atomicWrite(hrConfPath, out.String())
 }
 
-// configValue returns the string representation for a scalar known key.
-func configValue(key string, cfg *Config) string {
-	switch key {
-	case "AutoStart":
+// configValue returns the string representation for a scalar managed key.
+// lowerKey must already be lowercased.
+func configValue(lowerKey string, cfg *Config) string {
+	switch lowerKey {
+	case "autostart":
 		return formatBool(cfg.AutoStart)
-	case "ClearIPSet":
+	case "clearipset":
 		return formatBool(cfg.ClearIPSet)
-	case "CIDR":
+	case "cidr":
 		return formatBool(cfg.CIDR)
-	case "IpsetEnableTimeout":
+	case "ipsetenabletimeout":
 		return formatBool(cfg.IpsetEnableTimeout)
-	case "IpsetTimeout":
+	case "ipsettimeout":
 		return strconv.Itoa(cfg.IpsetTimeout)
-	case "IpsetMaxElem":
+	case "ipsetmaxelem":
 		return strconv.Itoa(cfg.IpsetMaxElem)
-	case "DirectRouteEnabled":
+	case "directrouteenabled":
 		return formatBool(cfg.DirectRouteEnabled)
-	case "GlobalRouting":
+	case "globalrouting":
 		return formatBool(cfg.GlobalRouting)
-	case "ConntrackFlush":
+	case "conntrackflush":
 		return formatBool(cfg.ConntrackFlush)
-	case "Log":
+	case "log":
 		return cfg.Log
-	case "LogFile":
+	case "logfile":
 		return cfg.LogFile
-	case "PolicyOrder":
+	case "policyorder":
 		return strings.Join(cfg.PolicyOrder, ",")
 	}
 	return ""

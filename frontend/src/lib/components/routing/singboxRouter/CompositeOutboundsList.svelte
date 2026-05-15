@@ -1,17 +1,28 @@
 <script lang="ts">
 	import { api } from '$lib/api/client';
 	import { notifications } from '$lib/stores/notifications';
-	import type { SingboxRouterOutbound } from '$lib/types';
+	import type { SingboxRouterOutbound, SingboxProxyGroup } from '$lib/types';
 	import type { OutboundGroup } from './outboundOptions';
 	import CompositeOutboundEditModal from './CompositeOutboundEditModal.svelte';
 	import ConfirmModal from '$lib/components/ui/ConfirmModal.svelte';
+	import { LatencySparkline } from '$lib/components/ui';
+	import Button from '$lib/components/ui/Button.svelte';
+	import { latencyTier } from '$lib/utils/latencyTier';
 
 	interface Props {
 		outbounds: SingboxRouterOutbound[];
 		outboundOptions: OutboundGroup[];
 		onChange: () => Promise<void> | void;
+		proxies?: SingboxProxyGroup[];
+		latencyHistory?: Map<string, number[]>;
 	}
-	let { outbounds, outboundOptions, onChange }: Props = $props();
+	let {
+		outbounds,
+		outboundOptions,
+		onChange,
+		proxies = [],
+		latencyHistory = new Map(),
+	}: Props = $props();
 
 	let addMode = $state(false);
 	let editTag = $state<string | null>(null);
@@ -20,8 +31,52 @@
 	let forceDeleteMessage = $state('');
 	let busy = $state(false);
 
+	let expanded = $state<Record<string, boolean>>({});
+	let testingGroup = $state<string | null>(null);
+
 	function badgeCls(type: string): string {
 		return `badge badge-${type}`;
+	}
+
+	function toggleExpand(tag: string): void {
+		expanded[tag] = !expanded[tag];
+	}
+
+	function liveGroup(tag: string): SingboxProxyGroup | null {
+		return proxies.find((g) => g.tag === tag) ?? null;
+	}
+
+	function delayClass(d: number): string {
+		switch (latencyTier(d)) {
+			case 'success': return 'delay-good';
+			case 'warning': return 'delay-warn';
+			case 'error':   return 'delay-bad';
+			default:        return 'delay-muted';
+		}
+	}
+
+	async function testGroup(group: string): Promise<void> {
+		testingGroup = group;
+		try {
+			await api.singboxRouterTestProxy({ group });
+			// Polling will pick up new delays within 5s; no client-side merge.
+		} catch (e) {
+			notifications.error(e instanceof Error ? e.message : String(e));
+		} finally {
+			testingGroup = null;
+		}
+	}
+
+	async function selectMember(group: string, member: string): Promise<void> {
+		try {
+			await api.singboxRouterSelectProxy({ group, member });
+			// Optimistic update: mutate the in-memory `now` so UI reflects
+			// the change before the next polling tick.
+			const g = proxies.find((p) => p.tag === group);
+			if (g) g.now = member;
+		} catch (e) {
+			notifications.error(e instanceof Error ? e.message : String(e));
+		}
 	}
 
 	function requestDelete(tag: string): void {
@@ -69,20 +124,46 @@
 
 <div class="header">
 	<div class="hint">{outbounds.length} composite outbound'ов</div>
-	<button class="btn btn-primary" onclick={() => (addMode = true)}>+ Создать outbound</button>
+	<Button variant="primary" size="sm" onclick={() => (addMode = true)}>
+		+ Создать outbound
+	</Button>
 </div>
 
 <div class="cards">
 	{#each outbounds as o (o.tag)}
+		{@const live = liveGroup(o.tag)}
+		{@const isOpen = !!expanded[o.tag]}
 		<div class="card">
 			<div class="card-header">
-				<div class="head-left">
+				<button
+					class="row-toggle"
+					type="button"
+					onclick={() => toggleExpand(o.tag)}
+					aria-expanded={isOpen}
+				>
+					<span class="chevron" class:open={isOpen}>›</span>
 					<span class={badgeCls(o.type)}>{o.type.toUpperCase()}</span>
 					<span class="tag mono">{o.tag}</span>
-				</div>
+					{#if o.source === 'subscription'}
+						<span class="badge-managed" title="Управляется подпиской — редактирование заблокировано">из подписки</span>
+					{/if}
+					{#if live}
+						<span class="now">now: <span class="now-tag mono">{live.now}</span></span>
+						{#if !isOpen}
+							{@const m = live.members.find((x) => x.tag === live.now)}
+							{#if m && m.lastDelay && m.lastDelay > 0}
+								<span class="now-delay {delayClass(m.lastDelay)}">{m.lastDelay}ms</span>
+							{/if}
+						{/if}
+					{:else}
+						<span class="muted">offline</span>
+					{/if}
+				</button>
 				<div class="card-actions">
-					<button class="icon-btn" onclick={() => (editTag = o.tag)} aria-label="Редактировать">✎</button>
-					<button class="icon-btn danger" onclick={() => requestDelete(o.tag)} aria-label="Удалить">✕</button>
+					{#if o.source !== 'subscription'}
+						<button class="icon-btn" onclick={() => (editTag = o.tag)} aria-label="Редактировать">✎</button>
+						<button class="icon-btn danger" onclick={() => requestDelete(o.tag)} aria-label="Удалить">✕</button>
+					{/if}
 				</div>
 			</div>
 			<div class="card-body">
@@ -115,6 +196,50 @@
 					</div>
 				{/if}
 			</div>
+
+			{#if isOpen && live}
+				<div class="member-grid">
+					<div class="grid-toolbar">
+						{#if live.type !== 'selector'}
+							<button
+								class="btn btn-sm"
+								type="button"
+								disabled={testingGroup === o.tag}
+								onclick={() => testGroup(o.tag)}
+							>
+								{testingGroup === o.tag ? 'Тест…' : 'Тест всех'}
+							</button>
+						{/if}
+					</div>
+					<div class="member-cards">
+						{#each live.members as m (m.tag)}
+							{@const isNow = m.tag === live.now}
+							{@const hist = latencyHistory.get(m.tag) ?? []}
+							{@const hasDelay = !!(m.lastDelay && m.lastDelay > 0)}
+							<button
+								class="member-chip"
+								class:active={isNow}
+								type="button"
+								disabled={live.type !== 'selector'}
+								onclick={() => live.type === 'selector' && selectMember(o.tag, m.tag)}
+							>
+								<div class="chip-row">
+									<span class="chip-tag mono">{m.tag}</span>
+									{#if isNow}
+										<span class="chip-mark">●</span>
+									{/if}
+								</div>
+								<div class="chip-row">
+									<span class="chip-delay {hasDelay ? delayClass(m.lastDelay!) : 'delay-muted'}">
+										{hasDelay ? `${m.lastDelay}ms` : '—'}
+									</span>
+									<LatencySparkline history={hist} />
+								</div>
+							</button>
+						{/each}
+					</div>
+				</div>
+			{/if}
 		</div>
 	{/each}
 </div>
@@ -195,12 +320,30 @@
 		display: flex;
 		justify-content: space-between;
 		align-items: center;
+		gap: 0.5rem;
 		margin-bottom: 0.5rem;
 	}
-	.head-left {
+	.row-toggle {
 		display: flex;
-		gap: 0.5rem;
 		align-items: center;
+		gap: 0.5rem;
+		flex: 1;
+		min-width: 0;
+		background: transparent;
+		border: none;
+		padding: 0;
+		cursor: pointer;
+		color: var(--color-text);
+		text-align: left;
+	}
+	.chevron {
+		display: inline-block;
+		font-family: ui-monospace, monospace;
+		transition: transform 0.15s;
+		color: var(--color-text-secondary, var(--muted-text));
+	}
+	.chevron.open {
+		transform: rotate(90deg);
 	}
 	.tag {
 		font-weight: 600;
@@ -225,9 +368,26 @@
 	.badge-loadbalance {
 		background: #ec4899;
 	}
+	.now {
+		font-size: 0.8rem;
+		color: var(--color-text-secondary, var(--muted-text));
+	}
+	.now-tag {
+		color: var(--color-text, inherit);
+	}
+	.now-delay {
+		font-size: 0.75rem;
+		margin-left: 0.25rem;
+		font-family: ui-monospace, monospace;
+	}
+	.muted {
+		font-size: 0.75rem;
+		color: var(--color-text-muted, var(--muted-text));
+	}
 	.card-actions {
 		display: flex;
 		gap: 0.25rem;
+		flex-shrink: 0;
 	}
 	.icon-btn {
 		background: transparent;
@@ -272,5 +432,85 @@
 		text-align: center;
 		color: var(--muted-text);
 		font-size: 0.85rem;
+	}
+
+	.member-grid {
+		margin-top: 0.5rem;
+		padding: 0.5rem;
+		background: var(--color-bg-primary, var(--bg));
+		border: 1px solid var(--color-border, var(--surface-bg));
+		border-radius: 8px;
+	}
+	.grid-toolbar {
+		display: flex;
+		justify-content: flex-end;
+		margin-bottom: 0.5rem;
+	}
+	.member-cards {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+		gap: 0.5rem;
+	}
+	.member-chip {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+		padding: 0.5rem 0.6rem;
+		background: var(--color-bg-secondary, var(--surface-bg));
+		border: 1px solid var(--color-border, transparent);
+		border-radius: 8px;
+		cursor: pointer;
+		color: var(--color-text, inherit);
+		text-align: left;
+	}
+	.member-chip:hover:not(:disabled) {
+		border-color: var(--color-accent);
+	}
+	.member-chip:disabled {
+		cursor: default;
+	}
+	.member-chip.active {
+		background: color-mix(in srgb, var(--color-accent) 12%, var(--color-bg-secondary, var(--surface-bg)));
+		border-color: var(--color-accent);
+	}
+	.chip-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.5rem;
+	}
+	.chip-tag {
+		font-size: 0.78rem;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.chip-mark {
+		color: var(--color-accent);
+		font-size: 0.85rem;
+	}
+	.chip-delay {
+		font-size: 0.72rem;
+		font-family: ui-monospace, monospace;
+	}
+	.delay-good {
+		color: var(--color-success, #22c55e);
+	}
+	.delay-warn {
+		color: var(--color-warning, #f59e0b);
+	}
+	.delay-bad {
+		color: var(--color-error, #dc2626);
+	}
+	.delay-muted {
+		color: var(--color-text-muted, var(--muted-text));
+	}
+	.badge-managed {
+		background: rgba(120, 130, 200, 0.18);
+		color: var(--text-muted);
+		font-size: 0.6875rem;
+		padding: 0.125rem 0.5rem;
+		border-radius: var(--radius-pill);
+		margin-left: 0.375rem;
 	}
 </style>

@@ -3,9 +3,9 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 
+	"github.com/hoaxisr/awg-manager/internal/response"
 	"github.com/hoaxisr/awg-manager/internal/singbox/awgoutbounds"
 )
 
@@ -13,6 +13,14 @@ import (
 // Implemented by awgoutbounds.Service.
 type AWGOutboundsService interface {
 	ListTags(ctx context.Context) ([]awgoutbounds.TagInfo, error)
+}
+
+// AWGOutboundTagDTO mirrors awgoutbounds.TagInfo for OpenAPI exposure.
+type AWGOutboundTagDTO struct {
+	Tag   string `json:"tag" example:"awg-vpn0"`
+	Label string `json:"label" example:"My VPN"`
+	Kind  string `json:"kind" example:"managed"`
+	Iface string `json:"iface" example:"t2s0"`
 }
 
 // AWGOutboundsHandler exposes the catalog of AWG-direct outbound tags
@@ -32,23 +40,33 @@ func NewAWGOutboundsHandler(svc AWGOutboundsService) *AWGOutboundsHandler {
 //	@Tags			singbox
 //	@Produce		json
 //	@Security		CookieAuth
-//	@Success		200	{array}		map[string]interface{}
-//	@Failure		405	{string}	string
-//	@Failure		500	{string}	string
+//	@Success		200	{object}	AWGOutboundTagsResponse
+//	@Failure		405	{object}	APIErrorEnvelope
+//	@Failure		500	{object}	APIErrorEnvelope
 //	@Router			/singbox/awg-outbounds/tags [get]
 func (h *AWGOutboundsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		response.MethodNotAllowed(w)
 		return
 	}
 	tags, err := h.svc.ListTags(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		response.InternalError(w, err.Error())
 		return
 	}
 	if tags == nil {
 		tags = []awgoutbounds.TagInfo{}
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(tags)
+	// Wrapped in the standard {success, data} envelope so the frontend
+	// request<T>() helper (which always expects the envelope) returns
+	// the array correctly. Previously json-encoded raw, which made
+	// request<T>'s data.data resolve to undefined and silently emptied
+	// the AWG tunnels group in the rule-editor outbound dropdown.
+	response.Success(w, tags)
+}
+
+// AWGOutboundTagsResponse is the envelope shape for /singbox/awg-outbounds/tags.
+type AWGOutboundTagsResponse struct {
+	Success bool                `json:"success" example:"true"`
+	Data    []AWGOutboundTagDTO `json:"data"`
 }

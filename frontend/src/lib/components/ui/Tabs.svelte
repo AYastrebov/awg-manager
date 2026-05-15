@@ -1,4 +1,8 @@
 <script lang="ts">
+    import { untrack } from 'svelte';
+    import { goto } from '$app/navigation';
+    import { page } from '$app/stores';
+
     interface Tab {
         id: string;
         label: string;
@@ -7,20 +11,98 @@
         // the neutral default. `success` = green, `warning` = amber,
         // `muted` = subdued grey (e.g. "stopped").
         badgeTone?: 'default' | 'success' | 'warning' | 'muted';
+        // When true, renders a small vertical divider + extra spacing before
+        // this tab. Used to visually group tabs into clusters (e.g. legacy
+        // NDMS-stack tabs vs sing-box stack on /routing).
+        separatorBefore?: boolean;
     }
 
     interface Props {
         tabs: Tab[];
         active: string;
         onchange: (id: string) => void;
+        /**
+         * When set, syncs the active tab with this URL query param. The
+         * primitive reads it on mount / on history navigation, and writes
+         * to it on user clicks via goto({ replaceState: true }). Other
+         * search params are preserved.
+         */
+        urlParam?: string;
+        /**
+         * Tab id treated as the page default. When the active tab equals
+         * this value, the URL param is removed (clean URL). Defaults to
+         * tabs[0]?.id.
+         */
+        defaultTab?: string;
     }
 
-    let { tabs, active, onchange }: Props = $props();
+    let { tabs, active, onchange, urlParam, defaultTab }: Props = $props();
 
     let containerEl: HTMLDivElement | undefined = $state();
     let measureEl: HTMLDivElement | undefined = $state();
     let visibleCount = $state(Infinity);
     let dropdownOpen = $state(false);
+
+    // Gates the outbound URL writer until the inbound effect has had a chance
+    // to apply (or rule out) the value from the URL. Conditional tabs whose
+    // visibility depends on async stores ($systemInfo.isOS5,
+    // $systemInfo.singbox.installed, hydrarouteInstalled) arrive AFTER mount,
+    // so a deep-linked `?tab=policy` may not yet match any known tab on the
+    // first inbound run. Without this flag, the outbound effect would
+    // overwrite `?tab=policy` with the default tab's empty URL before the
+    // conditional tab appears, losing the deep-link value.
+    let urlConsumed = $state(false);
+
+    function writeUrl(id: string) {
+        if (!urlParam) return;
+        const url = new URL($page.url);
+        const fallback = defaultTab ?? tabs[0]?.id;
+        if (id === fallback) {
+            url.searchParams.delete(urlParam);
+        } else {
+            url.searchParams.set(urlParam, id);
+        }
+        const nextSearch = url.searchParams.toString();
+        const currentSearch = $page.url.searchParams.toString();
+        if (
+            url.pathname === $page.url.pathname &&
+            nextSearch === currentSearch &&
+            url.hash === $page.url.hash
+        ) return;
+        const target = url.pathname + (nextSearch ? `?${nextSearch}` : '') + url.hash;
+        void goto(target, { replaceState: true, keepFocus: true, noScroll: true });
+    }
+
+    // Inbound sync: URL → onchange. Triggers on mount, browser back/forward,
+    // and any external goto() touching this query param. Silently ignores
+    // values that don't match a known tab id. `active` is read via untrack
+    // so this effect does NOT re-fire when the parent updates active —
+    // otherwise on a click the inbound effect would race the outbound one
+    // (declaration order: inbound first), see stale URL, and override the
+    // user's selection by calling onchange with the previous tab.
+    //
+    // Sets urlConsumed in every terminal branch except "tab not yet known" —
+    // that branch leaves urlConsumed=false so outbound holds off until
+    // `tabs` updates (effect re-fires on the tabs.find dependency).
+    $effect(() => {
+        if (!urlParam) { urlConsumed = true; return; }
+        const fromUrl = $page.url.searchParams.get(urlParam);
+        if (fromUrl == null) { urlConsumed = true; return; }
+        if (fromUrl === untrack(() => active)) { urlConsumed = true; return; }
+        if (!tabs.find((t) => t.id === fromUrl)) return;
+        urlConsumed = true;
+        onchange(fromUrl);
+    });
+
+    // Outbound sync: active prop → URL. Catches programmatic changes
+    // (e.g. parent bouncing off a hidden tab). No-op when URL already
+    // matches via writeUrl's own guard. Holds off until inbound has
+    // consumed the URL value to avoid clobbering deep links to async tabs.
+    $effect(() => {
+        if (!urlParam) return;
+        if (!urlConsumed) return;
+        writeUrl(active);
+    });
 
     let visibleTabs = $derived(tabs.slice(0, visibleCount));
     let overflowTabs = $derived(tabs.slice(visibleCount));
@@ -28,28 +110,41 @@
 
     function recalc() {
         if (!containerEl || !measureEl) return;
-        const children = measureEl.children;
+        const children = Array.from(measureEl.children) as HTMLElement[];
         if (children.length === 0) return;
 
         // Available width minus space for the "+N" chip (≈60px)
         const containerWidth = containerEl.offsetWidth;
         const chipWidth = 60;
         let usedWidth = 0;
-        let fits = 0;
+        let tabsFit = 0;
+        const totalTabs = tabs.length;
 
-        for (let i = 0; i < children.length; i++) {
-            const childWidth = (children[i] as HTMLElement).offsetWidth;
-            const needsChip = i < children.length - 1;
-            if (usedWidth + childWidth + (needsChip ? chipWidth : 0) <= containerWidth) {
-                usedWidth += childWidth;
-                fits++;
+        // Children are a mix of button.tab (real tabs) and span.tab-separator
+        // (visual dividers). We count only the buttons toward fits, but
+        // include separator widths in the running total when we cross them.
+        let pendingSeparator = 0;
+        for (const child of children) {
+            const w = child.offsetWidth;
+            if (child.tagName === 'SPAN') {
+                // separator — accumulate; only "spent" once we accept the
+                // following tab.
+                pendingSeparator += w;
+                continue;
+            }
+            const isLastTab = tabsFit === totalTabs - 1;
+            const cost = w + pendingSeparator + (isLastTab ? 0 : chipWidth);
+            if (usedWidth + cost <= containerWidth) {
+                usedWidth += w + pendingSeparator;
+                pendingSeparator = 0;
+                tabsFit++;
             } else {
                 break;
             }
         }
 
         // At least 1 tab visible
-        visibleCount = Math.max(1, fits);
+        visibleCount = Math.max(1, tabsFit);
     }
 
     $effect(() => {
@@ -77,10 +172,13 @@
     <div class="backdrop" onclick={() => dropdownOpen = false} onkeydown={() => {}}></div>
 {/if}
 
-<div class="overflow-tabs" bind:this={containerEl}>
+<div class="overflow-tabs" class:has-dropdown={dropdownOpen} bind:this={containerEl}>
     <!-- Hidden measurement row: renders all tabs offscreen to measure widths -->
     <div class="measure-row" bind:this={measureEl} aria-hidden="true">
-        {#each tabs as tab (tab.id)}
+        {#each tabs as tab, i (tab.id)}
+            {#if tab.separatorBefore && i > 0}
+                <span class="tab-separator"></span>
+            {/if}
             <button class="tab" tabindex="-1">
                 {tab.label}
                 {#if tab.badge !== undefined}
@@ -92,7 +190,10 @@
 
     <!-- Visible tabs -->
     <div class="tab-row">
-        {#each visibleTabs as tab (tab.id)}
+        {#each visibleTabs as tab, i (tab.id)}
+            {#if tab.separatorBefore && i > 0}
+                <span class="tab-separator" aria-hidden="true"></span>
+            {/if}
             <button
                 class="tab"
                 class:active={tab.id === active}
@@ -154,6 +255,14 @@
         margin-bottom: 1rem;
     }
 
+    /* When an instance opens its dropdown, lift its stacking context above
+       any sibling Tabs instances (e.g. /routing has both a page-level Tabs
+       and SingboxRoutingPage's inner Tabs — without this, the later DOM
+       sibling paints over the earlier one's dropdown at z-index 41). */
+    .overflow-tabs.has-dropdown {
+        z-index: 100;
+    }
+
     .measure-row {
         display: flex;
         visibility: hidden;
@@ -163,6 +272,15 @@
         pointer-events: none;
         height: 0;
         overflow: hidden;
+    }
+
+    .tab-separator {
+        align-self: center;
+        width: 1px;
+        height: 18px;
+        margin: 0 0.75rem;
+        background: var(--border);
+        flex: 0 0 auto;
     }
 
     .tab-row {
@@ -212,7 +330,7 @@
 
     .tab.active .tab-badge {
         background: var(--accent);
-        color: #fff;
+        color: var(--color-accent-contrast, #fff);
     }
 
     .tab-badge.success {
@@ -231,10 +349,13 @@
     /* Active-tab overrides keep contrast on the selected tab. */
     .tab.active .tab-badge.success,
     .tab.active .tab-badge.warning {
-        color: #fff;
+        color: var(--color-success-contrast, #fff);
     }
     .tab.active .tab-badge.success { background: var(--success); }
-    .tab.active .tab-badge.warning { background: var(--warning); }
+    .tab.active .tab-badge.warning {
+        background: var(--warning);
+        color: var(--color-warning-contrast, #fff);
+    }
 
     /* ─── More chip ─── */
     .more-wrap {
@@ -286,6 +407,13 @@
         min-width: 180px;
         z-index: 50;
         overflow: hidden;
+    }
+
+    @media (max-width: 768px) {
+        .dropdown {
+            max-height: calc(100vh - 200px);
+            overflow-y: auto;
+        }
     }
 
     .dropdown-item {

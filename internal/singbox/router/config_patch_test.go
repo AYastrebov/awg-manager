@@ -7,7 +7,7 @@ import (
 
 func TestRuleSetAddDuplicate(t *testing.T) {
 	cfg := NewEmptyConfig()
-	rs := RuleSet{Tag: "geosite-youtube", Type: "remote", Format: "binary", URL: "u", UpdateInterval: "24h"}
+	rs := RuleSet{Tag: "geosite-youtube", Type: "remote", Format: "binary", URL: "https://example.com/yt.srs", UpdateInterval: "24h"}
 	if err := cfg.AddRuleSet(rs); err != nil {
 		t.Fatal(err)
 	}
@@ -15,6 +15,107 @@ func TestRuleSetAddDuplicate(t *testing.T) {
 	if !errors.Is(err, ErrRuleSetTagConflict) {
 		t.Errorf("expected ErrRuleSetTagConflict, got %v", err)
 	}
+}
+
+func TestRuleSetUpdate(t *testing.T) {
+	cfg := NewEmptyConfig()
+	cfg.Route.RuleSet = []RuleSet{
+		{Tag: "geosite-youtube", Type: "remote", Format: "binary", URL: "https://example.com/yt.srs", UpdateInterval: "24h"},
+	}
+
+	// Successful update — replace URL.
+	next := RuleSet{Tag: "geosite-youtube", Type: "remote", Format: "binary", URL: "https://example.com/yt-new.srs", UpdateInterval: "24h"}
+	if err := cfg.UpdateRuleSet("geosite-youtube", next); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if cfg.Route.RuleSet[0].URL != "https://example.com/yt-new.srs" {
+		t.Errorf("URL not updated, got %q", cfg.Route.RuleSet[0].URL)
+	}
+
+	// Not found.
+	missing := RuleSet{Tag: "missing", Type: "remote", Format: "binary", URL: "https://example.com/x.srs", UpdateInterval: "24h"}
+	err := cfg.UpdateRuleSet("missing", missing)
+	if !errors.Is(err, ErrRuleSetNotFound) {
+		t.Errorf("expected ErrRuleSetNotFound, got %v", err)
+	}
+
+	// Tag rename rejected.
+	renamed := RuleSet{Tag: "geosite-renamed", Type: "remote", Format: "binary", URL: "https://example.com/x.srs", UpdateInterval: "24h"}
+	err = cfg.UpdateRuleSet("geosite-youtube", renamed)
+	if err == nil {
+		t.Error("expected tag-rename to be rejected, got nil")
+	}
+}
+
+func TestRuleSetRemoteURLValidation(t *testing.T) {
+	cfg := NewEmptyConfig()
+
+	// Garbage URL rejected.
+	err := cfg.AddRuleSet(RuleSet{Tag: "g1", Type: "remote", URL: "not a url"})
+	if err == nil || !contains(err.Error(), "invalid url") {
+		t.Errorf("expected 'invalid url' error, got %v", err)
+	}
+
+	// Missing host rejected (scheme but no host).
+	err = cfg.AddRuleSet(RuleSet{Tag: "g2", Type: "remote", URL: "https://"})
+	if err == nil || !contains(err.Error(), "invalid url") {
+		t.Errorf("expected 'invalid url' for empty host, got %v", err)
+	}
+
+	// Non-http/https scheme rejected.
+	err = cfg.AddRuleSet(RuleSet{Tag: "g3", Type: "remote", URL: "ftp://example.com/x.srs"})
+	if err == nil || !contains(err.Error(), "scheme must be http or https") {
+		t.Errorf("expected 'scheme' error, got %v", err)
+	}
+
+	// Valid http URL accepted.
+	if err := cfg.AddRuleSet(RuleSet{Tag: "ok-http", Type: "remote", URL: "http://example.com/x.srs"}); err != nil {
+		t.Fatalf("valid http URL: %v", err)
+	}
+
+	// Valid https URL accepted.
+	if err := cfg.AddRuleSet(RuleSet{Tag: "ok-https", Type: "remote", URL: "https://example.com/x.srs"}); err != nil {
+		t.Fatalf("valid https URL: %v", err)
+	}
+}
+
+func TestRuleSetInlineValidation(t *testing.T) {
+	cfg := NewEmptyConfig()
+
+	// Empty rules rejected.
+	err := cfg.AddRuleSet(RuleSet{Tag: "in-empty", Type: "inline"})
+	if err == nil || !contains(err.Error(), "rules required") {
+		t.Errorf("expected 'rules required' error, got %v", err)
+	}
+
+	// Rule with no known matcher rejected.
+	err = cfg.AddRuleSet(RuleSet{Tag: "in-bad", Type: "inline", Rules: []map[string]any{{"unknown_field": "x"}}})
+	if err == nil || !contains(err.Error(), "no known matcher") {
+		t.Errorf("expected 'no known matcher' error, got %v", err)
+	}
+
+	// Rule with empty domain_suffix array rejected.
+	err = cfg.AddRuleSet(RuleSet{Tag: "in-empty-arr", Type: "inline", Rules: []map[string]any{{"domain_suffix": []any{}}}})
+	if err == nil {
+		t.Error("expected error for empty domain_suffix array, got nil")
+	}
+
+	// Valid inline rule_set.
+	err = cfg.AddRuleSet(RuleSet{Tag: "in-ok", Type: "inline", Rules: []map[string]any{
+		{"domain_suffix": []any{".example.com"}},
+	}})
+	if err != nil {
+		t.Fatalf("valid inline: %v", err)
+	}
+}
+
+func contains(haystack, needle string) bool {
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] == needle {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRuleSetDeleteWithReferences(t *testing.T) {
@@ -93,9 +194,54 @@ func TestEnsureSystemRules(t *testing.T) {
 	}
 }
 
+func TestCompositeOutboundRejectsDirectMember(t *testing.T) {
+	cfg := NewEmptyConfig()
+
+	// Add: direct as member rejected.
+	err := cfg.AddCompositeOutbound(Outbound{Tag: "auto", Type: "urltest", Outbounds: []string{"awg10", "direct"}})
+	if err == nil || !contains(err.Error(), "not allowed in composite groups") {
+		t.Errorf("expected 'not allowed' error for direct member, got %v", err)
+	}
+
+	// Add: case-insensitive direct also rejected.
+	err = cfg.AddCompositeOutbound(Outbound{Tag: "auto", Type: "urltest", Outbounds: []string{"awg10", "Direct"}})
+	if err == nil {
+		t.Error("expected case-insensitive direct to be rejected")
+	}
+
+	// Add: direct as default rejected.
+	err = cfg.AddCompositeOutbound(Outbound{Tag: "auto", Type: "selector", Outbounds: []string{"awg10"}, Default: "direct"})
+	if err == nil || !contains(err.Error(), "default") {
+		t.Errorf("expected 'default' error for direct default, got %v", err)
+	}
+
+	// Empty members rejected.
+	err = cfg.AddCompositeOutbound(Outbound{Tag: "auto", Type: "urltest"})
+	if err == nil || !contains(err.Error(), "at least one member") {
+		t.Errorf("expected 'at least one member' error, got %v", err)
+	}
+
+	// Empty tag rejected.
+	err = cfg.AddCompositeOutbound(Outbound{Tag: "", Type: "selector", Outbounds: []string{"awg10"}})
+	if err == nil || !contains(err.Error(), "tag is required") {
+		t.Errorf("expected 'tag is required' error, got %v", err)
+	}
+
+	// Valid composite accepted.
+	if err := cfg.AddCompositeOutbound(Outbound{Tag: "auto", Type: "urltest", Outbounds: []string{"awg10", "awg20"}}); err != nil {
+		t.Fatalf("valid composite rejected: %v", err)
+	}
+
+	// Update: same validation applies.
+	err = cfg.UpdateCompositeOutbound("auto", Outbound{Tag: "auto", Type: "urltest", Outbounds: []string{"direct"}})
+	if err == nil {
+		t.Error("expected Update with direct member to be rejected")
+	}
+}
+
 func TestCompositeOutboundTagConflict(t *testing.T) {
 	cfg := NewEmptyConfig()
-	o := Outbound{Type: "urltest", Tag: "fast"}
+	o := Outbound{Type: "urltest", Tag: "fast", Outbounds: []string{"awg10", "awg20"}}
 	if err := cfg.AddCompositeOutbound(o); err != nil {
 		t.Fatal(err)
 	}

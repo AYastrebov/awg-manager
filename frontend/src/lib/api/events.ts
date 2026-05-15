@@ -17,6 +17,7 @@ export interface LogEntryEvent {
 	action: string;
 	target: string;
 	message: string;
+	bucket: 'app' | 'singbox';
 }
 
 export interface SystemBootingEvent {
@@ -62,6 +63,14 @@ export interface GeoDownloadProgressEvent {
 	error?: string;
 }
 
+export interface SingboxInstallProgressEvent {
+	op: 'install' | 'update';
+	phase: 'download' | 'activate' | 'stop' | 'start' | 'done' | 'error';
+	downloaded: number;
+	total: number; // 0 when unknown
+	error?: string;
+}
+
 export interface DnsRouteFailoverEvent {
 	listId: string;
 	listName: string;
@@ -101,9 +110,14 @@ export interface SSEEventHandlers {
 	onSingboxRouterRules?: (data: SingboxRouterRule[]) => void;
 	onSingboxRouterRuleSets?: (data: SingboxRouterRuleSet[]) => void;
 	onSingboxRouterOutbounds?: (data: SingboxRouterOutbound[]) => void;
+	// NOTE: staging updates arrive via resource:invalidated ("singbox.router.staging"),
+	// not as a direct push event. No onSingboxRouterStaging handler here.
 
 	// HydraRoute geo download progress
 	onHydraRouteGeoProgress?: (data: GeoDownloadProgressEvent) => void;
+
+	// Sing-box install/update lifecycle progress
+	onSingboxInstallProgress?: (data: SingboxInstallProgressEvent) => void;
 
 	// DNS-route failover notification (user-visible toast)
 	onDnsRouteFailover?: (data: DnsRouteFailoverEvent) => void;
@@ -152,9 +166,14 @@ export function connectSSE(handlers: SSEEventHandlers): () => void {
 	handle('singbox-router:rules', handlers.onSingboxRouterRules);
 	handle('singbox-router:rulesets', handlers.onSingboxRouterRuleSets);
 	handle('singbox-router:outbounds', handlers.onSingboxRouterOutbounds);
+	// singbox-router:staging is NOT a direct push event; staging state arrives via
+	// resource:invalidated → onResourceInvalidated → singboxRouter.loadStaging()
 
 	// HydraRoute events
 	handle('hydraroute:geo-progress', handlers.onHydraRouteGeoProgress);
+
+	// Sing-box install/update progress
+	handle('singbox:install-progress', handlers.onSingboxInstallProgress);
 
 	// DNS-route failover
 	handle('dnsroute:failover', handlers.onDnsRouteFailover);

@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hoaxisr/awg-manager/internal/events"
 	"github.com/hoaxisr/awg-manager/internal/logging"
@@ -41,29 +42,29 @@ type TunnelPingCheckStatus struct {
 
 // TunnelListItemDTO mirrors frontend TunnelListItem.
 type TunnelListItemDTO struct {
-	ID                       string                `json:"id" example:"tun_abc123"`
-	Name                     string                `json:"name" example:"My AWG Tunnel"`
-	Type                     string                `json:"type" example:"awg" enums:"awg,wg"`
-	Status                   string                `json:"status" example:"connected" enums:"connected,disconnected,error,disabled"`
-	Enabled                  bool                  `json:"enabled" example:"true"`
-	DefaultRoute             bool                  `json:"defaultRoute" example:"false"`
-	Endpoint                 string                `json:"endpoint" example:"vpn.example.com:51820"`
-	Address                  string                `json:"address" example:"10.0.0.2/32"`
-	InterfaceName            string                `json:"interfaceName,omitempty" example:"nwg0"`
-	NdmsName                 string                `json:"ndmsName,omitempty" example:"Wireguard0"`
-	Backend                  string                `json:"backend,omitempty" example:"nativewg" enums:"nativewg,kernel"`
-	AWGVersion               string                `json:"awgVersion,omitempty" example:"awg2.0" enums:"wg,awg1.0,awg1.5,awg2.0"`
-	MTU                      int                   `json:"mtu,omitempty" example:"1420"`
-	IspInterface             string                `json:"ispInterface,omitempty" example:"PPPoE0"`
-	IspInterfaceLabel        string                `json:"ispInterfaceLabel,omitempty" example:"WAN"`
-	ResolvedIspInterface     string                `json:"resolvedIspInterface,omitempty" example:"PPPoE0"`
-	ResolvedIspInterfaceLabel string               `json:"resolvedIspInterfaceLabel,omitempty" example:"WAN"`
-	HasAddressConflict       bool                  `json:"hasAddressConflict,omitempty" example:"false"`
-	StartedAt                string                `json:"startedAt,omitempty" example:"2024-01-15T10:00:00Z"`
-	RxBytes                  int64                 `json:"rxBytes,omitempty" example:"10485760"`
-	TxBytes                  int64                 `json:"txBytes,omitempty" example:"5242880"`
-	LastHandshake            string                `json:"lastHandshake,omitempty" example:"2024-01-15T10:30:00Z"`
-	PingCheck                TunnelPingCheckStatus `json:"pingCheck"`
+	ID                        string                `json:"id" example:"tun_abc123"`
+	Name                      string                `json:"name" example:"My AWG Tunnel"`
+	Type                      string                `json:"type" example:"awg" enums:"awg,wg"`
+	Status                    string                `json:"status" example:"connected" enums:"connected,disconnected,error,disabled"`
+	Enabled                   bool                  `json:"enabled" example:"true"`
+	DefaultRoute              bool                  `json:"defaultRoute" example:"false"`
+	Endpoint                  string                `json:"endpoint" example:"vpn.example.com:51820"`
+	Address                   string                `json:"address" example:"10.0.0.2/32"`
+	InterfaceName             string                `json:"interfaceName,omitempty" example:"nwg0"`
+	NdmsName                  string                `json:"ndmsName,omitempty" example:"Wireguard0"`
+	Backend                   string                `json:"backend,omitempty" example:"nativewg" enums:"nativewg,kernel"`
+	AWGVersion                string                `json:"awgVersion,omitempty" example:"awg2.0" enums:"wg,awg1.0,awg1.5,awg2.0"`
+	MTU                       int                   `json:"mtu,omitempty" example:"1420"`
+	IspInterface              string                `json:"ispInterface,omitempty" example:"PPPoE0"`
+	IspInterfaceLabel         string                `json:"ispInterfaceLabel,omitempty" example:"WAN"`
+	ResolvedIspInterface      string                `json:"resolvedIspInterface,omitempty" example:"PPPoE0"`
+	ResolvedIspInterfaceLabel string                `json:"resolvedIspInterfaceLabel,omitempty" example:"WAN"`
+	HasAddressConflict        bool                  `json:"hasAddressConflict,omitempty" example:"false"`
+	StartedAt                 string                `json:"startedAt,omitempty" example:"2024-01-15T10:00:00Z"`
+	RxBytes                   int64                 `json:"rxBytes,omitempty" example:"10485760"`
+	TxBytes                   int64                 `json:"txBytes,omitempty" example:"5242880"`
+	LastHandshake             string                `json:"lastHandshake,omitempty" example:"2024-01-15T10:30:00Z"`
+	PingCheck                 TunnelPingCheckStatus `json:"pingCheck"`
 }
 
 // TunnelListResponse is the envelope for GET /tunnels/list.
@@ -74,9 +75,9 @@ type TunnelListResponse struct {
 
 // TunnelsAllSnapshotData is the payload for GET /tunnels/all.
 type TunnelsAllSnapshotData struct {
-	Tunnels  []TunnelListItemDTO  `json:"tunnels"`
-	External []ExternalTunnelDTO  `json:"external"`
-	System   []SystemTunnelDTO    `json:"system"`
+	Tunnels  []TunnelListItemDTO `json:"tunnels"`
+	External []ExternalTunnelDTO `json:"external"`
+	System   []SystemTunnelDTO   `json:"system"`
 }
 
 // TunnelsAllResponse is the envelope for GET /tunnels/all.
@@ -125,17 +126,17 @@ type TunnelStateInfoDTO struct {
 
 // AWGTunnelDTO mirrors frontend AWGTunnel.
 type AWGTunnelDTO struct {
-	ID             string             `json:"id" example:"tun_abc123"`
-	Name           string             `json:"name" example:"My VPN"`
-	Type           string             `json:"type" example:"awg" enums:"awg,wg"`
-	Enabled        bool               `json:"enabled" example:"true"`
-	DefaultRoute   bool               `json:"defaultRoute" example:"false"`
-	InterfaceName  string             `json:"interfaceName,omitempty" example:"nwg0"`
-	State          string             `json:"state,omitempty" example:"connected"`
-	Backend        string             `json:"backend,omitempty" example:"nativewg"`
-	Interface      AWGInterfaceDTO    `json:"interface"`
-	Peer           AWGPeerDTO         `json:"peer"`
-	StateInfo      *TunnelStateInfoDTO `json:"stateInfo,omitempty"`
+	ID            string              `json:"id" example:"tun_abc123"`
+	Name          string              `json:"name" example:"My VPN"`
+	Type          string              `json:"type" example:"awg" enums:"awg,wg"`
+	Enabled       bool                `json:"enabled" example:"true"`
+	DefaultRoute  bool                `json:"defaultRoute" example:"false"`
+	InterfaceName string              `json:"interfaceName,omitempty" example:"nwg0"`
+	State         string              `json:"state,omitempty" example:"connected"`
+	Backend       string              `json:"backend,omitempty" example:"nativewg"`
+	Interface     AWGInterfaceDTO     `json:"interface"`
+	Peer          AWGPeerDTO          `json:"peer"`
+	StateInfo     *TunnelStateInfoDTO `json:"stateInfo,omitempty"`
 }
 
 // TunnelDetailResponse is the envelope for GET /tunnels/get.
@@ -159,6 +160,10 @@ type TunnelTrafficStats struct {
 	AvgTx     float64 `json:"avgTx" example:"262144"`
 	CurrentRx float64 `json:"currentRx" example:"102400"`
 	CurrentTx float64 `json:"currentTx" example:"51200"`
+	// VolumeRx is estimated bytes received over the selected window (Σ rxRate×Δt on raw history samples).
+	VolumeRx int64 `json:"volumeRx" example:"1073741824"`
+	// VolumeTx is estimated bytes sent over the selected window (Σ txRate×Δt on raw history samples).
+	VolumeTx int64 `json:"volumeTx" example:"536870912"`
 }
 
 // TunnelTrafficData is the payload for GET /tunnels/traffic.
@@ -667,19 +672,49 @@ func (h *TunnelsHandler) writeAll(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// parseTrafficPeriod maps the period query value to a duration.
+func parseTrafficPeriod(raw string) (time.Duration, bool) {
+	switch raw {
+	case "5m":
+		return 5 * time.Minute, true
+	case "10m":
+		return 10 * time.Minute, true
+	case "30m":
+		return 30 * time.Minute, true
+	case "1h":
+		return time.Hour, true
+	case "3h":
+		return 3 * time.Hour, true
+	case "6h":
+		return 6 * time.Hour, true
+	case "12h":
+		return 12 * time.Hour, true
+	case "24h":
+		return 24 * time.Hour, true
+	case "48h":
+		return 48 * time.Hour, true
+	default:
+		return 0, false
+	}
+}
+
 // Traffic returns rate history + aggregates for a single tunnel.
-// GET /api/tunnels/traffic?id=<tunnelID>&period=1h|24h
+// GET /api/tunnels/traffic?id=<tunnelID>&period=5m|10m|30m|1h|3h|6h|12h|24h|48h
 //
-// Only 1h and 24h are accepted — anything else returns 400. 1h is
-// what the card chart fetches on mount to backfill before SSE takes
-// over; 24h is what the detail modal fetches when it opens.
+// Only a fixed set of short/long-range presets is accepted — anything
+// else returns 400. 1h is what the card chart fetches on mount to
+// backfill before SSE takes over; the detail modal can request any of
+// the supported presets.
+//
+// data.stats.volumeRx and data.stats.volumeTx are byte estimates for the
+// selected window from raw in-memory samples (zero if fewer than two samples).
 //
 //	@Summary		Tunnel traffic history
 //	@Tags			tunnels
 //	@Produce		json
 //	@Security		CookieAuth
 //	@Param			id		query	string	true	"Tunnel id"
-//	@Param			period	query	string	true	"1h or 24h"
+//	@Param			period	query	string	true	"5m, 10m, 30m, 1h, 3h, 6h, 12h, 24h, or 48h"
 //	@Success		200	{object}	TunnelTrafficResponse
 //	@Failure		400	{object}	APIErrorEnvelope
 //	@Failure		500	{object}	APIErrorEnvelope
@@ -695,19 +730,17 @@ func (h *TunnelsHandler) Traffic(w http.ResponseWriter, r *http.Request) {
 		response.Error(w, "missing id parameter", "MISSING_ID")
 		return
 	}
-	if !isValidTunnelID(id) {
+	// Read-only handler reading an in-memory map: tolerate non-AWG ids
+	// (singbox subscription tags include emoji/spaces). Sanity-check still
+	// rejects binary garbage and oversized ids. Unknown id → 200 + empty.
+	if len(id) > 256 || !utf8.ValidString(id) || strings.ContainsFunc(id, func(r rune) bool { return r < 0x20 }) {
 		response.Error(w, "invalid tunnel ID", "INVALID_ID")
 		return
 	}
 
-	var since time.Duration
-	switch r.URL.Query().Get("period") {
-	case "1h":
-		since = time.Hour
-	case "24h":
-		since = 24 * time.Hour
-	default:
-		response.Error(w, "period must be 1h or 24h", "INVALID_PERIOD")
+	since, ok := parseTrafficPeriod(r.URL.Query().Get("period"))
+	if !ok {
+		response.Error(w, "period must be one of: 5m, 10m, 30m, 1h, 3h, 6h, 12h, 24h, 48h", "INVALID_PERIOD")
 		return
 	}
 

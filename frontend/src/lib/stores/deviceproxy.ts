@@ -5,17 +5,24 @@
 //   - runtime (5s poll): live selector.now + persisted default for
 //     the "Активный туннель" card; SSE-invalidated by
 //     resource:invalidated{resource:"deviceproxy.runtime"}.
+//   - instances (30s poll): list of all proxy instances for multi-instance UI.
 import { writable } from 'svelte/store';
 import { api } from '$lib/api/client';
 import { createPollingStore, type PollingStore } from './polling';
 import { registerStore } from './storeRegistry';
-import type { DeviceProxyConfig, DeviceProxyOutbound, DeviceProxyRuntime } from '$lib/types';
+import type { DeviceProxyConfig, DeviceProxyInstance, DeviceProxyOutbound, DeviceProxyRuntime } from '$lib/types';
 
 export const deviceProxyConfig: PollingStore<DeviceProxyConfig> = createPollingStore<DeviceProxyConfig>(
 	() => api.getDeviceProxyConfig(),
 	{ staleTime: 30_000, pollInterval: 30_000 },
 );
 registerStore('deviceproxy.config', deviceProxyConfig);
+
+export const deviceProxyInstances: PollingStore<DeviceProxyInstance[]> = createPollingStore<DeviceProxyInstance[]>(
+	() => api.listDeviceProxyInstances(),
+	{ staleTime: 30_000, pollInterval: 30_000 },
+);
+registerStore('deviceproxy.config', deviceProxyInstances);
 
 export const deviceProxyOutbounds: PollingStore<DeviceProxyOutbound[]> = createPollingStore<DeviceProxyOutbound[]>(
 	() => api.listDeviceProxyOutbounds(),
@@ -39,6 +46,7 @@ export function setDeviceProxyMissingTarget(wasTag: string): void {
 	deviceProxyMissingTarget.set(wasTag);
 	// Also kick both polling stores so the UI reflects the disabled state.
 	deviceProxyConfig.invalidate();
+	deviceProxyInstances.invalidate();
 	deviceProxyOutbounds.invalidate();
 }
 

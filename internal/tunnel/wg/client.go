@@ -17,10 +17,6 @@ type Client interface {
 	// Command: awg show <iface>
 	Show(ctx context.Context, iface string) (*ShowResult, error)
 
-	// RemovePeer removes a peer from an interface.
-	// Command: awg set <iface> peer <publicKey> remove
-	RemovePeer(ctx context.Context, iface, publicKey string) error
-
 	// GetPeerPublicKey extracts the peer public key from interface state.
 	// Uses Show internally.
 	GetPeerPublicKey(ctx context.Context, iface string) (string, error)

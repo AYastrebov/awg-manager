@@ -38,13 +38,14 @@ type Rule struct {
 }
 
 type RuleSet struct {
-	Tag            string `json:"tag"`
-	Type           string `json:"type"`
-	Format         string `json:"format"`
-	URL            string `json:"url,omitempty"`
-	UpdateInterval string `json:"update_interval,omitempty"`
-	DownloadDetour string `json:"download_detour,omitempty"`
-	Path           string `json:"path,omitempty"`
+	Tag            string           `json:"tag"`
+	Type           string           `json:"type"`
+	Format         string           `json:"format,omitempty"`
+	URL            string           `json:"url,omitempty"`
+	UpdateInterval string           `json:"update_interval,omitempty"`
+	DownloadDetour string           `json:"download_detour,omitempty"`
+	Path           string           `json:"path,omitempty"`
+	Rules          []map[string]any `json:"rules,omitempty"`
 }
 
 type Outbound struct {
@@ -59,14 +60,27 @@ type Outbound struct {
 	Strategy      string   `json:"strategy,omitempty"`
 }
 
+// CompositeOutboundView is the API/list projection of a composite
+// outbound — the canonical Outbound plus a Source tag identifying which
+// orchestrator slot owns it. "router" entries come from 20-router.json
+// (mutable via this service); "subscription" entries come from
+// 40-subscriptions.json (managed by the subscription service — the UI
+// renders them read-only).
+type CompositeOutboundView struct {
+	Outbound
+	Source string `json:"source"`
+}
+
 type Inbound struct {
-	Type        string `json:"type"`
-	Tag         string `json:"tag"`
-	Listen      string `json:"listen"`
-	ListenPort  int    `json:"listen_port"`
-	Network     string `json:"network,omitempty"`
-	UDPTimeout  string `json:"udp_timeout,omitempty"`
-	RoutingMark int    `json:"routing_mark,omitempty"`
+	Type         string `json:"type"`
+	Tag          string `json:"tag"`
+	Listen       string `json:"listen"`
+	ListenPort   int    `json:"listen_port"`
+	Network      string `json:"network,omitempty"`
+	UDPTimeout   string `json:"udp_timeout,omitempty"`
+	UDPFragment  bool   `json:"udp_fragment,omitempty"`
+	TCPFastOpen  bool   `json:"tcp_fast_open,omitempty"`
+	RoutingMark  int    `json:"routing_mark,omitempty"`
 }
 
 type Route struct {

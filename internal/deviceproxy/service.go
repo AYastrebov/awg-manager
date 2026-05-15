@@ -4,21 +4,29 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/hoaxisr/awg-manager/internal/events"
+	"github.com/hoaxisr/awg-manager/internal/logging"
+	"github.com/hoaxisr/awg-manager/internal/sys/exec"
 )
 
 // Deps groups the external collaborators Service needs. Wired once at
 // startup in main.go. Nil fields are tolerated — Service degrades and
 // logs where applicable.
 type Deps struct {
-	Store        *Store
-	Singbox      SingboxOperator     // nil → treated as "no sb tunnels, no apply"
-	NDMSQuery    NDMSInterfaceQuery  // nil → ListenInterface resolution fails explicitly
-	Bus          *events.Bus         // nil → no event subscriptions or publishes
-	AWGOutbounds AWGOutboundsCatalog // nil → AWG-related selector members empty
+	Store                 *Store
+	Singbox               SingboxOperator              // nil → treated as "no sb tunnels, no apply"
+	SubscriptionOutbounds SubscriptionOutboundsCatalog // nil → no subscription selector/urltest outbounds
+	NDMSQuery             NDMSInterfaceQuery           // nil → ListenInterface resolution fails explicitly
+	Bus                   *events.Bus                  // nil → no event subscriptions or publishes
+	AWGOutbounds          AWGOutboundsCatalog          // nil → AWG-related selector members empty
+	AppLogger             logging.AppLogger            // nil → silent in UI logs
 }
 
 // AWGOutboundsCatalog is the narrow contract Service needs from the
@@ -38,12 +46,28 @@ type AWGTagInfo struct {
 	Iface string
 }
 
+// SubscriptionOutboundsCatalog is the narrow contract Service needs from
+// the sing-box subscription service. It exposes subscription selector/urltest
+// outbounds that can be used as device-proxy targets.
+type SubscriptionOutboundsCatalog interface {
+	ListDeviceProxyOutbounds() []SubscriptionOutboundInfo
+}
+
+// SubscriptionOutboundInfo describes a subscription selector/urltest outbound
+// that can be selected by device-proxy.
+type SubscriptionOutboundInfo struct {
+	Tag    string
+	Label  string
+	Detail string
+}
+
 // SingboxOperator is the narrow contract Service needs from
 // singbox.Operator. Adapter in singbox_adapter.go binds it to the
 // real Operator.
 type SingboxOperator interface {
 	ApplyDeviceProxy(ctx context.Context, spec ExternalSpec) error
 	ApplyDeviceProxyNoReload(ctx context.Context, spec ExternalSpec) error
+	ApplyDeviceProxyInstances(ctx context.Context, specs []ExternalInstanceSpec) error
 	SetSelectorDefault(ctx context.Context, selectorTag, memberTag string) error
 	GetSelectorActive(ctx context.Context, selectorTag string) (string, error)
 	TunnelTags() []string
@@ -69,6 +93,18 @@ type ExternalSpec struct {
 	SBTags      []string
 }
 
+// ExternalInstanceSpec mirrors singbox.DeviceProxyInstanceSpec.
+type ExternalInstanceSpec struct {
+	ID          string
+	Enabled     bool
+	ListenAddr  string
+	Port        int
+	Auth        AuthSpec
+	SelectedTag string
+	AWGTags     []string
+	SBTags      []string
+}
+
 // TunnelInboundPortsFn returns the set of listen_ports currently used
 // by sing-box tunnel-internal inbounds. Used by ValidateConfig to
 // detect port conflicts when the user picks a port for the device proxy.
@@ -77,7 +113,8 @@ type TunnelInboundPortsFn func() []int
 // Service owns the deviceproxy storage + mutation surface. All public
 // methods serialise through the embedded mutex.
 type Service struct {
-	d Deps
+	d      Deps
+	appLog *logging.ScopedLogger
 
 	mu          sync.Mutex
 	tunnelPorts TunnelInboundPortsFn
@@ -86,14 +123,207 @@ type Service struct {
 // ErrOutboundUnavailable is returned by SelectRuntimeOutbound when the caller
 // requests a tag that is not in the current list of available outbounds.
 var ErrOutboundUnavailable = errors.New("outbound is not available")
+var ErrInstanceNotFound = errors.New("instance not found")
+
+// deviceProxyInstanceSelectorTag returns the selector tag for a given instance.
+// The default instance uses the shared "device-proxy-selector" tag;
+// named instances get their own isolated selector: "device-proxy-<id>-selector".
+func deviceProxyInstanceSelectorTag(id string) string {
+	if id == "" || id == "default" {
+		return "device-proxy-selector"
+	}
+	return "device-proxy-" + id + "-selector"
+}
 
 func NewService(d Deps) *Service {
-	return &Service{d: d}
+	return &Service{
+		d:      d,
+		appLog: logging.NewScopedLogger(d.AppLogger, logging.GroupRouting, logging.SubDeviceProxy),
+	}
 }
 
 // GetConfig returns the current persisted Config. Defensive copy via Store.
 func (s *Service) GetConfig() Config {
 	return s.d.Store.Get()
+}
+
+// GetSnapshot returns all configured proxy instances.
+func (s *Service) GetSnapshot() Snapshot {
+	return s.d.Store.Snapshot()
+}
+
+// GetInstance returns one configured proxy instance.
+func (s *Service) GetInstance(id string) (Instance, bool) {
+	return s.d.Store.GetInstance(id)
+}
+
+// SaveInstance validates and persists one proxy instance.
+// It now applies the full snapshot after saving.
+func (s *Service) SaveInstance(ctx context.Context, in Instance) error {
+	if in.ID == "" {
+		return fmt.Errorf("instance id is empty")
+	}
+	if in.Name == "" {
+		in.Name = in.ID
+	}
+
+	s.mu.Lock()
+	portFn := s.tunnelPorts
+	prev := s.d.Store.Snapshot()
+	s.mu.Unlock()
+
+	// Build list of OTHER instances (exclude the one being saved by ID).
+	others := make([]Instance, 0, len(prev.Instances))
+	for _, ins := range prev.Instances {
+		if ins.ID != in.ID {
+			others = append(others, ins)
+		}
+	}
+
+	cfg := instanceToConfig(in)
+	if err := validateConfigRaw(cfg, portFn, others); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	prev = s.d.Store.Snapshot()
+
+	if err := s.d.Store.SaveInstance(in); err != nil {
+		return err
+	}
+	if err := s.applyInstancesLocked(ctx); err != nil {
+		_ = s.restoreSnapshot(ctx, prev)
+		return err
+	}
+	return nil
+}
+
+// DeleteInstance removes one configured proxy instance.
+// The default instance is preserved by Store.DeleteInstance.
+func (s *Service) DeleteInstance(ctx context.Context, id string) error {
+	if id == "" {
+		return fmt.Errorf("instance id is empty")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	prev := s.d.Store.Snapshot()
+
+	if err := s.d.Store.DeleteInstance(id); err != nil {
+		return err
+	}
+	if err := s.applyInstancesLocked(ctx); err != nil {
+		_ = s.restoreSnapshot(ctx, prev)
+		return err
+	}
+	return nil
+}
+
+// buildInstanceSpec builds an ExternalInstanceSpec from a stored Instance.
+func (s *Service) buildInstanceSpec(ctx context.Context, in Instance) (ExternalInstanceSpec, error) {
+	cfg := instanceToConfig(in)
+
+	base, err := s.buildSpec(ctx, cfg)
+	if err != nil {
+		return ExternalInstanceSpec{}, err
+	}
+
+	return ExternalInstanceSpec{
+		ID:          in.ID,
+		Enabled:     base.Enabled,
+		ListenAddr:  base.ListenAddr,
+		Port:        base.Port,
+		Auth:        base.Auth,
+		SelectedTag: base.SelectedTag,
+		AWGTags:     append([]string(nil), base.AWGTags...),
+		SBTags:      append([]string(nil), base.SBTags...),
+	}, nil
+}
+
+// buildSnapshotSpecs converts a Snapshot into a slice of ExternalInstanceSpec.
+func (s *Service) buildSnapshotSpecs(ctx context.Context, snap Snapshot) ([]ExternalInstanceSpec, error) {
+	specs := make([]ExternalInstanceSpec, 0, len(snap.Instances))
+	for _, in := range snap.Instances {
+		spec, err := s.buildInstanceSpec(ctx, in)
+		if err != nil {
+			return nil, fmt.Errorf("build instance %q: %w", in.ID, err)
+		}
+		specs = append(specs, spec)
+	}
+	return specs, nil
+}
+
+// ApplyInstances rebuilds and applies all configured proxy instances.
+func (s *Service) ApplyInstances(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.applyInstancesLocked(ctx)
+}
+
+func (s *Service) applyInstancesLocked(ctx context.Context) error {
+	snap := s.d.Store.Snapshot()
+
+	specs, err := s.buildSnapshotSpecs(ctx, snap)
+	if err != nil {
+		return err
+	}
+
+	if s.d.Singbox != nil {
+		if err := s.d.Singbox.ApplyDeviceProxyInstances(ctx, specs); err != nil {
+			return fmt.Errorf("apply device proxy instances: %w", err)
+		}
+	}
+
+	if s.d.Bus != nil {
+		s.d.Bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.config"})
+		s.d.Bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.runtime"})
+	}
+	return nil
+}
+
+// restoreSnapshot attempts to roll the Store back to a previous snapshot
+// and re-apply the restored snapshot to sing-box so the runtime matches
+// storage. Best-effort: errors during rollback (storage or reapply) are
+// logged via appLog but not returned — the caller already has the
+// original error from the failed mutation.
+func (s *Service) restoreSnapshot(ctx context.Context, snap Snapshot) error {
+	current := s.d.Store.Snapshot()
+
+	// Delete instances present in current but missing in previous.
+	for _, cur := range current.Instances {
+		found := false
+		for _, prev := range snap.Instances {
+			if prev.ID == cur.ID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			if err := s.d.Store.DeleteInstance(cur.ID); err != nil {
+				s.appLog.Warn("rollback", "delete", fmt.Sprintf("failed to delete instance %s: %v", cur.ID, err))
+				return err
+			}
+		}
+	}
+
+	// Restore (upsert) all instances from the previous snapshot.
+	for _, prev := range snap.Instances {
+		if err := s.d.Store.SaveInstance(prev); err != nil {
+			s.appLog.Warn("rollback", "restore", fmt.Sprintf("failed to restore instance %s: %v", prev.ID, err))
+			return err
+		}
+	}
+
+	// Re-apply restored snapshot to sing-box so runtime matches storage.
+	// Best-effort: if this also fails, log via appLog — there's nothing
+	// more we can do at this layer, the next Reconcile will retry.
+	if err := s.applyInstancesLocked(ctx); err != nil {
+		s.appLog.Warn("rollback", "reapply", fmt.Sprintf("post-rollback reapply failed: %v", err))
+	}
+	return nil
 }
 
 // SetTunnelInboundPorts wires a lookup that ValidateConfig uses to
@@ -110,9 +340,12 @@ func (s *Service) withTunnelInboundPorts(ports []int) {
 }
 
 // validateConfigRaw contains the stateless validation rules that both
-// ValidateConfig (public, takes the mutex) and validateLocked
-// (internal, caller holds the mutex) share.
-func validateConfigRaw(cfg Config, tunnelPorts TunnelInboundPortsFn) error {
+// ValidateConfig (public, takes the mutex), validateLocked (internal,
+// caller holds the mutex), and SaveInstance share. otherInstances may
+// be nil for legacy single-config call sites; multi-instance callers
+// pass the snapshot's other instances (excluding the one being saved)
+// so port collisions across instances are caught at validation time.
+func validateConfigRaw(cfg Config, tunnelPorts TunnelInboundPortsFn, otherInstances []Instance) error {
 	if !cfg.Enabled {
 		return nil
 	}
@@ -124,6 +357,11 @@ func validateConfigRaw(cfg Config, tunnelPorts TunnelInboundPortsFn) error {
 			if p == cfg.Port {
 				return fmt.Errorf("port %d is used by a sing-box tunnel inbound", cfg.Port)
 			}
+		}
+	}
+	for _, other := range otherInstances {
+		if other.Enabled && other.Port == cfg.Port {
+			return fmt.Errorf("port %d is used by another device-proxy instance %q", cfg.Port, other.ID)
 		}
 	}
 	if cfg.Auth.Enabled {
@@ -147,7 +385,7 @@ func (s *Service) ValidateConfig(cfg Config) error {
 	s.mu.Lock()
 	portFn := s.tunnelPorts
 	s.mu.Unlock()
-	return validateConfigRaw(cfg, portFn)
+	return validateConfigRaw(cfg, portFn, nil)
 }
 
 // SaveConfig validates, applies to sing-box, and persists cfg.
@@ -197,6 +435,17 @@ func (s *Service) SaveConfig(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("persist storage: %w", err)
 	}
 
+	switch {
+	case oldCfg.Enabled && !cfg.Enabled:
+		s.appLog.Info("disable", cfg.SelectedOutbound, "Device proxy disabled")
+	case !oldCfg.Enabled && cfg.Enabled:
+		s.appLog.Info("enable", cfg.SelectedOutbound, fmt.Sprintf("Device proxy enabled on :%d via %s", cfg.Port, cfg.SelectedOutbound))
+	case onlySelectedOutboundChanged(oldCfg, cfg):
+		s.appLog.Info("change-outbound", cfg.SelectedOutbound, fmt.Sprintf("Device proxy outbound switched to %s", cfg.SelectedOutbound))
+	default:
+		s.appLog.Info("update", cfg.SelectedOutbound, fmt.Sprintf("Device proxy config updated (port=%d outbound=%s)", cfg.Port, cfg.SelectedOutbound))
+	}
+
 	if s.d.Bus != nil {
 		s.d.Bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.config"})
 		// A default-only change also shifts what the runtime store would
@@ -222,6 +471,19 @@ func (s *Service) ForceApply(ctx context.Context) error {
 
 	cfg := s.d.Store.Get()
 
+	if cfg.Enabled && s.d.Singbox != nil {
+		active, err := s.d.Singbox.GetSelectorActive(ctx, "device-proxy-selector")
+		if err != nil {
+			return fmt.Errorf("force apply read active selector: %w", err)
+		}
+		if active != "" && active != cfg.SelectedOutbound {
+			cfg.SelectedOutbound = active
+			if err := s.d.Store.Save(cfg); err != nil {
+				return fmt.Errorf("force apply persist active selector: %w", err)
+			}
+		}
+	}
+
 	spec, err := s.buildSpec(ctx, cfg)
 	if err != nil {
 		return err
@@ -230,6 +492,12 @@ func (s *Service) ForceApply(ctx context.Context) error {
 	if s.d.Singbox != nil {
 		if err := s.d.Singbox.ApplyDeviceProxy(ctx, spec); err != nil {
 			return fmt.Errorf("force apply: %w", err)
+		}
+
+		if cfg.Enabled && cfg.SelectedOutbound != "" {
+			if err := s.d.Singbox.SetSelectorDefault(ctx, "device-proxy-selector", cfg.SelectedOutbound); err != nil {
+				return fmt.Errorf("force apply selector: %w", err)
+			}
 		}
 	}
 
@@ -257,7 +525,7 @@ func onlySelectedOutboundChanged(oldCfg, newCfg Config) bool {
 // avoid a nested Lock(). ValidateConfig (the public form) still works
 // standalone for API-layer input checking.
 func (s *Service) validateLocked(cfg Config) error {
-	return validateConfigRaw(cfg, s.tunnelPorts)
+	return validateConfigRaw(cfg, s.tunnelPorts, nil)
 }
 
 func (s *Service) buildSpec(ctx context.Context, cfg Config) (ExternalSpec, error) {
@@ -296,6 +564,13 @@ func (s *Service) buildSpec(ctx context.Context, cfg Config) (ExternalSpec, erro
 	if s.d.Singbox != nil {
 		spec.SBTags = s.d.Singbox.TunnelTags()
 	}
+
+	// Sing-box subscription selector/urltest tags
+	if s.d.SubscriptionOutbounds != nil {
+		for _, t := range s.d.SubscriptionOutbounds.ListDeviceProxyOutbounds() {
+			spec.SBTags = append(spec.SBTags, t.Tag)
+		}
+	}
 	return spec, nil
 }
 
@@ -305,6 +580,15 @@ type RuntimeState struct {
 	Alive      bool   `json:"alive"`
 	ActiveTag  string `json:"activeTag"`
 	DefaultTag string `json:"defaultTag"`
+}
+
+// InstanceIPCheckResult contains the direct WAN IP and IP observed through
+// a concrete device-proxy instance.
+type InstanceIPCheckResult struct {
+	DirectIP  string `json:"directIp"`
+	ProxyIP   string `json:"proxyIp"`
+	IPChanged bool   `json:"ipChanged"`
+	Service   string `json:"service"`
 }
 
 // GetRuntimeState returns the current selector.now from Clash API
@@ -327,12 +611,54 @@ func (s *Service) GetRuntimeState(ctx context.Context) RuntimeState {
 	return state
 }
 
+// GetInstanceRuntimeState returns the current selector.now for a specific
+// instance (empty if sing-box is down) plus the persisted default for
+// that instance.
+func (s *Service) GetInstanceRuntimeState(ctx context.Context, id string) (RuntimeState, error) {
+	if id == "" {
+		return RuntimeState{}, fmt.Errorf("instance id is empty")
+	}
+
+	s.mu.Lock()
+	in, ok := s.d.Store.GetInstance(id)
+	sb := s.d.Singbox
+	s.mu.Unlock()
+
+	if !ok {
+		return RuntimeState{}, fmt.Errorf("instance %q not found", id)
+	}
+
+	state := RuntimeState{DefaultTag: in.SelectedOutbound}
+	if sb == nil || !sb.IsRunning() {
+		return state, nil
+	}
+
+	state.Alive = true
+	if active, err := sb.GetSelectorActive(ctx, deviceProxyInstanceSelectorTag(id)); err == nil {
+		state.ActiveTag = active
+	}
+	return state, nil
+}
+
 // Outbound describes one selectable proxy target exposed to the UI.
 type Outbound struct {
 	Tag    string `json:"tag"`
-	Kind   string `json:"kind"`   // "direct" | "singbox" | "awg"
+	Kind   string `json:"kind"` // "direct" | "singbox" | "awg"
 	Label  string `json:"label"`
 	Detail string `json:"detail"` // extra info for UI (kernel iface, protocol, etc)
+}
+
+// TunnelOutboundInfo describes one standalone sing-box tunnel outbound
+// for device-proxy selector UI metadata.
+type TunnelOutboundInfo struct {
+	Tag      string
+	Protocol string
+	Server   string
+	Port     int
+}
+
+type singboxTunnelOutboundsProvider interface {
+	TunnelOutbounds() []TunnelOutboundInfo
 }
 
 // ListOutbounds returns all members that can be assigned as the
@@ -351,8 +677,42 @@ func (s *Service) listOutboundsLocked(ctx context.Context) []Outbound {
 	if s.d.Singbox != nil {
 		tags := append([]string(nil), s.d.Singbox.TunnelTags()...)
 		sort.Strings(tags)
+
+		byTag := map[string]TunnelOutboundInfo{}
+		if p, ok := s.d.Singbox.(singboxTunnelOutboundsProvider); ok {
+			for _, ti := range p.TunnelOutbounds() {
+				byTag[ti.Tag] = ti
+			}
+		}
+
 		for _, tag := range tags {
-			out = append(out, Outbound{Tag: tag, Kind: "singbox", Label: tag})
+			detail := ""
+			if ti, ok := byTag[tag]; ok {
+				switch {
+				case ti.Protocol != "" && ti.Server != "" && ti.Port > 0:
+					detail = strings.ToUpper(ti.Protocol) + " · " + ti.Server + ":" + fmt.Sprintf("%d", ti.Port)
+				case ti.Server != "" && ti.Port > 0:
+					detail = ti.Server + ":" + fmt.Sprintf("%d", ti.Port)
+				case ti.Protocol != "":
+					detail = strings.ToUpper(ti.Protocol)
+				}
+			}
+			out = append(out, Outbound{Tag: tag, Kind: "singbox", Label: tag, Detail: detail})
+		}
+	}
+
+	if s.d.SubscriptionOutbounds != nil {
+		subs := append([]SubscriptionOutboundInfo(nil), s.d.SubscriptionOutbounds.ListDeviceProxyOutbounds()...)
+		sort.Slice(subs, func(i, j int) bool {
+			return subs[i].Label < subs[j].Label
+		})
+		for _, sub := range subs {
+			out = append(out, Outbound{
+				Tag:    sub.Tag,
+				Kind:   "singbox",
+				Label:  sub.Label,
+				Detail: sub.Detail,
+			})
 		}
 	}
 
@@ -402,8 +762,10 @@ func (s *Service) SelectRuntimeOutbound(ctx context.Context, tag string) error {
 		return fmt.Errorf("singbox operator unavailable")
 	}
 	if err := sb.SetSelectorDefault(ctx, "device-proxy-selector", tag); err != nil {
+		s.appLog.Warn("select-runtime", tag, fmt.Sprintf("hot-switch failed: %v", err))
 		return err
 	}
+	s.appLog.Info("select-runtime", tag, "Device proxy hot-switched outbound")
 
 	// Hot-switch changed runtime.activeTag — give the frontend SSE
 	// fast-path so the "Активный туннель" card updates sub-second,
@@ -414,55 +776,118 @@ func (s *Service) SelectRuntimeOutbound(ctx context.Context, tag string) error {
 	return nil
 }
 
-// Reconcile is the single idempotent rebuild path. It verifies the
-// currently-selected outbound still exists in the available list
-// (disables the proxy + publishes deviceproxy:missing-target if not)
-// and re-applies the resulting spec to sing-box.
+// SelectInstanceRuntimeOutbound switches the live selector.now for a
+// specific instance via Clash API. No storage write. No config.json
+// write. The choice is ephemeral — sing-box reload/restart reverts to
+// the instance's persisted default.
+//
+// Errors:
+//   - ErrOutboundUnavailable — tag is not in the currently-available list.
+//   - singbox.ErrSingboxNotRunning — bubbled up from the operator when
+//     the daemon is down.
+func (s *Service) SelectInstanceRuntimeOutbound(ctx context.Context, id, tag string) error {
+	if id == "" {
+		return fmt.Errorf("instance id is empty")
+	}
+
+	s.mu.Lock()
+	_, ok := s.d.Store.GetInstance(id)
+	available := s.listOutboundsLocked(ctx)
+	sb := s.d.Singbox
+	bus := s.d.Bus
+	s.mu.Unlock()
+
+	if !ok {
+		return fmt.Errorf("instance %q not found", id)
+	}
+
+	found := false
+	for _, ob := range available {
+		if ob.Tag == tag {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("%w: %q", ErrOutboundUnavailable, tag)
+	}
+
+	if sb == nil {
+		return fmt.Errorf("singbox operator unavailable")
+	}
+
+	selectorTag := deviceProxyInstanceSelectorTag(id)
+	if err := sb.SetSelectorDefault(ctx, selectorTag, tag); err != nil {
+		s.appLog.Warn("select-runtime", tag, fmt.Sprintf("hot-switch failed for instance %s: %v", id, err))
+		return err
+	}
+	s.appLog.Info("select-runtime", tag, fmt.Sprintf("Device proxy instance %s hot-switched outbound", id))
+
+	if bus != nil {
+		bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.runtime"})
+	}
+	return nil
+}
+
+// Reconcile is the idempotent rebuild that verifies every enabled instance's
+// selected outbound is still available. Instances with missing targets are
+// disabled, then the full snapshot is applied to sing-box.
 func (s *Service) Reconcile(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cfg := s.d.Store.Get()
-	if cfg.Enabled && cfg.SelectedOutbound != "" {
-		available := s.listOutboundsLocked(ctx)
-		found := false
-		for _, ob := range available {
-			if ob.Tag == cfg.SelectedOutbound {
-				found = true
-				break
-			}
+	snap := s.d.Store.Snapshot()
+	available := s.listOutboundsLocked(ctx)
+
+	availableByTag := make(map[string]struct{}, len(available))
+	for _, ob := range available {
+		availableByTag[ob.Tag] = struct{}{}
+	}
+
+	changed := false
+	missingTags := make([]string, 0)
+
+	for i := range snap.Instances {
+		in := &snap.Instances[i]
+		if !in.Enabled || in.SelectedOutbound == "" {
+			continue
 		}
-		if !found {
-			wasTag := cfg.SelectedOutbound
-			cfg.Enabled = false
-			cfg.SelectedOutbound = ""
-			if err := s.d.Store.Save(cfg); err != nil {
-				return fmt.Errorf("persist after missing target: %w", err)
-			}
-			if s.d.Bus != nil {
-				s.d.Bus.Publish("deviceproxy:missing-target", map[string]string{"wasTag": wasTag})
-				s.d.Bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.config"})
-				s.d.Bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.runtime"})
-			}
+		if _, ok := availableByTag[in.SelectedOutbound]; ok {
+			continue
+		}
+
+		missingTags = append(missingTags, in.SelectedOutbound)
+		in.Enabled = false
+		in.SelectedOutbound = ""
+		changed = true
+
+		// Persist the changed instance immediately.
+		if err := s.d.Store.SaveInstance(*in); err != nil {
+			return fmt.Errorf("persist after missing target: %w", err)
 		}
 	}
 
-	// Rebuild sing-box config from whatever cfg is now.
-	spec, err := s.buildSpec(ctx, cfg)
+	if changed && s.d.Bus != nil {
+		for _, wasTag := range missingTags {
+			s.d.Bus.Publish("deviceproxy:missing-target", map[string]string{"wasTag": wasTag})
+		}
+		s.d.Bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.config"})
+		s.d.Bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.runtime"})
+	}
+
+	snap = s.d.Store.Snapshot()
+
+	specs, err := s.buildSnapshotSpecs(ctx, snap)
 	if err != nil {
 		return err
 	}
+
 	if s.d.Singbox != nil {
-		// Skip the apply if there is nothing meaningful to do — no proxy,
-		// no sing-box tunnels, no AWG tunnels. Applying in this case would
-		// just write an empty config.json + start sing-box for nothing.
-		if !spec.Enabled && len(spec.SBTags) == 0 && len(spec.AWGTags) == 0 {
-			return nil
-		}
-		if err := s.d.Singbox.ApplyDeviceProxy(ctx, spec); err != nil {
-			return fmt.Errorf("apply spec: %w", err)
+		if err := s.d.Singbox.ApplyDeviceProxyInstances(ctx, specs); err != nil {
+			return fmt.Errorf("apply specs: %w", err)
 		}
 	}
+
 	return nil
 }
 
@@ -538,7 +963,9 @@ func (s *Service) SubscribeBus(ctx context.Context) func() {
 				if !ok {
 					continue
 				}
-				if payload.Resource != "tunnels" && payload.Resource != "singbox.tunnels" {
+				if payload.Resource != "tunnels" &&
+					payload.Resource != "singbox.tunnels" &&
+					payload.Resource != "singbox.subscriptions" {
 					continue
 				}
 			}
@@ -555,20 +982,129 @@ func (s *Service) SubscribeBus(ctx context.Context) func() {
 	return unsub
 }
 
-// HasSelectorReference reports whether the persisted Config references
-// the given outbound tag as the user-chosen SelectedOutbound default.
-// Used by tunnel.Service.Delete to refuse deletions that would orphan
-// the user's explicit choice.
-//
-// Selector membership (the dynamic awg-* member list rebuilt every
-// buildSpec call) is NOT consulted: every existing AWG tunnel is in
-// that list by construction, so consulting it would refuse every
-// delete. Membership disappears naturally on the next Reconcile after
-// the tunnel is gone, and the awgoutbounds + deviceproxy reload chain
-// is debounce-coalesced so sing-box never sees an inconsistent state.
+// HasSelectorReference reports whether any persisted proxy instance references
+// the given outbound tag as its user-chosen SelectedOutbound default.
+// Used by tunnel/subscription delete flows to refuse deletions that would
+// orphan an explicit proxy choice.
 func (s *Service) HasSelectorReference(tag string) bool {
+	if tag == "" {
+		return false
+	}
+
 	s.mu.Lock()
-	cfg := s.d.Store.Get()
+	snap := s.d.Store.Snapshot()
 	s.mu.Unlock()
-	return cfg.SelectedOutbound == tag
+
+	for _, in := range snap.Instances {
+		if in.SelectedOutbound == tag {
+			return true
+		}
+	}
+	return false
+}
+
+const (
+	instanceIPDirectTimeout = 10 * time.Second
+	instanceIPProxyTimeout  = 20 * time.Second
+	instanceIPMaxTimeSec    = 4
+)
+
+var instanceIPCheckServices = []string{
+	"https://api.ipify.org",
+	"https://wtfismyip.com/text",
+	"https://ipinfo.io/ip",
+}
+
+func parseIPResult(stdout string) (string, bool) {
+	ip := strings.TrimSpace(stdout)
+	return ip, net.ParseIP(ip) != nil
+}
+
+func fetchIPViaCurl(ctx context.Context, serviceURL string, extraArgs []string) (string, string, error) {
+	if serviceURL != "" {
+		args := []string{"-s", "--max-time", fmt.Sprintf("%d", instanceIPMaxTimeSec)}
+		args = append(args, extraArgs...)
+		args = append(args, serviceURL)
+		res, err := exec.Run(ctx, "/opt/bin/curl", args...)
+		if err != nil {
+			return "", "", fmt.Errorf("%s: %w", serviceURL, exec.FormatError(res, err))
+		}
+		if ip, ok := parseIPResult(res.Stdout); ok {
+			return ip, serviceURL, nil
+		}
+		return "", "", fmt.Errorf("%s: invalid response %q", serviceURL, strings.TrimSpace(res.Stdout))
+	}
+
+	var lastErr error
+	for _, svcURL := range instanceIPCheckServices {
+		ip, usedService, err := fetchIPViaCurl(ctx, svcURL, extraArgs)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return ip, usedService, nil
+	}
+	if lastErr != nil {
+		return "", "", lastErr
+	}
+	return "", "", fmt.Errorf("all IP services failed")
+}
+
+// CheckInstanceExternalIP resolves external IP through the selected proxy
+// instance and compares it to direct WAN IP.
+func (s *Service) CheckInstanceExternalIP(ctx context.Context, id, serviceURL string) (InstanceIPCheckResult, error) {
+	if id == "" {
+		return InstanceIPCheckResult{}, fmt.Errorf("instance id is empty")
+	}
+
+	s.mu.Lock()
+	in, ok := s.d.Store.GetInstance(id)
+	s.mu.Unlock()
+	if !ok {
+		return InstanceIPCheckResult{}, fmt.Errorf("%w: %q", ErrInstanceNotFound, id)
+	}
+	if !in.Enabled {
+		return InstanceIPCheckResult{}, fmt.Errorf("instance %q is disabled", id)
+	}
+
+	proxyHost := "127.0.0.1"
+	if !in.ListenAll {
+		if s.d.NDMSQuery == nil {
+			return InstanceIPCheckResult{}, fmt.Errorf("cannot resolve listen interface: NDMS query unavailable")
+		}
+		addr, err := s.d.NDMSQuery.GetInterfaceAddress(ctx, in.ListenInterface)
+		if err != nil || addr == "" {
+			return InstanceIPCheckResult{}, fmt.Errorf("resolve listen interface %q: %w", in.ListenInterface, err)
+		}
+		proxyHost = addr
+	}
+
+	proxyURL := &url.URL{
+		Scheme: "socks5h",
+		Host:   fmt.Sprintf("%s:%d", proxyHost, in.Port),
+	}
+	if in.Auth.Enabled {
+		proxyURL.User = url.UserPassword(in.Auth.Username, in.Auth.Password)
+	}
+
+	directCtx, directCancel := context.WithTimeout(ctx, instanceIPDirectTimeout)
+	defer directCancel()
+	directIP, _, err := fetchIPViaCurl(directCtx, serviceURL, nil)
+	if err != nil {
+		return InstanceIPCheckResult{}, fmt.Errorf("failed to get WAN IP: %w", err)
+	}
+
+	proxyCtx, proxyCancel := context.WithTimeout(ctx, instanceIPProxyTimeout)
+	defer proxyCancel()
+	proxyIP, usedService, err := fetchIPViaCurl(proxyCtx, serviceURL, []string{"--proxy", proxyURL.String()})
+	if err != nil {
+		return InstanceIPCheckResult{}, fmt.Errorf("failed to get IP through proxy instance %q: %w", id, err)
+	}
+
+	return InstanceIPCheckResult{
+		DirectIP:  directIP,
+		ProxyIP:   proxyIP,
+		IPChanged: directIP != proxyIP,
+		Service:   usedService,
+	}, nil
 }

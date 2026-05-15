@@ -5,7 +5,7 @@
 	import { servers } from '$lib/stores/servers';
 	import { systemInfo } from '$lib/stores/system';
 	import { goto } from '$app/navigation';
-	import { PageContainer } from '$lib/components/layout';
+	import { PageContainer, PageHeader } from '$lib/components/layout';
 	import { LoadingSpinner, EmptyState } from '$lib/components/layout';
 	import { StoreStatusBadge, Button } from '$lib/components/ui';
 	import type { ManagedServer, ManagedServerStats } from '$lib/types';
@@ -50,7 +50,11 @@
 				name: m.description || m.interfaceName,
 				iface: m.interfaceName,
 				listenPort: m.listenPort,
-				status: stats?.status === 'running' ? 'running' : 'stopped',
+				// Backend ManagedServerStats.Status mirrors NDMS interface state
+				// ("up"/"down"), not the layer-state word "running" that NDMS
+				// hooks emit. Comparing against "running" never matched and
+				// flagged the rail item as stopped even on healthy servers.
+				status: stats?.status === 'up' ? 'running' : 'stopped',
 				peerActive: statsPeers.filter((p) => p.online).length,
 				peerCount: mPeers.length,
 				kind: 'managed',
@@ -134,12 +138,11 @@
 </svelte:head>
 
 <PageContainer width="full">
-	<div class="page-header">
-		<div class="title-group">
-			<h1 class="page-title">Серверы</h1>
+	<PageHeader title="Серверы">
+		{#snippet actions()}
 			<StoreStatusBadge store={servers} />
-		</div>
-	</div>
+		{/snippet}
+	</PageHeader>
 
 	{#if loading}
 		<div class="flex justify-center py-8">
@@ -149,7 +152,11 @@
 		<EmptyState
 			title="Нет серверов"
 			description="Создайте свой WireGuard-сервер или добавьте существующий интерфейс."
-		/>
+		>
+			{#snippet action()}
+				<Button variant="primary" size="md" onclick={openCreate}>Добавить сервер</Button>
+			{/snippet}
+		</EmptyState>
 	{:else}
 		<div class="layout">
 			<ServerRail
@@ -186,26 +193,6 @@
 </PageContainer>
 
 <style>
-	.page-header {
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-		margin-bottom: 1rem;
-		gap: 0.75rem;
-		flex-wrap: wrap;
-	}
-
-	.title-group {
-		display: flex;
-		align-items: center;
-		gap: 0.75rem;
-	}
-
-	.page-title {
-		font-size: 1.25rem;
-		font-weight: 600;
-	}
-
 	.layout {
 		display: flex;
 		gap: 1rem;
