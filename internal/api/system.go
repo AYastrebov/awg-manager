@@ -193,9 +193,19 @@ type SystemHandler struct {
 	singboxVersionFetchedAt      time.Time
 	singboxVersionRefreshRunning bool
 	singboxBinaryFingerprint     string
+
+	routerDetailsMu       sync.RWMutex
+	routerDetailsCache    *RouterDetails
+	routerDetailsCachedAt time.Time
 }
 
 const singboxVersionCacheTTL = 45 * time.Second
+
+// routerDetailsCacheTTL caps how often the router makes RCI calls when the
+// settings page is refreshed rapidly. Static fields (model, firmware) never
+// change; dynamic fields (temps, memory) are also polled every 30 s by the
+// frontend, so 15 s staleness is imperceptible.
+const routerDetailsCacheTTL = 15 * time.Second
 
 // SetEventBus wires the SSE bus so HR Neo control actions emit
 // `routing.hydrarouteStatus` resource:invalidated hints.
@@ -461,7 +471,7 @@ func (h *SystemHandler) BuildSystemInfo() map[string]interface{} {
 
 func (h *SystemHandler) buildSystemInfo(disableMemorySaving bool, gcMemLimit, gogc string, kernelModuleExists, kernelModuleLoaded bool, kernelModuleModel, kernelModuleVersion string, isAarch64 bool, activeBackendType, routerIP string) map[string]interface{} {
 	singboxInstalled, singboxVersion := h.getSingboxInfoFast()
-	routerDetails := collectRouterDetails()
+	routerDetails := h.getRouterDetailsCached()
 
 	return map[string]interface{}{
 		"version":             h.version,
@@ -549,7 +559,47 @@ func collectRouterDetails() *RouterDetails {
 		FirmwareTitle:   strings.TrimSpace(ver.Title),
 	}
 
-	rciVer := fetchRCIVersion()
+	// Run all RCI HTTP calls in parallel to avoid sequential 1500ms timeouts.
+	var (
+		rciVer     *rciVersionWire
+		wifi24     int
+		wifi5      int
+		opkgStore  string
+		meshMember []string
+		wg         sync.WaitGroup
+		mu         sync.Mutex
+	)
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		v := fetchRCIVersion()
+		mu.Lock()
+		rciVer = v
+		mu.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		w24, w5 := fetchWiFiTemps()
+		mu.Lock()
+		wifi24, wifi5 = w24, w5
+		mu.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		s := fetchOPKGStorage()
+		mu.Lock()
+		opkgStore = s
+		mu.Unlock()
+	}()
+	go func() {
+		defer wg.Done()
+		m := fetchMeshMembers()
+		mu.Lock()
+		meshMember = m
+		mu.Unlock()
+	}()
+	wg.Wait()
+
 	if rciVer != nil {
 		if out.Model == "" {
 			out.Model = strings.TrimSpace(rciVer.Model)
@@ -599,13 +649,13 @@ func collectRouterDetails() *RouterDetails {
 	out.ModelDisplay, out.PortedBuild = buildModelDisplay(out.Model)
 	out.CPUModel = detectCPUModel()
 	out.CPUTempC = readThermalZoneC("/sys/devices/virtual/thermal/thermal_zone0/temp")
-	out.WiFi24TempC, out.WiFi5TempC = fetchWiFiTemps()
+	out.WiFi24TempC, out.WiFi5TempC = wifi24, wifi5
 	out.MemoryUsedMB, out.MemoryTotalMB, out.MemoryUsedPercent = readMemUsage()
 	out.UptimeHuman = formatUptime(readUptimeSeconds())
 	out.LoadAverage = readLoadAverage()
 	out.BootSlot = strings.TrimSpace(readTextFile("/proc/dual_image/boot_current"))
-	out.OpkgStorage = fetchOPKGStorage()
-	out.MeshMembers = fetchMeshMembers()
+	out.OpkgStorage = opkgStore
+	out.MeshMembers = meshMember
 
 	return out
 }
@@ -1044,6 +1094,34 @@ func readTextFile(path string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(bytes.TrimSpace(b)))
+}
+
+// getRouterDetailsCached returns cached router details, refreshing in the
+// background when the TTL expires. Concurrent refreshes are coalesced: only
+// one goroutine runs RCI calls at a time; subsequent callers get the stale
+// cached value until the refresh completes.
+func (h *SystemHandler) getRouterDetailsCached() *RouterDetails {
+	now := time.Now()
+
+	h.routerDetailsMu.RLock()
+	cached := h.routerDetailsCache
+	cachedAt := h.routerDetailsCachedAt
+	h.routerDetailsMu.RUnlock()
+
+	if cached != nil && now.Sub(cachedAt) < routerDetailsCacheTTL {
+		return cached
+	}
+
+	// Cache miss or expired — collect synchronously on first call so the
+	// response contains real data, then reuse cached value on rapid retries.
+	fresh := collectRouterDetails()
+
+	h.routerDetailsMu.Lock()
+	h.routerDetailsCache = fresh
+	h.routerDetailsCachedAt = now
+	h.routerDetailsMu.Unlock()
+
+	return fresh
 }
 
 // getSingboxInfoFast returns sing-box install/version data without blocking

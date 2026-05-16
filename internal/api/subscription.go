@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/response"
 	"github.com/hoaxisr/awg-manager/internal/singbox/subscription"
 )
@@ -23,10 +24,19 @@ type SingboxPresenceProbe interface {
 type SubscriptionHandler struct {
 	svc      *subscription.Service
 	presence SingboxPresenceProbe
+	log      *logging.ScopedLogger
 }
 
-func NewSubscriptionHandler(svc *subscription.Service, presence SingboxPresenceProbe) *SubscriptionHandler {
-	return &SubscriptionHandler{svc: svc, presence: presence}
+func NewSubscriptionHandler(svc *subscription.Service, presence SingboxPresenceProbe, appLogger ...logging.AppLogger) *SubscriptionHandler {
+	var lg logging.AppLogger
+	if len(appLogger) > 0 {
+		lg = appLogger[0]
+	}
+	return &SubscriptionHandler{
+		svc:      svc,
+		presence: presence,
+		log:      logging.NewScopedLogger(lg, logging.GroupSingbox, logging.SubSBRuntime),
+	}
 }
 
 // SubscriptionMemberDTO carries per-member parsed metadata for the UI.
@@ -400,6 +410,7 @@ func (h *SubscriptionHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.presence != nil && !h.presence.IsPresent() {
+		h.log.Warn("subscription-create", "", "rejected: sing-box is not installed")
 		response.ErrorWithStatus(w, http.StatusPreconditionFailed,
 			"Sing-box не установлен — установите перед добавлением подписки",
 			"SINGBOX_NOT_INSTALLED")
@@ -431,6 +442,7 @@ func (h *SubscriptionHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	sub, err := h.svc.Create(r.Context(), in)
 	if err != nil {
+		h.log.Warn("subscription-create", req.Label, "failed: "+err.Error())
 		response.InternalError(w, err.Error())
 		return
 	}
@@ -562,6 +574,7 @@ func (h *SubscriptionHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.URL.Query().Get("id")
+	h.log.Info("subscription-refresh", id, "requested via API")
 	res, err := h.svc.Refresh(r.Context(), id)
 	if err != nil {
 		response.InternalError(w, err.Error())
@@ -588,6 +601,7 @@ func (h *SubscriptionHandler) ActiveMember(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	id := r.URL.Query().Get("id")
+	h.log.Info("subscription-active-member", id, "requested via API")
 	var req ActiveMemberRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.ErrorWithStatus(w, http.StatusBadRequest, "bad request body", "INVALID_JSON")
@@ -631,6 +645,7 @@ func (h *SubscriptionHandler) ActiveNow(w http.ResponseWriter, r *http.Request) 
 		response.Error(w, "missing id parameter", "MISSING_ID")
 		return
 	}
+	h.log.Info("subscription-active-now", id, "requested via API")
 	now, err := h.svc.GetActiveNow(r.Context(), id)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
@@ -730,6 +745,7 @@ func (h *SubscriptionHandler) OrphansDelete(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	id := r.URL.Query().Get("id")
+	h.log.Info("subscription-orphans-delete", id, "requested via API")
 	if err := h.svc.DeleteOrphans(r.Context(), id); err != nil {
 		response.InternalError(w, err.Error())
 		return
@@ -762,6 +778,7 @@ func (h *SubscriptionHandler) AddMember(w http.ResponseWriter, r *http.Request) 
 		response.ErrorWithStatus(w, http.StatusBadRequest, "id required", "MISSING_ID")
 		return
 	}
+	h.log.Info("subscription-member-add", id, "requested via API")
 	var req AddMemberRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.ErrorWithStatus(w, http.StatusBadRequest, "bad request body", "INVALID_JSON")
@@ -810,6 +827,7 @@ func (h *SubscriptionHandler) RemoveMember(w http.ResponseWriter, r *http.Reques
 		response.ErrorWithStatus(w, http.StatusBadRequest, "id required", "MISSING_ID")
 		return
 	}
+	h.log.Info("subscription-member-remove", id, "requested via API")
 	var req RemoveMemberRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.ErrorWithStatus(w, http.StatusBadRequest, "bad request body", "INVALID_JSON")

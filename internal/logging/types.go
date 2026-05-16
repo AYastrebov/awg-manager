@@ -37,37 +37,38 @@ const (
 
 // Subgroups — app-buckets (tunnel/routing/server/system)
 const (
-	SubLifecycle     = "lifecycle"
-	SubOps           = "ops"
-	SubState         = "state"
-	SubFirewall      = "firewall"
-	SubPingcheck     = "pingcheck"
-	SubConnectivity  = "connectivity"
-	SubTest          = "test"
-	SubSignature     = "signature"
-	SubDnsRoute      = "dns-route"
-	SubStaticRoute   = "static-route"
-	SubAccessPolicy  = "access-policy"
-	SubClientRoute   = "client-route"
-	SubSingboxRouter = "singbox-router"
-	SubDeviceProxy   = "deviceproxy"
-	SubHrNeo         = "hrneo"
+	SubLifecycle      = "lifecycle"
+	SubOps            = "ops"
+	SubState          = "state"
+	SubFirewall       = "firewall"
+	SubPingcheck      = "pingcheck"
+	SubConnectivity   = "connectivity"
+	SubTest           = "test"
+	SubSignature      = "signature"
+	SubDnsRoute       = "dns-route"
+	SubStaticRoute    = "static-route"
+	SubAccessPolicy   = "access-policy"
+	SubClientRoute    = "client-route"
+	SubSingboxRouter  = "singbox-router"
+	SubDeviceProxy    = "deviceproxy"
+	SubHrNeo          = "hrneo"
 	SubRoutingCatalog = "catalog"
-	SubAWGOutbounds  = "awg-outbounds"
-	SubManaged       = "managed"
-	SubSystemTunnel  = "system-tunnels"
-	SubBoot          = "boot"
-	SubWan           = "wan"
-	SubAuth          = "auth"
-	SubSettings      = "settings"
-	SubUpdate        = "update"
-	SubCleanup       = "cleanup"
-	SubDnsCheck      = "dnscheck"
-	SubConnections   = "connections"
-	SubTraffic       = "traffic"
-	SubDiagnostics   = "diagnostics"
-	SubRCI           = "rci"
-	SubNDMS          = "ndms"
+	SubAWGOutbounds   = "awg-outbounds"
+	SubManaged        = "managed"
+	SubSystemTunnel   = "system-tunnels"
+	SubBoot           = "boot"
+	SubWan            = "wan"
+	SubAuth           = "auth"
+	SubSettings       = "settings"
+	SubUpdate         = "update"
+	SubCleanup        = "cleanup"
+	SubDnsCheck       = "dnscheck"
+	SubConnections    = "connections"
+	SubTraffic        = "traffic"
+	SubDiagnostics    = "diagnostics"
+	SubProfiling      = "profiling" // slow HTTP telemetry (handlers → UI journal)
+	SubRCI            = "rci"
+	SubNDMS           = "ndms"
 
 	// Singbox bucket subgroups
 	SubSBInbound  = "inbound"
@@ -116,7 +117,7 @@ var KnownSubgroups = map[string][]string{
 	GroupSystem: {
 		SubBoot, SubAuth, SubSettings, SubUpdate, SubWan, SubSystemTunnel,
 		SubCleanup, SubDnsCheck, SubConnections, SubTraffic, SubDiagnostics,
-		SubRCI, SubNDMS,
+		SubProfiling, SubRCI, SubNDMS,
 	},
 	GroupSingbox: {
 		SubSBProcess, SubSBInbound, SubSBOutbound, SubSBDNS, SubSBRouter, SubSBRuntime,

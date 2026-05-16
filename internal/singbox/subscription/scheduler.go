@@ -2,7 +2,11 @@ package subscription
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"time"
+
+	"github.com/hoaxisr/awg-manager/internal/logging"
 )
 
 // RefreshFunc is the callback the scheduler invokes for due subscriptions.
@@ -17,6 +21,8 @@ type Scheduler struct {
 	doRefresh    RefreshFunc
 	tickInterval time.Duration
 	stop         chan struct{}
+	stopOnce     sync.Once
+	log          *logging.ScopedLogger
 }
 
 func NewScheduler(store *Store, doRefresh RefreshFunc) *Scheduler {
@@ -33,7 +39,13 @@ func (s *Scheduler) Start(ctx context.Context) {
 }
 
 func (s *Scheduler) Stop() {
-	close(s.stop)
+	s.stopOnce.Do(func() {
+		close(s.stop)
+	})
+}
+
+func (s *Scheduler) SetAppLogger(app logging.AppLogger) {
+	s.log = logging.NewScopedLogger(app, logging.GroupSingbox, logging.SubSBRuntime)
 }
 
 func (s *Scheduler) loop(ctx context.Context) {
@@ -53,7 +65,16 @@ func (s *Scheduler) loop(ctx context.Context) {
 
 // tick is the internal step exercised by tests.
 func (s *Scheduler) tick(ctx context.Context, now time.Time) {
-	for _, sub := range s.store.MaybeRefresh(now) {
-		go s.doRefresh(ctx, sub.ID)
+	due := s.store.MaybeRefresh(now)
+	if s.log != nil && len(due) > 0 {
+		s.log.Info("subscription-scheduler", "", fmt.Sprintf("tick due=%d", len(due)))
+	}
+	for _, sub := range due {
+		id := sub.ID
+		go func() {
+			if err := s.doRefresh(ctx, id); err != nil && s.log != nil {
+				s.log.Warn("subscription-scheduler", id, "refresh failed: "+err.Error())
+			}
+		}()
 	}
 }

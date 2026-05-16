@@ -33,24 +33,25 @@
 	let startLabel = $derived(
 		running
 			? currentPhase
-				? `⟳ ${currentPhase}`
-				: '⟳ Запуск...'
+				? currentPhase
+				: 'Запуск...'
 			: hasResults
 				? 'Запустить ещё раз'
-				: 'Запустить проверки',
+				: 'Запустить все проверки',
 	);
 </script>
 
 <div class="bar">
-	<Button variant="primary" onclick={onStart} disabled={running}>
+	<Button variant="primary" onclick={onStart} disabled={running} loading={running}>
 		{startLabel}
 	</Button>
 	<Button
 		variant="secondary"
 		onclick={onDownloadReport}
 		disabled={!hasReport || downloadingReport || running}
+		loading={downloadingReport}
 	>
-		{downloadingReport ? 'Загрузка...' : '⤓ Отчёт'}
+		⤓ Отчёт
 	</Button>
 
 	{#if hasResults && !running}

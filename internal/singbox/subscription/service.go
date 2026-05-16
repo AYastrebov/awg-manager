@@ -58,7 +58,19 @@ func NewService(store *Store, mutator ConfigMutator) *Service {
 // "URL rewritten from web-view to raw" notices that would otherwise
 // be invisible to the user.
 func (s *Service) SetAppLogger(app logging.AppLogger) {
-	s.log = logging.NewScopedLogger(app, "subscriptions", "refresh")
+	s.log = logging.NewScopedLogger(app, logging.GroupSingbox, logging.SubSBRuntime)
+}
+
+func (s *Service) logInfo(action, target, msg string) {
+	if s.log != nil {
+		s.log.Info(action, target, msg)
+	}
+}
+
+func (s *Service) logWarn(action, target, msg string) {
+	if s.log != nil {
+		s.log.Warn(action, target, msg)
+	}
 }
 
 func (s *Service) lockSub(id string) *sync.Mutex {
@@ -71,6 +83,11 @@ func (s *Service) lockSub(id string) *sync.Mutex {
 }
 
 func (s *Service) Create(ctx context.Context, in CreateInput) (*Subscription, error) {
+	source := "url"
+	if in.Inline != "" {
+		source = "inline"
+	}
+	s.logInfo("subscription-create", in.Label, fmt.Sprintf("start source=%s refresh_hours=%d enabled=%v", source, in.RefreshHours, in.Enabled))
 	switch {
 	case in.URL == "" && in.Inline == "":
 		return nil, errors.New("subscription: either URL or inline content is required")
@@ -79,6 +96,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Subscription, er
 	}
 	sub, err := s.store.Create(in)
 	if err != nil {
+		s.logWarn("subscription-create", in.Label, "failed to create store row: "+err.Error())
 		return nil, err
 	}
 	mu := s.lockSub(sub.ID)
@@ -88,6 +106,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Subscription, er
 	port, err := s.mutator.AllocListenPort()
 	if err != nil {
 		s.store.Delete(sub.ID)
+		s.logWarn("subscription-create", sub.ID, "failed to allocate listen port: "+err.Error())
 		return nil, fmt.Errorf("subscription: alloc listen port: %w", err)
 	}
 	if err := s.store.SetListenPort(sub.ID, port); err != nil {
@@ -98,6 +117,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Subscription, er
 	proxyIdx, err := s.mutator.AllocProxyIndex(ctx)
 	if err != nil {
 		s.store.Delete(sub.ID)
+		s.logWarn("subscription-create", sub.ID, "failed to allocate proxy index: "+err.Error())
 		return nil, fmt.Errorf("subscription: alloc proxy index: %w", err)
 	}
 	if err := s.store.SetProxyIndex(sub.ID, proxyIdx); err != nil {
@@ -109,6 +129,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Subscription, er
 		// the interface before failing. RemoveProxy is idempotent.
 		_ = s.mutator.RemoveProxy(ctx, proxyIdx)
 		s.store.Delete(sub.ID)
+		s.logWarn("subscription-create", sub.ID, "failed to ensure NDMS proxy: "+err.Error())
 		return nil, fmt.Errorf("subscription: register NDMS proxy: %w", err)
 	}
 
@@ -121,10 +142,12 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Subscription, er
 		// and a stranded ProxyN is recoverable via Settings → cleanup.
 		_ = s.mutator.RemoveProxy(ctx, proxyIdx)
 		s.store.Delete(sub.ID)
+		s.logWarn("subscription-create", sub.ID, "initial refresh failed: "+err.Error())
 		return nil, fmt.Errorf("subscription: initial fetch failed: %w", err)
 	}
 
 	final, _ := s.store.Get(sub.ID)
+	s.logInfo("subscription-create", sub.ID, fmt.Sprintf("created mode=%s members=%d listen_port=%d proxy_index=%d", final.EffectiveMode(), len(final.MemberTags), final.ListenPort, final.ProxyIndex))
 	return final, nil
 }
 
@@ -136,8 +159,10 @@ func (s *Service) Refresh(ctx context.Context, id string) (*RefreshResult, error
 }
 
 func (s *Service) refreshLocked(ctx context.Context, id string) (*RefreshResult, error) {
+	s.logInfo("subscription-refresh", id, "start")
 	sub, err := s.store.Get(id)
 	if err != nil {
+		s.logWarn("subscription-refresh", id, "load failed: "+err.Error())
 		return nil, err
 	}
 	var body []byte
@@ -173,13 +198,14 @@ func (s *Service) refreshLocked(ctx context.Context, id string) (*RefreshResult,
 		// HardVPN-bypass-WhiteLists/good_keys.txt regression).
 		fetchURL, rewrote := RewriteForRaw(sub.URL)
 		if rewrote {
-			s.log.Warn("rewrite-url", id,
-				fmt.Sprintf("rewrote web-view URL to raw: %s → %s", sub.URL, fetchURL))
+			s.logWarn("subscription-refresh", id,
+				"rewrote web-view URL to raw URL")
 		}
 		fetched, fetchedCT, fetchErr := Fetch(fetchURL, sub.Headers, s.fetchOpts)
 		if fetchErr != nil {
 			masked := fmt.Errorf("%s", MaskURL(fetchErr.Error(), sub.URL))
 			s.store.UpdateState(id, RefreshResult{When: time.Now(), Err: masked})
+			s.logWarn("subscription-refresh", id, "fetch failed: "+masked.Error())
 			return nil, masked
 		}
 		body = fetched
@@ -195,6 +221,7 @@ func (s *Service) refreshLocked(ctx context.Context, id string) (*RefreshResult,
 	if !isClash && !isSbJSON && vlink.LooksLikeJSON(body) {
 		err := errors.New("subscription: тело подписки выглядит как JSON, но не похоже на sing-box config (нет outbounds). Поддерживаются: sing-box JSON config (одиночный, массив конфигов, или массив outbounds), Clash / mihomo YAML, base64 share-links, plain text vless://, trojan://, ss://, hysteria2://.")
 		s.store.UpdateState(id, RefreshResult{When: time.Now(), Err: err})
+		s.logWarn("subscription-refresh", id, err.Error())
 		return nil, err
 	}
 	var parseRes vlink.BatchResult
@@ -230,6 +257,7 @@ func (s *Service) refreshLocked(ctx context.Context, id string) (*RefreshResult,
 		}
 		err := errors.New(errMsg)
 		s.store.UpdateState(id, RefreshResult{When: time.Now(), Err: err})
+		s.logWarn("subscription-refresh", id, err.Error())
 		return nil, err
 	}
 
@@ -237,6 +265,7 @@ func (s *Service) refreshLocked(ctx context.Context, id string) (*RefreshResult,
 
 	if err := s.applyDiff(ctx, sub, diff); err != nil {
 		s.store.UpdateState(id, RefreshResult{When: time.Now(), Err: err})
+		s.logWarn("subscription-refresh", id, "apply failed: "+err.Error())
 		return nil, err
 	}
 
@@ -264,8 +293,10 @@ func (s *Service) refreshLocked(ctx context.Context, id string) (*RefreshResult,
 		res.ParseErrors = append(res.ParseErrors, e.Error())
 	}
 	if err := s.store.UpdateState(id, *res); err != nil {
+		s.logWarn("subscription-refresh", id, "failed to update refresh state: "+err.Error())
 		return nil, err
 	}
+	s.logInfo("subscription-refresh", id, fmt.Sprintf("done added=%d updated=%d orphaned=%d skipped_dup=%d skipped_vmess=%d skipped_other=%d parse_errors=%d", res.Added, res.Updated, res.Orphaned, res.SkippedDuplicate, res.SkippedVmess, res.SkippedOther, len(res.ParseErrors)))
 	return res, nil
 }
 
@@ -478,6 +509,7 @@ var ErrActiveMemberOnURLTest = errors.New("subscription: SetActiveMember not sup
 // member in the store, then hits the Clash API for an instant runtime switch
 // — no SIGHUP, no connection drop.
 func (s *Service) SetActiveMember(ctx context.Context, id, memberTag string) error {
+	s.logInfo("subscription-active-member", id, "set requested: "+memberTag)
 	mu := s.lockSub(id)
 	mu.Lock()
 	defer mu.Unlock()
@@ -520,9 +552,11 @@ func (s *Service) SetActiveMember(ctx context.Context, id, memberTag string) err
 	//    drop. If clash is unreachable (sing-box not running), return error but
 	//    config is already updated so a future restart will use the new default.
 	if err := s.mutator.SelectClashProxy(sub.SelectorTag, memberTag); err != nil {
+		s.logWarn("subscription-active-member", id, "clash switch failed: "+err.Error())
 		return fmt.Errorf("subscription: clash select: %w", err)
 	}
 
+	s.logInfo("subscription-active-member", id, "set to "+memberTag)
 	return nil
 }
 
@@ -556,6 +590,7 @@ var ErrMemberNotFound = errors.New("subscription: member not found")
 // on urltest-mode subs it joins the auto-test pool. Active member is
 // preserved (caller chooses whether to switch).
 func (s *Service) AddManualMember(ctx context.Context, id, shareLink string) (*Subscription, error) {
+	s.logInfo("subscription-member-add", id, "add requested")
 	mu := s.lockSub(id)
 	mu.Lock()
 	defer mu.Unlock()
@@ -592,6 +627,7 @@ func (s *Service) AddManualMember(ctx context.Context, id, shareLink string) (*S
 	groupBody := BuildGroupOutbound(subForBuild, newTags, sub.ActiveMember)
 
 	if err := s.mutator.AddOutbound(tag, replaceTag(out.Outbound, tag)); err != nil {
+		s.logWarn("subscription-member-add", id, "failed to add outbound: "+err.Error())
 		return nil, fmt.Errorf("add outbound: %w", err)
 	}
 	if err := s.mutator.AddOutbound(sub.SelectorTag, groupBody); err != nil {
@@ -601,8 +637,10 @@ func (s *Service) AddManualMember(ctx context.Context, id, shareLink string) (*S
 		// that explicitly so the caller can advise a full subscription
 		// refresh/delete to clean the slot.
 		if rbErr := s.mutator.RemoveOutbound(tag); rbErr != nil {
+			s.logWarn("subscription-member-add", id, "failed to rebuild selector and rollback member outbound")
 			return nil, fmt.Errorf("rebuild group outbound: %w (rollback also failed, leaving orphan outbound %q in sing-box config: %v)", err, tag, rbErr)
 		}
+		s.logWarn("subscription-member-add", id, "failed to rebuild selector outbound: "+err.Error())
 		return nil, fmt.Errorf("rebuild group outbound: %w", err)
 	}
 
@@ -613,12 +651,15 @@ func (s *Service) AddManualMember(ctx context.Context, id, shareLink string) (*S
 	}
 
 	if err := s.mutator.Reload(ctx); err != nil {
+		s.logWarn("subscription-member-add", id, "reload failed: "+err.Error())
 		return nil, fmt.Errorf("reload: %w", err)
 	}
 	updated, err := s.store.Get(id)
 	if err != nil {
+		s.logWarn("subscription-member-add", id, "post-add read failed: "+err.Error())
 		return nil, err
 	}
+	s.logInfo("subscription-member-add", id, "member added: "+tag)
 	return updated, nil
 }
 
@@ -633,6 +674,7 @@ func (s *Service) AddManualMember(ctx context.Context, id, shareLink string) (*S
 // Returns (nil, nil) when the subscription was deleted (last-member case);
 // returns (updatedSub, nil) otherwise.
 func (s *Service) RemoveMember(ctx context.Context, id, memberTag string) (*Subscription, error) {
+	s.logInfo("subscription-member-remove", id, "remove requested: "+memberTag)
 	mu := s.lockSub(id)
 	mu.Lock()
 	defer mu.Unlock()
@@ -659,8 +701,10 @@ func (s *Service) RemoveMember(ctx context.Context, id, memberTag string) (*Subs
 	// Last member → full subscription teardown.
 	if len(sub.Members) == 1 {
 		if err := s.deleteLocked(ctx, id); err != nil {
+			s.logWarn("subscription-member-remove", id, "last-member delete failed: "+err.Error())
 			return nil, err
 		}
+		s.logInfo("subscription-member-remove", id, "removed last member, subscription deleted")
 		return nil, nil
 	}
 
@@ -676,6 +720,7 @@ func (s *Service) RemoveMember(ctx context.Context, id, memberTag string) (*Subs
 	}
 	groupBody := BuildGroupOutbound(*sub, newTags, newActive)
 	if err := s.mutator.AddOutbound(sub.SelectorTag, groupBody); err != nil {
+		s.logWarn("subscription-member-remove", id, "failed to rebuild selector outbound: "+err.Error())
 		return nil, fmt.Errorf("rebuild group outbound: %w", err)
 	}
 
@@ -703,8 +748,10 @@ func (s *Service) RemoveMember(ctx context.Context, id, memberTag string) (*Subs
 	}
 
 	if err := s.mutator.Reload(ctx); err != nil {
+		s.logWarn("subscription-member-remove", id, "reload failed: "+err.Error())
 		return updated, fmt.Errorf("reload: %w", err)
 	}
+	s.logInfo("subscription-member-remove", id, "member removed: "+memberTag)
 	return updated, nil
 }
 
@@ -716,14 +763,26 @@ func (s *Service) RemoveMember(ctx context.Context, id, memberTag string) (*Subs
 func (s *Service) GetActiveNow(_ context.Context, id string) (string, error) {
 	sub, err := s.store.Get(id)
 	if err != nil {
+		s.logWarn("subscription-active-now", id, "load failed: "+err.Error())
 		return "", err
 	}
-	return s.mutator.GetClashSelectorActive(sub.SelectorTag)
+	now, err := s.mutator.GetClashSelectorActive(sub.SelectorTag)
+	if err != nil {
+		s.logWarn("subscription-active-now", id, "clash query failed: "+err.Error())
+		return "", err
+	}
+	if now == "" {
+		s.logInfo("subscription-active-now", id, "no live active member (clash unavailable or not selected yet)")
+	} else {
+		s.logInfo("subscription-active-now", id, "live active member: "+now)
+	}
+	return now, nil
 }
 
 // DeleteOrphans removes orphan-flagged outbounds from sing-box config and
 // clears the OrphanTags slice in the store.
 func (s *Service) DeleteOrphans(ctx context.Context, id string) error {
+	s.logInfo("subscription-orphans-delete", id, "delete requested")
 	mu := s.lockSub(id)
 	mu.Lock()
 	defer mu.Unlock()
@@ -735,7 +794,13 @@ func (s *Service) DeleteOrphans(ctx context.Context, id string) error {
 		s.mutator.RemoveOutbound(t)
 	}
 	if err := s.store.SetMembership(id, sub.MemberTags, nil); err != nil {
+		s.logWarn("subscription-orphans-delete", id, "failed to clear orphan list in store: "+err.Error())
 		return err
 	}
-	return s.mutator.Reload(ctx)
+	if err := s.mutator.Reload(ctx); err != nil {
+		s.logWarn("subscription-orphans-delete", id, "reload failed: "+err.Error())
+		return err
+	}
+	s.logInfo("subscription-orphans-delete", id, fmt.Sprintf("deleted %d orphan outbounds", len(sub.OrphanTags)))
+	return nil
 }

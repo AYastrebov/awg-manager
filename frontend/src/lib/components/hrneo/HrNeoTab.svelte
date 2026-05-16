@@ -143,13 +143,26 @@
 	}
 
 	let targets = $derived.by<TargetEntry[]>(() => {
+		const tunnelNameByIface = new Map(
+			tunnels
+				.filter((tn) => !!tn.iface)
+				.map((tn) => [tn.iface as string, tn.name]),
+		);
 		const byName = new Map<string, TargetEntry>();
 		for (const r of hrRules) {
 			const t = targetOf(r);
 			if (!t) continue;
+			const tunnelName = t.kind === 'interface' ? tunnelNameByIface.get(t.name) : undefined;
 			const existing = byName.get(t.name);
 			if (existing) existing.ruleCount++;
-			else byName.set(t.name, { name: t.name, kind: t.kind, ruleCount: 1, broken: isBroken(t) });
+			else
+				byName.set(t.name, {
+					name: t.name,
+					kind: t.kind,
+					ruleCount: 1,
+					displayName: tunnelName,
+					broken: isBroken(t),
+				});
 		}
 		const entries = [...byName.values()];
 		if (policyOrder.length === 0) return entries;

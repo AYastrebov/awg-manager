@@ -85,7 +85,8 @@ import type {
 	SubscriptionActiveNowResponse,
 	CreateSubscriptionInput,
 	UpdateSubscriptionInput,
-	RouterStagingStatusResponse
+	RouterStagingStatusResponse,
+	AmneziaPremiumAccountInfo
 } from '$lib/types';
 import { isMockDevMode } from '$lib/env';
 
@@ -168,7 +169,12 @@ class ApiClient {
 		}
 
 		if (!response.ok || data.error) {
-			throw new Error(data.message || `Ошибка запроса (${response.status})`);
+			const err: Error & { status?: number; body?: unknown } = new Error(
+				data.message || `Ошибка запроса (${response.status})`
+			);
+			err.status = response.status;
+			err.body = data;
+			throw err;
 		}
 
 		return data.data as T;
@@ -327,6 +333,30 @@ class ApiClient {
 		return this.request(`/tunnels/replace?id=${encodeURIComponent(id)}`, {
 			method: 'POST',
 			body: JSON.stringify({ content, name: name || '' })
+		});
+	}
+
+	async amneziaPremiumLogin(vpnKey: string): Promise<{ sid: string }> {
+		return this.request('/amnezia-premium/login', {
+			method: 'POST',
+			body: JSON.stringify({ vpnKey: vpnKey.trim(), remember: true })
+		});
+	}
+
+	async amneziaPremiumAccountInfo(sid: string): Promise<AmneziaPremiumAccountInfo> {
+		return this.request('/amnezia-premium/account-info', {
+			method: 'POST',
+			body: JSON.stringify({ sid })
+		});
+	}
+
+	async amneziaPremiumDownloadConfig(
+		sid: string,
+		countryCode: string
+	): Promise<{ config: string }> {
+		return this.request('/amnezia-premium/download-config', {
+			method: 'POST',
+			body: JSON.stringify({ sid, countryCode })
 		});
 	}
 
@@ -506,16 +536,17 @@ class ApiClient {
 		return this.request('/settings/get');
 	}
 
-	async updateSettings(settings: Settings): Promise<Settings> {
+	async updateSettings(settings: Partial<Settings>): Promise<Settings> {
 		const updated = await this.request<Settings>('/settings/update', {
 			method: 'POST',
 			body: JSON.stringify(settings)
 		});
 		// Prism mock is stateless: it often returns schema examples instead of
 		// echoing persisted values. In mock-dev mode keep UI controls usable by
-		// honoring the submitted payload.
+		// merging the patch into current settings snapshot.
 		if (this.isMockDevMode()) {
-			return settings;
+			const current = await this.getSettings().catch(() => ({} as Settings));
+			return { ...current, ...settings };
 		}
 		return updated;
 	}
@@ -902,11 +933,11 @@ class ApiClient {
 	streamDiagnostics(
 		restart: boolean,
 		onEvent: (event: DiagEvent) => void,
-		onError: (error: Event) => void
+		onError: (error: Event) => void,
+		tunnelId?: string,
 	): EventSource {
-		const params = new URLSearchParams({
-			restart: String(restart),
-		});
+		const params = new URLSearchParams({ restart: String(restart) });
+		if (tunnelId) params.set('tunnelId', tunnelId);
 		const es = new EventSource(`/api/diagnostics/stream?${params}`);
 
 		const handleEvent = (e: MessageEvent) => {
@@ -920,7 +951,12 @@ class ApiClient {
 		es.addEventListener('phase', handleEvent);
 		es.addEventListener('test', handleEvent);
 		es.addEventListener('done', handleEvent);
-		es.addEventListener('error', (e) => {
+		es.addEventListener('error', (e: Event) => {
+			// Named SSE event `error` carries JSON in MessageEvent.data; connection faults do not.
+			if (e instanceof MessageEvent && typeof e.data === 'string' && e.data.length > 0) {
+				handleEvent(e);
+				return;
+			}
 			if (es.readyState === EventSource.CLOSED) return;
 			onError(e);
 		});
@@ -1418,6 +1454,19 @@ class ApiClient {
 		});
 	}
 
+	async singboxCheckConnectivity(tag: string, iface?: string): Promise<ConnectivityResult> {
+		let url = `/singbox/tunnels/test/connectivity?tag=${encodeURIComponent(tag)}`;
+		if (iface) url += `&iface=${encodeURIComponent(iface)}`;
+		return this.request(url);
+	}
+
+	async singboxCheckIP(tag: string, serviceURL?: string, iface?: string): Promise<IPResult> {
+		let url = `/singbox/tunnels/test/ip?tag=${encodeURIComponent(tag)}`;
+		if (serviceURL) url += `&service=${encodeURIComponent(serviceURL)}`;
+		if (iface) url += `&iface=${encodeURIComponent(iface)}`;
+		return this.request(url);
+	}
+
 	singboxSpeedTestStream(
 		tag: string,
 		server: string,
@@ -1654,13 +1703,6 @@ class ApiClient {
 		await this.request('/singbox/router/rulesets/delete', {
 			method: 'POST',
 			body: JSON.stringify({ tag, force }),
-		});
-	}
-
-	async singboxRouterRefreshRuleSet(tag: string): Promise<void> {
-		await this.request('/singbox/router/rulesets/refresh', {
-			method: 'POST',
-			body: JSON.stringify({ tag }),
 		});
 	}
 

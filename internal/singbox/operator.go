@@ -97,6 +97,7 @@ type Operator struct {
 	// methods no-op on nil), so zero-value Operator structs in tests
 	// stay usable.
 	processLogger *logging.ScopedLogger
+	runtimeLogger *logging.ScopedLogger
 
 	// lastError holds the last fatal exit reason (stderr tail or wait
 	// error) captured by Process.OnExit. Surfaced via Status.LastError so
@@ -201,6 +202,7 @@ func NewOperator(d OperatorDeps) *Operator {
 		proxyMgr:          NewProxyManager(d.Queries, d.Commands),
 		clash:             NewClashClient(clashAPIAddr),
 		processLogger:     logging.NewScopedLogger(d.AppLogger, logging.GroupSingbox, logging.SubSBProcess),
+		runtimeLogger:     logging.NewScopedLogger(d.AppLogger, logging.GroupSingbox, logging.SubSBRuntime),
 		persistManualStop: d.SetManuallyStopped,
 	}
 	op.manuallyStopped.Store(d.InitialManuallyStopped)
@@ -1011,12 +1013,14 @@ func (o *Operator) GetStatus(ctx context.Context) Status {
 		detectedVersion, detectedFeatures := o.detectVersionAndFeaturesCached(ctx)
 		s.Features = detectedFeatures
 		if o.inst != nil {
-			s.Version = o.inst.CurrentVersion(ctx)
-			// Some builds print a slightly different version banner that
-			// CurrentVersion may fail to parse. Fall back to runtime detect
-			// so status always exposes a usable semantic version.
+			// Prefer the version from detectVersionAndFeaturesCached: it already
+			// ran `sing-box version` (or served the 5m cache). Installer
+			// CurrentVersion runs the same subprocess again — on slow MIPS/UPX
+			// binaries that can exceed 6s per call, doubling latency for every
+			// /api/singbox/status poll (~12s back-to-back).
+			s.Version = detectedVersion
 			if s.Version == "" {
-				s.Version = detectedVersion
+				s.Version = o.inst.CurrentVersion(ctx)
 			}
 		} else {
 			s.Version = detectedVersion
@@ -1202,12 +1206,18 @@ func outboundJSONWithTag(raw json.RawMessage, tag string) (json.RawMessage, erro
 // AddTunnels parses one or more links and atomically adds them.
 // Returns successfully-added tunnels and parse errors.
 func (o *Operator) AddTunnels(ctx context.Context, linksText string) ([]TunnelInfo, []BatchError, error) {
+	if o.runtimeLogger != nil {
+		o.runtimeLogger.Info("single-add", "", "start add tunnels batch")
+	}
 	batchResult := vlink.ParseBatch(strings.Split(linksText, "\n"))
 	var parseErrs []BatchError
 	for _, pe := range batchResult.Errors {
 		parseErrs = append(parseErrs, BatchError{Line: pe.LineIdx + 1, Input: pe.Scheme, Err: fmt.Errorf("%s", pe.Message)})
 	}
 	if len(batchResult.Outbounds) == 0 {
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Warn("single-add", "", "no valid outbounds parsed from input")
+		}
 		return nil, parseErrs, nil
 	}
 
@@ -1247,6 +1257,9 @@ func (o *Operator) AddTunnels(ctx context.Context, linksText string) ([]TunnelIn
 	}
 
 	if err := o.applyConfig(ctx, cfg); err != nil {
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Error("single-add", "", "apply config failed: "+err.Error())
+		}
 		return nil, parseErrs, fmt.Errorf("apply: %w", err)
 	}
 
@@ -1280,13 +1293,22 @@ func (o *Operator) AddTunnels(ctx context.Context, linksText string) ([]TunnelIn
 	if o.bus != nil {
 		o.bus.Publish("singbox:tunnels-changed", nil)
 	}
+	if o.runtimeLogger != nil {
+		o.runtimeLogger.Info("single-add", "", fmt.Sprintf("done added=%d parse_errors=%d", len(added), len(parseErrs)))
+	}
 	return added, parseErrs, nil
 }
 
 // RemoveTunnel removes outbound+inbound+route+Proxy for a tag.
 func (o *Operator) RemoveTunnel(ctx context.Context, tag string) error {
+	if o.runtimeLogger != nil {
+		o.runtimeLogger.Info("single-remove", tag, "start")
+	}
 	cfg, err := o.loadConfig()
 	if err != nil {
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Error("single-remove", tag, "load config failed: "+err.Error())
+		}
 		return err
 	}
 	proxyIdx := -1
@@ -1301,16 +1323,26 @@ func (o *Operator) RemoveTunnel(ctx context.Context, tag string) error {
 		}
 	}
 	if err := cfg.RemoveTunnel(tag); err != nil {
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Warn("single-remove", tag, "remove from config failed: "+err.Error())
+		}
 		return err
 	}
 
 	// Commit config/process state BEFORE NDMS teardown so a mid-failure leaves
 	// a consistent recoverable state (sing-box config matches on-disk reality).
 	if len(cfg.Tunnels()) == 0 {
-		_ = o.proc.Stop()
-		_ = os.Remove(o.tunnelsFile())
+		if err := o.proc.Stop(); err != nil && o.runtimeLogger != nil {
+			o.runtimeLogger.Warn("single-remove", tag, "failed to stop process after last tunnel removal: "+err.Error())
+		}
+		if err := os.Remove(o.tunnelsFile()); err != nil && !os.IsNotExist(err) && o.runtimeLogger != nil {
+			o.runtimeLogger.Warn("single-remove", tag, "failed to remove tunnels file: "+err.Error())
+		}
 	} else {
 		if err := o.applyConfig(ctx, cfg); err != nil {
+			if o.runtimeLogger != nil {
+				o.runtimeLogger.Error("single-remove", tag, "apply config failed: "+err.Error())
+			}
 			return err
 		}
 	}
@@ -1324,19 +1356,40 @@ func (o *Operator) RemoveTunnel(ctx context.Context, tag string) error {
 	if o.bus != nil {
 		o.bus.Publish("singbox:tunnels-changed", nil)
 	}
+	if o.runtimeLogger != nil {
+		o.runtimeLogger.Info("single-remove", tag, "done")
+	}
 	return nil
 }
 
 // UpdateTunnel replaces outbound JSON, reloads.
 func (o *Operator) UpdateTunnel(ctx context.Context, tag string, outbound json.RawMessage) error {
+	if o.runtimeLogger != nil {
+		o.runtimeLogger.Info("single-update", tag, "start")
+	}
 	cfg, err := o.loadConfig()
 	if err != nil {
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Error("single-update", tag, "load config failed: "+err.Error())
+		}
 		return err
 	}
 	if err := cfg.UpdateTunnel(tag, outbound); err != nil {
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Warn("single-update", tag, "update outbound failed: "+err.Error())
+		}
 		return err
 	}
-	return o.applyConfig(ctx, cfg)
+	if err := o.applyConfig(ctx, cfg); err != nil {
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Error("single-update", tag, "apply config failed: "+err.Error())
+		}
+		return err
+	}
+	if o.runtimeLogger != nil {
+		o.runtimeLogger.Info("single-update", tag, "done")
+	}
+	return nil
 }
 
 // Reconcile: ensure process is running if config has tunnels; ensure Proxies are up.
@@ -1344,6 +1397,9 @@ func (o *Operator) UpdateTunnel(ctx context.Context, tag string, outbound json.R
 // must not bring sing-box back up. Cleared only by Control("start"/"restart").
 func (o *Operator) Reconcile(ctx context.Context) error {
 	if o.manuallyStopped.Load() {
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Debug("reconcile", "", "skipped: manually stopped")
+		}
 		return nil
 	}
 	cfg, err := o.loadConfig()
@@ -1355,14 +1411,32 @@ func (o *Operator) Reconcile(ctx context.Context) error {
 	}
 	tunnels := cfg.Tunnels()
 	if len(tunnels) == 0 {
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Debug("reconcile", "", "skipped: no tunnels in config")
+		}
 		return nil
 	}
 	if running, _ := o.proc.IsRunning(); !running {
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Warn("reconcile", "", fmt.Sprintf("process down, starting before proxy sync (tunnels=%d)", len(tunnels)))
+		}
 		if err := o.startAndWait(ctx); err != nil {
+			if o.runtimeLogger != nil {
+				o.runtimeLogger.Error("reconcile", "", "start failed: "+err.Error())
+			}
 			return fmt.Errorf("start: %w", err)
 		}
 	}
-	return o.proxyMgr.SyncProxies(ctx, tunnels)
+	if err := o.proxyMgr.SyncProxies(ctx, tunnels); err != nil {
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Warn("reconcile", "", "proxy sync failed: "+err.Error())
+		}
+		return err
+	}
+	if o.runtimeLogger != nil {
+		o.runtimeLogger.Info("reconcile", "", fmt.Sprintf("done tunnels=%d", len(tunnels)))
+	}
+	return nil
 }
 
 // Control starts/stops/restarts the sing-box daemon. Mirrors the shape of
@@ -1379,7 +1453,13 @@ func (o *Operator) Reconcile(ctx context.Context) error {
 // The persisted intent survives awgm restarts so the watchdog never
 // resurrects a daemon the user shut down.
 func (o *Operator) Control(ctx context.Context, action string) error {
+	if o.runtimeLogger != nil {
+		o.runtimeLogger.Info("control", "", "requested action="+action)
+	}
 	if installed, _ := o.IsInstalled(); !installed {
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Warn("control", "", "rejected: sing-box is not installed")
+		}
 		return fmt.Errorf("sing-box is not installed")
 	}
 	running, _ := o.IsRunningPublic()
@@ -1389,28 +1469,67 @@ func (o *Operator) Control(ctx context.Context, action string) error {
 			return err
 		}
 		if running {
+			if o.runtimeLogger != nil {
+				o.runtimeLogger.Info("control", "", "start skipped: already running")
+			}
 			return nil
 		}
-		return o.startAndWait(ctx)
+		if err := o.startAndWait(ctx); err != nil {
+			if o.runtimeLogger != nil {
+				o.runtimeLogger.Error("control", "", "start failed: "+err.Error())
+			}
+			return err
+		}
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Info("control", "", "start done")
+		}
+		return nil
 	case "stop":
 		if err := o.setManualStop(true); err != nil {
 			return err
 		}
 		if !running {
+			if o.runtimeLogger != nil {
+				o.runtimeLogger.Info("control", "", "stop skipped: already stopped")
+			}
 			return nil
 		}
-		return o.proc.Stop()
+		if err := o.proc.Stop(); err != nil {
+			if o.runtimeLogger != nil {
+				o.runtimeLogger.Error("control", "", "stop failed: "+err.Error())
+			}
+			return err
+		}
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Info("control", "", "stop done")
+		}
+		return nil
 	case "restart":
 		if err := o.setManualStop(false); err != nil {
 			return err
 		}
 		if running {
 			if err := o.proc.Stop(); err != nil {
+				if o.runtimeLogger != nil {
+					o.runtimeLogger.Error("control", "", "restart stop phase failed: "+err.Error())
+				}
 				return fmt.Errorf("stop: %w", err)
 			}
 		}
-		return o.startAndWait(ctx)
+		if err := o.startAndWait(ctx); err != nil {
+			if o.runtimeLogger != nil {
+				o.runtimeLogger.Error("control", "", "restart start phase failed: "+err.Error())
+			}
+			return err
+		}
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Info("control", "", "restart done")
+		}
+		return nil
 	default:
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Warn("control", "", "unknown action="+action)
+		}
 		return fmt.Errorf("unknown action: %s", action)
 	}
 }
@@ -1447,8 +1566,14 @@ func (o *Operator) setManualStop(v bool) error {
 // during init, or is still loading gvisor/TUN. On timeout the half-started
 // process is stopped to avoid a zombie PID file misleading future ticks.
 func (o *Operator) startAndWait(ctx context.Context) error {
+	if o.runtimeLogger != nil {
+		o.runtimeLogger.Info("start-and-wait", "", "starting sing-box process")
+	}
 	if err := o.proc.Start(); err != nil {
 		o.setLastError(err.Error())
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Error("start-and-wait", "", "process start failed: "+err.Error())
+		}
 		return err
 	}
 	if err := o.waitClashReady(ctx, maxSingboxBootWait); err != nil {
@@ -1461,9 +1586,15 @@ func (o *Operator) startAndWait(ctx context.Context) error {
 		if o.LastError() == "" {
 			o.setLastError("sing-box запущен, но Clash API не отвечает: " + err.Error())
 		}
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Error("start-and-wait", "", "clash API readiness timeout: "+err.Error())
+		}
 		return err
 	}
 	o.setLastError("")
+	if o.runtimeLogger != nil {
+		o.runtimeLogger.Info("start-and-wait", "", "clash API ready")
+	}
 	return nil
 }
 
@@ -1637,6 +1768,9 @@ func (o *Operator) Cleanup(ctx context.Context) error {
 }
 
 func (o *Operator) applyConfig(ctx context.Context, cfg *Config) error {
+	if o.runtimeLogger != nil {
+		o.runtimeLogger.Debug("apply-config", "", fmt.Sprintf("start tunnels=%d", len(cfg.Tunnels())))
+	}
 	tunnelsPath := o.tunnelsFile()
 	backupPath := tunnelsPath + ".bak"
 
@@ -1656,10 +1790,16 @@ func (o *Operator) applyConfig(ctx context.Context, cfg *Config) error {
 
 	if err := cfg.Save(tunnelsPath); err != nil {
 		restore()
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Error("apply-config", "", "save failed: "+err.Error())
+		}
 		return err
 	}
 	if err := o.preflightConfigDir(); err != nil {
 		restore()
+		if o.runtimeLogger != nil {
+			o.runtimeLogger.Error("apply-config", "", "validate failed: "+err.Error())
+		}
 		return fmt.Errorf("validate: %w", err)
 	}
 	var runErr error
@@ -1670,6 +1810,12 @@ func (o *Operator) applyConfig(ctx context.Context, cfg *Config) error {
 	}
 	if hadExisting == nil {
 		_ = os.Remove(backupPath)
+	}
+	if runErr != nil && o.runtimeLogger != nil {
+		o.runtimeLogger.Error("apply-config", "", "run phase failed: "+runErr.Error())
+	}
+	if runErr == nil && o.runtimeLogger != nil {
+		o.runtimeLogger.Info("apply-config", "", "done")
 	}
 	return runErr
 }

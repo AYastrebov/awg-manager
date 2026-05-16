@@ -1,3 +1,4 @@
+export { default as AmneziaConfEditor } from './AmneziaConfEditor.svelte';
 export { default as AWGAdvancedParams } from './AWGAdvancedParams.svelte';
 export { default as ConnectivitySettingsModal } from './ConnectivitySettingsModal.svelte';
 export { default as TunnelCard } from './TunnelCard.svelte';

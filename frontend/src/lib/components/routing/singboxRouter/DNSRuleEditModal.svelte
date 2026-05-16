@@ -7,10 +7,17 @@
 		rule?: SingboxRouterDNSRule;
 		servers: SingboxRouterDNSServer[];
 		availableRuleSets: SingboxRouterRuleSet[];
+		/**
+		 * Per-tag count of how many *other* DNS rules reference each rule_set.
+		 * The currently edited rule must be excluded by the caller (use
+		 * computeRuleSetUsage with excludeIndex=editIndex). Empty map is fine
+		 * — all sets render as unused.
+		 */
+		ruleSetUsage?: Map<string, number>;
 		onClose: () => void;
 		onSave: (rule: SingboxRouterDNSRule) => Promise<void> | void;
 	}
-	let { rule, servers, availableRuleSets, onClose, onSave }: Props = $props();
+	let { rule, servers, availableRuleSets, ruleSetUsage, onClose, onSave }: Props = $props();
 
 	function normalizeTags(tags: string[]): string[] {
 		return [...new Set(tags.map((s) => s.trim()).filter(Boolean))];
@@ -28,7 +35,11 @@
 	// svelte-ignore state_referenced_locally
 	let ruleSetTags = $state<string[]>(rule?.rule_set ?? []);
 	const ruleSetOptions = $derived<ChipOption[]>(
-		availableRuleSets.map((rs) => ({ value: rs.tag, label: rs.tag })),
+		availableRuleSets.map((rs) => ({
+			value: rs.tag,
+			label: rs.tag,
+			usedCount: ruleSetUsage?.get(rs.tag) ?? 0,
+		})),
 	);
 	// svelte-ignore state_referenced_locally
 	let domainSuffixStr = $state((rule?.domain_suffix ?? []).join('\n'));

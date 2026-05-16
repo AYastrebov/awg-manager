@@ -9,6 +9,7 @@ import (
 	"strconv"
 
 	"github.com/hoaxisr/awg-manager/internal/events"
+	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/response"
 	"github.com/hoaxisr/awg-manager/internal/singbox"
 	"github.com/hoaxisr/awg-manager/internal/testing"
@@ -75,11 +76,24 @@ type SingboxHandler struct {
 	bus          *events.Bus
 	delayChecker *singbox.DelayChecker
 	testingSvc   *testing.Service
+	log          *logging.ScopedLogger
 }
 
+var errTunnelNoInterface = errors.New("tunnel has no kernel interface")
+
 // NewSingboxHandler creates a new singbox handler.
-func NewSingboxHandler(op *singbox.Operator, bus *events.Bus, dc *singbox.DelayChecker, ts *testing.Service) *SingboxHandler {
-	return &SingboxHandler{op: op, bus: bus, delayChecker: dc, testingSvc: ts}
+func NewSingboxHandler(op *singbox.Operator, bus *events.Bus, dc *singbox.DelayChecker, ts *testing.Service, appLogger ...logging.AppLogger) *SingboxHandler {
+	var lg logging.AppLogger
+	if len(appLogger) > 0 {
+		lg = appLogger[0]
+	}
+	return &SingboxHandler{
+		op:           op,
+		bus:          bus,
+		delayChecker: dc,
+		testingSvc:   ts,
+		log:          logging.NewScopedLogger(lg, logging.GroupSingbox, logging.SubSBRuntime),
+	}
 }
 
 // DelayCheck handles POST /api/singbox/tunnels/delay-check?tag=X.
@@ -218,6 +232,7 @@ func (h *SingboxHandler) Control(w http.ResponseWriter, r *http.Request) {
 		response.Error(w, "invalid request", "INVALID_REQUEST")
 		return
 	}
+	h.log.Info("single-control", "", "requested action="+req.Action)
 	if err := h.op.Control(r.Context(), req.Action); err != nil {
 		response.Error(w, err.Error(), "SINGBOX_CONTROL_ERROR")
 		return
@@ -319,6 +334,7 @@ func (h *SingboxHandler) AddTunnels(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	h.log.Info("single-add", "", "requested via API")
 	added, errs, err := h.op.AddTunnels(r.Context(), body.Links)
 	if err != nil {
 		response.InternalError(w, err.Error())
@@ -398,6 +414,7 @@ func (h *SingboxHandler) UpdateTunnel(w http.ResponseWriter, r *http.Request) {
 		response.BadRequest(w, "tag required")
 		return
 	}
+	h.log.Info("single-update", tag, "requested via API")
 	if err := h.op.UpdateTunnel(r.Context(), tag, body.Outbound); err != nil {
 		response.InternalError(w, err.Error())
 		return
@@ -409,6 +426,132 @@ func (h *SingboxHandler) UpdateTunnel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response.Success(w, out)
+}
+
+// CheckConnectivity performs connectivity test through a sing-box tunnel.
+//
+//	@Summary		Sing-box tunnel connectivity test
+//	@Description	Tests connectivity through a sing-box tunnel. Provide either `tag` (resolved to tunnel kernel interface) or `iface` (direct kernel interface override, useful for subscription tests).
+//	@Tags			singbox
+//	@Produce		json
+//	@Security		CookieAuth
+//	@Param			tag		query		string	false	"Tunnel tag (required when iface is not set)"
+//	@Param			iface	query		string	false	"Kernel interface override (e.g. t2s12)"
+//	@Success		200		{object}	APIEnvelope
+//	@Failure		400		{object}	APIErrorEnvelope
+//	@Failure		404		{object}	APIErrorEnvelope
+//	@Failure		500		{object}	APIErrorEnvelope
+//	@Router			/singbox/tunnels/test/connectivity [get]
+func (h *SingboxHandler) CheckConnectivity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		response.MethodNotAllowed(w)
+		return
+	}
+	tag := r.URL.Query().Get("tag")
+	ifaceOverride := r.URL.Query().Get("iface")
+	if tag == "" && ifaceOverride == "" {
+		response.BadRequest(w, "tag or iface required")
+		return
+	}
+
+	iface := ifaceOverride
+	if iface == "" {
+		if h.op == nil {
+			response.InternalError(w, "singbox operator not wired")
+			return
+		}
+		var err error
+		iface, err = h.resolveTunnelInterface(r.Context(), tag)
+		if err != nil {
+			if errors.Is(err, singbox.ErrTunnelNotFound) {
+				response.ErrorWithStatus(w, http.StatusNotFound, err.Error(), "NOT_FOUND")
+			} else if errors.Is(err, errTunnelNoInterface) {
+				response.ErrorWithStatus(w, http.StatusBadRequest, err.Error(), "NO_INTERFACE")
+			} else {
+				response.InternalError(w, err.Error())
+			}
+			return
+		}
+	}
+
+	result := testing.CheckConnectivityByInterface(r.Context(), iface)
+	response.Success(w, result)
+}
+
+// CheckIP tests IP through a sing-box tunnel.
+//
+//	@Summary		Sing-box tunnel IP test
+//	@Description	Resolves current external IP through a sing-box tunnel. Provide either `tag` (resolved to tunnel kernel interface) or `iface` (direct kernel interface override, useful for subscription tests). Optional `service` overrides IP-check endpoint.
+//	@Tags			singbox
+//	@Produce		json
+//	@Security		CookieAuth
+//	@Param			tag		query		string	false	"Tunnel tag (required when iface is not set)"
+//	@Param			iface	query		string	false	"Kernel interface override (e.g. t2s12)"
+//	@Param			service	query		string	false	"Custom IP-check service URL"
+//	@Success		200		{object}	APIEnvelope
+//	@Failure		400		{object}	APIErrorEnvelope
+//	@Failure		404		{object}	APIErrorEnvelope
+//	@Failure		500		{object}	APIErrorEnvelope
+//	@Router			/singbox/tunnels/test/ip [get]
+func (h *SingboxHandler) CheckIP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		response.MethodNotAllowed(w)
+		return
+	}
+	tag := r.URL.Query().Get("tag")
+	ifaceOverride := r.URL.Query().Get("iface")
+	if tag == "" && ifaceOverride == "" {
+		response.BadRequest(w, "tag or iface required")
+		return
+	}
+
+	iface := ifaceOverride
+	if iface == "" {
+		if h.op == nil {
+			response.InternalError(w, "singbox operator not wired")
+			return
+		}
+		var err error
+		iface, err = h.resolveTunnelInterface(r.Context(), tag)
+		if err != nil {
+			if errors.Is(err, singbox.ErrTunnelNotFound) {
+				response.ErrorWithStatus(w, http.StatusNotFound, err.Error(), "NOT_FOUND")
+			} else if errors.Is(err, errTunnelNoInterface) {
+				response.ErrorWithStatus(w, http.StatusBadRequest, err.Error(), "NO_INTERFACE")
+			} else {
+				response.InternalError(w, err.Error())
+			}
+			return
+		}
+	}
+
+	service := r.URL.Query().Get("service")
+	result, err := testing.CheckIPByInterface(r.Context(), iface, service)
+	if err != nil {
+		response.Error(w, err.Error(), "IP_CHECK_FAILED")
+		return
+	}
+	response.Success(w, result)
+}
+
+func (h *SingboxHandler) resolveTunnelInterface(ctx context.Context, tag string) (string, error) {
+	tunnels, err := h.op.ListTunnels(ctx)
+	if err != nil {
+		return "", err
+	}
+	return resolveTunnelInterfaceFromList(tunnels, tag)
+}
+
+func resolveTunnelInterfaceFromList(tunnels []singbox.TunnelInfo, tag string) (string, error) {
+	for _, t := range tunnels {
+		if t.Tag == tag {
+			if t.KernelInterface == "" {
+				return "", fmt.Errorf("%w: %s", errTunnelNoInterface, tag)
+			}
+			return t.KernelInterface, nil
+		}
+	}
+	return "", fmt.Errorf("%w: %s", singbox.ErrTunnelNotFound, tag)
 }
 
 // SpeedTestStream handles GET /api/singbox/tunnels/test/speed/stream?tag=X&server=Y&port=Z.
@@ -457,19 +600,15 @@ func (h *SingboxHandler) SpeedTestStream(w http.ResponseWriter, r *http.Request)
 	// would otherwise 404 on every subscription speedtest attempt.
 	iface := ifaceOverride
 	if iface == "" {
-		tunnels, err := h.op.ListTunnels(r.Context())
+		iface, err = h.resolveTunnelInterface(r.Context(), tag)
 		if err != nil {
-			response.InternalError(w, err.Error())
-			return
-		}
-		for _, t := range tunnels {
-			if t.Tag == tag {
-				iface = t.KernelInterface
-				break
+			if errors.Is(err, singbox.ErrTunnelNotFound) {
+				response.ErrorWithStatus(w, http.StatusNotFound, "tunnel tag not found", "NOT_FOUND")
+			} else if errors.Is(err, errTunnelNoInterface) {
+				response.ErrorWithStatus(w, http.StatusBadRequest, "tunnel has no kernel interface", "NO_INTERFACE")
+			} else {
+				response.InternalError(w, err.Error())
 			}
-		}
-		if iface == "" {
-			response.ErrorWithStatus(w, http.StatusNotFound, "tunnel tag not found or no kernel interface", "NOT_FOUND")
 			return
 		}
 	}
@@ -564,6 +703,7 @@ func (h *SingboxHandler) DeleteTunnel(w http.ResponseWriter, r *http.Request) {
 		response.BadRequest(w, "tag required")
 		return
 	}
+	h.log.Info("single-remove", tag, "requested via API")
 	if err := h.op.RemoveTunnel(r.Context(), tag); err != nil {
 		response.InternalError(w, err.Error())
 		return

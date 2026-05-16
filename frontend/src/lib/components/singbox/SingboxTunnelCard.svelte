@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { SingboxTunnel } from '$lib/types';
 	import { goto } from '$app/navigation';
+	import { browser } from '$app/environment';
 	import { api } from '$lib/api/client';
 	import {
 		singboxTunnels,
@@ -8,10 +9,9 @@
 		singboxTraffic,
 		triggerDelayCheck,
 	} from '$lib/stores/singbox';
-	import { untrack } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { Modal, Button, TrafficChart, TrafficSparkline } from '$lib/components/ui';
 	import { getTrafficRates, subscribeTraffic, loadHistory } from '$lib/stores/traffic';
-	import SingboxSpeedTestModal from './SingboxSpeedTestModal.svelte';
 	import type { SingboxLayoutMode } from '$lib/constants/singboxLayout';
 
 	interface Props {
@@ -19,6 +19,7 @@
 		layout?: SingboxLayoutMode;
 		autoDelayCheckNonce?: number;
 		autoDelayCheckDelayMs?: number;
+		ondetail?: (tag: string) => void;
 	}
 
 	let {
@@ -26,6 +27,7 @@
 		layout = 'grid',
 		autoDelayCheckNonce = 0,
 		autoDelayCheckDelayMs = 0,
+		ondetail,
 	}: Props = $props();
 
 	let deleting = $state(false);
@@ -84,6 +86,9 @@
 		return `${latest}ms`;
 	});
 
+	const testHref = $derived(`/singbox/${encodeURIComponent(tunnel.tag)}/test`);
+	const resolvedTestHref = $derived(tunnel.kernelInterface ? testHref : undefined);
+
 	const protocolLabel = $derived.by(() => {
 		if (tunnel.protocol === 'vless') return 'VLESS';
 		if (tunnel.protocol === 'hysteria2') return 'Hysteria2';
@@ -130,13 +135,6 @@
 		goto(`/singbox/${encodeURIComponent(tunnel.tag)}`);
 	}
 
-	let speedtestOpen = $state(false);
-
-	function openSpeedtest(): void {
-		if (!tunnel.kernelInterface) return;
-		speedtestOpen = true;
-	}
-
 	function formatBytes(n: number): string {
 		if (n < 1024) return `${n} B`;
 		if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
@@ -167,6 +165,19 @@
 		initialLoadDone = true;
 		untrack(() => loadHistory(tag));
 	});
+
+	const CHART_KEY_PREFIX = 'sbx_chart_expanded_';
+	let chartStorageKey = $derived(`${CHART_KEY_PREFIX}${tunnel.tag}`);
+	let chartExpanded = $state(true);
+	onMount(() => {
+		chartExpanded = localStorage.getItem(chartStorageKey) !== 'false';
+	});
+	function toggleCharts() {
+		chartExpanded = !chartExpanded;
+		if (browser) {
+			localStorage.setItem(chartStorageKey, String(chartExpanded));
+		}
+	}
 </script>
 
 {#if layout === 'list'}
@@ -236,12 +247,26 @@
 		</div>
 		<div class="list-cell list-cell-traffic" data-label="Трафик">
 			<div class="traffic-row-list">
-				<TrafficSparkline
-					data={trafficSparkData}
-					width={84}
-					height={22}
-					color={tunnel.running === true ? 'var(--color-accent)' : 'var(--color-border-hover)'}
-				/>
+				<div
+					role="button"
+					tabindex="0"
+					class="traffic-mini-click"
+					onclick={() => ondetail?.(tunnel.tag)}
+					onkeydown={(e) => {
+						if (e.key === 'Enter' || e.key === ' ') {
+							e.preventDefault();
+							ondetail?.(tunnel.tag);
+						}
+					}}
+					title="Открыть детальный график"
+				>
+					<TrafficSparkline
+						data={trafficSparkData}
+						width={84}
+						height={22}
+						color={tunnel.running === true ? 'var(--color-accent)' : 'var(--color-border-hover)'}
+					/>
+				</div>
 				<div class="traffic-mini-col mono">
 					<span>↓ {formatBytes(traffic?.download ?? 0)}</span>
 					<span>↑ {formatBytes(traffic?.upload ?? 0)}</span>
@@ -271,10 +296,41 @@
 		</div>
 		<div class="list-cell list-cell-actions" data-label="Действия">
 			<div class="list-actions">
-				<Button variant="ghost" size="sm" onclick={edit}>Изменить</Button>
-				<Button variant="danger" size="sm" onclick={() => (confirmDeleteOpen = true)} loading={deleting}>
+				<button class="action-btn" type="button" onclick={edit}>
+					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+						<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+						<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+					</svg>
+					Изменить
+				</button>
+				{#if resolvedTestHref}
+					<a class="action-btn" href={resolvedTestHref}>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+							<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+							<polyline points="22,4 12,14.01 9,11.01"/>
+						</svg>
+						Тест
+					</a>
+				{:else}
+					<button class="action-btn" type="button" disabled>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+							<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+							<polyline points="22,4 12,14.01 9,11.01"/>
+						</svg>
+						Тест
+					</button>
+				{/if}
+				<button class="action-btn action-danger" type="button" onclick={() => (confirmDeleteOpen = true)} disabled={deleting}>
+					{#if deleting}
+						<span class="action-spinner"></span>
+					{:else}
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+							<polyline points="3,6 5,6 21,6"/>
+							<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+						</svg>
+					{/if}
 					Удалить
-				</Button>
+				</button>
 			</div>
 		</div>
 	</div>
@@ -351,81 +407,84 @@
 		</div>
 	{/if}
 
-	<div class="divider"></div>
-
-	<div class="chart-block">
-		<div class="chart-head">
-			<span>Delay (5 мин)</span>
-			<span class="stats">
-				{#if cardState === 'unknown'}
-					ещё не тестировали
-				{:else if cardState === 'fail'}
-					<span class="err">не отвечает</span>
-				{:else}
-					avg {avg}ms
-				{/if}
-			</span>
-		</div>
-		<div
-			class="spark {cardState}"
-			onclick={triggerCheck}
-			onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && triggerCheck()}
-			role="button"
-			tabindex="0"
-			title="Клик — обновить delay"
-		>
-			{#if history.length === 0}
-				{#each Array(6) as _}
-					<div class="bar empty"></div>
-				{/each}
-			{:else}
-				{@const max = Math.max(...history.map((v) => (v <= 0 ? 100 : v)), 100)}
-				{#each history as d}
-					<div class="bar" style="height: {Math.max((d <= 0 ? max : d) / max, 0.1) * 100}%;"></div>
-				{/each}
-			{/if}
-		</div>
-	</div>
-
-	<div class="chart-block traffic-block">
-		<div class="chart-head">
-			<span>Трафик</span>
-			<span class="stats">
-				↓ {formatBytes(traffic?.download ?? 0)} · ↑ {formatBytes(traffic?.upload ?? 0)}
-			</span>
-		</div>
-		<TrafficChart
-			{rxRates}
-			{txRates}
-			rxTotal={traffic?.download ?? 0}
-			txTotal={traffic?.upload ?? 0}
-			height={56}
-		/>
-	</div>
-
 	<div class="actions">
+		<Button variant="ghost" size="sm" onclick={edit} iconBefore={editIcon}>Изменить</Button>
 		<Button
 			variant="ghost"
 			size="sm"
-			onclick={openSpeedtest}
+			href={resolvedTestHref}
 			disabled={!tunnel.kernelInterface}
+			iconBefore={testIcon}
 		>
-			Тест скорости
+			Тест
 		</Button>
-		<Button variant="ghost" size="sm" onclick={edit}>Изменить</Button>
-		<Button variant="danger" size="sm" onclick={() => (confirmDeleteOpen = true)} loading={deleting}>
+		<button
+			class="action-btn action-danger"
+			type="button"
+			onclick={() => (confirmDeleteOpen = true)}
+			disabled={deleting}
+			title="Удалить туннель"
+		>
+			{#if deleting}
+				<span class="action-spinner"></span>
+			{:else}
+				{@render deleteIcon()}
+			{/if}
 			Удалить
-		</Button>
+		</button>
+	</div>
+
+	<div class="chart-section">
+		<button type="button" class="chart-header" onclick={toggleCharts}>
+			<span class="chart-label">Графики</span>
+			<span class="chart-chevron" class:expanded={chartExpanded}>▾</span>
+		</button>
+		<div class="chart-body" class:expanded={chartExpanded}>
+			<div class="chart-head">
+				<span>Delay (5 мин)</span>
+				<span class="stats">
+					{#if cardState === 'unknown'}
+						ещё не тестировали
+					{:else if cardState === 'fail'}
+						<span class="err">не отвечает</span>
+					{:else}
+						avg {avg}ms
+					{/if}
+				</span>
+			</div>
+			<div
+				class="spark {cardState}"
+				title="Delay за последние проверки"
+			>
+				{#if history.length === 0}
+					{#each Array(6) as _}
+						<div class="bar empty"></div>
+					{/each}
+				{:else}
+					{@const max = Math.max(...history.map((v) => (v <= 0 ? 100 : v)), 100)}
+					{#each history as d}
+						<div class="bar" style="height: {Math.max((d <= 0 ? max : d) / max, 0.1) * 100}%;"></div>
+					{/each}
+				{/if}
+			</div>
+			<div class="chart-head traffic-head">
+				<span>Трафик</span>
+				<span class="stats">
+					↓ {formatBytes(traffic?.download ?? 0)} · ↑ {formatBytes(traffic?.upload ?? 0)}
+				</span>
+			</div>
+			<TrafficChart
+				{rxRates}
+				{txRates}
+				rxTotal={traffic?.download ?? 0}
+				txTotal={traffic?.upload ?? 0}
+				height={56}
+				onclick={() => ondetail?.(tunnel.tag)}
+			/>
+		</div>
 	</div>
 </div>
 {/if}
-
-<SingboxSpeedTestModal
-	open={speedtestOpen}
-	tag={tunnel.tag}
-	kernelInterface={tunnel.kernelInterface ?? ''}
-	onclose={() => (speedtestOpen = false)}
-/>
 
 <Modal
 	open={confirmDeleteOpen}
@@ -439,6 +498,27 @@
 		<Button variant="danger" size="md" onclick={remove}>Удалить</Button>
 	{/snippet}
 </Modal>
+
+{#snippet testIcon()}
+	<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+		<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+		<polyline points="22,4 12,14.01 9,11.01"/>
+	</svg>
+{/snippet}
+
+{#snippet editIcon()}
+	<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+		<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+		<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+	</svg>
+{/snippet}
+
+{#snippet deleteIcon()}
+	<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+		<polyline points="3,6 5,6 21,6"/>
+		<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+	</svg>
+{/snippet}
 
 <style>
 	.card {
@@ -607,6 +687,7 @@
 		text-transform: none;
 		letter-spacing: normal;
 	}
+	.traffic-head { margin-top: 8px; }
 	.chart-head .err { color: #ef4444; }
 
 	.spark {
@@ -614,10 +695,8 @@
 		display: flex;
 		align-items: flex-end;
 		gap: 2px;
-		cursor: pointer;
 		padding: 2px 0;
 	}
-	.spark:focus { outline: 1px dashed var(--text-muted); }
 	.spark .bar {
 		flex: 1;
 		background: linear-gradient(to top, rgba(59, 130, 246, 0.6), rgba(96, 165, 250, 0.9));
@@ -643,6 +722,7 @@
 	}
 	.list-cell-ping-mini {
 		justify-content: flex-start;
+		padding-right: 0.6rem;
 	}
 	.traffic-row-list {
 		display: flex;
@@ -659,14 +739,100 @@
 		color: var(--text-muted);
 		flex-shrink: 0;
 	}
+	.traffic-mini-click {
+		display: inline-flex;
+		border-radius: 4px;
+		cursor: pointer;
+		transition: background var(--t-fast) ease;
+	}
+	.traffic-mini-click:hover {
+		background: rgba(96, 165, 250, 0.06);
+	}
+	.traffic-mini-click:focus-visible {
+		outline: 1px solid var(--color-accent, #58a6ff);
+		outline-offset: 1px;
+	}
 
 	.actions {
 		display: flex;
 		gap: 6px;
 		justify-content: flex-end;
 		margin-top: 12px;
-		padding-top: 10px;
+		padding: 10px 0;
 		border-top: 1px solid var(--border);
+		border-bottom: 1px solid var(--border);
+	}
+	.action-btn {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		padding: 5px 9px;
+		font-size: 11px;
+		font-weight: 500;
+		border: none;
+		background: transparent;
+		color: var(--text-secondary, var(--text));
+		cursor: pointer;
+		border-radius: var(--radius-sm);
+		text-decoration: none;
+		font-family: inherit;
+		transition: background var(--t-fast) ease, color var(--t-fast) ease;
+	}
+	.action-btn:hover:not(:disabled) {
+		background: var(--bg-hover, var(--color-bg-hover));
+		color: var(--text);
+	}
+	.action-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+	.chart-section {
+		margin: 0 -16px -16px;
+		border-radius: 0 0 var(--radius) var(--radius);
+		background: var(--bg-card);
+		overflow: hidden;
+	}
+	.chart-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		width: 100%;
+		padding: 6px 12px;
+		border: none;
+		background: none;
+		cursor: pointer;
+		user-select: none;
+		font: inherit;
+		transition: background var(--t-fast) ease;
+	}
+	.chart-header:hover {
+		background: var(--bg-tertiary);
+	}
+	.chart-label {
+		font-size: 11px;
+		font-weight: 500;
+		color: var(--text-muted);
+		text-transform: uppercase;
+		letter-spacing: 0.03em;
+	}
+	.chart-chevron {
+		font-size: 14px;
+		color: var(--text-muted);
+		transition: transform var(--t-fast) ease;
+		transform: rotate(-90deg);
+	}
+	.chart-chevron.expanded {
+		transform: rotate(0deg);
+	}
+	.chart-body {
+		max-height: 0;
+		overflow: hidden;
+		transition: max-height var(--t-med) ease;
+		padding: 0 12px;
+	}
+	.chart-body.expanded {
+		max-height: 300px;
+		padding: 0 12px 8px;
 	}
 
 	/* List row (grid columns set on parent .singbox-tunnel-list-table) */
@@ -747,8 +913,16 @@
 	}
 	.list-actions {
 		display: flex;
-		flex-wrap: wrap;
-		gap: 0.35rem;
+		flex-wrap: nowrap;
+		gap: 0.5rem;
 		justify-content: flex-end;
+		align-items: center;
+		white-space: nowrap;
+		margin-left: 0.5rem;
+	}
+	.action-danger:hover:not(:disabled),
+	.list-actions :global(.action-danger:hover:not(:disabled)) {
+		color: #ff6b6b;
+		background: rgba(239, 68, 68, 0.18);
 	}
 </style>

@@ -181,6 +181,9 @@ func main() {
 	cleanup := flag.Bool("cleanup", false, "Stop and delete all tunnels, then exit (for uninstall)")
 	serviceAction := flag.String("service", "", "Service management (start|stop|restart|status)")
 	forceBoot := flag.Bool("force-boot", false, "Simulate boot mode (for testing boot path on running router)")
+	pprofListen := flag.String("pprof-listen", "", "Dedicated TCP address for Go /debug/pprof only (recommended: 127.0.0.1:6060); empty disables standalone pprof")
+	pprofOnMain := flag.Bool("pprof-on-main", false, "Also mount /debug/pprof/* on the main HTTP server (LAN/loopback listeners)")
+	slowReqMS := flag.Int("slow-request-ms", 500, "Log HTTP handlers slower than this (ms) to stderr via slog (0 disables); long-lived SSE/WS routes are excluded")
 	flag.Parse()
 
 	// Ensure Go can find CA certificates on entware-based systems (Keenetic).
@@ -518,6 +521,7 @@ func main() {
 	monitoringService = monitoring.NewService(monitoring.SchedulerDeps{
 		TunnelLister:  tunnelService,
 		TunnelStore:   awgStore,
+		SettingsStore: settingsStore,
 		SystemTunnels: &monitoringSystemTunnelAdapter{svc: systemTunnelSvc},
 		Prober:        monitoring.NewHTTPProber(),
 		ICMPProber:    monitoring.NewICMPProber(),
@@ -801,7 +805,7 @@ func main() {
 		&singboxAndSubLister{op: singboxOp, sub: subSvc},
 		eventBus,
 	)
-	singboxHandler := api.NewSingboxHandler(singboxOp, eventBus, delayChecker, testService)
+	singboxHandler := api.NewSingboxHandler(singboxOp, eventBus, delayChecker, testService, loggingService)
 	clashProxy := api.NewClashProxy(singboxOp)
 	singboxConnsHandler := api.NewSingboxConnectionsHandler(ndmsQueries.Hotspot)
 
@@ -853,10 +857,18 @@ func main() {
 		return hydraService.GetStatus(), nil
 	})
 
+	var slowHTTPThreshold time.Duration
+	if *slowReqMS > 0 {
+		slowHTTPThreshold = time.Duration(*slowReqMS) * time.Millisecond
+	}
+
 	srv := server.New(
 		server.Config{
-			Version: version,
-			WebRoot: *webRoot,
+			Version:              version,
+			WebRoot:              *webRoot,
+			PprofStandaloneAddr:  strings.TrimSpace(*pprofListen),
+			PprofOnMain:          *pprofOnMain,
+			SlowRequestThreshold: slowHTTPThreshold,
 		},
 		server.Deps{
 			Log:                 log,
@@ -1055,8 +1067,9 @@ func main() {
 		_, err := subSvc.Refresh(ctx, id)
 		return err
 	})
+	subSched.SetAppLogger(loggingService)
 	subSched.Start(context.Background())
-	srv.SetSubscriptionHandler(api.NewSubscriptionHandler(subSvc, singboxOp))
+	srv.SetSubscriptionHandler(api.NewSubscriptionHandler(subSvc, singboxOp, loggingService))
 	srv.AddShutdownHook(subSched.Stop)
 
 	// Boot status: 0 = booting, 1 = done. Used by /api/system/info.

@@ -5,6 +5,7 @@
 		name: string;
 		kind: 'policy' | 'interface';
 		ruleCount: number;
+		displayName?: string;
 		broken?: boolean;
 	}
 
@@ -79,7 +80,10 @@
 			>
 				<span class="row-num">{i + 1}</span>
 				<div class="row-body">
-					<div class="row-title">{t.name}</div>
+					<div class="row-title">{t.displayName ?? t.name}</div>
+					{#if t.displayName && t.displayName !== t.name}
+						<div class="row-subtitle">{t.name}</div>
+					{/if}
 					<div class="row-meta">
 						<span class="kind kind-{t.kind}">{t.kind}</span>
 						<span class="count">{t.ruleCount}</span>
@@ -275,6 +279,15 @@
 		gap: 6px;
 		align-items: center;
 		font-size: 0.6875rem;
+	}
+
+	.row-subtitle {
+		font-size: 0.75rem;
+		color: var(--text-muted);
+		line-height: 1.1;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
 	}
 
 	.kind {

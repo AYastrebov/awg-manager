@@ -16,6 +16,7 @@
 		ServerRail,
 		type RailItem,
 	} from '$lib/components/servers';
+	import { dedupBy } from '$lib/utils/dedupBy';
 
 	let unsub: (() => void) | undefined;
 	onMount(() => { unsub = servers.subscribe(() => {}); });
@@ -25,8 +26,7 @@
 	let serverList = $derived(snap.data?.servers ?? []);
 	let managedServers: ManagedServer[] = $derived(snap.data?.managed ?? []);
 	let managedStatsMap: Record<string, ManagedServerStats> = $derived(snap.data?.managedStats ?? {});
-	let wanIP = $derived(snap.data?.wanIP ?? '');
-	let loading = $derived(snap.lastFetchedAt === 0);
+	let loading = $derived(snap.status === 'idle' || snap.status === 'loading');
 	let routerIP = $derived($systemInfo.data?.routerIP ?? '');
 
 	let createManagedOpen = $state(false);
@@ -73,7 +73,7 @@
 				kind: 'system',
 			});
 		}
-		return items;
+		return dedupBy(items, (i) => i.id, { warnTag: 'server rail' });
 	});
 
 	// Default to empty; the effect below snaps to the first item once the rail loads
@@ -148,6 +148,11 @@
 		<div class="flex justify-center py-8">
 			<LoadingSpinner size="md" />
 		</div>
+	{:else if snap.status === 'error' && !snap.data}
+		<EmptyState
+			title="Ошибка загрузки"
+			description={snap.error ?? 'Не удалось получить список серверов'}
+		/>
 	{:else if railItems.length === 0}
 		<EmptyState
 			title="Нет серверов"
@@ -174,12 +179,11 @@
 						onOpenASC={() => openManagedASC(activeManaged!.interfaceName)}
 					/>
 				{:else if activeItem?.kind === 'system' && activeServer}
-					<ServerCard
-						server={activeServer}
-						isBuiltIn={activeServer.description === 'Wireguard VPN Server'}
-						{wanIP}
-						onUnmark={unmarkServer}
-					/>
+				<ServerCard
+					server={activeServer}
+					isBuiltIn={activeServer.description === 'Wireguard VPN Server'}
+					onUnmark={unmarkServer}
+				/>
 				{/if}
 			</main>
 		</div>

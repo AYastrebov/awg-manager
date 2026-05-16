@@ -114,14 +114,50 @@ func TestTrafficAggregator_IngestEmptyChains(t *testing.T) {
 	}
 }
 
-func TestTrafficAggregator_IngestPicksInnermostChain(t *testing.T) {
+// Subscriptions / selector groups appear as chains[0]. Crediting every hop
+// (not just the innermost) means the subscription card and the terminal
+// member card both surface non-zero traffic — the v2.10.0 regression where
+// "Суммарный трафик" sat at 0 B on the subscriptions page.
+func TestTrafficAggregator_IngestCreditsEveryChainHop(t *testing.T) {
 	agg := NewTrafficAggregator("unused", nil, nil)
-	msg := []byte(`{"connections":[{"chains":["Selector","Germany"],"upload":10,"download":20}]}`)
+	msg := []byte(`{"connections":[{"chains":["Proxy0","Germany"],"upload":10,"download":20}]}`)
 	agg.ingest(msg)
-	if _, ok := agg.tags["Germany"]; !ok {
-		t.Errorf("expected Germany (innermost) to be tracked, got %v", agg.tags)
+	if got := agg.tags["Germany"]; got == nil || got.Upload != 10 || got.Download != 20 {
+		t.Errorf("Germany (terminal): want upload=10 download=20, got %+v", got)
 	}
-	if _, ok := agg.tags["Selector"]; ok {
-		t.Errorf("should NOT track Selector (group wrapper)")
+	if got := agg.tags["Proxy0"]; got == nil || got.Upload != 10 || got.Download != 20 {
+		t.Errorf("Proxy0 (selector wrapper): want upload=10 download=20, got %+v", got)
+	}
+}
+
+// Per-connection dedup: Clash sometimes emits transitively self-referential
+// chains (e.g. when a selector resolves through itself). Each connection's
+// bytes must credit each tag exactly once.
+func TestTrafficAggregator_IngestDedupsWithinSingleConnection(t *testing.T) {
+	agg := NewTrafficAggregator("unused", nil, nil)
+	msg := []byte(`{"connections":[{"chains":["A","A","B"],"upload":7,"download":13}]}`)
+	agg.ingest(msg)
+	if got := agg.tags["A"]; got == nil || got.Upload != 7 || got.Download != 13 {
+		t.Errorf("A (repeated in chain): want single credit upload=7 download=13, got %+v", got)
+	}
+	if got := agg.tags["B"]; got == nil || got.Upload != 7 || got.Download != 13 {
+		t.Errorf("B: want upload=7 download=13, got %+v", got)
+	}
+}
+
+// Cross-connection accumulation still works after the every-hop change —
+// two connections through the same chain double the totals on every tag.
+func TestTrafficAggregator_IngestAccumulatesAcrossConnections(t *testing.T) {
+	agg := NewTrafficAggregator("unused", nil, nil)
+	msg := []byte(`{"connections":[
+		{"chains":["Proxy0","Germany"],"upload":10,"download":20},
+		{"chains":["Proxy0","Germany"],"upload":100,"download":200}
+	]}`)
+	agg.ingest(msg)
+	if got := agg.tags["Proxy0"]; got == nil || got.Upload != 110 || got.Download != 220 {
+		t.Errorf("Proxy0 across two conns: want upload=110 download=220, got %+v", got)
+	}
+	if got := agg.tags["Germany"]; got == nil || got.Upload != 110 || got.Download != 220 {
+		t.Errorf("Germany across two conns: want upload=110 download=220, got %+v", got)
 	}
 }

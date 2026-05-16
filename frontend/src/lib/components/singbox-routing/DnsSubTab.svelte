@@ -21,6 +21,7 @@
 	import {
 		DNSServerEditModal,
 		DNSRuleEditModal,
+		computeRuleSetUsage,
 	} from '$lib/components/routing/singboxRouter';
 
 	const dnsServersStore = singboxRouter.dnsServers;
@@ -173,6 +174,16 @@
 	let ruleAddMode = $state(false);
 	let ruleDeleteIndex = $state<number | null>(null);
 	let ruleBusy = $state(false);
+
+	// Usage map for the picker. Add-mode counts every existing DNS rule;
+	// edit-mode excludes the rule being edited so its own rule_set isn't
+	// credited against itself.
+	const ruleSetUsageAdd = $derived(computeRuleSetUsage(rules));
+	const ruleSetUsageEdit = $derived.by(() =>
+		ruleEditIndex === null
+			? new Map<string, number>()
+			: computeRuleSetUsage(rules, ruleEditIndex),
+	);
 
 	function requestServerDelete(tag: string): void {
 		serverDeleteTag = tag;
@@ -541,6 +552,7 @@
 	<DNSRuleEditModal
 		{servers}
 		availableRuleSets={ruleSets}
+		ruleSetUsage={ruleSetUsageAdd}
 		onClose={() => (ruleAddMode = false)}
 		onSave={async (rule) => {
 			await api.singboxRouterAddDNSRule(rule);
@@ -556,6 +568,7 @@
 		rule={rules[idx]}
 		{servers}
 		availableRuleSets={ruleSets}
+		ruleSetUsage={ruleSetUsageEdit}
 		onClose={() => (ruleEditIndex = null)}
 		onSave={async (rule) => {
 			await api.singboxRouterUpdateDNSRule(idx, rule);

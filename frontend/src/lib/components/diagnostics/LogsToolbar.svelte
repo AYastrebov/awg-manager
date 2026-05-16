@@ -65,6 +65,7 @@
     connections: 'Соединения',
     traffic: 'Трафик',
     diagnostics: 'Диагностика',
+    profiling: 'Profiling HTTP',
     rci: 'RCI',
     ndms: 'NDMS',
   };
@@ -79,6 +80,7 @@
 <script lang="ts">
   import { Badge, StatusDot, Modal, Button } from '$lib/components/ui';
   import { formatRelativeTime } from '$lib/utils/format';
+  import { usageLevel } from '$lib/stores/settings';
 
   interface Props {
     filter: LogsFilter;
@@ -132,6 +134,10 @@
 
   const groupOptions = $derived(bucket === 'singbox' ? SINGBOX_GROUPS : APP_GROUPS);
 
+  /** `profiling` has a dedicated expert-only chip — never duplicate it in subgroup chips. */
+  const visibleSubgroups = $derived(availableSubgroups.filter((s) => s !== 'profiling'));
+  const showExpertProfilingChip = $derived(bucket === 'app' && $usageLevel === 'expert');
+
   function toggleLevel(lvl: string) {
     const set = new Set(filter.levels);
     if (set.has(lvl)) set.delete(lvl);
@@ -150,6 +156,16 @@
   function selectSubgroup(s: string) {
     if (filter.subgroup === s) return;
     filter.subgroup = s;
+    onFilterChange({ ...filter });
+  }
+
+  function toggleProfilingFilter() {
+    if (filter.subgroup === 'profiling') {
+      filter.subgroup = '';
+    } else {
+      filter.group = '';
+      filter.subgroup = 'profiling';
+    }
     onFilterChange({ ...filter });
   }
 
@@ -249,6 +265,18 @@
           {levelLabel[lvl]}
         </button>
       {/each}
+      {#if showExpertProfilingChip}
+        <button
+          type="button"
+          class="chip chip-profiling-stack"
+          class:chip-active={filter.subgroup === 'profiling'}
+          aria-label="Журнал медленных HTTP-запросов"
+          aria-pressed={filter.subgroup === 'profiling'}
+          onclick={toggleProfilingFilter}
+        >
+          Profiling
+        </button>
+      {/if}
     </span>
 
     <span class="divider" aria-hidden="true"></span>
@@ -291,7 +319,7 @@
         >
           ALL
         </button>
-        {#each availableSubgroups as s (s)}
+        {#each visibleSubgroups as s (s)}
           {@const active = filter.subgroup === s}
           <button
             type="button"
@@ -418,6 +446,11 @@
     background: var(--color-border);
     margin: 0 0.125rem;
   }
+
+  .profiling-divider {
+    margin-inline: 0.25rem 0.375rem;
+  }
+
 
   .chip-row {
     display: inline-flex;

@@ -1,8 +1,9 @@
 <script lang="ts">
-    import { untrack } from 'svelte';
+    import { onMount, untrack } from 'svelte';
     import { goto } from '$app/navigation';
+    import { browser } from '$app/environment';
     import { api } from '$lib/api/client';
-    import { Button, TrafficSparkline } from '$lib/components/ui';
+    import { Button, Modal, TrafficChart, TrafficSparkline } from '$lib/components/ui';
     import { getTrafficRates, subscribeTraffic, loadHistory } from '$lib/stores/traffic';
     import {
         singboxDelayHistory,
@@ -14,7 +15,6 @@
     import type { Subscription, SubscriptionMember } from '$lib/types';
     import { formatRelativeTime } from '$lib/utils/format';
     import SubscriptionMemberPicker from './SubscriptionMemberPicker.svelte';
-    import SingboxSpeedTestModal from '$lib/components/singbox/SingboxSpeedTestModal.svelte';
     import type { SingboxLayoutMode } from '$lib/constants/singboxLayout';
 
     interface Props {
@@ -23,6 +23,7 @@
         autoDelayCheckNonce?: number;
         autoDelayCheckDelayMs?: number;
         layout?: SingboxLayoutMode;
+        ondetail?: (tag: string) => void;
     }
     let {
         subscription,
@@ -30,12 +31,14 @@
         autoDelayCheckNonce = 0,
         autoDelayCheckDelayMs = 0,
         layout = 'grid',
+        ondetail,
     }: Props = $props();
 
     let pickerOpen = $state(false);
     let checking = $state(false);
-    let speedtestOpen = $state(false);
     let showEndpoint = $state(false);
+    let confirmDeleteOpen = $state(false);
+    let deleting = $state(false);
 
     // NDMS Proxy interface name (Proxy<N>) and matching kernel TUN
     // (t2s<N>) — same naming convention sing-box tunnels use, just
@@ -91,6 +94,18 @@
         const tag = trafficMemberTag;
         untrack(() => loadHistory(tag));
     });
+    const CHART_KEY_PREFIX = 'sub_chart_expanded_';
+    let chartStorageKey = $derived(`${CHART_KEY_PREFIX}${subscription.id}`);
+    let chartExpanded = $state(true);
+    onMount(() => {
+        chartExpanded = localStorage.getItem(chartStorageKey) !== 'false';
+    });
+    function toggleCharts() {
+        chartExpanded = !chartExpanded;
+        if (browser) {
+            localStorage.setItem(chartStorageKey, String(chartExpanded));
+        }
+    }
     const endpointText = $derived(`${activeMember.server}:${activeMember.port}`);
     /** List row: title above IP — prefer remark, else outbound tag. */
     const listActiveServerName = $derived(
@@ -163,6 +178,20 @@
 
     function openDetail(): void {
         goto(`/subscriptions/${subscription.id}`);
+    }
+
+    async function removeSubscription(): Promise<void> {
+        if (deleting) return;
+        deleting = true;
+        try {
+            await api.deleteSubscription(subscription.id);
+            await subscriptionsStore.refetch();
+            confirmDeleteOpen = false;
+        } catch (e) {
+            notifications.error(e instanceof Error ? e.message : 'Не удалось удалить подписку');
+        } finally {
+            deleting = false;
+        }
     }
 
     function formatBytes(n: number): string {
@@ -261,12 +290,30 @@
                     <span class="delay-dash">—</span>
                 {:else}
                     <div class="traffic-row-list">
-                        <TrafficSparkline
-                            data={trafficSparkData}
-                            width={84}
-                            height={22}
-                            color="var(--color-accent)"
-                        />
+                        <div
+                            role="button"
+                            tabindex="0"
+                            class="traffic-mini-click"
+                            onclick={(e) => {
+                                e.stopPropagation();
+                                ondetail?.(activeMember.tag);
+                            }}
+                            onkeydown={(e) => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    ondetail?.(activeMember.tag);
+                                }
+                            }}
+                            title="Открыть детальный график"
+                        >
+                            <TrafficSparkline
+                                data={trafficSparkData}
+                                width={84}
+                                height={22}
+                                color="var(--color-accent)"
+                            />
+                        </div>
                         <div class="traffic-mini-col mono">
                             <span>↓ {formatBytes(traffic?.download ?? 0)}</span>
                             <span>↑ {formatBytes(traffic?.upload ?? 0)}</span>
@@ -280,20 +327,7 @@
                 {:else}
                     <div
                         class="spark-mini {cardState}"
-                        role="button"
-                        tabindex="0"
-                        onclick={(e) => {
-                            e.stopPropagation();
-                            void triggerCheck(e);
-                        }}
-                        onkeydown={(e) => {
-                            if (e.key === 'Enter' || e.key === ' ') {
-                                e.preventDefault();
-                                e.stopPropagation();
-                                void triggerCheck(e);
-                            }
-                        }}
-                        title="Клик — обновить delay"
+                        title="Delay за последние проверки"
                     >
                         {#if history.length === 0}
                             {#each Array(10) as _, i (i)}
@@ -309,27 +343,46 @@
                 {/if}
             </div>
             <div class="lc lc-actions" data-label="">
-                <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={!kernelIface}
-                    onclick={(e) => {
-                        e.stopPropagation();
-                        if (kernelIface) speedtestOpen = true;
-                    }}
-                >
-                    Скорость
-                </Button>
-                <Button
-                    variant="ghost"
-                    size="sm"
+                <button
+                    class="action-btn"
                     onclick={(e) => {
                         e.stopPropagation();
                         openDetail();
                     }}
                 >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                    </svg>
                     Открыть
-                </Button>
+                </button>
+                <button
+                    class="action-btn"
+                    disabled={!kernelIface}
+                    onclick={(e) => {
+                        e.stopPropagation();
+                        if (kernelIface) goto(`/subscriptions/${subscription.id}/test`);
+                    }}
+                >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                        <polyline points="22,4 12,14.01 9,11.01"/>
+                    </svg>
+                    Тест
+                </button>
+                <button
+                    class="action-btn action-danger"
+                    onclick={(e) => {
+                        e.stopPropagation();
+                        confirmDeleteOpen = true;
+                    }}
+                >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="3,6 5,6 21,6"/>
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                    </svg>
+                    Удалить
+                </button>
             </div>
         </div>
     </div>
@@ -369,6 +422,18 @@
         <span class="kernel">· :{subscription.listenPort}</span>
     </div>
 
+    <div class="badges">
+        <span class="badge proto">{protocolLabel}</span>
+        {#if activeMember.transport && activeMember.transport !== 'tcp'}
+            <span class="badge transport">{activeMember.transport.toUpperCase()}</span>
+        {/if}
+        {#if activeMember.security === 'reality'}
+            <span class="badge reality">Reality</span>
+        {:else if activeMember.security === 'tls'}
+            <span class="badge tls">TLS</span>
+        {/if}
+    </div>
+
     <div class="sub-meta">
         <div>
             <span>{subscription.memberTags.length} серверов</span>
@@ -388,17 +453,7 @@
         <div class="sub-error mono">{subscription.lastError}</div>
     {/if}
 
-    <div class="badges">
-        <span class="badge proto">{protocolLabel}</span>
-        {#if activeMember.transport && activeMember.transport !== 'tcp'}
-            <span class="badge transport">{activeMember.transport.toUpperCase()}</span>
-        {/if}
-        {#if activeMember.security === 'reality'}
-            <span class="badge reality">Reality</span>
-        {:else if activeMember.security === 'tls'}
-            <span class="badge tls">TLS</span>
-        {/if}
-    </div>
+    <div class="divider"></div>
 
     <div class="server-row">
         <span class="label">{isURLTest ? 'Авто' : 'Сервер'}</span>
@@ -466,66 +521,105 @@
             {/if}
         </div>
     </div>
-
     <div class="divider"></div>
 
-    <div class="chart-block">
-        <div class="chart-head">
-            <span>Delay (5 мин)</span>
-            <span class="stats">
-                {#if cardState === 'unknown'}ещё не тестировали
-                {:else if cardState === 'fail'}<span class="err">не отвечает</span>
-                {:else}{latText}{/if}
-            </span>
-        </div>
-        <div
-            class="spark {cardState}"
-            onclick={triggerCheck}
-            onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && triggerCheck(e)}
-            role="button"
-            tabindex="0"
-            title="Клик — обновить delay"
-        >
-            {#if history.length === 0}
-                {#each Array(6) as _, i (i)}<div class="bar empty"></div>{/each}
-            {:else}
-                {@const max = Math.max(...history.map((v) => (v <= 0 ? 100 : v)), 100)}
-                {#each history as d, i (i)}
-                    <div class="bar" style="height: {Math.max((d <= 0 ? max : d) / max, 0.1) * 100}%;"></div>
-                {/each}
-            {/if}
-        </div>
-    </div>
-
-    <div class="chart-block">
-        <div class="chart-head">
-            <span>Трафик</span>
-            <span class="stats">
-                ↓ {formatBytes(traffic?.download ?? 0)} · ↑ {formatBytes(traffic?.upload ?? 0)}
-            </span>
-        </div>
-    </div>
-
     <div class="actions">
-        <Button
-            variant="ghost"
-            size="sm"
+        <button class="action-btn" onclick={openDetail}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+            </svg>
+            Открыть подписку
+        </button>
+        <button
+            class="action-btn"
             disabled={!kernelIface}
-            onclick={() => kernelIface && (speedtestOpen = true)}
+            onclick={() => kernelIface && goto(`/subscriptions/${subscription.id}/test`)}
         >
-            Тест скорости
-        </Button>
-        <Button variant="ghost" size="sm" onclick={openDetail}>Открыть подписку</Button>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                <polyline points="22,4 12,14.01 9,11.01"/>
+            </svg>
+            Тест
+        </button>
+        <button class="action-btn action-danger" onclick={() => (confirmDeleteOpen = true)}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="3,6 5,6 21,6"/>
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            </svg>
+            Удалить
+        </button>
+    </div>
+
+    <div class="chart-section">
+        <button type="button" class="chart-header" onclick={toggleCharts}>
+            <span class="chart-label">Графики</span>
+            <span class="chart-chevron" class:expanded={chartExpanded}>▾</span>
+        </button>
+        <div class="chart-body" class:expanded={chartExpanded}>
+            <div class="chart-head">
+                <span>Delay (5 мин)</span>
+                <span class="stats">
+                    {#if cardState === 'unknown'}ещё не тестировали
+                    {:else if cardState === 'fail'}<span class="err">не отвечает</span>
+                    {:else}{latText}{/if}
+                </span>
+            </div>
+            <div
+                class="spark {cardState}"
+                title="Delay за последние проверки"
+            >
+                {#if history.length === 0}
+                    {#each Array(6) as _, i (i)}<div class="bar empty"></div>{/each}
+                {:else}
+                    {@const max = Math.max(...history.map((v) => (v <= 0 ? 100 : v)), 100)}
+                    {#each history as d, i (i)}
+                        <div class="bar" style="height: {Math.max((d <= 0 ? max : d) / max, 0.1) * 100}%;"></div>
+                    {/each}
+                {/if}
+            </div>
+            <div class="chart-head traffic-head">
+                <span>Трафик</span>
+                <span class="stats">
+                    ↓ {formatBytes(traffic?.download ?? 0)} · ↑ {formatBytes(traffic?.upload ?? 0)}
+                </span>
+            </div>
+            <TrafficChart
+                {rxRates}
+                {txRates}
+                rxTotal={traffic?.download ?? 0}
+                txTotal={traffic?.upload ?? 0}
+                height={56}
+                onclick={() => ondetail?.(activeMember.tag)}
+            />
+        </div>
     </div>
 </div>
 {/if}
 
-<SingboxSpeedTestModal
-    open={speedtestOpen}
-    tag={subscription.selectorTag}
-    kernelInterface={kernelIface}
-    onclose={() => (speedtestOpen = false)}
-/>
+<Modal
+    open={confirmDeleteOpen}
+    title="Удалить подписку?"
+    size="md"
+    onclose={() => {
+        if (deleting) return;
+        confirmDeleteOpen = false;
+    }}
+>
+    <p>
+        Подписка <strong>{subscription.label || subscription.url}</strong> будет
+        удалена вместе с её sing-box outbound'ами и NDMS Proxy
+        <code class="mono">Proxy{subscription.proxyIndex}</code>.
+    </p>
+    {#snippet actions()}
+        <Button variant="ghost" disabled={deleting} onclick={() => (confirmDeleteOpen = false)}>
+            Отмена
+        </Button>
+        <Button variant="danger" disabled={deleting} loading={deleting} onclick={removeSubscription}>
+            {deleting ? 'Удаляем...' : 'Удалить'}
+        </Button>
+    {/snippet}
+</Modal>
 
 <style>
     .card {
@@ -616,6 +710,7 @@
         gap: 0.5rem;
         align-items: center;
         font-size: 0.82rem;
+        margin: 0.2rem 0;
     }
     .label { color: var(--color-text-muted); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.5px; }
     .picker-anchor { position: relative; min-width: 0; }
@@ -674,8 +769,9 @@
         transition: color var(--t-fast) ease;
     }
     .eye-btn:hover { color: var(--color-text-secondary); }
-    .divider { height: 1px; background: var(--color-border); margin: 0.4rem 0; }
+    .divider { height: 1px; background: var(--color-border); margin: 0.2rem 0; }
     .chart-block { display: flex; flex-direction: column; gap: 0.3rem; }
+    .traffic-block { margin-bottom: 0.25rem; }
     .chart-head {
         display: flex;
         justify-content: space-between;
@@ -691,14 +787,98 @@
         gap: 1px;
         align-items: flex-end;
         height: 28px;
-        cursor: pointer;
     }
     .bar { flex: 1; background: var(--color-bg-tertiary); border-radius: 1px; }
     .spark.ok .bar    { background: #3fb950; }
     .spark.slow .bar  { background: #d29922; }
     .spark.fail .bar  { background: #f85149; }
     .bar.empty        { opacity: 0.3; }
-    .actions { display: flex; gap: 0.4rem; justify-content: flex-end; margin-top: 0.4rem; }
+    .actions {
+        display: flex;
+        gap: 0.4rem;
+        justify-content: flex-end;
+        align-items: center;
+        margin-top: 0;
+        padding: 10px 0;
+        border-bottom: 1px solid var(--color-border);
+    }
+    .action-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 5px 9px;
+        font-size: 11px;
+        font-weight: 500;
+        border: none;
+        background: transparent;
+        color: var(--color-text-secondary);
+        cursor: pointer;
+        border-radius: var(--radius-sm);
+        text-decoration: none;
+        font-family: inherit;
+        transition: background var(--t-fast) ease, color var(--t-fast) ease;
+    }
+    .action-btn:hover:not(:disabled) {
+        background: var(--color-bg-hover);
+        color: var(--color-text-primary);
+    }
+    .action-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+    .action-danger:hover:not(:disabled) {
+        color: var(--color-error);
+        background: var(--color-error-tint);
+    }
+    .chart-section {
+        margin: 0 -16px -16px;
+        border-radius: 0 0 10px 10px;
+        background: var(--color-bg-secondary);
+        overflow: hidden;
+    }
+    .chart-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        width: 100%;
+        padding: 6px 12px;
+        border: none;
+        background: none;
+        cursor: pointer;
+        user-select: none;
+        font: inherit;
+        transition: background var(--t-fast) ease;
+    }
+    .chart-header:hover {
+        background: var(--color-bg-tertiary);
+    }
+    .chart-label {
+        font-size: 11px;
+        font-weight: 500;
+        color: var(--color-text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+    }
+    .chart-chevron {
+        font-size: 14px;
+        color: var(--color-text-muted);
+        transition: transform var(--t-fast) ease;
+        transform: rotate(-90deg);
+    }
+    .chart-chevron.expanded {
+        transform: rotate(0deg);
+    }
+    .chart-body {
+        max-height: 0;
+        overflow: hidden;
+        transition: max-height var(--t-med) ease;
+        padding: 0 12px;
+    }
+    .chart-body.expanded {
+        max-height: 300px;
+        padding: 0 12px 8px;
+    }
+    .traffic-head { margin-top: 8px; }
 
     .sub-meta {
         font-size: 0.78rem;
@@ -732,8 +912,8 @@
             minmax(52px, 0.75fr)
             minmax(88px, 0.95fr)
             minmax(148px, 1.1fr)
-            minmax(72px, 0.88fr)
-            minmax(150px, 1fr);
+            minmax(120px, 0.95fr)
+            minmax(220px, 1.15fr);
         gap: 0.75rem 1rem;
         align-items: center;
         padding: 0.75rem 1rem;
@@ -773,17 +953,13 @@
         justify-content: flex-start;
     }
     .spark-mini {
+        width: 100%;
         height: 22px;
         max-width: 100%;
         display: flex;
         align-items: flex-end;
         gap: 1px;
         padding: 1px 0;
-        cursor: pointer;
-    }
-    .spark-mini:focus {
-        outline: 1px dashed var(--color-text-muted);
-        outline-offset: 2px;
     }
     .spark-mini .bar {
         flex: 1;
@@ -821,6 +997,19 @@
         line-height: 1.15;
         color: var(--color-text-muted);
         flex-shrink: 0;
+    }
+    .traffic-mini-click {
+        display: inline-flex;
+        border-radius: 4px;
+        cursor: pointer;
+        transition: background var(--t-fast) ease;
+    }
+    .traffic-mini-click:hover {
+        background: rgba(96, 165, 250, 0.06);
+    }
+    .traffic-mini-click:focus-visible {
+        outline: 1px solid var(--color-accent, #58a6ff);
+        outline-offset: 1px;
     }
     .lc-name {
         flex-direction: column;
@@ -881,8 +1070,10 @@
         align-self: center;
     }
     .lc-actions {
-        flex-wrap: wrap;
-        gap: 0.25rem;
+        flex-wrap: nowrap;
+        gap: 0.5rem;
         justify-content: flex-end;
+        align-items: center;
+        white-space: nowrap;
     }
 </style>

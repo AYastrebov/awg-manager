@@ -7,7 +7,7 @@
 	import { notifications } from '$lib/stores/notifications';
 	import { api } from '$lib/api/client';
 	import { TunnelCard, ExternalTunnelCard, AdoptTunnelDialog, SystemTunnelCard, TunnelReferencedModal } from '$lib/components/tunnels';
-	import { PageContainer, PageHeader, LoadingSpinner, WelcomeBanner } from '$lib/components/layout';
+	import { PageContainer, PageHeader, LoadingSpinner, EmptyState, WelcomeBanner } from '$lib/components/layout';
 	import {
 		Modal,
 		StoreStatusBadge,
@@ -47,6 +47,8 @@
 	type EndpointScope = 'managed' | 'system' | 'external';
 
 	const AWG_TUNNEL_VIEW_STORAGE_KEY = 'awg_tunnel_view_mode';
+	const SINGBOX_TUNNELS_LAYOUT_STORAGE_KEY = 'singbox_tunnels_layout_mode';
+	const SINGBOX_SUBSCRIPTIONS_LAYOUT_STORAGE_KEY = 'singbox_subscriptions_layout_mode';
 	const isMockDevMode = getIsMockDevMode();
 
 	// Polling-store subscription: first subscriber triggers the fetch,
@@ -75,7 +77,11 @@
 	// Wait for both system info AND the first tunnels snapshot before leaving
 	// the loading state — otherwise sysInfo arrives first and the empty-state
 	// flashes until /api/tunnels/all lands.
-	let loading = $derived(!sysInfo || tunnelSnap.lastFetchedAt === 0);
+	let loading = $derived(
+		!sysInfo ||
+		tunnelSnap.status === 'idle' ||
+		tunnelSnap.status === 'loading',
+	);
 
 	// System tunnels don't emit tunnel:traffic stream events (no awg-manager
 	// peer entry tracks them) — feed the traffic store from the polled
@@ -118,6 +124,7 @@
 	let referencedTunnelName = $state<string>('');
 
 	let detailId = $state<string | null>(null);
+	let singboxDetailTag = $state<string | null>(null);
 	let endpointVisibility = $state<Record<string, boolean>>({});
 
 	function endpointVisibilityKey(scope: EndpointScope, id: string): string {
@@ -151,8 +158,10 @@
 
 	function openDetail(id: string) {
 		detailId = id;
+		singboxDetailTag = null;
 		const url = new URL(window.location.href);
 		url.searchParams.set('detail', id);
+		url.searchParams.delete('sbDetail');
 		history.replaceState(history.state, '', url);
 	}
 
@@ -163,10 +172,28 @@
 		history.replaceState(history.state, '', url);
 	}
 
+	function openSingboxDetail(tag: string) {
+		singboxDetailTag = tag;
+		detailId = null;
+		const url = new URL(window.location.href);
+		url.searchParams.set('sbDetail', tag);
+		url.searchParams.delete('detail');
+		history.replaceState(history.state, '', url);
+	}
+
+	function closeSingboxDetail() {
+		singboxDetailTag = null;
+		const url = new URL(window.location.href);
+		url.searchParams.delete('sbDetail');
+		history.replaceState(history.state, '', url);
+	}
+
 	// Sync from URL on mount + whenever the page store changes (back/forward).
 	$effect(() => {
-		const q = $page.url.searchParams.get('detail');
-		detailId = q && q.length > 0 ? q : null;
+		const awgQ = $page.url.searchParams.get('detail');
+		const sbQ = $page.url.searchParams.get('sbDetail');
+		detailId = awgQ && awgQ.length > 0 ? awgQ : null;
+		singboxDetailTag = sbQ && sbQ.length > 0 ? sbQ : null;
 	});
 
 	async function markAsServer(id: string) {
@@ -428,11 +455,20 @@
 	let awgViewModeReady = false;
 	let isAwgMobile = $state(false);
 	let showAwgListViewOption = $derived($usageLevel !== 'basic');
-	let singboxLayoutMode = $state<SingboxLayoutMode>('grid');
-	let singboxLayoutReady = false;
+	let singboxTunnelsLayoutMode = $state<SingboxLayoutMode>('grid');
+	let singboxSubscriptionsLayoutMode = $state<SingboxLayoutMode>('grid');
+	let singboxTunnelsLayoutReady = false;
+	let singboxSubscriptionsLayoutReady = false;
 	let showSingboxListOption = $derived($usageLevel !== 'basic');
-	let singboxEffectiveLayout = $derived<SingboxLayoutMode>(
-		isAwgMobile || (!showSingboxListOption && singboxLayoutMode === 'list') ? 'grid' : singboxLayoutMode,
+	let singboxTunnelsEffectiveLayout = $derived<SingboxLayoutMode>(
+		isAwgMobile || (!showSingboxListOption && singboxTunnelsLayoutMode === 'list')
+			? 'grid'
+			: singboxTunnelsLayoutMode,
+	);
+	let singboxSubscriptionsEffectiveLayout = $derived<SingboxLayoutMode>(
+		isAwgMobile || (!showSingboxListOption && singboxSubscriptionsLayoutMode === 'list')
+			? 'grid'
+			: singboxSubscriptionsLayoutMode,
 	);
 	let showSingboxGridListToggle = $derived(showSingboxListOption && !isAwgMobile);
 	let awgEffectiveViewMode = $derived<AwgTunnelViewMode>(
@@ -472,11 +508,23 @@
 			awgViewMode = stored;
 		}
 		awgViewModeReady = true;
-		const sb = localStorage.getItem(SINGBOX_LAYOUT_STORAGE_KEY);
-		if (isSingboxLayoutMode(sb)) {
-			singboxLayoutMode = sb;
+
+		// Backward compatible migration:
+		// if per-tab keys are missing, fall back to the old shared sing-box layout key.
+		const legacyShared = localStorage.getItem(SINGBOX_LAYOUT_STORAGE_KEY);
+
+		const sbTunnels = localStorage.getItem(SINGBOX_TUNNELS_LAYOUT_STORAGE_KEY) ?? legacyShared;
+		if (isSingboxLayoutMode(sbTunnels)) {
+			singboxTunnelsLayoutMode = sbTunnels;
 		}
-		singboxLayoutReady = true;
+		singboxTunnelsLayoutReady = true;
+
+		const sbSubscriptions =
+			localStorage.getItem(SINGBOX_SUBSCRIPTIONS_LAYOUT_STORAGE_KEY) ?? legacyShared;
+		if (isSingboxLayoutMode(sbSubscriptions)) {
+			singboxSubscriptionsLayoutMode = sbSubscriptions;
+		}
+		singboxSubscriptionsLayoutReady = true;
 	});
 
 	onMount(() => {
@@ -496,8 +544,16 @@
 	});
 
 	$effect(() => {
-		if (!singboxLayoutReady) return;
-		localStorage.setItem(SINGBOX_LAYOUT_STORAGE_KEY, singboxLayoutMode);
+		if (!singboxTunnelsLayoutReady) return;
+		localStorage.setItem(SINGBOX_TUNNELS_LAYOUT_STORAGE_KEY, singboxTunnelsLayoutMode);
+	});
+
+	$effect(() => {
+		if (!singboxSubscriptionsLayoutReady) return;
+		localStorage.setItem(
+			SINGBOX_SUBSCRIPTIONS_LAYOUT_STORAGE_KEY,
+			singboxSubscriptionsLayoutMode,
+		);
 	});
 
 
@@ -945,6 +1001,11 @@
 		<div class="py-12">
 			<LoadingSpinner size="lg" message="Загрузка туннелей..." />
 		</div>
+	{:else if tunnelSnap.status === 'error' && !tunnelSnap.data}
+		<EmptyState
+			title="Ошибка загрузки"
+			description={tunnelSnap.error ?? 'Не удалось получить список туннелей'}
+		/>
 	{:else}
 		<Tabs
 			tabs={tunnelTabs}
@@ -1034,7 +1095,7 @@
 						<button class="term-cmd" onclick={() => fileInput?.click()}>
 							<span class="term-arrow">{'>'}</span> импортировать файл
 						</button>
-						<button class="term-cmd" onclick={() => goto('/tunnels/new?tab=link')}>
+						<button class="term-cmd" onclick={() => goto('/tunnels/new?tab=vpn')}>
 							<span class="term-arrow">{'>'}</span> импортировать ссылку
 						</button>
 					</div>
@@ -1589,9 +1650,9 @@
 						<div class="toolbar-actions">
 							{#if subscriptionsList.length > 0}
 								<GridListToggle
-									value={singboxEffectiveLayout}
+									value={singboxSubscriptionsEffectiveLayout}
 									showListOption={showSingboxGridListToggle}
-									onchange={(v) => (singboxLayoutMode = v)}
+									onchange={(v) => (singboxSubscriptionsLayoutMode = v)}
 								/>
 							{/if}
 							<Button variant="primary" size="md" onclick={() => openWizard('url')}>+ Добавить</Button>
@@ -1605,7 +1666,7 @@
 							</p>
 							<Button variant="primary" size="md" onclick={() => openWizard('url')}>+ Добавить подписку</Button>
 						</div>
-					{:else if singboxEffectiveLayout === 'list'}
+					{:else if singboxSubscriptionsEffectiveLayout === 'list'}
 						<div class="awg-summary-row">
 							<StatStrip>
 								<Stat
@@ -1643,6 +1704,7 @@
 										autoDelayCheckNonce={singboxAutoDelayCheckNonce}
 										autoDelayCheckDelayMs={i * 180}
 										layout="list"
+										ondetail={(tag) => openSingboxDetail(tag)}
 									/>
 								{/each}
 							</div>
@@ -1667,6 +1729,7 @@
 										liveActiveMember={liveActives[sub.id] || null}
 										layout="list"
 										ondelete={requestSubscriptionDelete}
+										ondetail={(tag) => openSingboxDetail(tag)}
 									/>
 								{/each}
 							</div>
@@ -1682,6 +1745,7 @@
 										autoDelayCheckNonce={singboxAutoDelayCheckNonce}
 										autoDelayCheckDelayMs={i * 180}
 										layout="grid"
+										ondetail={(tag) => openSingboxDetail(tag)}
 									/>
 								{/each}
 							</div>
@@ -1695,6 +1759,7 @@
 										liveActiveMember={liveActives[sub.id] || null}
 										layout="grid"
 										ondelete={requestSubscriptionDelete}
+										ondetail={(tag) => openSingboxDetail(tag)}
 									/>
 								{/each}
 							</div>
@@ -1713,9 +1778,9 @@
 					<div class="toolbar-actions">
 						{#if singboxTunnelsList.length > 0}
 							<GridListToggle
-								value={singboxEffectiveLayout}
+								value={singboxTunnelsEffectiveLayout}
 								showListOption={showSingboxGridListToggle}
-								onchange={(v) => (singboxLayoutMode = v)}
+								onchange={(v) => (singboxTunnelsLayoutMode = v)}
 							/>
 						{/if}
 						<Button variant="primary" size="md" onclick={() => openWizard('choose')}>+ Добавить</Button>
@@ -1779,7 +1844,7 @@
 					</div>
 				</div>
 			{:else if singboxTunnelsList.length > 0}
-				{#if singboxEffectiveLayout === 'list'}
+				{#if singboxTunnelsEffectiveLayout === 'list'}
 					<div class="awg-summary-row">
 						<StatStrip>
 							<Stat
@@ -1818,6 +1883,7 @@
 								layout="list"
 								autoDelayCheckNonce={singboxAutoDelayCheckNonce}
 								autoDelayCheckDelayMs={i * 180}
+								ondetail={(tag) => openSingboxDetail(tag)}
 							/>
 						{/each}
 					</div>
@@ -1829,6 +1895,7 @@
 								layout="grid"
 								autoDelayCheckNonce={singboxAutoDelayCheckNonce}
 								autoDelayCheckDelayMs={i * 180}
+								ondetail={(tag) => openSingboxDetail(tag)}
 							/>
 						{/each}
 					</div>
@@ -1916,6 +1983,32 @@
 			onclose={closeDetail}
 		/>
 	{/if}
+{/if}
+
+{#if singboxDetailTag}
+	{@const sb = singboxTunnelsList.find((x) => x.tag === singboxDetailTag)}
+	{@const subActiveCard = subscriptionsActiveCards.find((c) => c.activeMember.tag === singboxDetailTag)}
+	{@const subListRow = subscriptionsListRows.find(
+		(s) => resolveSubscriptionMemberTag(s, liveActives[s.id] || null) === singboxDetailTag,
+	)}
+	{@const detailName =
+		subActiveCard?.subscription.label
+		?? subListRow?.label
+		?? sb?.tag
+		?? singboxDetailTag}
+	{@const detailIface =
+		subActiveCard
+			? (subActiveCard.subscription.proxyIndex >= 0 ? `Proxy${subActiveCard.subscription.proxyIndex}` : '')
+			: (subListRow
+				? (subListRow.proxyIndex >= 0 ? `Proxy${subListRow.proxyIndex}` : '')
+				: (sb?.proxyInterface ?? ''))}
+	<TrafficChartModal
+		open={true}
+		tunnelId={singboxDetailTag}
+		tunnelName={detailName}
+		ifaceName={detailIface}
+		onclose={closeSingboxDetail}
+	/>
 {/if}
 
 {#snippet exportIcon()}
@@ -2256,7 +2349,7 @@
 	.awg-rate-button {
 		display: flex;
 		align-items: center;
-		justify-content: space-between;
+		justify-content: flex-start;
 		gap: 0.75rem;
 		width: 100%;
 		padding: 0;
@@ -2285,8 +2378,8 @@
 		gap: 0.1875rem;
 		font-size: 0.6875rem;
 		color: var(--color-text-secondary);
-		margin-left: auto;
-		text-align: right;
+		text-align: left;
+		min-width: 0;
 	}
 
 	.awg-list-cell-mono {
@@ -2684,7 +2777,7 @@
 	.unsupported-overlay {
 		position: fixed;
 		inset: 0;
-		z-index: 100;
+		z-index: var(--z-full-overlay);
 		background: rgba(0, 0, 0, 0.85);
 		display: flex;
 		align-items: center;
@@ -2807,13 +2900,13 @@
 			minmax(0, 1.05fr)
 			minmax(76px, 0.95fr)
 			minmax(150px, 1.1fr)
-			minmax(72px, 0.95fr)
-			minmax(150px, 1fr);
+			minmax(128px, 0.95fr)
+			minmax(220px, 1.15fr);
 		gap: 0.75rem 1rem;
 		align-items: center;
 		padding: 0.75rem 1rem;
 		border-bottom: 1px solid var(--color-border);
-		min-width: 960px;
+		min-width: 1120px;
 	}
 	.singbox-tunnel-list-table :global(.sbx-tunnel-list-row:last-child) {
 		border-bottom: none;
@@ -2836,7 +2929,7 @@
 		margin-bottom: 1.25rem;
 	}
 	.singbox-sub-list-table :global(.sbx-sub-active-row) {
-		min-width: 1040px;
+		min-width: 1120px;
 	}
 	.singbox-sub-list-table--inactive :global(.sbx-sub-inactive-row) {
 		min-width: 960px;
@@ -2863,9 +2956,9 @@
 			minmax(52px, 0.75fr)
 			minmax(88px, 0.95fr)
 			minmax(148px, 1.1fr)
-			minmax(72px, 0.88fr)
-			minmax(150px, 1fr);
-		min-width: 1040px;
+			minmax(120px, 0.95fr)
+			minmax(220px, 1.15fr);
+		min-width: 1120px;
 	}
 	.singbox-sub-list-table--inactive .sbx-sub-inactive-head {
 		grid-template-columns:

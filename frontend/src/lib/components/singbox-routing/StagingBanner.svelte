@@ -56,6 +56,12 @@
 	}
 
 	const hasErrors = $derived(!!(inlineErrors || inlineSbCheck));
+
+	const missingRuleSetTag = $derived(
+		inlineSbCheck
+			? (inlineSbCheck.match(/rule-set not found:\s*([^\s\n]+)/)?.[1] ?? null)
+			: null,
+	);
 </script>
 
 {#if hasDraft}
@@ -80,6 +86,11 @@
 					<li><strong>{e.inRule || e.slot}</strong>: {e.message}{#if e.tag} ({e.tag}){/if}</li>
 				{/each}
 			</ul>
+		{/if}
+		{#if missingRuleSetTag}
+			<div class="hint">
+				DNS-правило ссылается на rule_set «{missingRuleSetTag}», которого нет в Route → Наборы. Добавьте набор или удалите DNS-правило, которое на него ссылается.
+			</div>
 		{/if}
 		{#if inlineSbCheck}
 			<pre class="sb-check">{inlineSbCheck}</pre>
@@ -147,6 +158,13 @@
 		margin: 0;
 		padding-left: 1.5rem;
 		font-size: 0.85rem;
+	}
+	.hint {
+		padding: 0.5rem 0.6rem;
+		background: var(--color-bg-tertiary);
+		border-radius: 4px;
+		font-size: 0.85rem;
+		line-height: 1.35;
 	}
 	.sb-check {
 		margin: 0;

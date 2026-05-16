@@ -3,6 +3,7 @@
 	import { api } from '$lib/api/client';
 	import { diagnosticsStore } from '$lib/stores/diagnostics';
 	import type { DiagnosticsTargetSeed } from '$lib/stores/diagnostics';
+	import type { DiagEvent } from '$lib/types';
 	import {
 		ChecksToolbar,
 		ChecksGroup,
@@ -31,6 +32,10 @@
 	$effect(() => {
 		diagnosticsStore.seedTargets(visibleTunnels);
 	});
+
+	let dnsCheckTrigger = $state(0);
+	/** ID туннеля, который сейчас проверяется кнопкой ▷. Пусто = полный прогон. */
+	let activeTunnelId = $state('');
 
 	let running = $derived($diagnosticsStore.running);
 	let currentPhase = $derived($diagnosticsStore.currentPhase);
@@ -93,32 +98,59 @@
 		return `${c.pass}/${c.total} ✓`;
 	}
 
+	function makeEventHandler(single: boolean) {
+		return (event: DiagEvent) => {
+			switch (event.type) {
+				case 'phase':
+					diagnosticsStore.setPhase(event.label ?? '');
+					break;
+				case 'test':
+					if (event.test) diagnosticsStore.addTest(event.test, visibleTunnels);
+					break;
+				case 'done':
+					activeTunnelId = '';
+					if (single) {
+						diagnosticsStore.finishSingle();
+					} else if (event.summary) {
+						diagnosticsStore.finish(event.summary);
+					}
+					cleanup();
+					break;
+				case 'error':
+					activeTunnelId = '';
+					diagnosticsStore.fail(event.message ?? 'Ошибка диагностики');
+					cleanup();
+					break;
+			}
+		};
+	}
+
 	function start() {
+		activeTunnelId = '';
 		diagnosticsStore.start(visibleTunnels);
 		expandedMap = {};
 		cleanup();
-
 		eventSource = api.streamDiagnostics(
 			includeRestart,
-			(event) => {
-				switch (event.type) {
-					case 'phase':
-						diagnosticsStore.setPhase(event.label ?? '');
-						break;
-					case 'test':
-						if (event.test) diagnosticsStore.addTest(event.test, visibleTunnels);
-						break;
-					case 'done':
-						if (event.summary) diagnosticsStore.finish(event.summary);
-						cleanup();
-						break;
-					case 'error':
-						diagnosticsStore.fail(event.message ?? 'Ошибка диагностики');
-						cleanup();
-						break;
-				}
-			},
+			makeEventHandler(false),
 			() => diagnosticsStore.fail('Соединение потеряно'),
+		);
+		// Let the SSE connection register first so DNS/NDMS work does not race the same browser slot.
+		queueMicrotask(() => {
+			dnsCheckTrigger++;
+		});
+	}
+
+	function startSingle(tunnelId: string) {
+		diagnosticsStore.startSingleTunnel(tunnelId, visibleTunnels);
+		expandedMap = { ...expandedMap, [tunnelId]: true };
+		cleanup();
+		activeTunnelId = tunnelId;
+		eventSource = api.streamDiagnostics(
+			false,
+			makeEventHandler(true),
+			() => { activeTunnelId = ''; diagnosticsStore.fail('Соединение потеряно'); },
+			tunnelId,
 		);
 	}
 
@@ -159,18 +191,23 @@
 	/>
 
 	<!-- DNS-маршрутизация — первая группа, отдельный flow -->
-	<ClientDnsCheck />
+	<ClientDnsCheck triggerRun={dnsCheckTrigger} />
 
 	<!-- Глобальные + per-tunnel группы -->
 	{#each targets as target (target.id)}
 		<div class="divider"></div>
 		<ChecksGroup
 			name={target.name}
+			kind={target.kind}
+			isGlobal={target.isGlobal}
 			led={targetLed(target, running)}
 			summary={targetSummary(target, running)}
 			tests={targetTests(target)}
 			expanded={!!expandedMap[target.id]}
 			onToggle={() => toggle(target.id)}
+			onRun={() => startSingle(target.id)}
+			groupRunning={running && activeTunnelId === target.id}
+			anyRunning={running}
 		/>
 	{/each}
 

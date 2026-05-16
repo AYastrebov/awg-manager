@@ -57,8 +57,10 @@ func (s *SettingsStore) Load() (*Settings, error) {
 		return nil, err
 	}
 
+	needsSave := false
 	// Migrate if needed
 	if settings.SchemaVersion < CurrentSchemaVersion {
+		needsSave = true
 		if settings.SchemaVersion < 2 {
 			if err := s.migrateToV2(&settings); err != nil {
 				return nil, err
@@ -109,7 +111,15 @@ func (s *SettingsStore) Load() (*Settings, error) {
 		if settings.SchemaVersion < 17 {
 			s.migrateToV17(&settings)
 		}
-		// Save migrated settings
+	}
+
+	// Self-heal duplicated managed servers — see dedupManagedServers comment.
+	if deduped, removed := dedupManagedServers(settings.ManagedServers); removed > 0 {
+		settings.ManagedServers = deduped
+		needsSave = true
+	}
+
+	if needsSave {
 		if err := s.saveUnlocked(&settings); err != nil {
 			return nil, err
 		}
@@ -306,6 +316,33 @@ func (s *SettingsStore) migrateToV17(settings *Settings) {
 	settings.SchemaVersion = 17
 }
 
+// dedupManagedServers returns servers with duplicate InterfaceName entries
+// removed (first occurrence wins). Second return value is how many entries
+// were dropped. Pure: caller decides whether to persist.
+//
+// Defense-in-depth against pre-3.0 storage bugs that occasionally produced
+// two or three copies of the same server on disk (root cause was the
+// non-idempotent legacy migrate path coexisting with parallel writes).
+func dedupManagedServers(servers []ManagedServer) ([]ManagedServer, int) {
+	if len(servers) < 2 {
+		return servers, 0
+	}
+	seen := make(map[string]struct{}, len(servers))
+	out := make([]ManagedServer, 0, len(servers))
+	for _, sv := range servers {
+		if _, dup := seen[sv.InterfaceName]; dup {
+			continue
+		}
+		seen[sv.InterfaceName] = struct{}{}
+		out = append(out, sv)
+	}
+	removed := len(servers) - len(out)
+	if removed == 0 {
+		return servers, 0
+	}
+	return out, removed
+}
+
 // migrateManagedServers moves a legacy singular managedServer into the
 // new ManagedServers slice. Idempotent. Caller holds s.mu.
 func (s *SettingsStore) migrateManagedServers() {
@@ -329,8 +366,9 @@ func (s *SettingsStore) GetManagedServers() []ManagedServer {
 		return []ManagedServer{}
 	}
 	s.migrateManagedServers()
-	out := make([]ManagedServer, len(s.settings.ManagedServers))
-	for i, src := range s.settings.ManagedServers {
+	deduped, _ := dedupManagedServers(s.settings.ManagedServers)
+	out := make([]ManagedServer, len(deduped))
+	for i, src := range deduped {
 		cp := src
 		cp.Peers = append([]ManagedPeer(nil), src.Peers...)
 		if cp.Policy == "" {

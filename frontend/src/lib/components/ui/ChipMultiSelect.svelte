@@ -2,6 +2,11 @@
     export interface ChipOption {
         value: string;
         label?: string;
+        // usedCount: how many *other* records already reference this value.
+        // 0 / undefined = unused; > 0 = used elsewhere. The dropdown groups
+        // unused entries on top and pushes used ones below a divider so the
+        // picker stays scannable when most options are already in use.
+        usedCount?: number;
     }
 </script>
 
@@ -30,9 +35,12 @@
     let triggerEl = $state<HTMLButtonElement | null>(null);
     let containerEl = $state<HTMLDivElement | null>(null);
     let panelEl = $state<HTMLDivElement | null>(null);
+    let searchInputEl = $state<HTMLInputElement | null>(null);
     let panelTop = $state(0);
     let panelLeft = $state(0);
     let panelWidth = $state(0);
+    let panelMaxHeight = $state(0);
+    let searchQuery = $state('');
 
     const selectedSet = $derived(new Set(values));
     const orphanValues = $derived(
@@ -46,6 +54,29 @@
     const dropdownItems = $derived(options.filter((o) => !selectedSet.has(o.value)));
     const allSelected = $derived(dropdownItems.length === 0);
 
+    const filteredItems = $derived.by(() => {
+        const q = searchQuery.toLowerCase().trim();
+        if (!q) return dropdownItems;
+        return dropdownItems.filter((o) => {
+            const text = (o.label ?? o.value).toLowerCase();
+            return text.includes(q) || o.value.toLowerCase().includes(q);
+        });
+    });
+    // Group split: unused options first (so users find fresh sets without
+    // scrolling past 50 already-used ones), divider, then used options sorted
+    // by usage descending. Sort key is stable on equal usedCount because
+    // Array.prototype.sort in V8/JSC is stable for ES2019+.
+    const unusedItems = $derived(
+        filteredItems.filter((o) => !(o.usedCount && o.usedCount > 0)),
+    );
+    const usedItems = $derived(
+        filteredItems
+            .filter((o): o is ChipOption & { usedCount: number } =>
+                Boolean(o.usedCount && o.usedCount > 0),
+            )
+            .sort((a, b) => b.usedCount - a.usedCount),
+    );
+
     function portal(node: HTMLElement, target: HTMLElement = document.body) {
         target.appendChild(node);
         return {
@@ -57,11 +88,29 @@
         };
     }
 
+    // recomputePlacement positions the panel below the trigger by default,
+    // but flips up when there's more room above. Crucially, panelMaxHeight is
+    // derived from the *available* viewport space rather than a fixed `60vh`
+    // — without this, opening the picker low on the page would push the
+    // panel below the viewport edge, hiding the bottom items even though the
+    // internal scroll appeared to be at its limit.
     function recomputePlacement() {
         const el = containerEl ?? triggerEl;
         if (!el) return;
         const r = el.getBoundingClientRect();
-        panelTop = r.bottom + 4;
+        const margin = 16;
+        const spaceBelow = window.innerHeight - r.bottom - margin;
+        const spaceAbove = r.top - margin;
+        const wantedHeight = 400;
+        // Flip up only when below is genuinely too cramped AND above offers
+        // meaningfully more room. Avoids flicker when both sides are ~equal.
+        if (spaceBelow < wantedHeight && spaceAbove > spaceBelow) {
+            panelMaxHeight = Math.max(180, spaceAbove);
+            panelTop = Math.max(margin, r.top - 4 - panelMaxHeight);
+        } else {
+            panelMaxHeight = Math.max(180, spaceBelow);
+            panelTop = r.bottom + 4;
+        }
         panelLeft = r.left;
         panelWidth = r.width;
     }
@@ -70,8 +119,10 @@
         if (disabled || allSelected) return;
         open = !open;
         if (open) {
+            searchQuery = '';
             await tick();
             recomputePlacement();
+            searchInputEl?.focus();
         }
     }
 
@@ -97,7 +148,14 @@
     }
 
     function handleKeydown(e: KeyboardEvent) {
-        if (e.key === 'Escape' && open) {
+        if (e.key !== 'Escape' || !open) return;
+        // Two-stage Esc: first clear the search if any, then close. Matches
+        // common search-dropdown UX so users don't lose their entire query
+        // state when they only meant to dismiss the filter.
+        if (searchQuery) {
+            searchQuery = '';
+            searchInputEl?.focus();
+        } else {
             open = false;
             triggerEl?.focus();
         }
@@ -165,20 +223,57 @@
         use:portal
         class="panel"
         bind:this={panelEl}
-        style="top: {panelTop}px; left: {panelLeft}px; min-width: {panelWidth}px;"
+        style="top: {panelTop}px; left: {panelLeft}px; min-width: {panelWidth}px; max-height: {panelMaxHeight}px;"
         role="listbox"
     >
-        {#each dropdownItems as opt (opt.value)}
-            <button
-                type="button"
-                class="panel-item"
-                onclick={() => addValue(opt.value)}
-                role="option"
-                aria-selected="false"
-            >
-                {opt.label ?? opt.value}
-            </button>
-        {/each}
+        <div class="search-row">
+            <input
+                type="text"
+                class="search-input"
+                bind:this={searchInputEl}
+                bind:value={searchQuery}
+                placeholder="Поиск…"
+                aria-label="Поиск по списку"
+                autocomplete="off"
+                spellcheck="false"
+                inputmode="search"
+            />
+        </div>
+        <div class="list">
+            {#each unusedItems as opt (opt.value)}
+                <button
+                    type="button"
+                    class="panel-item"
+                    onclick={() => addValue(opt.value)}
+                    role="option"
+                    aria-selected="false"
+                >
+                    <span class="opt-label">{opt.label ?? opt.value}</span>
+                </button>
+            {/each}
+
+            {#if usedItems.length > 0 && unusedItems.length > 0}
+                <div class="group-divider">Используются в других правилах</div>
+            {/if}
+
+            {#each usedItems as opt (opt.value)}
+                <button
+                    type="button"
+                    class="panel-item panel-item-used"
+                    onclick={() => addValue(opt.value)}
+                    role="option"
+                    aria-selected="false"
+                    title="Уже используется в {opt.usedCount} прав{opt.usedCount === 1 ? 'иле' : 'илах'}"
+                >
+                    <span class="opt-label">{opt.label ?? opt.value}</span>
+                    <span class="usage-badge">×{opt.usedCount}</span>
+                </button>
+            {/each}
+
+            {#if filteredItems.length === 0}
+                <div class="empty">Ничего не найдено</div>
+            {/if}
+        </div>
     </div>
 {/if}
 
@@ -260,17 +355,48 @@
     }
     .panel {
         position: fixed;
-        z-index: 1000;
+        z-index: var(--z-floating);
         background: var(--bg-tertiary, var(--surface-bg));
         border: 1px solid var(--border-bright, var(--border));
         border-radius: 4px;
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
-        max-height: min(60vh, calc(100vh - 200px));
+        display: flex;
+        flex-direction: column;
+        /* min-height: 0 on flex children below lets the inner list shrink
+           and scroll instead of overflowing the panel's clipped area. */
+        overflow: hidden;
+    }
+    .search-row {
+        flex: 0 0 auto;
+        padding: 0.4rem 0.5rem;
+        border-bottom: 1px solid var(--border);
+        background: var(--bg-tertiary, var(--surface-bg));
+    }
+    .search-input {
+        width: 100%;
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        color: var(--text);
+        font-family: ui-monospace, monospace;
+        font-size: 0.82rem;
+        padding: 0.35rem 0.5rem;
+        outline: none;
+    }
+    .search-input:focus {
+        border-color: var(--accent, #3b82f6);
+    }
+    .list {
+        flex: 1 1 auto;
+        min-height: 0;
         overflow-y: auto;
         padding: 0.25rem 0;
     }
     .panel-item {
-        display: block;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
         width: 100%;
         text-align: left;
         background: none;
@@ -283,5 +409,42 @@
     }
     .panel-item:hover {
         background: var(--bg-hover);
+    }
+    .opt-label {
+        flex: 1 1 auto;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .panel-item-used .opt-label {
+        color: var(--muted-text);
+    }
+    .usage-badge {
+        flex: 0 0 auto;
+        font-size: 0.7rem;
+        font-weight: 600;
+        color: var(--muted-text);
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 0.05rem 0.4rem;
+    }
+    .group-divider {
+        padding: 0.4rem 0.7rem 0.2rem;
+        margin-top: 0.25rem;
+        border-top: 1px solid var(--border);
+        font-size: 0.7rem;
+        font-weight: 600;
+        color: var(--muted-text);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        background: var(--bg);
+    }
+    .empty {
+        padding: 0.6rem 0.7rem;
+        font-family: ui-monospace, monospace;
+        font-size: 0.8rem;
+        color: var(--muted-text);
+        text-align: center;
     }
 </style>

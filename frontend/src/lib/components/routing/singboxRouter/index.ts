@@ -25,3 +25,4 @@ export { default as ConnectionsTable } from './ConnectionsTable.svelte';
 export { default as ConnectionsBulkBar } from './ConnectionsBulkBar.svelte';
 export { buildOutboundOptions } from './outboundOptions';
 export type { OutboundGroup } from './outboundOptions';
+export { computeRuleSetUsage } from './ruleSetUsage';

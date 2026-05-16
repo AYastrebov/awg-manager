@@ -1,8 +1,25 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import { Button, StatusDot } from '$lib/components/ui';
 	import { api } from '$lib/api/client';
 	import type { DnsCheckResult } from '$lib/types';
 	import ChecksGroup, { type GroupLed } from './ChecksGroup.svelte';
+
+	interface Props {
+		/** Increment to trigger a DNS check run externally (e.g. from "run all"). */
+		triggerRun?: number;
+	}
+
+	let { triggerRun = 0 }: Props = $props();
+
+	$effect(() => {
+		const gen = triggerRun;
+		if (gen <= 0) return;
+		// Only depend on `triggerRun`; do not subscribe to state touched inside runCheck().
+		untrack(() => {
+			void runCheck();
+		});
+	});
 
 	type CheckStatus = 'pending' | 'ok' | 'fail' | 'warning';
 
@@ -15,6 +32,8 @@
 	}
 
 	let running = $state(false);
+	/** Prevents overlapping runs when triggerRun fires while a check is already in flight. */
+	let runInFlight = $state(false);
 	let clientIP = $state('');
 	let resolveCheck = $state<CheckRow>({
 		id: 'dns_probe',
@@ -73,25 +92,31 @@
 
 	async function runCheck(e?: Event) {
 		e?.stopPropagation();
+		// External trigger (no click event): skip if already running to avoid piling requests onto NDMS.
+		if (!e && runInFlight) return;
+		runInFlight = true;
 		running = true;
-		expanded = true;
-		resolveCheck = { ...resolveCheck, status: 'pending', message: 'Запрос к awgm-dnscheck.test...' };
-		policyCheck = null;
+		try {
+			expanded = true;
+			resolveCheck = { ...resolveCheck, status: 'pending', message: 'Запрос к awgm-dnscheck.test...' };
+			policyCheck = null;
 
-		const startPromise = api.startDnsCheck().catch(() => null);
-		const probePromise = doResolveProbe();
+			const startPromise = api.startDnsCheck().catch(() => null);
+			const probePromise = doResolveProbe();
 
-		const start = await startPromise;
-		if (start) {
-			clientIP = start.clientIP;
-			const policy = start.checks.find((c) => c.id === 'client_policy');
-			if (policy) policyCheck = toRow(policy);
+			const start = await startPromise;
+			if (start) {
+				clientIP = start.clientIP;
+				const policy = start.checks.find((c) => c.id === 'client_policy');
+				if (policy) policyCheck = toRow(policy);
+			}
+
+			const probe = await probePromise;
+			resolveCheck = probe;
+		} finally {
+			running = false;
+			runInFlight = false;
 		}
-
-		const probe = await probePromise;
-		resolveCheck = probe;
-
-		running = false;
 	}
 
 	async function doResolveProbe(): Promise<CheckRow> {

@@ -14,7 +14,7 @@
 	} from '$lib/components/ui';
 	import type { StatTile } from '$lib/components/ui';
 	import type { SingboxRouterRule, SingboxRouterRuleSet } from '$lib/types';
-	import { RuleEditModal, RouteGlobals } from '$lib/components/routing/singboxRouter';
+	import { RuleEditModal, RouteGlobals, computeRuleSetUsage } from '$lib/components/routing/singboxRouter';
 
 	const statusStore = singboxRouter.status;
 	const rulesStore = singboxRouter.rules;
@@ -71,6 +71,14 @@
 		const idx = rules.findIndex((r) => !isSystem(r));
 		return idx === -1 ? rules.length : idx;
 	});
+
+	// Usage map for the picker. Add-mode counts every existing rule; edit-mode
+	// excludes the rule being edited so its own rule_set isn't credited
+	// against itself (would show "×1" on a set used nowhere else).
+	const ruleSetUsageAdd = $derived(computeRuleSetUsage(rules));
+	const ruleSetUsageEdit = $derived.by(() =>
+		editIndex === null ? new Map<string, number>() : computeRuleSetUsage(rules, editIndex),
+	);
 
 	async function moveRule(from: number, to: number): Promise<void> {
 		if (movingIndex !== null) return;
@@ -337,6 +345,7 @@
 		initialRuleSetTags={prefillRuleSet ? [prefillRuleSet] : undefined}
 		{outboundOptions}
 		availableRuleSets={ruleSets}
+		ruleSetUsage={ruleSetUsageAdd}
 		onClose={() => { addMode = false; prefillRuleSet = null; }}
 		onSave={async (rule) => {
 			await api.singboxRouterAddRule(rule);
@@ -353,6 +362,7 @@
 		rule={rules[idx]}
 		{outboundOptions}
 		availableRuleSets={ruleSets}
+		ruleSetUsage={ruleSetUsageEdit}
 		onClose={() => (editIndex = null)}
 		onSave={async (rule) => {
 			await api.singboxRouterUpdateRule(idx, rule);

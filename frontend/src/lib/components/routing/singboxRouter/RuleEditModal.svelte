@@ -14,6 +14,13 @@
 		 * Ignored when `rule` is provided (edit mode reads rule.rule_set).
 		 */
 		initialRuleSetTags?: string[];
+		/**
+		 * Per-tag count of how many *other* router rules reference each
+		 * rule_set. The currently edited rule must be excluded by the caller
+		 * (use computeRuleSetUsage with excludeIndex=editIndex). Empty map
+		 * is fine — all sets render as unused.
+		 */
+		ruleSetUsage?: Map<string, number>;
 		onClose: () => void;
 		onSave: (rule: SingboxRouterRule) => Promise<void> | void;
 	}
@@ -22,6 +29,7 @@
 		outboundOptions,
 		availableRuleSets,
 		initialRuleSetTags,
+		ruleSetUsage,
 		onClose,
 		onSave,
 	}: Props = $props();
@@ -42,7 +50,11 @@
 	// svelte-ignore state_referenced_locally
 	let ruleSetTags = $state<string[]>(rule?.rule_set ?? initialRuleSetTags ?? []);
 	const ruleSetOptions = $derived<ChipOption[]>(
-		availableRuleSets.map((rs) => ({ value: rs.tag, label: rs.tag })),
+		availableRuleSets.map((rs) => ({
+			value: rs.tag,
+			label: rs.tag,
+			usedCount: ruleSetUsage?.get(rs.tag) ?? 0,
+		})),
 	);
 	// svelte-ignore state_referenced_locally
 	let portStr = $state((rule?.port ?? []).join(', '));

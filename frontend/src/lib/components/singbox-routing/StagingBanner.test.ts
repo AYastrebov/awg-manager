@@ -76,6 +76,20 @@ describe('StagingBanner', () => {
 		await findByText(/no slot declares this outbound tag/);
 	});
 
+	it('on 422 with sbCheck containing "rule-set not found", shows friendly hint with the missing tag', async () => {
+		stagingWritable.set({ hasDraft: true, draftedAt: '2026-05-11T16:32:00Z' });
+		vi.mocked(apiFn.singboxRouterStagingApply).mockRejectedValue({
+			status: 422,
+			body: {
+				sbCheck:
+					'\x1b[31mFATAL\x1b[0m[0000] initialize dns router: dns rule[0]: rule-set not found: geosite-google\n: exit status 1',
+			},
+		});
+		const { getByText, findByText } = render(StagingBanner);
+		await fireEvent.click(getByText('Применить'));
+		await findByText(/rule_set «geosite-google»/);
+	});
+
 	it('clicking Discard shows confirm modal', async () => {
 		stagingWritable.set({ hasDraft: true, draftedAt: '2026-05-11T16:32:00Z' });
 		const { getByText, queryByText } = render(StagingBanner);

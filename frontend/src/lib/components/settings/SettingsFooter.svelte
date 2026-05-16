@@ -1,4 +1,8 @@
 <script lang="ts">
+	import { usageLevel } from '$lib/stores/settings';
+
+	const isExpert = $derived($usageLevel === 'expert');
+
 	const credits = [
 		'@paris19891', '@The_Immortal', '@LionEvil', '@dio1122', '@Nidre',
 		'@rexsniper', '@tiffolk', '@Shidla', '@palik_lelyakin', '@user_shurik',
@@ -32,6 +36,10 @@
 			Документация: <a href="https://awgm.hoaxisr.ru" target="_blank" rel="noopener noreferrer">awgm.hoaxisr.ru</a>
 			<span class="footer-sep">·</span>
 			<a href="/terms">Пользовательское соглашение</a>
+			{#if isExpert}
+				<span class="footer-sep">·</span>
+				<a href="/api-docs">Swagger UI</a>
+			{/if}
 		</span>
 		<button
 			type="button"

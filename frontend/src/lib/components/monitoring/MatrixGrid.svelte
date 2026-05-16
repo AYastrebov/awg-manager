@@ -8,9 +8,16 @@
 	interface Props {
 		snapshot: MonitoringSnapshot;
 		onCellClick: (target: MonitoringTarget, tunnel: MonitoringTunnel) => void;
+		excludedTunnelIds?: Set<string>;
+		onToggleTunnelExcluded?: (tunnelId: string, excluded: boolean, tunnelName: string) => void;
 	}
 
-	let { snapshot, onCellClick }: Props = $props();
+	let {
+		snapshot,
+		onCellClick,
+		excludedTunnelIds = new Set<string>(),
+		onToggleTunnelExcluded = () => {},
+	}: Props = $props();
 
 	const sortedTunnels = $derived(
 		[...snapshot.tunnels].sort((a, b) => a.name.localeCompare(b.name)),
@@ -42,6 +49,38 @@
 	function findCell(targetId: string, tunnelId: string): MonitoringCell | null {
 		return cellByKey.get(`${targetId}|${tunnelId}`) ?? null;
 	}
+
+	const GOOGLE_CONNECTIVITY_HOST = 'connectivitycheck.gstatic.com';
+
+	function isGoogleConnectivityTarget(target: MonitoringTarget): boolean {
+		return target.host === GOOGLE_CONNECTIVITY_HOST || target.name === GOOGLE_CONNECTIVITY_HOST;
+	}
+
+	function mobileTargetName(target: MonitoringTarget): string {
+		return isGoogleConnectivityTarget(target) ? 'Google' : target.name;
+	}
+
+	function mobileHostDomain(host: string): string {
+		const parts = host.split('.');
+		return parts.length > 2 ? parts.slice(-2).join('.') : host;
+	}
+
+	function mobileTargetHost(target: MonitoringTarget): string {
+		return isGoogleConnectivityTarget(target) ? mobileHostDomain(target.host) : target.host;
+	}
+
+	function isExcluded(tunnelId: string): boolean {
+		return excludedTunnelIds.has(tunnelId);
+	}
+
+	// Matrix exclusions are intentionally available for all row sources
+	// (awg/system/singbox): this toggle controls visibility/probing in
+	// the monitoring matrix only, not per-source pingcheck engines.
+	function tunnelMatrixToggleTitle(tunnelId: string): string {
+		return isExcluded(tunnelId)
+			? 'Показывать туннель в матрице мониторинга'
+			: 'Скрыть туннель из матрицы мониторинга';
+	}
 </script>
 
 {#if sortedTunnels.length === 0}
@@ -54,34 +93,57 @@
 					<th class="th-target">Target</th>
 					{#each sortedTunnels as t (t.id)}
 						<th class="th-tunnel">
-							{#if isSystem(t)}
-								<span class="tunnel-system" title="Системный туннель роутера — pingcheck управляется в системе">
-									{t.name}
-								</span>
-							{:else if isSingbox(t)}
-								<span class="tunnel-system" title="Sing-box туннель — мониторинг через Clash urltest, NDMS pingcheck не применяется">
-									{t.name}
-								</span>
-							{:else}
-								<a href={tunnelHref(t)} class="tunnel-link" title="Открыть настройки pingcheck">
-									{t.name}
-									<span class="settings-icon" aria-hidden="true">›</span>
-								</a>
-							{/if}
+							<div class="tunnel-head">
+								<div class="tunnel-title-row">
+									{#if isSystem(t)}
+										<span class="tunnel-system" title="Системный туннель роутера — pingcheck управляется в системе">
+											{t.name}
+										</span>
+									{:else if isSingbox(t)}
+										<span class="tunnel-system" title="Sing-box туннель — мониторинг через Clash urltest, NDMS pingcheck не применяется">
+											{t.name}
+										</span>
+									{:else}
+										<a href={tunnelHref(t)} class="tunnel-link tunnel-name" title="Открыть настройки pingcheck">
+											{t.name}
+											<span class="settings-icon" aria-hidden="true">›</span>
+										</a>
+									{/if}
+								</div>
+
+								<div class="tunnel-toggle-row">
+									<button
+										type="button"
+										class="exclude-toggle"
+										class:is-excluded={isExcluded(t.id)}
+										onclick={() => onToggleTunnelExcluded(t.id, !isExcluded(t.id), t.name)}
+										title={tunnelMatrixToggleTitle(t.id)}
+										aria-label={tunnelMatrixToggleTitle(t.id)}
+										aria-pressed={isExcluded(t.id)}
+									>
+										<span class="toggle-track" aria-hidden="true">
+											<span class="toggle-thumb"></span>
+										</span>
+										<span class="toggle-text">{#if isExcluded(t.id)}выкл{:else}вкл{/if}</span>
+									</button>
+								</div>
+							</div>
 							{#if t.source === 'singbox' && t.clashDelay && t.clashDelay > 0}
-								<Badge
-									variant={latencyTier(t.clashDelay)}
-									size="sm"
-									mono
-									title={`Источник: urltest группа "${t.urltestGroup ?? ''}"`}
-								>
-									<span class="clash-num">clash: <span class="clash-val">{t.clashDelay}</span>ms</span>
-									<LatencySparkline
-										history={$latencyHistory.get(t.singboxTag ?? '') ?? []}
-										width={36}
-										height={10}
-									/>
-								</Badge>
+								<div class="tunnel-badge-row">
+									<Badge
+										variant={latencyTier(t.clashDelay)}
+										size="sm"
+										mono
+										title={`Источник: urltest группа "${t.urltestGroup ?? ''}"`}
+									>
+										<span class="clash-num">clash: <span class="clash-val">{t.clashDelay}</span>ms</span>
+										<LatencySparkline
+											history={$latencyHistory.get(t.singboxTag ?? '') ?? []}
+											width={36}
+											height={10}
+										/>
+									</Badge>
+								</div>
 							{/if}
 						</th>
 					{/each}
@@ -91,8 +153,20 @@
 				{#each snapshot.targets as target (target.id)}
 					<tr>
 						<th class="td-target" scope="row">
-							<span class="target-name">{target.name}</span>
-							<span class="target-host">{target.host}</span>
+							{#if isGoogleConnectivityTarget(target)}
+								<div class="target-desktop">
+									<span class="target-name">{target.name}</span>
+									<span class="target-host">{target.host}</span>
+								</div>
+
+								<div class="target-mobile-google" title={target.host}>
+									<div class="target-name">{mobileTargetName(target)}</div>
+									<div class="target-host">{mobileTargetHost(target)}</div>
+								</div>
+							{:else}
+								<span class="target-name">{target.name}</span>
+								<span class="target-host">{target.host}</span>
+							{/if}
 						</th>
 						{#each sortedTunnels as tunnel (tunnel.id)}
 							{@const cell = findCell(target.id, tunnel.id)}
@@ -165,6 +239,95 @@
 	.th-tunnel {
 		min-width: 100px;
 		text-align: center;
+		z-index: 1;
+	}
+
+	.tunnel-head {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.25rem;
+		flex-wrap: wrap;
+		justify-content: flex-end;
+	}
+
+	.tunnel-title-row {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.25rem;
+	}
+
+	.tunnel-toggle-row {
+		display: flex;
+		justify-content: flex-end;
+	}
+
+	.tunnel-badge-row {
+		display: flex;
+		justify-content: center;
+		width: 100%;
+		margin-top: 6px;
+	}
+
+	@media (max-width: 768px) {
+		.th-tunnel {
+			padding: 0.5rem 0.5rem 0.625rem;
+			text-align: center;
+			vertical-align: middle;
+		}
+
+		.th-tunnel > .tunnel-head {
+			display: flex;
+			flex-direction: column;
+			align-items: center;
+			justify-content: center;
+			gap: 6px;
+			width: 100%;
+			min-width: 0;
+			margin: 0 auto;
+		}
+
+		.th-tunnel > .tunnel-head > .tunnel-title-row,
+		.th-tunnel > .tunnel-head > .tunnel-toggle-row {
+			display: flex;
+			justify-content: center;
+			align-items: center;
+			width: 100%;
+			min-width: 0;
+			margin: 0 auto;
+			text-align: center;
+		}
+
+		.th-tunnel > .tunnel-head > .tunnel-title-row > .tunnel-link,
+		.th-tunnel > .tunnel-head > .tunnel-title-row > .tunnel-system {
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			max-width: 100%;
+			min-width: 0;
+			margin: 0 auto;
+			text-align: center;
+		}
+
+		.th-tunnel > .tunnel-head > .tunnel-title-row > .tunnel-name,
+		.th-tunnel > .tunnel-head > .tunnel-title-row > .tunnel-link {
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+		}
+
+		.exclude-toggle {
+			margin: 0 auto;
+		}
+
+		.th-tunnel > .tunnel-badge-row {
+			display: flex;
+			justify-content: center;
+			align-items: center;
+			width: 100%;
+			min-width: 0;
+			margin-top: 6px;
+			text-align: center;
+		}
 	}
 
 	.tunnel-link {
@@ -186,6 +349,70 @@
 		opacity: 0.7;
 	}
 
+	.exclude-toggle {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: 0.3125rem;
+		height: 22px;
+		padding: 0 0.375rem 0 0.25rem;
+		border-radius: 999px;
+		border: 1px solid var(--color-border);
+		background: var(--color-bg-secondary);
+		color: var(--color-text-muted);
+		font-size: 10px;
+		font-weight: 600;
+		letter-spacing: 0.02em;
+		text-transform: uppercase;
+		cursor: pointer;
+		transition:
+			background var(--t-fast) ease,
+			color var(--t-fast) ease,
+			border-color var(--t-fast) ease,
+			box-shadow var(--t-fast) ease;
+	}
+	.exclude-toggle:hover {
+		background: var(--color-bg-hover);
+		color: var(--color-text-primary);
+	}
+	.exclude-toggle:focus-visible {
+		outline: none;
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent) 45%, transparent);
+	}
+	.exclude-toggle.is-excluded {
+		border-color: color-mix(in srgb, var(--color-error) 45%, var(--color-border));
+		color: var(--color-error);
+	}
+	.toggle-track {
+		position: relative;
+		width: 24px;
+		height: 12px;
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--color-success) 35%, var(--color-bg-secondary));
+		transition: background var(--t-fast) ease;
+	}
+	.toggle-thumb {
+		position: absolute;
+		top: 1px;
+		left: 13px;
+		width: 10px;
+		height: 10px;
+		border-radius: 50%;
+		background: color-mix(in srgb, var(--color-success) 75%, white);
+		transition: left var(--t-fast) ease, background var(--t-fast) ease;
+	}
+	.exclude-toggle.is-excluded .toggle-track {
+		background: color-mix(in srgb, var(--color-error) 35%, var(--color-bg-secondary));
+	}
+	.exclude-toggle.is-excluded .toggle-thumb {
+		left: 1px;
+		background: color-mix(in srgb, var(--color-error) 72%, white);
+	}
+	.toggle-text {
+		min-width: 3.2ch;
+		text-align: left;
+	}
+
 	.tunnel-system {
 		display: inline-block;
 		padding: 0.125rem 0.375rem;
@@ -205,6 +432,7 @@
 		background: var(--color-bg-secondary);
 		position: sticky;
 		left: 0;
+		z-index: 1;
 		min-width: 160px;
 	}
 
@@ -219,6 +447,34 @@
 		font-family: var(--font-mono);
 		font-size: 11px;
 		color: var(--color-text-muted);
+	}
+
+	.target-desktop {
+		display: block;
+	}
+
+	.target-mobile-google {
+		display: none;
+	}
+
+	.target-mobile-google .target-host {
+		overflow-wrap: anywhere;
+		line-height: 1.25;
+	}
+
+	@media (max-width: 768px) {
+		.target-mobile-google {
+			display: block;
+		}
+
+		.target-desktop {
+			display: none;
+		}
+
+		.target-host {
+			overflow-wrap: anywhere;
+			line-height: 1.25;
+		}
 	}
 
 	.td-cell {

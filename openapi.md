@@ -39,8 +39,8 @@ func (h *SystemHandler) Info(w http.ResponseWriter, r *http.Request) {
 ## 3) Как открыть Swagger UI
 
 - Запусти backend (daemon) и frontend dev-сервер.
-- Открой страницу: `/dev/api-docs`
-- Исходник страницы: `frontend/src/routes/dev/api-docs/+page.svelte`
+- Открой страницу: `/api-docs`
+- Исходник страницы: `frontend/src/routes/api-docs/+page.svelte`
 - UI получает спеку с `/api/openapi.yaml` (через Vite proxy).
 
 ## 4) Как собрать/пересобрать OpenAPI YAML

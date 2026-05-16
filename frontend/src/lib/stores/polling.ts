@@ -55,7 +55,13 @@ export function createPollingStore<T>(
 
     async function doFetch(): Promise<void> {
         if (inflight) return inflight;
-        state.update(s => ({ ...s, status: s.data ? 'stale' : 'loading' }));
+        state.update(s => {
+            const newStatus = s.data ? 'stale' : 'loading';
+            // Return same reference if nothing changed — writable skips
+            // subscriber notification when old === new, avoiding a wasted re-render.
+            if (s.status === newStatus) return s;
+            return { ...s, status: newStatus };
+        });
         inflight = (async () => {
             try {
                 const data = await fetcher();
@@ -72,21 +78,14 @@ export function createPollingStore<T>(
                     const message = e instanceof Error ? e.message : String(e);
                     let status: PollingState<T>['status'];
                     if (!s.data) {
-                        // No cached data — any failure is user-visible.
                         status = 'error';
                     } else if (fails >= threshold) {
-                        // Tier 2: exceeded silent threshold, show badge.
                         status = 'error';
                     } else {
-                        // Tier 1: keep showing cached data, no badge.
                         status = 'stale';
                     }
-                    return {
-                        ...s,
-                        status,
-                        error: message,
-                        consecutiveFailures: fails,
-                    };
+                    if (s.status === status && s.error === message && s.consecutiveFailures === fails) return s;
+                    return { ...s, status, error: message, consecutiveFailures: fails };
                 });
             } finally {
                 inflight = null;
@@ -157,7 +156,10 @@ export function createPollingStore<T>(
             if (subCount > 0) {
                 void doFetch();
             } else {
-                state.update(s => ({ ...s, lastFetchedAt: 0 }));
+                state.update(s => {
+                    if (s.lastFetchedAt === 0) return s;
+                    return { ...s, lastFetchedAt: 0 };
+                });
             }
         },
         applyMutationResponse(data: T) {

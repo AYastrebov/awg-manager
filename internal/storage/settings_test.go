@@ -235,6 +235,69 @@ func TestSettings_MigrateLegacyManagedServer(t *testing.T) {
 	}
 }
 
+func TestSettingsStore_LoadDedupesManagedServers(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "settings.json")
+	// settings.json with three duplicate Wireguard4 entries (reproduces
+	// the on-disk state observed on a real user's router).
+	corrupt := `{
+        "schemaVersion": 17,
+        "managedServers": [
+            {"interfaceName":"Wireguard4","address":"10.0.0.1","mask":"255.255.255.0","listenPort":51820,"policy":"none","peers":[]},
+            {"interfaceName":"Wireguard4","address":"10.0.0.1","mask":"255.255.255.0","listenPort":51820,"policy":"none","peers":[]},
+            {"interfaceName":"Wireguard4","address":"10.0.0.1","mask":"255.255.255.0","listenPort":51820,"policy":"none","peers":[]}
+        ]
+    }`
+	if err := os.WriteFile(path, []byte(corrupt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewSettingsStore(tmpDir)
+	if _, err := store.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	servers := store.GetManagedServers()
+	if len(servers) != 1 {
+		t.Fatalf("expected 1 deduped server, got %d", len(servers))
+	}
+	if servers[0].InterfaceName != "Wireguard4" {
+		t.Errorf("interface mismatch: %s", servers[0].InterfaceName)
+	}
+
+	// File on disk MUST be rewritten — open it raw and count.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed Settings
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("re-parse: %v", err)
+	}
+	if len(parsed.ManagedServers) != 1 {
+		t.Errorf("expected disk to have 1 managed server after Load, got %d", len(parsed.ManagedServers))
+	}
+}
+
+func TestSettingsStore_GetManagedServersDedupes(t *testing.T) {
+	tmpDir := t.TempDir()
+	store := NewSettingsStore(tmpDir)
+	if _, err := store.Load(); err != nil {
+		t.Fatal(err)
+	}
+	// SaveManagedServers is the only API that lets the slice contain
+	// dups (Add rejects). Used here to simulate a corrupted slice
+	// reaching the read path without going through Load.
+	dup := ManagedServer{InterfaceName: "Wireguard5", Address: "10.0.0.1", Mask: "255.255.255.0", ListenPort: 51820, Policy: "none"}
+	if err := store.SaveManagedServers([]ManagedServer{dup, dup, dup}); err != nil {
+		t.Fatal(err)
+	}
+	out := store.GetManagedServers()
+	if len(out) != 1 {
+		t.Errorf("expected GetManagedServers to dedupe, got %d entries", len(out))
+	}
+}
+
 func TestSettingsMigrationV8_SchemaVersion(t *testing.T) {
 	tmpDir := t.TempDir()
 	store := NewSettingsStore(tmpDir)

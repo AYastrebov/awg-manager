@@ -72,9 +72,13 @@
 		});
 	});
 
+	let collapsed = $state(false);
+
 	if (browser) {
 		const saved = localStorage.getItem(DETAILS_KEY);
 		detailsOpen = saved === '1';
+
+		collapsed = window.innerWidth <= 900;
 	}
 
 	$effect(() => {
@@ -109,7 +113,26 @@
 
 <div class="card">
 	<div class="head-row">
-		<div class="section-label">Система</div>
+		<button
+			type="button"
+			class="section-collapse-btn"
+			onclick={() => (collapsed = !collapsed)}
+			aria-expanded={!collapsed}
+			aria-label={collapsed ? 'Развернуть информацию о системе' : 'Свернуть информацию о системе'}
+		>
+			<span class="section-label">Система</span>
+			<svg
+				class="collapse-chevron"
+				class:rotated={!collapsed}
+				viewBox="0 0 24 24"
+				fill="none"
+				stroke="currentColor"
+				stroke-width="2"
+				aria-hidden="true"
+			>
+				<polyline points="6 9 12 15 18 9" />
+			</svg>
+		</button>
 		{#if !isBasic}
 			<div class="head-actions">
 				{#if updatedLabel}
@@ -136,6 +159,7 @@
 		{/if}
 	</div>
 
+	<div class="collapsible-body" class:body-hidden={collapsed}>
 	<div class="setting-row">
 		<span class="info-key">AWGM</span>
 		<span class="info-val">{systemInfo.version}</span>
@@ -191,7 +215,7 @@
 		</div>
 	{/if}
 	<div class="setting-row">
-		<span class="info-key">Связь</span>
+		<span class="info-key">Сообщество</span>
 		<a class="info-link" href="https://t.me/awgmanager" target="_blank" rel="noopener noreferrer">Telegram →</a>
 	</div>
 	{#if isExpert && details}
@@ -226,6 +250,7 @@
 			</div>
 		</details>
 	{/if}
+	</div>
 </div>
 
 <style>
@@ -233,6 +258,68 @@
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
+	}
+
+	.section-collapse-btn {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+		background: none;
+		border: none;
+		padding: 0;
+		cursor: default;
+		color: inherit;
+		pointer-events: none;
+	}
+
+	.collapse-chevron {
+		display: none;
+		width: 14px;
+		height: 14px;
+		color: var(--color-text-muted);
+		transition: transform 0.2s ease;
+		flex-shrink: 0;
+	}
+
+	.collapse-chevron.rotated {
+		transform: rotate(180deg);
+	}
+
+	.collapsible-body {
+		display: contents;
+	}
+
+	@media (max-width: 900px) {
+		.section-collapse-btn {
+			cursor: pointer;
+			pointer-events: auto;
+			border-radius: var(--radius-sm);
+			margin: -0.125rem;
+			padding: 0.125rem;
+		}
+
+		.section-collapse-btn:hover .section-label {
+			color: var(--color-text-primary);
+		}
+
+		.collapse-chevron {
+			display: block;
+		}
+
+		.collapsible-body {
+			display: flex;
+			flex-direction: column;
+			overflow: hidden;
+			transition: max-height 0.25s ease, opacity 0.2s ease;
+			max-height: 1000px;
+			opacity: 1;
+		}
+
+		.collapsible-body.body-hidden {
+			max-height: 0;
+			opacity: 0;
+			pointer-events: none;
+		}
 	}
 
 	.head-actions {

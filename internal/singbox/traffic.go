@@ -115,8 +115,22 @@ func (t *TrafficAggregator) runOnce(ctx context.Context) {
 
 // ingest updates per-tag totals from a /connections message.
 // Clash /connections emits a full snapshot on each tick — so we REPLACE totals
-// (not accumulate) per the Clash API semantics. Sum within one message because
-// there can be multiple connections sharing the same terminal tag.
+// (not accumulate) per the Clash API semantics.
+//
+// Every tag in a connection's chains gets credited the connection's bytes.
+// chains lists outbounds from outermost wrapper (selector / urltest group)
+// to innermost terminal outbound. Crediting both ends — and any
+// intermediate hop — lets the UI surface traffic both per terminal-tunnel
+// (which subscription members carry as their tag) and per subscription /
+// selector group (where the group's tag is chains[0]); previously
+// chains[0] was discarded and subscription cards always showed 0 B.
+//
+// Within one connection we deduplicate by tag so a chain like
+// ["A","A","B"] still credits A only once — Clash sometimes repeats tags
+// when a selector points to itself transitively, and double-counting one
+// connection's bytes would distort the per-tag totals.
+//
+// Multiple connections sharing the same tag accumulate, as before.
 func (t *TrafficAggregator) ingest(msg []byte) {
 	var m struct {
 		Connections []struct {
@@ -129,23 +143,30 @@ func (t *TrafficAggregator) ingest(msg []byte) {
 		return
 	}
 	sums := map[string]*TrafficSnapshot{}
+	seenWithinConn := make(map[string]struct{})
 	for _, conn := range m.Connections {
 		if len(conn.Chains) == 0 {
 			continue
 		}
-		// chains lists outbounds from outermost (e.g. a selector group name) to
-		// innermost (the actual outbound tunnel tag). For flat outbounds the
-		// list has a single element; once selector/urltest groups are introduced
-		// chains[0] would be the group name — we want the actual tunnel tag,
-		// so take the last element.
-		tag := conn.Chains[len(conn.Chains)-1]
-		s, ok := sums[tag]
-		if !ok {
-			s = &TrafficSnapshot{Tag: tag}
-			sums[tag] = s
+		for k := range seenWithinConn {
+			delete(seenWithinConn, k)
 		}
-		s.Upload += conn.Upload
-		s.Download += conn.Download
+		for _, tag := range conn.Chains {
+			if tag == "" {
+				continue
+			}
+			if _, dup := seenWithinConn[tag]; dup {
+				continue
+			}
+			seenWithinConn[tag] = struct{}{}
+			s, ok := sums[tag]
+			if !ok {
+				s = &TrafficSnapshot{Tag: tag}
+				sums[tag] = s
+			}
+			s.Upload += conn.Upload
+			s.Download += conn.Download
+		}
 	}
 	t.mu.Lock()
 	t.tags = sums
