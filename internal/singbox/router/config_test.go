@@ -131,3 +131,51 @@ func TestStripLegacyAWGDirect(t *testing.T) {
 		t.Errorf("unexpected outbounds: %+v", got)
 	}
 }
+
+func TestRuleUnmarshalJSON_PortScalar(t *testing.T) {
+	// sing-box allows "port": 53 (scalar), our struct expects []int.
+	raw := `{"port": 53, "action": "route", "outbound": "direct"}`
+	var r Rule
+	if err := json.Unmarshal([]byte(raw), &r); err != nil {
+		t.Fatalf("unmarshal scalar port: %v", err)
+	}
+	if len(r.Port) != 1 || r.Port[0] != 53 {
+		t.Errorf("want Port=[53], got %v", r.Port)
+	}
+}
+
+func TestRuleUnmarshalJSON_PortArray(t *testing.T) {
+	raw := `{"port": [80, 443], "action": "route", "outbound": "proxy"}`
+	var r Rule
+	if err := json.Unmarshal([]byte(raw), &r); err != nil {
+		t.Fatalf("unmarshal array port: %v", err)
+	}
+	if len(r.Port) != 2 || r.Port[0] != 80 || r.Port[1] != 443 {
+		t.Errorf("want Port=[80,443], got %v", r.Port)
+	}
+}
+
+func TestRuleUnmarshalJSON_LogicalWithScalarPort(t *testing.T) {
+	// The exact shape that triggers the original crash: a logical rule
+	// with a nested sub-rule containing "port": 53 (scalar).
+	raw := `{
+		"type": "logical",
+		"mode": "or",
+		"rules": [
+			{"protocol": "dns"},
+			{"port": 53}
+		],
+		"action": "hijack-dns"
+	}`
+	var r Rule
+	if err := json.Unmarshal([]byte(raw), &r); err != nil {
+		t.Fatalf("unmarshal logical rule with scalar port: %v", err)
+	}
+	if r.Type != "logical" || len(r.Rules) != 2 {
+		t.Fatalf("unexpected shape: %+v", r)
+	}
+	nested := r.Rules[1]
+	if len(nested.Port) != 1 || nested.Port[0] != 53 {
+		t.Errorf("nested rule: want Port=[53], got %v", nested.Port)
+	}
+}

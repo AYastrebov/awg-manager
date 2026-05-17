@@ -1,5 +1,9 @@
 <script lang="ts">
-	import { Button } from '$lib/components/ui';
+	import { Button, ConfirmModal } from '$lib/components/ui';
+	import { api } from '$lib/api/client';
+	import { notifications } from '$lib/stores/notifications';
+	import { tunnels as tunnelsStore } from '$lib/stores/tunnels';
+	import type { AWGTunnel, TunnelListItem } from '$lib/types';
 	import {
 		parseAWG,
 		detectVersion,
@@ -19,8 +23,11 @@
 		type AwgVerdict,
 		type AwgSummaryRow,
 	} from '$lib/utils/awgConfAnalyzer';
+	import { onMount } from 'svelte';
 
 	let raw = $state('');
+	let lastAnalyzedRaw = $state('');
+	let loadedTunnelRaw = $state('');
 	let error = $state('');
 	let parsed: AwgParsed | null = $state(null);
 	let version: AwgVersionInfo | null = $state(null);
@@ -31,6 +38,15 @@
 	let camouflage = $state<'LOW' | 'MEDIUM' | 'HIGH'>('LOW');
 	let fileInput: HTMLInputElement | undefined = $state();
 
+	let tunnels = $state<TunnelListItem[]>([]);
+	let selectedTunnelId = $state('');
+	let tunnelsLoading = $state(false);
+	let tunnelLoading = $state(false);
+	let tunnelLoadError = $state('');
+
+	let savingTunnel = $state(false);
+	let confirmSaveOpen = $state(false);
+
 	function analyze() {
 		error = '';
 		parsed = null;
@@ -39,6 +55,7 @@
 		awgScores = null;
 		verdict = null;
 		fixes = [];
+		tunnelLoadError = '';
 
 		const t = raw.trim();
 		if (!t) {
@@ -62,6 +79,7 @@
 			verdict = ver;
 			fixes = f;
 			camouflage = cam;
+			lastAnalyzedRaw = t;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		}
@@ -69,6 +87,8 @@
 
 	function clearAll() {
 		raw = '';
+		lastAnalyzedRaw = '';
+		loadedTunnelRaw = '';
 		error = '';
 		parsed = null;
 		version = null;
@@ -77,6 +97,219 @@
 		verdict = null;
 		fixes = [];
 		camouflage = 'LOW';
+		selectedTunnelId = '';
+		tunnelLoadError = '';
+	}
+
+	function awgTunnelToConf(t: AWGTunnel): string {
+		const i = t.interface;
+		const p = t.peer;
+
+		const lines: string[] = [
+			'[Interface]',
+			i.privateKey ? `PrivateKey = ${i.privateKey}` : '',
+			i.address ? `Address = ${i.address}` : '',
+			i.dns ? `DNS = ${i.dns}` : '',
+			i.mtu ? `MTU = ${i.mtu}` : '',
+			i.jc != null ? `Jc = ${i.jc}` : '',
+			i.jmin != null ? `Jmin = ${i.jmin}` : '',
+			i.jmax != null ? `Jmax = ${i.jmax}` : '',
+			i.s1 != null ? `S1 = ${i.s1}` : '',
+			i.s2 != null ? `S2 = ${i.s2}` : '',
+			i.s3 != null ? `S3 = ${i.s3}` : '',
+			i.s4 != null ? `S4 = ${i.s4}` : '',
+			i.h1 ? `H1 = ${i.h1}` : '',
+			i.h2 ? `H2 = ${i.h2}` : '',
+			i.h3 ? `H3 = ${i.h3}` : '',
+			i.h4 ? `H4 = ${i.h4}` : '',
+			i.i1 ? `I1 = ${i.i1}` : '',
+			i.i2 ? `I2 = ${i.i2}` : '',
+			i.i3 ? `I3 = ${i.i3}` : '',
+			i.i4 ? `I4 = ${i.i4}` : '',
+			i.i5 ? `I5 = ${i.i5}` : '',
+			'',
+			'[Peer]',
+			p.publicKey ? `PublicKey = ${p.publicKey}` : '',
+			p.presharedKey ? `PresharedKey = ${p.presharedKey}` : '',
+			p.endpoint ? `Endpoint = ${p.endpoint}` : '',
+			p.allowedIPs?.length ? `AllowedIPs = ${p.allowedIPs.join(', ')}` : '',
+			p.persistentKeepalive != null ? `PersistentKeepalive = ${p.persistentKeepalive}` : '',
+		];
+
+		return lines.filter((line) => line !== '').join('\n');
+	}
+
+	function numOrCurrent(value: string | undefined, current: number): number {
+		const n = value !== undefined && value !== '' ? Number(value) : NaN;
+		return Number.isFinite(n) ? n : current;
+	}
+
+	function strOrCurrent(value: string | undefined, current: string): string {
+		const v = value?.trim();
+		return v ? v : current;
+	}
+
+	function emptyToUndefined(value: string | undefined): string | undefined {
+		const v = value?.trim();
+		return v ? v : undefined;
+	}
+
+	function optionalStrOrCurrent(value: string | undefined, current: string | undefined): string | undefined {
+		if (value === undefined) return current;
+		const v = value.trim();
+		return v ? v : undefined;
+	}
+
+	function parsedToTunnelUpdate(current: AWGTunnel, parsed: AwgParsed): Partial<AWGTunnel> {
+		const iface = parsed.iface;
+		const peer = parsed.peer;
+
+		return {
+			interface: {
+				...current.interface,
+
+				privateKey: strOrCurrent(iface.privatekey, current.interface.privateKey),
+				address: strOrCurrent(iface.address, current.interface.address),
+				mtu: numOrCurrent(iface.mtu, current.interface.mtu),
+				dns: iface.dns === undefined ? current.interface.dns : emptyToUndefined(iface.dns),
+
+				jc: numOrCurrent(iface.jc, current.interface.jc),
+				jmin: numOrCurrent(iface.jmin, current.interface.jmin),
+				jmax: numOrCurrent(iface.jmax, current.interface.jmax),
+
+				s1: numOrCurrent(iface.s1, current.interface.s1),
+				s2: numOrCurrent(iface.s2, current.interface.s2),
+				s3: numOrCurrent(iface.s3, current.interface.s3),
+				s4: numOrCurrent(iface.s4, current.interface.s4),
+
+				h1: strOrCurrent(iface.h1, current.interface.h1),
+				h2: strOrCurrent(iface.h2, current.interface.h2),
+				h3: strOrCurrent(iface.h3, current.interface.h3),
+				h4: strOrCurrent(iface.h4, current.interface.h4),
+
+				i1: optionalStrOrCurrent(iface.i1, current.interface.i1),
+				i2: optionalStrOrCurrent(iface.i2, current.interface.i2),
+				i3: optionalStrOrCurrent(iface.i3, current.interface.i3),
+				i4: optionalStrOrCurrent(iface.i4, current.interface.i4),
+				i5: optionalStrOrCurrent(iface.i5, current.interface.i5),
+			},
+			peer: {
+				...current.peer,
+
+				publicKey: strOrCurrent(peer.publickey, current.peer.publicKey),
+				presharedKey: optionalStrOrCurrent(peer.presharedkey, current.peer.presharedKey),
+				endpoint: strOrCurrent(peer.endpoint, current.peer.endpoint),
+
+				allowedIPs:
+					peer.allowedips !== undefined && peer.allowedips.trim() !== ''
+						? peer.allowedips.split(',').map((s) => s.trim()).filter(Boolean)
+						: current.peer.allowedIPs,
+
+				persistentKeepalive:
+					peer.persistentkeepalive !== undefined && peer.persistentkeepalive !== ''
+						? numOrCurrent(peer.persistentkeepalive, current.peer.persistentKeepalive ?? 25)
+						: current.peer.persistentKeepalive,
+			},
+		};
+	}
+
+	let rawChangedSinceAnalyze = $derived(
+		parsed !== null && raw.trim() !== lastAnalyzedRaw
+	);
+
+	let rawDiffersFromLoadedTunnel = $derived(
+		!!selectedTunnelId &&
+		loadedTunnelRaw !== '' &&
+		raw.trim() !== loadedTunnelRaw
+	);
+
+	let canSave = $derived(
+		!!selectedTunnelId &&
+		parsed !== null &&
+		!error &&
+		!savingTunnel &&
+		!rawChangedSinceAnalyze &&
+		rawDiffersFromLoadedTunnel
+	);
+
+	function saveToTunnel() {
+		if (!selectedTunnelId) return;
+		confirmSaveOpen = true;
+	}
+
+	async function doSaveToTunnel() {
+		if (!selectedTunnelId) return;
+
+		if (raw.trim() !== lastAnalyzedRaw) {
+			confirmSaveOpen = false;
+			notifications.error('Конфиг изменён после анализа. Нажмите «Анализировать» перед записью в туннель.');
+			return;
+		}
+
+		if (loadedTunnelRaw !== '' && raw.trim() === loadedTunnelRaw) {
+			confirmSaveOpen = false;
+			notifications.error('Изменений относительно выбранного туннеля нет.');
+			return;
+		}
+
+		savingTunnel = true;
+		try {
+			const currentRaw = raw.trim();
+			if (!currentRaw) {
+				throw new Error('Вставьте содержимое .conf файла AmneziaWG / WireGuard');
+			}
+
+			const freshParsed = parseAWG(currentRaw);
+			const current = await api.getTunnel(selectedTunnelId);
+			const update = parsedToTunnelUpdate(current, freshParsed);
+			await tunnelsStore.update(selectedTunnelId, update);
+
+			const v = detectVersion(freshParsed.iface);
+			const c = runChecks(freshParsed.iface, freshParsed.peer, v);
+			const s = calcScores(c, freshParsed.iface, v);
+			const f = buildFixes(c, freshParsed.iface, freshParsed.peer, v);
+			version = v;
+			checks = c;
+			awgScores = s;
+			fixes = f;
+			verdict = getVerdict(s.total);
+			camouflage = camouflageFromI1(freshParsed.iface);
+			parsed = freshParsed;
+			error = '';
+			tunnelLoadError = '';
+			lastAnalyzedRaw = currentRaw;
+			loadedTunnelRaw = currentRaw;
+
+			notifications.success('Конфиг записан в туннель');
+			confirmSaveOpen = false;
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+			notifications.error(e instanceof Error ? e.message : 'Ошибка сохранения');
+		} finally {
+			savingTunnel = false;
+		}
+	}
+
+	async function analyzeSelectedTunnel() {
+		if (!selectedTunnelId) {
+			tunnelLoadError = 'Выберите туннель';
+			return;
+		}
+
+		tunnelLoading = true;
+		tunnelLoadError = '';
+
+		try {
+			const tunnel = await api.getTunnel(selectedTunnelId);
+			const conf = awgTunnelToConf(tunnel);
+			loadedTunnelRaw = conf.trim();
+			raw = conf;
+			analyze();
+		} catch (e) {
+			tunnelLoadError = e instanceof Error ? e.message : String(e);
+		} finally {
+			tunnelLoading = false;
+		}
 	}
 
 	function onPickFile(e: Event) {
@@ -85,6 +318,8 @@
 		if (!file) return;
 		const reader = new FileReader();
 		reader.onload = () => {
+			loadedTunnelRaw = '';
+			selectedTunnelId = '';
 			raw = String(reader.result ?? '').trim();
 			analyze();
 		};
@@ -98,6 +333,8 @@
 		if (!file) return;
 		const reader = new FileReader();
 		reader.onload = () => {
+			loadedTunnelRaw = '';
+			selectedTunnelId = '';
 			raw = String(reader.result ?? '').trim();
 			analyze();
 		};
@@ -110,6 +347,20 @@
 		e.preventDefault();
 		analyze();
 	}
+
+	onMount(async () => {
+		tunnelsLoading = true;
+		tunnelLoadError = '';
+		try {
+			const snap = await api.getTunnelsAll();
+			tunnels = (snap.tunnels ?? []).filter((t) => t.id && t.type !== 'singbox');
+		} catch (e) {
+			tunnelLoadError = e instanceof Error ? e.message : String(e);
+			tunnels = [];
+		} finally {
+			tunnelsLoading = false;
+		}
+	});
 
 	let parsedLines = $derived.by(() => {
 		if (!parsed) return [] as { key: string; value: string }[];
@@ -179,6 +430,39 @@
 
 	<div class="layout">
 		<div class="col-input">
+			<div class="existing-tunnel-box">
+				<div class="existing-tunnel-head">
+					<span class="existing-tunnel-title">Существующий AWG-туннель</span>
+					<span class="existing-tunnel-note">или вставьте .conf ниже</span>
+				</div>
+				<div class="existing-tunnel-row">
+					<select
+						class="existing-tunnel-select"
+						bind:value={selectedTunnelId}
+						disabled={tunnelsLoading || tunnelLoading || tunnels.length === 0}
+					>
+						<option value="">
+							{tunnelsLoading ? 'Загрузка туннелей…' : tunnels.length ? 'Выберите туннель' : 'Нет AWG-туннелей'}
+						</option>
+						{#each tunnels as t (t.id)}
+							<option value={t.id}>
+								{t.name || t.id} · {t.endpoint || t.interfaceName || t.id}
+							</option>
+						{/each}
+					</select>
+					<Button
+						variant="secondary"
+						onclick={analyzeSelectedTunnel}
+						disabled={!selectedTunnelId || tunnelLoading}
+					>
+						{tunnelLoading ? 'Загрузка…' : 'Анализировать'}
+					</Button>
+				</div>
+				{#if tunnelLoadError}
+					<div class="warn" role="alert">{tunnelLoadError}</div>
+				{/if}
+			</div>
+
 			<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
 			<label
 				class="drop"
@@ -200,8 +484,24 @@
 				<Button variant="primary" onclick={analyze}>Анализировать</Button>
 				<Button variant="secondary" onclick={() => fileInput?.click()}>Файл…</Button>
 				<Button variant="ghost" onclick={clearAll}>Очистить</Button>
+				{#if canSave}
+					<Button variant="outline-primary" onclick={saveToTunnel} loading={savingTunnel}>
+						Записать в туннель
+					</Button>
+				{/if}
 				<span class="kbd">⌘/Ctrl+Enter</span>
 			</div>
+			{#if selectedTunnelId && rawChangedSinceAnalyze}
+				<div class="warn" role="status">
+					Конфиг изменён после анализа. Нажмите «Анализировать» перед записью в туннель.
+				</div>
+			{/if}
+			{#if selectedTunnelId && parsed !== null && !rawChangedSinceAnalyze && !rawDiffersFromLoadedTunnel}
+				<div class="warn" role="status">
+					Изменений относительно выбранного туннеля нет — записывать нечего.
+				</div>
+			{/if}
+
 			<input
 				bind:this={fileInput}
 				type="file"
@@ -412,6 +712,18 @@
 		</div>
 	</div>
 </div>
+
+<ConfirmModal
+	open={confirmSaveOpen}
+	title="Записать конфиг в туннель?"
+	message="Вы собираетесь перезаписать параметры выбранного туннеля данными из поля конфига."
+	secondary="Будут обновлены параметры Interface и Peer. Если туннель сейчас работает, для применения изменений может потребоваться перезапуск. Действие необратимо без ручного восстановления старого конфига."
+	confirmLabel="Записать"
+	variant="danger"
+	busy={savingTunnel}
+	onConfirm={doSaveToTunnel}
+	onClose={() => !savingTunnel && (confirmSaveOpen = false)}
+/>
 
 <style>
 	.shell {
@@ -1015,6 +1327,78 @@
 		.ring {
 			width: 100px;
 			height: 100px;
+		}
+	}
+
+	/* Existing AWG tunnel selector */
+	.existing-tunnel-box {
+		margin-bottom: 12px;
+		padding: 12px 14px;
+		border-radius: 10px;
+		background: var(--bg-secondary);
+		border: 1px dashed var(--color-border);
+	}
+
+	.existing-tunnel-head {
+		display: flex;
+		align-items: baseline;
+		gap: 8px;
+		margin-bottom: 10px;
+	}
+
+	.existing-tunnel-title {
+		font-size: 12px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.06em;
+		color: var(--text-primary);
+	}
+
+	.existing-tunnel-note {
+		font-size: 11px;
+		color: var(--text-tertiary);
+	}
+
+	.existing-tunnel-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+
+	.existing-tunnel-select {
+		flex: 1;
+		min-width: 0;
+		padding: 8px 10px;
+		border-radius: 8px;
+		border: 1px solid var(--color-border);
+		background: var(--bg-primary, rgba(0, 0, 0, 0.15));
+		color: var(--text-primary);
+		font-size: 13px;
+		line-height: 1.4;
+		outline: none;
+	}
+
+	.existing-tunnel-select:focus {
+		border-color: var(--color-accent, #8b5cf6);
+	}
+
+	.existing-tunnel-select:disabled {
+		opacity: 0.55;
+		cursor: not-allowed;
+	}
+
+	@media (max-width: 640px) {
+		.existing-tunnel-row {
+			flex-direction: column;
+			align-items: stretch;
+		}
+
+		.existing-tunnel-select {
+			width: 100%;
+		}
+
+		.existing-tunnel-row :global(button) {
+			width: 100%;
 		}
 	}
 </style>

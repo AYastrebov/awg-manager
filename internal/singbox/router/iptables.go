@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	TPROXYPort   = 51271
+	TPROXYPort = 51271
 	// RedirectPort is sing-box's REDIRECT inbound for TCP. We split TCP
 	// onto NAT REDIRECT (instead of mangle TPROXY) because TPROXY for
 	// TCP requires a working `-m socket --transparent` bypass to deliver
@@ -31,18 +31,6 @@ const (
 	RoutingTable  = 100
 	ChainName     = "AWGM-TPROXY"
 	RedirectChain = "AWGM-REDIRECT"
-	// DNSOffloadChain DNATs non-policy UDP/TCP DNS aimed at a router-local
-	// IP to 127.0.0.1:53 so the kernel socket lookup falls through to
-	// NDMS's ndnproxy (bound on 0.0.0.0:53) instead of hitting sing-box's
-	// transparent listener on the LAN IP. sing-box's hijack-dns route
-	// action creates such a listener as a side effect — it catches any
-	// packet whose dst matches a router-owned IP, but silently drops what
-	// arrives without TPROXY ancillary data, leaving non-policy clients
-	// without DNS. Two filters keep policy traffic untouched: dst must be
-	// `addrtype LOCAL` (so external DNS like 8.8.8.8 isn't rewritten) and
-	// connmark must not match the policy mark (so in-policy DNS continues
-	// through AWGM-TPROXY → sing-box).
-	DNSOffloadChain = "AWGM-DNS-OFFLOAD"
 	// IPRulePriority is the fixed `ip rule` priority for our fwmark rule.
 	// Above NDMS policy rules (~100-200) and below system main/default
 	// (32766/32767). Hard-coded so Install is fully idempotent and so
@@ -106,14 +94,18 @@ func IsNetfilterAvailable() bool {
 }
 
 func EnsureTProxyModule(ctx context.Context) error {
-	if isModuleLoaded(kernelModuleName()) {
+	return ensureKernelModule(ctx, kernelModuleName())
+}
+
+func ensureKernelModule(ctx context.Context, name string) error {
+	if isModuleLoaded(name) {
 		return nil
 	}
 	kernel := osdetect.KernelRelease()
 	if kernel == "" {
 		return ErrNetfilterComponentMissing
 	}
-	path := buildTProxyModulePath(kernel)
+	path := filepath.Join("/lib/modules", kernel, name+".ko")
 	if _, err := os.Stat(path); err != nil {
 		return ErrNetfilterComponentMissing
 	}
@@ -158,9 +150,9 @@ type RestoreInputSpec struct {
 var bypassCIDRs = []string{
 	"127.0.0.0/8",
 	"169.254.0.0/16",
-	"100.64.0.0/10",  // CGNAT (RFC 6598)
-	"0.0.0.0/8",      // this network (RFC 1122)
-	"192.0.0.0/24",   // IETF Protocol Assignments (NAT64 well-known)
+	"100.64.0.0/10", // CGNAT (RFC 6598)
+	"0.0.0.0/8",     // this network (RFC 1122)
+	"192.0.0.0/24",  // IETF Protocol Assignments (NAT64 well-known)
 	"224.0.0.0/4",
 	"255.255.255.255/32",
 	"10.0.0.0/8",
@@ -171,106 +163,86 @@ var bypassCIDRs = []string{
 func buildRestoreInput(spec RestoreInputSpec) string {
 	var b strings.Builder
 
+	// SKeen-style layout (`reference/SKeen/skeen.sh`, set_chain_rules /
+	// set_prerouting_rules / add_tproxy_rules / add_redirect_rules):
+	//
+	//   - one chain per table (mangle: AWGM-TPROXY, nat: AWGM-REDIRECT)
+	//   - policy connmark filter lives ON THE PREROUTING JUMP, not inside
+	//     the chain — non-policy traffic never enters the chain at all
+	//   - jump uses `-j` (not `-g`) so bypasses can `-j RETURN` cleanly
+	//     back into PREROUTING; the catch-all TPROXY/REDIRECT at the end
+	//     of the chain handles everything else
+	//   - jump is `-A PREROUTING` (append) so it runs AFTER NDMS
+	//     _NDM_*_PREROUTING_* chains have a chance to set the connmark;
+	//     this also keeps the fast_nat-cache issue (FORWARD MASQUERADE
+	//     poisoning conntrack with WAN-IP source) from coming back
+	//   - NO AWGM-DNS-OFFLOAD chain: with policy filter on the jump,
+	//     non-policy DNS never reaches sing-box via these rules. (If the
+	//     `hijack-dns` side-effect listener turns out to still grab
+	//     non-policy DNS at the kernel socket-lookup level, that's a
+	//     sing-box inbound/dns config matter — see Уровень Б discussion
+	//     in commit log)
+	//   - no `-m addrtype` or `-i br+` matchers anywhere: zero kernel
+	//     module surface beyond xt_TPROXY
+
 	// ---- *mangle table: UDP via TPROXY ----
-	//
-	// PREROUTING entry uses `-A` (append) so it runs AFTER the NDMS
-	// _NDM_*_PREROUTING_* chains. The previous `-I PREROUTING 1` placed
-	// us first, before _NDM_DNSRT_PREROUTING_MANGLE (which matches
-	// `mark match 0x0`) had a chance to handle no-mark-yet UDP — the
-	// no-mark path triggered MASQUERADE through FORWARD/POSTROUTING,
-	// conntrack recorded has_nat=true, and from then on every packet of
-	// the flow reached sing-box's tproxy-in with WAN IP source.
-	// Empirically confirmed 2026-05-16 against SKeen's working setup,
-	// which uses the same append pattern.
-	//
-	// Policy/direction filters live INSIDE the chain (SKeen-style),
-	// because the jump itself is now unconditional. Bypass exemptions
-	// use `-j ACCEPT` (not RETURN): with `-g` on the entry, RETURN would
-	// unwind back to PREROUTING and let the bypass'd packet hit further
-	// NDMS rules; ACCEPT terminates the mangle table cleanly.
+	// Literal port of `add_tproxy_rules` from reference/SKeen/skeen.sh
+	// (hybrid mode, mangle table) plus the DNS interception rule from
+	// set_chain_rules (`INTERCEPT_DNS_ENABLE=1` branch). No extras.
 	b.WriteString("*mangle\n")
 	fmt.Fprintf(&b, ":%s - [0:0]\n", ChainName)
 
-	if spec.PolicyMark != "" {
-		// Exit early when packet doesn't belong to our access policy.
-		fmt.Fprintf(&b, "-A %s -m connmark ! --mark %s -j ACCEPT\n", ChainName, spec.PolicyMark)
-	}
-	// Reply direction: NDMS's connmark applies to BOTH directions of the
-	// conntrack entry, so return packets from the internet would also
-	// match the policy mark above. ACCEPT them out before TPROXY.
-	fmt.Fprintf(&b, "-A %s -m conntrack --ctdir REPLY -j ACCEPT\n", ChainName)
-
-	// DNS intercept MUST precede the dst-based ACCEPTs below: LAN clients
-	// configured with DNS=router-LAN-IP (192.168.1.1 etc.) would otherwise
-	// hit the 192.168.0.0/16 ACCEPT first, leaking DNS into NDMS-resolver.
+	// set_chain_rules: DNS first (when INTERCEPT_DNS_ENABLE=1)
 	fmt.Fprintf(&b, "-A %s -p udp --dport 53 -j TPROXY --on-port %d --on-ip 127.0.0.1 --tproxy-mark 0x%x\n",
 		ChainName, TPROXYPort, Fwmark)
 
+	// set_chain_rules: bypass set. SKeen uses one ipset rule; we render
+	// the same destinations as discrete CIDR rules (semantically equal).
 	for _, cidr := range bypassCIDRs {
-		fmt.Fprintf(&b, "-A %s -d %s -j ACCEPT\n", ChainName, cidr)
+		fmt.Fprintf(&b, "-A %s -d %s -j RETURN\n", ChainName, cidr)
 	}
 	for _, ip := range spec.WANIPs {
-		fmt.Fprintf(&b, "-A %s -d %s -j ACCEPT\n", ChainName, ip)
+		fmt.Fprintf(&b, "-A %s -d %s -j RETURN\n", ChainName, ip)
 	}
-	fmt.Fprintf(&b, "-A %s -m mark --mark 0xff -j ACCEPT\n", ChainName)
+
+	// add_tproxy_rules: catch-all TPROXY for UDP.
 	fmt.Fprintf(&b, "-A %s -p udp -j TPROXY --on-port %d --on-ip 127.0.0.1 --tproxy-mark 0x%x\n",
 		ChainName, TPROXYPort, Fwmark)
 
+	// set_prerouting_rules: policy connmark filter ON THE JUMP, no `-p`
+	// matcher (SKeen jumps unconditionally; per-proto matching happens
+	// inside the chain).
 	if spec.PolicyMark != "" {
-		fmt.Fprintf(&b, "-A PREROUTING -p udp -m conntrack ! --ctstate INVALID -g %s\n", ChainName)
+		fmt.Fprintf(&b, "-A PREROUTING -m connmark --mark %s -m conntrack ! --ctstate INVALID -j %s\n",
+			spec.PolicyMark, ChainName)
 	}
 	b.WriteString("COMMIT\n")
 
 	// ---- *nat table: TCP via REDIRECT ----
-	// REDIRECT is a NAT operation; conntrack records the DNAT for the
-	// SYN and auto-applies it to subsequent packets. Established TCP
-	// flows therefore route to sing-box's ACCEPT()ed socket without
-	// re-evaluating our PREROUTING jump, sidestepping the
-	// transparent-socket-lookup failure that breaks pure-TPROXY TCP
-	// on this kernel. Same `-A` + `-g` + filters-inside pattern as mangle.
+	// Literal port of `add_redirect_rules` from reference/SKeen/skeen.sh
+	// (hybrid mode, nat table). SKeen's nat chain has ONLY the bypass set
+	// + catch-all `-p tcp -j REDIRECT`; there is no DNS-specific TCP rule
+	// because the catch-all already covers TCP/53.
 	b.WriteString("*nat\n")
 	fmt.Fprintf(&b, ":%s - [0:0]\n", RedirectChain)
 
-	if spec.PolicyMark != "" {
-		fmt.Fprintf(&b, "-A %s -m connmark ! --mark %s -j ACCEPT\n", RedirectChain, spec.PolicyMark)
-	}
-	fmt.Fprintf(&b, "-A %s -m conntrack --ctdir REPLY -j ACCEPT\n", RedirectChain)
-
-	// DNS-перехват on TCP — same ordering rationale as mangle chain.
-	fmt.Fprintf(&b, "-A %s -p tcp --dport 53 -j REDIRECT --to-ports %d\n", RedirectChain, RedirectPort)
-
 	for _, cidr := range bypassCIDRs {
-		fmt.Fprintf(&b, "-A %s -d %s -j ACCEPT\n", RedirectChain, cidr)
+		fmt.Fprintf(&b, "-A %s -d %s -j RETURN\n", RedirectChain, cidr)
 	}
 	for _, ip := range spec.WANIPs {
-		fmt.Fprintf(&b, "-A %s -d %s -j ACCEPT\n", RedirectChain, ip)
+		fmt.Fprintf(&b, "-A %s -d %s -j RETURN\n", RedirectChain, ip)
 	}
 	// Bypass router admin port so we don't redirect our own UI traffic.
-	fmt.Fprintf(&b, "-A %s -p tcp --dport 79 -j ACCEPT\n", RedirectChain)
+	// (SKeen has equivalent dynamic admin-port discovery — same intent.)
+	fmt.Fprintf(&b, "-A %s -p tcp --dport 79 -j RETURN\n", RedirectChain)
+
+	// add_redirect_rules: catch-all REDIRECT for TCP.
 	fmt.Fprintf(&b, "-A %s -p tcp -j REDIRECT --to-ports %d\n", RedirectChain, RedirectPort)
 
 	if spec.PolicyMark != "" {
-		fmt.Fprintf(&b, "-A PREROUTING -p tcp -m conntrack ! --ctstate INVALID -g %s\n", RedirectChain)
+		fmt.Fprintf(&b, "-A PREROUTING -m connmark --mark %s -m conntrack ! --ctstate INVALID -j %s\n",
+			spec.PolicyMark, RedirectChain)
 	}
-
-	// ---- AWGM-DNS-OFFLOAD chain (still inside *nat) ----
-	// See DNSOffloadChain const docs for why this chain exists. Inserted
-	// at PREROUTING position 1 so it fires before NDMS DNS chains; that
-	// way any sing-box transparent listener on a router LAN-IP:53 stops
-	// catching non-policy DNS, which previously landed in sing-box and
-	// got silently dropped (no IP_RECVORIGDSTADDR ancillary data). The
-	// `addrtype --dst-type LOCAL` matcher targets only router-owned IPs
-	// — external DNS (8.8.8.8 etc.) is untouched and continues through
-	// normal WAN MASQUERADE.
-	fmt.Fprintf(&b, ":%s - [0:0]\n", DNSOffloadChain)
-	if spec.PolicyMark != "" {
-		for _, proto := range []string{"udp", "tcp"} {
-			fmt.Fprintf(&b, "-A %s -i br+ -p %s --dport 53 -m addrtype --dst-type LOCAL -m connmark ! --mark %s -j DNAT --to-destination 127.0.0.1:53\n",
-				DNSOffloadChain, proto, spec.PolicyMark)
-		}
-		fmt.Fprintf(&b, "-I PREROUTING 1 -j %s\n", DNSOffloadChain)
-	}
-
 	b.WriteString("COMMIT\n")
 	return b.String()
 }
@@ -389,15 +361,15 @@ if [ "$mangle_ok" -eq 0 ] || [ "$nat_ok" -eq 0 ]; then
     | sed 's/-A PREROUTING/-D PREROUTING/' \
     | while IFS= read -r line; do /opt/sbin/iptables -w -t mangle $line 2>/dev/null; done
   /opt/sbin/iptables -w -t nat -S PREROUTING 2>/dev/null \
-    | grep -E -- '-[jg] (%[6]s|%[7]s)($| )' \
-    | sed 's/-A PREROUTING/-D PREROUTING/; s/-I PREROUTING [0-9][0-9]*/-D PREROUTING/' \
+    | grep -E -- '-[jg] %[6]s($| )' \
+    | sed 's/-A PREROUTING/-D PREROUTING/' \
     | while IFS= read -r line; do /opt/sbin/iptables -w -t nat $line 2>/dev/null; done
   /opt/sbin/iptables-restore --noflush < %[1]q
   /opt/sbin/ip rule add fwmark 0x%[3]x table %[4]d priority %[5]d 2>/dev/null || true
   /opt/sbin/ip route add local 0.0.0.0/0 dev lo table %[4]d 2>/dev/null || true
   logger -t awgm-tproxy "netfilter.d: restored AWGM chains after NDMS reload"
 fi
-`, netfilterRulesPath, ChainName, Fwmark, RoutingTable, IPRulePriority, RedirectChain, DNSOffloadChain)
+`, netfilterRulesPath, ChainName, Fwmark, RoutingTable, IPRulePriority, RedirectChain)
 	return os.WriteFile(netfilterHookPath, []byte(script), 0755)
 }
 
@@ -428,8 +400,6 @@ func (it *IPTables) Uninstall(ctx context.Context) error {
 	_ = it.runIPTables(ctx, "-t", "mangle", "-X", ChainName)
 	_ = it.runIPTables(ctx, "-t", "nat", "-F", RedirectChain)
 	_ = it.runIPTables(ctx, "-t", "nat", "-X", RedirectChain)
-	_ = it.runIPTables(ctx, "-t", "nat", "-F", DNSOffloadChain)
-	_ = it.runIPTables(ctx, "-t", "nat", "-X", DNSOffloadChain)
 	// Drain ALL fwmark rules — historically Install accumulated
 	// duplicates at priorities 0-N (auto-assigned), so a single `del`
 	// would leave the rest. Loop until ENOENT, capped defensively.
@@ -446,7 +416,6 @@ func (it *IPTables) Uninstall(ctx context.Context) error {
 func (it *IPTables) removeSourceHooks(ctx context.Context) {
 	it.removeSourceHooksFromTable(ctx, "mangle", ChainName)
 	it.removeSourceHooksFromTable(ctx, "nat", RedirectChain)
-	it.removeSourceHooksFromTable(ctx, "nat", DNSOffloadChain)
 }
 
 func (it *IPTables) removeSourceHooksFromTable(ctx context.Context, table, chain string) {
@@ -476,4 +445,3 @@ func (it *IPTables) removeSourceHooksFromTable(ctx context.Context, table, chain
 func (it *IPTables) IsInstalled(ctx context.Context) bool {
 	return it.runIPTables(ctx, "-t", "mangle", "-nL", ChainName) == nil
 }
-

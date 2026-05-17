@@ -24,17 +24,23 @@ func Run(ctx context.Context, args ...string) error {
 
 func RestoreNoflush(ctx context.Context, input string) error {
 	var lastErr error
+	var lastResult *exec.Result
 	for attempt := 0; attempt < MaxRestoreTries; attempt++ {
 		if attempt > 0 {
 			time.Sleep(time.Duration(attempt) * RetryBaseWait)
 		}
-		_, err := exec.RunWithOptions(ctx, RestoreBinary, []string{"--noflush"}, exec.Options{
+		result, err := exec.RunWithOptions(ctx, RestoreBinary, []string{"--noflush"}, exec.Options{
 			Stdin: strings.NewReader(input),
 		})
 		if err == nil {
 			return nil
 		}
 		lastErr = err
+		lastResult = result
 	}
-	return fmt.Errorf("iptables-restore --noflush: %w", lastErr)
+	// Surface stderr (e.g. `iptables-restore: line N failed`) so the
+	// caller's log entry actually tells us where the kernel rejected the
+	// batch. Without FormatError, we get only "exit status 1" which is
+	// useless for diagnosing parse vs. commit failures.
+	return fmt.Errorf("iptables-restore --noflush: %w", exec.FormatError(lastResult, lastErr))
 }

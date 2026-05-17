@@ -1,5 +1,10 @@
 package router
 
+import (
+	"encoding/json"
+	"fmt"
+)
+
 type Status struct {
 	Enabled                bool    `json:"enabled"`
 	Installed              bool    `json:"installed"`
@@ -45,6 +50,39 @@ type Rule struct {
 	Protocol     string   `json:"protocol,omitempty"`
 	Action       string   `json:"action,omitempty"`
 	Outbound     string   `json:"outbound,omitempty"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler for Rule. It accepts both
+// `"port": 53` (scalar) and `"port": [53]` (array) forms so that
+// older or hand-edited sing-box configs deserialize without error.
+func (r *Rule) UnmarshalJSON(data []byte) error {
+	// Use an alias to prevent infinite recursion.
+	type ruleAlias Rule
+	type ruleRaw struct {
+		ruleAlias
+		RawPort json.RawMessage `json:"port,omitempty"`
+	}
+	var raw ruleRaw
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*r = Rule(raw.ruleAlias)
+	if len(raw.RawPort) == 0 || string(raw.RawPort) == "null" {
+		return nil
+	}
+	// Try array first (common case).
+	var ports []int
+	if err := json.Unmarshal(raw.RawPort, &ports); err == nil {
+		r.Port = ports
+		return nil
+	}
+	// Fall back to scalar.
+	var single int
+	if err := json.Unmarshal(raw.RawPort, &single); err != nil {
+		return fmt.Errorf("port: expected int or []int, got %s", string(raw.RawPort))
+	}
+	r.Port = []int{single}
+	return nil
 }
 
 type RuleSet struct {
