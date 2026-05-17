@@ -81,6 +81,7 @@
   import { Badge, StatusDot, Modal, Button } from '$lib/components/ui';
   import { formatRelativeTime } from '$lib/utils/format';
   import { usageLevel } from '$lib/stores/settings';
+  import { systemInfo } from '$lib/stores/system';
 
   interface Props {
     filter: LogsFilter;
@@ -136,7 +137,10 @@
 
   /** `profiling` has a dedicated expert-only chip — never duplicate it in subgroup chips. */
   const visibleSubgroups = $derived(availableSubgroups.filter((s) => s !== 'profiling'));
-  const showExpertProfilingChip = $derived(bucket === 'app' && $usageLevel === 'expert');
+  const slowRequestProfilingMs = $derived($systemInfo.data?.slowRequestThresholdMs ?? 0);
+  const showExpertProfilingChip = $derived(
+    bucket === 'app' && $usageLevel === 'expert' && slowRequestProfilingMs > 0,
+  );
 
   function toggleLevel(lvl: string) {
     const set = new Set(filter.levels);

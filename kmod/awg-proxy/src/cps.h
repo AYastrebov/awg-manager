@@ -19,9 +19,13 @@ int cps_generate(const cps_template_t *tmpl, u32 counter,
 /* Max possible size of generated packet from template. */
 int cps_max_size(const cps_template_t *tmpl);
 
-/* Generate all configured CPS packets (I1-I5).
- * Returns number of packets generated. counter is incremented per packet. */
-int cps_generate_all(cps_template_t *templates[5], u32 *counter,
+/* Generate all configured CPS packets (I1-I5) using pre-computed counter
+ * values. Returns number of packets generated. counters[k] is embedded into
+ * the k-th non-null template's <c> tokens. Caller is responsible for
+ * incrementing its own counter after each successful socket send (matching
+ * the reference's atomic_inc-after-send semantics). This function does not
+ * mutate any state. */
+int cps_generate_all(cps_template_t *templates[5], const u32 counters[5],
 		     u8 bufs[][1500], int lens[]);
 
 #endif /* _AWG_CPS_H */

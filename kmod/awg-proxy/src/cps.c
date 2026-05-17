@@ -14,9 +14,15 @@
 
 #include "cps.h"
 
-static const char alphanum[] =
-	"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-#define ALPHANUM_LEN 62
+/*
+ * `<rc>` (random chars) charset MUST match amneziawg-linux-kernel-module's
+ * src/junk.c (random_char_modifier): 26 lowercase + 26 uppercase = 52 chars,
+ * NO digits. The previous 62-char alphanum produced AWG-1.5 CPS packets with
+ * digit bytes that diverged from the reference wire-format and made our
+ * fingerprint distinct from upstream amneziawg-go users.
+ */
+#define ALPHABET_LEN 26
+#define LETTER_LEN   (ALPHABET_LEN * 2)
 
 static int hex_val(char c)
 {
@@ -233,7 +239,9 @@ int cps_generate(const cps_template_t *tmpl, u32 counter,
 				return off;
 			for (j = 0; j < seg->size; j++) {
 				get_random_bytes(&r, sizeof(r));
-				buf[off + j] = alphanum[r % ALPHANUM_LEN];
+				r %= LETTER_LEN;
+				buf[off + j] = (r < ALPHABET_LEN) ?
+					('a' + r) : ('A' + r - ALPHABET_LEN);
 			}
 			off += seg->size;
 			break;
@@ -252,22 +260,33 @@ int cps_generate(const cps_template_t *tmpl, u32 counter,
 			break;
 		}
 		case CPS_TIMESTAMP: {
-			__le32 ts_le;
+			/*
+			 * Big-endian (network byte order) to match
+			 * amneziawg-linux-kernel-module's unix_time_modifier
+			 * (src/junk.c): `time = htonl(time);`. The previous
+			 * little-endian encoding diverged from reference and
+			 * was DPI-distinct from amneziawg-go.
+			 */
+			__be32 ts_be;
 
 			if (off + 4 > bufsize)
 				return off;
-			ts_le = cpu_to_le32((u32)ktime_get_real_seconds());
-			memcpy(buf + off, &ts_le, 4);
+			ts_be = cpu_to_be32((u32)ktime_get_real_seconds());
+			memcpy(buf + off, &ts_be, 4);
 			off += 4;
 			break;
 		}
 		case CPS_COUNTER: {
-			__le32 ctr_le;
+			/*
+			 * Big-endian, same rationale as CPS_TIMESTAMP — matches
+			 * pkt_counter_modifier in the reference module.
+			 */
+			__be32 ctr_be;
 
 			if (off + 4 > bufsize)
 				return off;
-			ctr_le = cpu_to_le32(counter);
-			memcpy(buf + off, &ctr_le, 4);
+			ctr_be = cpu_to_be32(counter);
+			memcpy(buf + off, &ctr_be, 4);
 			off += 4;
 			break;
 		}
@@ -276,7 +295,16 @@ int cps_generate(const cps_template_t *tmpl, u32 counter,
 	return off;
 }
 
-int cps_generate_all(cps_template_t *templates[5], u32 *counter,
+/*
+ * Generate all configured CPS templates into bufs[]. counters[i] is the
+ * value embedded into <c> tokens of the i-th generated packet.
+ *
+ * Counter handling intentionally lives in the caller (proxy.c::send_cps_packets):
+ * the amneziawg reference (src/send.c) increments the per-peer counter
+ * AFTER each successful socket send, not at generation time. We mirror that
+ * by accepting an array of counter values and not mutating any state here.
+ */
+int cps_generate_all(cps_template_t *templates[5], const u32 counters[5],
 		     u8 bufs[][1500], int lens[])
 {
 	int count = 0;
@@ -285,9 +313,14 @@ int cps_generate_all(cps_template_t *templates[5], u32 *counter,
 	for (i = 0; i < 5; i++) {
 		if (!templates[i])
 			continue;
-		lens[count] = cps_generate(templates[i], *counter,
+		/*
+		 * counters[] is indexed by output-slot (count), NOT by
+		 * template-slot (i): NULL templates do not consume a counter
+		 * value, matching the reference's behaviour where the counter
+		 * advances only on a successful send.
+		 */
+		lens[count] = cps_generate(templates[i], counters[count],
 					   bufs[count], 1500);
-		(*counter)++;
 		count++;
 	}
 	return count;

@@ -50,18 +50,20 @@ vi.mock('$lib/stores/notifications', () => ({
 
 // Rule shape mirrors SingboxRouterRule. Subset that RulesSubTab reads.
 type R = {
-	action: string;
+	action?: string;
 	outbound?: string;
 	protocol?: string;
 	domain_suffix?: string[];
 	ip_cidr?: string[];
+	ip_is_private?: boolean;
 };
 
-// Standard ordering: 2 system rules (sniff, hijack-dns) at top, then user rules.
-// firstUserRuleIndex = 2 in this layout.
+// Standard ordering: 3 system rules (sniff, hijack-dns, ip_is_private) at
+// top, then user rules. firstUserRuleIndex = 3 in this layout.
 const systemRules: R[] = [
 	{ action: 'sniff' },
 	{ action: 'hijack-dns', protocol: 'dns' },
+	{ ip_is_private: true, outbound: 'direct' },
 ];
 
 function buildRules(userRules: R[]): R[] {
@@ -77,26 +79,40 @@ beforeEach(() => {
 });
 
 describe('RulesSubTab — rule ordering controls (PR #101 commit #3)', () => {
-	it('renders no move/drag controls for system rules (sniff, hijack-dns)', () => {
+	it('renders no move/drag/edit controls for system rules (sniff, hijack-dns, ip_is_private)', () => {
 		rulesStore.set(buildRules([{ action: 'route', outbound: 'veesp' }]));
 		const { container } = render(RulesSubTab);
 
 		const rows = container.querySelectorAll('.t-row');
-		expect(rows.length).toBe(3); // 2 system + 1 user
+		expect(rows.length).toBe(4); // 3 system + 1 user
 
-		// System rows must NOT contain drag-handle or move-btn.
-		const sysRow0 = rows[0];
-		expect(sysRow0.querySelector('.drag-handle')).toBeNull();
-		expect(sysRow0.querySelector('.move-btn')).toBeNull();
-
-		const sysRow1 = rows[1];
-		expect(sysRow1.querySelector('.drag-handle')).toBeNull();
-		expect(sysRow1.querySelector('.move-btn')).toBeNull();
+		// All 3 system rows must NOT contain drag-handle or move-btn.
+		for (let i = 0; i < 3; i++) {
+			expect(rows[i].querySelector('.drag-handle')).toBeNull();
+			expect(rows[i].querySelector('.move-btn')).toBeNull();
+		}
 
 		// User row must have BOTH controls.
-		const userRow = rows[2];
+		const userRow = rows[3];
 		expect(userRow.querySelector('.drag-handle')).toBeTruthy();
 		expect(userRow.querySelectorAll('.move-btn').length).toBe(2);
+	});
+
+	it('renders ip_is_private system rule with BYPASS label and direct outbound', () => {
+		rulesStore.set(buildRules([]));
+		const { container } = render(RulesSubTab);
+
+		const rows = container.querySelectorAll('.t-row');
+		expect(rows.length).toBe(3); // 3 system + 0 user
+
+		// rows[2] is ip_is_private. Should render BYPASS badge and
+		// "direct" outbound, even though `action` is omitted.
+		const ipPrivateRow = rows[2];
+		const actionBadge = ipPrivateRow.querySelector('.col-action');
+		expect(actionBadge?.textContent).toContain('BYPASS');
+
+		const outboundCol = ipPrivateRow.querySelector('.col-out');
+		expect(outboundCol?.textContent).toContain('direct');
 	});
 
 	it('disables ↑ on the first user rule (cannot escape system zone)', () => {
@@ -107,8 +123,8 @@ describe('RulesSubTab — rule ordering controls (PR #101 commit #3)', () => {
 		const { container } = render(RulesSubTab);
 
 		const rows = container.querySelectorAll('.t-row');
-		// rows[2] is the first user rule (firstUserRuleIndex == 2).
-		const firstUserBtns = rows[2].querySelectorAll('.move-btn');
+		// rows[3] is the first user rule (firstUserRuleIndex == 3).
+		const firstUserBtns = rows[3].querySelectorAll('.move-btn');
 		const upBtn = firstUserBtns[0] as HTMLButtonElement;
 		const downBtn = firstUserBtns[1] as HTMLButtonElement;
 		expect(upBtn.disabled).toBe(true); // i <= firstUserRuleIndex
@@ -124,8 +140,8 @@ describe('RulesSubTab — rule ordering controls (PR #101 commit #3)', () => {
 		const { container } = render(RulesSubTab);
 
 		const rows = container.querySelectorAll('.t-row');
-		// rows[3] is the middle user rule (index 3, firstUserRuleIndex == 2).
-		const midBtns = rows[3].querySelectorAll('.move-btn');
+		// rows[4] is the middle user rule (index 4, firstUserRuleIndex == 3).
+		const midBtns = rows[4].querySelectorAll('.move-btn');
 		expect((midBtns[0] as HTMLButtonElement).disabled).toBe(false);
 		expect((midBtns[1] as HTMLButtonElement).disabled).toBe(false);
 	});
@@ -151,12 +167,12 @@ describe('RulesSubTab — rule ordering controls (PR #101 commit #3)', () => {
 		const { api } = await import('$lib/api/client');
 
 		const rows = container.querySelectorAll('.t-row');
-		// rows[2] = first user rule (index 2). Click its ↓.
-		const downBtn = rows[2].querySelectorAll('.move-btn')[1] as HTMLButtonElement;
+		// rows[3] = first user rule (index 3). Click its ↓.
+		const downBtn = rows[3].querySelectorAll('.move-btn')[1] as HTMLButtonElement;
 		await fireEvent.click(downBtn);
 
 		expect(api.singboxRouterMoveRule).toHaveBeenCalledOnce();
-		expect(api.singboxRouterMoveRule).toHaveBeenCalledWith(2, 3);
+		expect(api.singboxRouterMoveRule).toHaveBeenCalledWith(3, 4);
 	});
 
 	it('clicking ↑ on a movable rule calls api.singboxRouterMoveRule(i, i-1)', async () => {
@@ -168,11 +184,11 @@ describe('RulesSubTab — rule ordering controls (PR #101 commit #3)', () => {
 		const { api } = await import('$lib/api/client');
 
 		const rows = container.querySelectorAll('.t-row');
-		// rows[3] = second user rule (index 3). Click its ↑.
-		const upBtn = rows[3].querySelectorAll('.move-btn')[0] as HTMLButtonElement;
+		// rows[4] = second user rule (index 4). Click its ↑.
+		const upBtn = rows[4].querySelectorAll('.move-btn')[0] as HTMLButtonElement;
 		await fireEvent.click(upBtn);
 
 		expect(api.singboxRouterMoveRule).toHaveBeenCalledOnce();
-		expect(api.singboxRouterMoveRule).toHaveBeenCalledWith(3, 2);
+		expect(api.singboxRouterMoveRule).toHaveBeenCalledWith(4, 3);
 	});
 });

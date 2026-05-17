@@ -554,6 +554,8 @@ export interface SystemInfo {
 	activeBackend: string;
 	routerIP: string;
 	bootInProgress: boolean;
+	/** >0 when started with -slow-request-ms (init script); drives Profiling log filter chip */
+	slowRequestThresholdMs?: number;
 	backendAvailability: { nativewg: boolean; kernel: boolean };
 	singbox?: {
 		installed: boolean;
@@ -1208,6 +1210,24 @@ export interface SingboxRouterSettings {
 	refreshMode?: 'interval' | 'daily';
 	refreshIntervalHours?: number;
 	refreshDailyTime?: string;
+	// WAN-binding discriminator (mirrors backend storage):
+	//   wanAutoDetect=true  + wanInterface=""    → sing-box auto_detect_interface
+	//   wanAutoDetect=false + wanInterface="X"   → sing-box default_interface=X
+	// All other combinations are invalid; backend validator rejects them.
+	wanAutoDetect: boolean;
+	wanInterface?: string; // kernel system-name (e.g. "ppp0"); empty when wanAutoDetect=true
+}
+
+// WAN interface for the sing-box router WAN-binding picker. `name` is
+// the kernel system-name (stable across NDMS re-creation) and is what
+// gets persisted into SingboxRouterSettings.wanInterface. `up` is
+// info-only — never gates selection (UI shows all, user picks).
+export interface SingboxRouterWANInterface {
+	name: string;
+	id: string;
+	label: string;
+	up: boolean;
+	priority: number;
 }
 
 export interface SingboxRouterIssue {
@@ -1255,7 +1275,15 @@ export interface SingboxRouterRule {
 	port?: number[];
 	rule_set?: string[];
 	protocol?: string;
-	action: 'route' | 'reject' | 'sniff' | 'hijack-dns';
+	// When true, matches packets whose destination is private (RFC1918,
+	// loopback, link-local, CGNAT, multicast). System ip_is_private
+	// bypass rule has this set + outbound:"direct".
+	ip_is_private?: boolean;
+	// Optional — sing-box defaults to `route` when omitted. The system
+	// ip_is_private rule omits action because that's how SKeen's
+	// reference config writes it and the backend's `omitempty` mirrors
+	// the same shape.
+	action?: 'route' | 'reject' | 'sniff' | 'hijack-dns';
 	outbound?: string;
 }
 

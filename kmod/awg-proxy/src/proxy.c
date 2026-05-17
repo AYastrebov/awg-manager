@@ -134,31 +134,58 @@ static int proxy_sendmsg(struct socket *sock, u8 *buf, int len,
 
 /*
  * Send CPS packets before handshake init.
- * Uses cps_generate_all from cps.c (reference's structured approach).
+ *
+ * Counter handling mirrors amneziawg-linux-kernel-module's wg_packet_send_handshake_initiation
+ * (src/send.c): the caller (c2s_thread_fn) re-seeds proxy->cps_counter to a
+ * fresh random value at the start of each handshake cycle, and we increment
+ * it ONLY after a successful socket send — never at generation time.
+ *
+ * Pre-compute the per-slot counter array first so cps_generate_all can stay
+ * pure (no shared-state mutation). Counter advance per packet sent: matches
+ * reference's atomic_inc-after-send.
  */
 static void send_cps_packets(struct awg_proxy *proxy)
 {
 	u8 (*bufs)[1500];
 	int lens[5];
-	int count, i;
+	u32 counters[5];
+	int count, i, slot;
 
 	bufs = kmalloc(5 * 1500, GFP_KERNEL);
 	if (!bufs)
 		return;
 
-	count = cps_generate_all(proxy->cfg.cps, &proxy->cps_counter,
-				 bufs, lens);
-	for (i = 0; i < count; i++) {
-		if (lens[i] > 0)
-			proxy_sendmsg(proxy->remote_sock, bufs[i], lens[i],
-				      NULL);
+	/* Counters[k] = current counter + k, one per non-null template. */
+	for (i = 0; i < 5; i++)
+		counters[i] = proxy->cps_counter + i;
+
+	count = cps_generate_all(proxy->cfg.cps, counters, bufs, lens);
+
+	for (slot = 0; slot < count; slot++) {
+		int sret;
+
+		if (lens[slot] <= 0)
+			continue;
+		sret = proxy_sendmsg(proxy->remote_sock, bufs[slot], lens[slot],
+				     NULL);
+		if (sret >= 0)
+			proxy->cps_counter++;
 	}
 	kfree(bufs);
 }
 
 /*
  * Send junk packets before handshake init.
- * Uses generate_junk from transform.c (reference's approach).
+ *
+ * Each junk datagram gets a freshly randomised IP TOS (DSCP) — mirrors the
+ * amneziawg-linux-kernel-module reference (src/send.c:68-69):
+ *     get_random_bytes(&ds, 1);
+ *     wg_socket_send_buffer_to_peer(peer, buffer, junk_packet_size, ds, 0);
+ *
+ * Without per-packet DSCP randomisation, every junk UDP datagram from our
+ * source goes out with TOS=0, producing a trivially-fingerprintable burst
+ * (N back-to-back UDP packets, identical TOS) that distinguishes us from
+ * amneziawg-go traffic on the wire.
  */
 static void send_junk_packets(struct awg_proxy *proxy)
 {
@@ -172,11 +199,31 @@ static void send_junk_packets(struct awg_proxy *proxy)
 
 	count = generate_junk(&proxy->cfg, junk, sizes, AWG_MAX_JC);
 	for (i = 0; i < count; i++) {
+		u8 ds;
+		int tos;
+
 		if (sizes[i] <= 0 || sizes[i] > 1500)
 			continue;
 		get_random_bytes(junk, sizes[i]);
+
+		/* Random per-packet IP TOS. setsockopt expects an int. */
+		get_random_bytes(&ds, 1);
+		tos = ds;
+		(void)kernel_setsockopt(proxy->remote_sock, IPPROTO_IP, IP_TOS,
+					(char *)&tos, sizeof(tos));
+
 		proxy_sendmsg(proxy->remote_sock, junk, sizes[i], NULL);
 	}
+
+	/* Restore default TOS=0 so the subsequent handshake init / steady-state
+	 * traffic doesn't inherit the last junk DSCP value. */
+	{
+		int zero_tos = 0;
+
+		(void)kernel_setsockopt(proxy->remote_sock, IPPROTO_IP, IP_TOS,
+					(char *)&zero_tos, sizeof(zero_tos));
+	}
+
 	kfree(junk);
 }
 
@@ -261,6 +308,19 @@ static int c2s_thread_fn(void *data)
 
 		/* Send CPS + junk before handshake init if needed */
 		if (sendJunk) {
+			/*
+			 * Re-seed CPS counter to a fresh random value at the
+			 * start of each handshake-init cycle — matches the
+			 * reference's `atomic_set(&peer->jp_packet_counter,
+			 * get_random_u32())` (src/send.c:43).
+			 *
+			 * Without this, our counter would start at 0 and grow
+			 * monotonically across the tunnel lifetime, producing
+			 * a trivially-predictable byte sequence in <c>-tokens
+			 * of every handshake's CPS packets (DPI fingerprint).
+			 */
+			get_random_bytes(&proxy->cps_counter,
+					 sizeof(proxy->cps_counter));
 			send_cps_packets(proxy);
 			send_junk_packets(proxy);
 		}

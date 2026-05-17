@@ -183,7 +183,7 @@ func main() {
 	forceBoot := flag.Bool("force-boot", false, "Simulate boot mode (for testing boot path on running router)")
 	pprofListen := flag.String("pprof-listen", "", "Dedicated TCP address for Go /debug/pprof only (recommended: 127.0.0.1:6060); empty disables standalone pprof")
 	pprofOnMain := flag.Bool("pprof-on-main", false, "Also mount /debug/pprof/* on the main HTTP server (LAN/loopback listeners)")
-	slowReqMS := flag.Int("slow-request-ms", 500, "Log HTTP handlers slower than this (ms) to stderr via slog (0 disables); long-lived SSE/WS routes are excluded")
+	slowReqMS := flag.Int("slow-request-ms", 0, "Log HTTP handlers slower than this (ms) to stderr via slog (0 disables); long-lived SSE/WS routes are excluded")
 	flag.Parse()
 
 	// Ensure Go can find CA certificates on entware-based systems (Keenetic).
@@ -1021,6 +1021,7 @@ func main() {
 		SingboxTunnels:         &routerSingboxTunnelAdapter{src: singboxOp},
 		SubscriptionComposites: router.NewSubscriptionCompositesAdapter(subAdapter),
 		Orch:                   sbOrch,
+		WANInterfaces:          &routerWANInterfaceAdapter{store: ndmsQueries.Interfaces},
 	})
 	tunnelService.SetAWGSyncer(awgoutboundsSvc)
 	tunnelService.SetDeviceProxyRefChecker(deviceProxySvc)

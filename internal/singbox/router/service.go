@@ -25,6 +25,12 @@ type Service interface {
 	GetSettings(ctx context.Context) (storage.SingboxRouterSettings, error)
 	UpdateSettings(ctx context.Context, s storage.SingboxRouterSettings) error
 
+	// ListWANInterfaces returns all router WAN interfaces (no up/down
+	// filtering) for the WAN-binding picker. Pairs with
+	// SingboxRouterSettings.WANInterface, which stores the kernel
+	// system-name from this list.
+	ListWANInterfaces(ctx context.Context) ([]WANInterfaceInfo, error)
+
 	SetRouteFinal(ctx context.Context, tag string) error
 
 	ListRules(ctx context.Context) ([]Rule, error)
@@ -92,6 +98,27 @@ type PolicyDevice struct {
 	IP    string `json:"ip"`
 	Name  string `json:"name,omitempty"`
 	Bound bool   `json:"bound"`
+}
+
+// WANInterfaceInfo is the public projection of one router WAN
+// interface for the WAN-binding picker. Name is the kernel system-name
+// (stable across NDMS re-creation) and is what gets persisted into
+// SingboxRouterSettings.WANInterface and emitted into sing-box config
+// route.default_interface. ID and Label are display-only.
+type WANInterfaceInfo struct {
+	Name     string `json:"name"`     // kernel system-name: "ppp0", "eth3"
+	ID       string `json:"id"`       // NDMS interface ID: "ISP", "PPPoE0"
+	Label    string `json:"label"`    // human-friendly: description or type-derived
+	Up       bool   `json:"up"`       // current up/down — info-only, never gates selection
+	Priority int    `json:"priority"` // NDMS priority (higher = preferred by user)
+}
+
+// WANInterfaceLister is the narrow contract the service needs from the
+// NDMS interface store. *ndmsquery.InterfaceStore satisfies it. The
+// router package can't import internal/ndms (would cycle through
+// internal/tunnel/wan); the adapter in cmd/awg-manager bridges the gap.
+type WANInterfaceLister interface {
+	ListWAN(ctx context.Context) ([]WANInterfaceInfo, error)
 }
 
 // PolicyInfo is the public projection of one NDMS access policy that
@@ -178,6 +205,11 @@ type Deps struct {
 	// not loop back into sing-box. Optional — when nil, NewService
 	// defaults to the production collector backed by d.Log.
 	WANIPCollector WANIPCollector
+	// WANInterfaces lists router WAN interfaces for the WAN-binding
+	// picker. Optional — when nil, ListWANInterfaces returns an empty
+	// slice (UI shows just the "auto" option). Production wiring in
+	// cmd/awg-manager bridges this to ndmsQueries.Interfaces.ListWAN.
+	WANInterfaces WANInterfaceLister
 }
 
 // routerLoggerAdapter narrows *logger.Logger to the wanLogger
@@ -205,8 +237,9 @@ func (a *routerLoggerAdapter) Info(msg string) {
 type ServiceImpl struct {
 	deps           Deps
 	mu             sync.Mutex
-	currentMark    string   // last-installed iptables mark; used by Reconcile to detect change
-	currentWANIPs  []string // last-collected WAN IPs; used by Reconcile to detect change
+	currentMark       string          // last-installed iptables mark; used by Reconcile to detect change
+	currentWANIPs     []string        // last-collected WAN IPs; used by Reconcile to detect change
+	currentLANBridges []LANBridgeMark // last-discovered LAN-bridge (name, NDMS mark) pairs; reconcile triggers re-install when this changes (e.g. user changed Keenetic hotspot policy or added a new bridge)
 
 	// inspectCache backs the route-inspector's rule_set match path. Lazy
 	// constructed on first Inspect call so dev-machine builds (no
@@ -391,6 +424,14 @@ func (s *ServiceImpl) Enable(ctx context.Context) error {
 	cfg.Inbounds = ensureTProxyInbound(cfg.Inbounds)
 	cfg.Outbounds = stripLegacyAWGDirect(cfg.Outbounds)
 	cfg.EnsureSystemRules()
+	// Settings was already loaded above; revalidate here in case the
+	// store is corrupted or hand-edited around a schema migration. We
+	// fail Enable rather than apply a half-broken config — the user
+	// sees a clean error in the UI and can fix it.
+	if err := ValidateSingboxRouterSettings(sr); err != nil {
+		return fmt.Errorf("router settings: %w", err)
+	}
+	cfg.EnsureRouteWAN(sr.WANAutoDetect, sr.WANInterface)
 
 	if err := s.persistConfig(ctx, cfg); err != nil {
 		return err
@@ -422,7 +463,22 @@ func (s *ServiceImpl) Enable(ctx context.Context) error {
 		return fmt.Errorf("collect WAN IPs: %w", err)
 	}
 
-	if err := s.deps.IPTables.Install(ctx, RestoreInputSpec{PolicyMark: mark, WANIPs: wanIPs}); err != nil {
+	// Discover LAN bridges where NDMS hotspot catch-all marks traffic
+	// — these are exactly the bridges where a mark=0 (no-policy) device
+	// can exist. DNS-NOPOLICY rules re-mark its DNS up to NDMS's
+	// catch-all mark so the existing _NDM_HOTSPOT_DNSREDIR REDIRECTs it
+	// to the per-policy ndnproxy. Empty result = no qualifying bridges
+	// = skip the DNS-NOPOLICY logic entirely (Install proceeds without it).
+	lanBridges, _ := DiscoverLANBridges(ctx)
+	if len(lanBridges) == 0 {
+		s.deps.Log.Warnf("router: no NDMS hotspot LAN bridges discovered; DNS fallback for no-policy devices skipped")
+	}
+
+	if err := s.deps.IPTables.Install(ctx, RestoreInputSpec{
+		PolicyMark: mark,
+		WANIPs:     wanIPs,
+		LANBridges: lanBridges,
+	}); err != nil {
 		// Stop sing-box from listening on the now-orphan TPROXY port,
 		// but DO NOT corrupt the persisted user config. With orchestrator
 		// wired we just park the slot back under disabled/ — sing-box
@@ -439,6 +495,7 @@ func (s *ServiceImpl) Enable(ctx context.Context) error {
 	}
 	s.currentMark = mark
 	s.currentWANIPs = wanIPs
+	s.currentLANBridges = lanBridges
 
 	settings.SingboxRouter = sr
 	if err := s.deps.Settings.Save(settings); err != nil {
@@ -643,6 +700,7 @@ func (s *ServiceImpl) Disable(ctx context.Context) error {
 	}
 	s.currentMark = ""
 	s.currentWANIPs = nil
+	s.currentLANBridges = nil
 
 	if s.deps.Orch != nil {
 		// Move 20-router.json under disabled/ — sing-box's non-recursive
@@ -716,18 +774,22 @@ func (s *ServiceImpl) reconcileInstalled(ctx context.Context, sr storage.Singbox
 
 	markChanged := mark != s.currentMark
 	wanIPsChanged := !slices.Equal(s.currentWANIPs, wanIPs)
+	lanBridges, _ := DiscoverLANBridges(ctx)
+	lanBridgesChanged := !equalLANBridges(s.currentLANBridges, lanBridges)
 
-	if markChanged || wanIPsChanged {
+	if markChanged || wanIPsChanged || lanBridgesChanged {
 		s.mu.Lock()
 		if err := s.deps.IPTables.Install(ctx, RestoreInputSpec{
 			PolicyMark: mark,
 			WANIPs:     wanIPs,
+			LANBridges: lanBridges,
 		}); err != nil {
 			s.mu.Unlock()
 			return err
 		}
 		s.currentMark = mark
 		s.currentWANIPs = wanIPs
+		s.currentLANBridges = lanBridges
 		s.mu.Unlock()
 	}
 
@@ -932,6 +994,9 @@ func (s *ServiceImpl) GetSettings(ctx context.Context) (storage.SingboxRouterSet
 }
 
 func (s *ServiceImpl) UpdateSettings(ctx context.Context, sr storage.SingboxRouterSettings) error {
+	if err := ValidateSingboxRouterSettings(sr); err != nil {
+		return err
+	}
 	settings, err := s.deps.Settings.Load()
 	if err != nil {
 		return err
@@ -941,6 +1006,33 @@ func (s *ServiceImpl) UpdateSettings(ctx context.Context, sr storage.SingboxRout
 		return err
 	}
 	return s.Reconcile(ctx)
+}
+
+// ValidateSingboxRouterSettings enforces the WAN-binding discriminator:
+//   - WANAutoDetect=true   && WANInterface==""    → OK
+//   - WANAutoDetect=false  && WANInterface!=""    → OK
+//   - WANAutoDetect=true   && WANInterface!=""    → error (contradictory)
+//   - WANAutoDetect=false  && WANInterface==""    → error (no target)
+//
+// This guards both the storage layer (UpdateSettings) and the apply
+// path (Enable → EnsureRouteWAN) so an invalid state cannot reach
+// sing-box config either through the API or through a hand-edited
+// settings.json.
+func ValidateSingboxRouterSettings(sr storage.SingboxRouterSettings) error {
+	if sr.WANAutoDetect && sr.WANInterface != "" {
+		return fmt.Errorf("wanAutoDetect=true requires wanInterface to be empty (got %q)", sr.WANInterface)
+	}
+	if !sr.WANAutoDetect && sr.WANInterface == "" {
+		return fmt.Errorf("wanAutoDetect=false requires wanInterface to be set to a kernel interface name")
+	}
+	return nil
+}
+
+func (s *ServiceImpl) ListWANInterfaces(ctx context.Context) ([]WANInterfaceInfo, error) {
+	if s.deps.WANInterfaces == nil {
+		return []WANInterfaceInfo{}, nil
+	}
+	return s.deps.WANInterfaces.ListWAN(ctx)
 }
 
 func (s *ServiceImpl) computeIssues(cfg *RouterConfig) []Issue {

@@ -58,6 +58,15 @@ type SingboxRouterSettingsData struct {
 	RefreshMode     string `json:"refreshMode,omitempty" example:"interval"`
 	RefreshInterval int    `json:"refreshIntervalHours,omitempty" example:"24"`
 	RefreshDaily    string `json:"refreshDailyTime,omitempty" example:"03:00"`
+	// WANAutoDetect / WANInterface form a two-field discriminator:
+	//   true  + ""    → sing-box auto_detect_interface
+	//   false + "ppp0"→ sing-box default_interface=ppp0
+	// Other combinations are rejected by the backend validator.
+	// Example below shows the PINNED case as it's the more interesting
+	// shape to document (auto case has WANInterface omitted via omitempty
+	// and wanAutoDetect=true); both examples are intentionally consistent.
+	WANAutoDetect bool   `json:"wanAutoDetect" example:"false"`
+	WANInterface  string `json:"wanInterface,omitempty" example:"ppp0"`
 }
 
 // SingboxRouterSettingsResponse is the envelope for GET /singbox/router/settings.
@@ -178,6 +187,23 @@ type SingboxRouterPoliciesListResponse struct {
 type SingboxRouterPolicyResponse struct {
 	Success bool                       `json:"success" example:"true"`
 	Data    SingboxRouterPolicyInfoDTO `json:"data"`
+}
+
+// SingboxRouterWANInterfaceDTO mirrors router.WANInterfaceInfo for the
+// WAN-binding picker.
+type SingboxRouterWANInterfaceDTO struct {
+	Name     string `json:"name" example:"ppp0"`
+	ID       string `json:"id" example:"PPPoE0"`
+	Label    string `json:"label" example:"Резервный канал"`
+	Up       bool   `json:"up" example:"true"`
+	Priority int    `json:"priority" example:"700000"`
+}
+
+// SingboxRouterWANInterfacesListResponse is the envelope for
+// GET /singbox/router/wan-interfaces.
+type SingboxRouterWANInterfacesListResponse struct {
+	Success bool                           `json:"success" example:"true"`
+	Data    []SingboxRouterWANInterfaceDTO `json:"data"`
 }
 
 // SingboxRouterPolicyDeviceDTO mirrors router.PolicyDevice.
@@ -848,6 +874,34 @@ func (h *SingboxRouterHandler) ApplyPreset(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	response.Success(w, map[string]bool{"ok": true})
+}
+
+// ListWANInterfaces returns all router WAN interfaces for the
+// WAN-binding picker. No up/down filtering — the UI shows every
+// interface and the user picks.
+//
+//	@Summary		List WAN interfaces
+//	@Description	Returns all router WAN interfaces (no up/down filtering) used by the WAN-binding picker in singbox-router settings. Always a JSON array, never null. The `name` field is the kernel system-name and is the value that should be persisted into `wanInterface`.
+//	@Tags			singbox-router
+//	@Produce		json
+//	@Security		CookieAuth
+//	@Success		200	{object}	SingboxRouterWANInterfacesListResponse
+//	@Failure		500	{object}	APIErrorEnvelope
+//	@Router			/singbox/router/wan-interfaces [get]
+func (h *SingboxRouterHandler) ListWANInterfaces(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		response.MethodNotAllowed(w)
+		return
+	}
+	ifaces, err := h.svc.ListWANInterfaces(r.Context())
+	if err != nil {
+		response.InternalError(w, err.Error())
+		return
+	}
+	if ifaces == nil {
+		ifaces = []router.WANInterfaceInfo{}
+	}
+	response.Success(w, ifaces)
 }
 
 // PoliciesCollection routes by HTTP method:

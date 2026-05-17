@@ -106,8 +106,18 @@ func (m *ManagerImpl) Start(ctx context.Context) (int, error) {
 		// Collect ttyd output so API errors include real failure reason (not generic timeout).
 		output := &syncBuffer{}
 		loginPath := resolveLoginBinary()
+		// `-d 3` keeps the lws log mask at ERR|WARN only. Without it the
+		// default mask includes NOTICE, and Entware's libwebsockets build
+		// emits N-level messages straight into syslog (router log) —
+		// bypassing our cmd.Stderr redirect. Most of the spam is the lws
+		// captive-portal-detection probe to connectivitycheck.android.com
+		// firing on every terminal session start. Level-mask gates messages
+		// before any emit function, so suppressing NOTICE silences syslog,
+		// stderr, and any other emit channel at once. ERR+WARN still surface
+		// real failures into stderr (collected in syncBuffer for diagnostics).
 		cmd := exec.Command(ttydBinary,
 			"--writable",
+			"-d", "3",
 			"--port", fmt.Sprintf("%d", port),
 			"--interface", "lo",
 			"--once",

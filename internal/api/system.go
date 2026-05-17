@@ -66,8 +66,9 @@ type SystemInfoData struct {
 	IsAarch64           bool                          `json:"isAarch64" example:"true"`
 	ActiveBackend       string                        `json:"activeBackend" example:"nativewg"`
 	RouterIP            string                        `json:"routerIP" example:"192.168.1.1"`
-	BootInProgress      bool                          `json:"bootInProgress" example:"false"`
-	BackendAvailability SystemInfoBackendAvailability `json:"backendAvailability"`
+	BootInProgress           bool                          `json:"bootInProgress" example:"false"`
+	SlowRequestThresholdMs   int                           `json:"slowRequestThresholdMs" example:"0"`
+	BackendAvailability      SystemInfoBackendAvailability `json:"backendAvailability"`
 	Singbox             SystemInfoSingbox             `json:"singbox"`
 	RouterDetails       *RouterDetails                `json:"routerDetails,omitempty"`
 }
@@ -183,8 +184,9 @@ type SystemHandler struct {
 	pingCheckService PingCheckService
 	ndmsQueries      *ndmsquery.Queries
 	restartFn        func()
-	bootStatusFn     func() bool // returns true if boot is still in progress
-	hydra            *hydraroute.Service
+	bootStatusFn             func() bool // returns true if boot is still in progress
+	slowRequestThresholdMs   int         // 0 = slow HTTP profiling disabled
+	hydra                    *hydraroute.Service
 	singboxOp        *singbox.Operator
 	bus              *events.Bus
 
@@ -259,6 +261,14 @@ func (h *SystemHandler) SetRestartFunc(fn func()) {
 // SetBootStatusFunc sets the callback to check if boot is in progress.
 func (h *SystemHandler) SetBootStatusFunc(fn func() bool) {
 	h.bootStatusFn = fn
+}
+
+// SetSlowRequestThresholdMs exposes the -slow-request-ms runtime flag to the UI.
+func (h *SystemHandler) SetSlowRequestThresholdMs(ms int) {
+	if ms < 0 {
+		ms = 0
+	}
+	h.slowRequestThresholdMs = ms
 }
 
 // SetHydraRoute sets the HydraRoute Neo service for status/control endpoints.
@@ -496,7 +506,8 @@ func (h *SystemHandler) buildSystemInfo(disableMemorySaving bool, gcMemLimit, go
 		"isAarch64":           isAarch64,
 		"activeBackend":       activeBackendType,
 		"routerIP":            routerIP,
-		"bootInProgress":      h.bootStatusFn != nil && h.bootStatusFn(),
+		"bootInProgress":           h.bootStatusFn != nil && h.bootStatusFn(),
+		"slowRequestThresholdMs":   h.slowRequestThresholdMs,
 		"backendAvailability": map[string]bool{
 			"nativewg": nativewgAvailable(),
 			// Kernel backend works on any OS where amneziawg.ko is loaded.

@@ -49,7 +49,15 @@
 	const finalLabel = $derived(status?.final || 'direct');
 
 	function isSystem(r: SingboxRouterRule): boolean {
-		return r.action === 'sniff' || r.action === 'hijack-dns';
+		// `ip_is_private: true` is a system bypass rule that the backend
+		// (EnsureSystemRules) keeps at a fixed position right after
+		// hijack-dns. Treating it as system disables drag/edit/delete and
+		// applies the muted styling so the user knows not to touch it.
+		return (
+			r.action === 'sniff' ||
+			r.action === 'hijack-dns' ||
+			r.ip_is_private === true
+		);
 	}
 
 	const userRules = $derived(rules.filter((r) => !isSystem(r)));
@@ -144,12 +152,16 @@
 		if (r.action === 'sniff') return 'SNIFF';
 		if (r.action === 'hijack-dns') return 'HIJACK';
 		if (r.action === 'reject') return 'REJECT';
+		if (r.ip_is_private === true) return 'BYPASS';
 		return 'ROUTE';
 	}
 
 	function matcherSummary(r: SingboxRouterRule): string {
 		if (r.action === 'sniff') return 'sniff';
-		if (r.action === 'hijack-dns') return 'hijack-dns (protocol=dns)';
+		if (r.action === 'hijack-dns') return 'hijack-dns (protocol=dns OR port=53)';
+		if (r.ip_is_private === true) {
+			return 'ip_is_private (RFC1918 / loopback / link-local / CGNAT / multicast)';
+		}
 		const parts: string[] = [];
 		if (r.domain_suffix?.length) {
 			const more =
@@ -285,8 +297,10 @@
 						{matcherSummary(r)}
 					</div>
 					<div class="col-out mono">
-						{#if r.action === 'route' && r.outbound}
-							<Badge variant="accent" size="sm" mono>{r.outbound}</Badge>
+						{#if r.outbound}
+							<Badge variant={sys ? 'muted' : 'accent'} size="sm" mono
+								>{r.outbound}</Badge
+							>
 						{:else}
 							<span class="dim">—</span>
 						{/if}

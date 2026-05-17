@@ -1,0 +1,5 @@
+OK   KN-1812 -> awg_proxy-arm64.ko     size=35928  v=1.1.2  sha=f2a6a0e595a9
+OK   KN-1810 -> awg_proxy-mt7621.ko    size=30500  v=1.1.2  sha=143f95b2040c
+OK   KN-1212 -> awg_proxy-mt7628.ko    size=30324  v=1.1.2  sha=f4c901e80dc2
+OK   KN-2010 -> awg_proxy-mips.ko      size=30532  v=1.1.2  sha=c4307a060f5d
+OK   KN-1011 -> awg_proxy-KN-1011.ko   size=33404  v=1.1.2  sha=9c33bfa56fc2

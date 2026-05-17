@@ -20,7 +20,7 @@ import (
 const (
 	awgProxyDir         = "/opt/etc/awg-manager/modules"
 	defaultKoPath       = awgProxyDir + "/awg_proxy.ko"
-	expectedKmodVersion = "1.1.1" // minimum required awg_proxy.ko version
+	expectedKmodVersion = "1.1.2" // minimum required awg_proxy.ko version
 )
 
 // KmodManager manages the awg_proxy.ko kernel module for NativeWG tunnels.
@@ -66,9 +66,17 @@ func NewKmodManager(log *logger.Logger) *KmodManager {
 }
 
 // resolveKoPath returns the path to awg_proxy.ko.
-// Priority: per-model (KN-1011 HIGHMEM) → per-device (Xiaomi-R3P) → SoC (mt7621/mt7628) → arch default.
+// Priority: per-model (KN-1011 HIGHMEM is currently the only model that
+// genuinely needs its own build) → SoC default → arch default.
+//
+// The per-device tier (Xiaomi-R3P) is gone — the v1.1.2 IPK no longer
+// ships a Xiaomi-specific .ko; non-Keenetic devices fall through to the
+// SoC/arch default just like every other configuration. SHA256 audit of
+// the v1.1.1 set showed all other per-model files (KN-1010, KN-1410,
+// KN-2010, KN-3811) were bit-exact duplicates of their SoC defaults, so
+// they are no longer shipped either.
 func (km *KmodManager) resolveKoPath() string {
-	// 1. Per-model override (e.g. awg_proxy-KN-1011.ko for HIGHMEM)
+	// 1. Per-model override (currently only KN-1011 HIGHMEM is unique)
 	model := kmod.DetectModel()
 	if model != "" {
 		modelPath := fmt.Sprintf(awgProxyDir+"/awg_proxy-%s.ko", model)
@@ -78,17 +86,7 @@ func (km *KmodManager) resolveKoPath() string {
 		}
 	}
 
-	// 2. Per-device override (e.g. awg_proxy-Xiaomi-R3P.ko for non-Keenetic HW)
-	device := kmod.DetectDevice()
-	if device != "" {
-		devicePath := fmt.Sprintf(awgProxyDir+"/awg_proxy-%s.ko", device)
-		if _, err := os.Stat(devicePath); err == nil {
-			km.log.Infof("kmod: using device-specific awg_proxy for %s", device)
-			return devicePath
-		}
-	}
-
-	// 3. SoC-specific (e.g. awg_proxy-mt7628.ko for non-SMP mipsel)
+	// 2. SoC-specific (e.g. awg_proxy-mt7628.ko for non-SMP mipsel)
 	soc := kmod.DetectSoC()
 	if soc != kmod.SoCUnknown {
 		socPath := fmt.Sprintf(awgProxyDir+"/awg_proxy-%s.ko", string(soc))
@@ -98,7 +96,7 @@ func (km *KmodManager) resolveKoPath() string {
 		}
 	}
 
-	// 4. Arch default (fallback)
+	// 3. Arch default (fallback)
 	return defaultKoPath
 }
 

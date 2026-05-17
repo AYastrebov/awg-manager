@@ -511,6 +511,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	systemHandler.SetHydraRoute(s.hydraService)
 	systemHandler.SetSingboxOperator(s.singboxOp)
 	systemHandler.SetEventBus(s.bus)
+	if ms := int(s.config.SlowRequestThreshold / time.Millisecond); ms > 0 {
+		systemHandler.SetSlowRequestThresholdMs(ms)
+	}
 	settingsHandler := api.NewSettingsHandler(s.settings, appLog)
 	settingsHandler.SetTunnelStore(s.tunnels)
 	settingsHandler.SetPingCheckService(s.pingCheckService)
@@ -1051,6 +1054,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("/api/singbox/router/presets/list", guarded(rh.ListPresets))
 		mux.HandleFunc("/api/singbox/router/presets/apply", guarded(rh.ApplyPreset))
 		mux.HandleFunc("/api/singbox/router/policies", guarded(rh.PoliciesCollection))
+		mux.HandleFunc("/api/singbox/router/wan-interfaces", guarded(rh.ListWANInterfaces))
 		mux.HandleFunc("/api/singbox/router/policy-devices", guarded(rh.ListPolicyDevices))
 		mux.HandleFunc("/api/singbox/router/policy-devices/bind", guarded(rh.BindDevice))
 		mux.HandleFunc("/api/singbox/router/policy-devices/unbind", guarded(rh.UnbindDevice))

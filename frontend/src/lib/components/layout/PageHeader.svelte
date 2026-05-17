@@ -66,4 +66,26 @@
         gap: 0.5rem;
         flex-shrink: 0;
     }
+
+    /* On mobile, stack title above actions: long page titles (single
+       unbreakable words like "Маршрутизация") + `flex-shrink: 0` on
+       .actions otherwise force the row to overflow past the viewport.
+       Body has `overflow-x: hidden` (app.css), so the overflow is
+       silently clipped AND a `ghost`-variant Button (transparent
+       background) ends up visually under the title text — user
+       perceives the button as missing. Stacking vertically gives the
+       actions their own row with full width, no overlap. Breakpoint
+       mirrors the `.setting-row` / `.section-header` patterns already
+       in app.css. */
+    @media (max-width: 640px) {
+        .page-header {
+            flex-direction: column;
+            align-items: stretch;
+            gap: 0.75rem;
+        }
+        .actions {
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+    }
 </style>

@@ -188,7 +188,14 @@ func (c *RouterConfig) EnsureSystemRules() {
 	}
 	hasSniff := false
 	hasHijack := false
-	for _, r := range c.Route.Rules {
+	hasPrivateBypass := false
+	// Track existing hijack-dns position. ip_is_private MUST be inserted
+	// right after hijack-dns; if we prepend it to position 0 instead,
+	// LAN-IP DNS matches ip_is_private first and routes `direct`,
+	// bypassing the hijack entirely and breaking DNS for in-policy
+	// clients.
+	hijackIdx := -1
+	for i, r := range c.Route.Rules {
 		if r.Action == "sniff" && !r.hasAnyMatcher() {
 			hasSniff = true
 		}
@@ -199,9 +206,22 @@ func (c *RouterConfig) EnsureSystemRules() {
 		if r.Action == "hijack-dns" {
 			if r.Protocol == "dns" || (r.Type == "logical" && r.Mode == "or") {
 				hasHijack = true
+				if hijackIdx == -1 {
+					hijackIdx = i
+				}
 			}
 		}
+		// Any user-authored ip_is_private rule wins over the system
+		// one — we just have to not duplicate. Outbound is intentionally
+		// not checked: a user might point private destinations at a
+		// specific direct-LAN outbound and we should respect that.
+		if r.IPIsPrivate != nil && *r.IPIsPrivate {
+			hasPrivateBypass = true
+		}
 	}
+
+	// Phase 1: prepend sniff + hijack-dns to front if missing.
+	// Predictable order inside the prepend block is [sniff, hijack-dns].
 	prepend := make([]Rule, 0, 2)
 	if !hasSniff {
 		prepend = append(prepend, Rule{Action: "sniff"})
@@ -221,10 +241,68 @@ func (c *RouterConfig) EnsureSystemRules() {
 			},
 			Action: "hijack-dns",
 		})
+		// Newly-prepended hijack ends up at the last slot of the
+		// prepend block (after the optional sniff).
+		hijackIdx = len(prepend) - 1
+	} else {
+		// Existing hijack shifts right by len(prepend) once prepend is
+		// stitched in front.
+		hijackIdx += len(prepend)
 	}
 	if len(prepend) > 0 {
 		c.Route.Rules = append(prepend, c.Route.Rules...)
 	}
+
+	// Phase 2: insert ip_is_private at hijackIdx+1 — directly after the
+	// hijack-dns rule, whether it was just prepended or already present.
+	if !hasPrivateBypass {
+		// Defense-in-depth: any packet that slips into sing-box with a
+		// private destination (RFC1918, loopback, link-local, CGNAT,
+		// multicast) goes `direct` instead of falling through to
+		// `final: proxy`. Matters specifically for non-policy DNS that
+		// the `hijack-dns` side-effect transparent listener picks up
+		// from router LAN IPs — those packets arrive without TPROXY
+		// ancillary data and would otherwise be silently dropped (no
+		// reply, client sees timeout). Mirrors SKeen example config
+		// (`reference/SKeen/examples/config.json:115`).
+		truePtr := true
+		privateRule := Rule{IPIsPrivate: &truePtr, Outbound: "direct"}
+		insertPos := hijackIdx + 1
+		newRules := make([]Rule, 0, len(c.Route.Rules)+1)
+		newRules = append(newRules, c.Route.Rules[:insertPos]...)
+		newRules = append(newRules, privateRule)
+		newRules = append(newRules, c.Route.Rules[insertPos:]...)
+		c.Route.Rules = newRules
+	}
+}
+
+// EnsureRouteWAN applies the WAN-binding discriminator to route.
+// Exactly one of `auto_detect_interface` / `default_interface` is written
+// to the emitted config — never both — so sing-box never sees a
+// contradictory state.
+//
+//   - autoDetect == true  → AutoDetectInterface = &true,
+//     DefaultInterface = "".
+//     kernelName MUST be empty here (validated upstream by
+//     ValidateSingboxRouterSettings); the field is accepted as an
+//     argument purely for the symmetric signature.
+//   - autoDetect == false → DefaultInterface = kernelName,
+//     AutoDetectInterface = nil.
+//     kernelName MUST be a non-empty kernel system-name (e.g. "ppp0").
+//     Same upstream validator enforces non-emptiness; this method does
+//     not second-guess the caller.
+//
+// Called from Enable() after EnsureSystemRules. Re-running with the same
+// arguments is a no-op idempotent update.
+func (c *RouterConfig) EnsureRouteWAN(autoDetect bool, kernelName string) {
+	if autoDetect {
+		t := true
+		c.Route.AutoDetectInterface = &t
+		c.Route.DefaultInterface = ""
+		return
+	}
+	c.Route.AutoDetectInterface = nil
+	c.Route.DefaultInterface = kernelName
 }
 
 // SetRouteFinal updates route.final. Caller must validate the tag refers
@@ -339,7 +417,8 @@ func stripLegacyAWGDirect(in []Outbound) []Outbound {
 
 func (r Rule) hasAnyMatcher() bool {
 	return len(r.DomainSuffix) > 0 || len(r.IPCIDR) > 0 || len(r.SourceIPCIDR) > 0 ||
-		len(r.Port) > 0 || len(r.RuleSet) > 0 || r.Protocol != "" || len(r.Rules) > 0
+		len(r.Port) > 0 || len(r.RuleSet) > 0 || r.Protocol != "" || len(r.Rules) > 0 ||
+		r.IPIsPrivate != nil
 }
 
 func validateRule(r Rule) error {

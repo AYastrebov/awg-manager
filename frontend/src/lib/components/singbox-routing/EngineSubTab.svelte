@@ -3,7 +3,7 @@
 	import { api } from '$lib/api/client';
 	import { notifications } from '$lib/stores/notifications';
 	import { singboxRouter } from '$lib/stores/singboxRouter';
-	import type { RouterPolicy } from '$lib/types';
+	import type { RouterPolicy, SingboxRouterWANInterface } from '$lib/types';
 	import {
 		Toggle,
 		Dropdown,
@@ -29,6 +29,7 @@
 
 	let busy = $state(false);
 	let policies = $state<RouterPolicy[]>([]);
+	let wanInterfaces = $state<SingboxRouterWANInterface[]>([]);
 	let creatingPolicy = $state(false);
 	let createModalOpen = $state(false);
 	let createDescription = $state('awgm-router');
@@ -46,12 +47,22 @@
 		}
 	}
 
+	async function loadWANInterfaces(): Promise<void> {
+		try {
+			wanInterfaces = await api.singboxRouterListWANInterfaces();
+		} catch (e) {
+			notifications.error((e as Error).message);
+			wanInterfaces = [];
+		}
+	}
+
 	onMount(() => {
 		// Engine sub-tab is the entry point of /routing?tab=singbox; refresh
 		// the cold router store on mount so all sub-tabs see fresh data
 		// without each one re-fetching.
 		refresh();
 		loadPolicies();
+		loadWANInterfaces();
 	});
 
 	async function selectPolicy(name: string): Promise<void> {
@@ -59,6 +70,59 @@
 		busy = true;
 		try {
 			await api.singboxRouterPutSettings({ ...settings, policyName: name });
+			await refresh();
+		} catch (e) {
+			notifications.error((e as Error).message);
+		} finally {
+			busy = false;
+		}
+	}
+
+	// Toggle wanAutoDetect. Switching to pinned mode requires also
+	// supplying a non-empty wanInterface — backend validator rejects
+	// {auto:false, interface:""}. We pick the first WAN as a default
+	// so the toggle never leaves the user with an invalid pending state.
+	async function setWANAutoDetect(next: boolean): Promise<void> {
+		if (!settings) return;
+		busy = true;
+		try {
+			if (next) {
+				await api.singboxRouterPutSettings({
+					...settings,
+					wanAutoDetect: true,
+					wanInterface: '',
+				});
+			} else {
+				const first = wanInterfaces[0]?.name ?? '';
+				if (!first) {
+					notifications.error(
+						'Не удалось получить список WAN-интерфейсов с роутера',
+					);
+					return;
+				}
+				await api.singboxRouterPutSettings({
+					...settings,
+					wanAutoDetect: false,
+					wanInterface: first,
+				});
+			}
+			await refresh();
+		} catch (e) {
+			notifications.error((e as Error).message);
+		} finally {
+			busy = false;
+		}
+	}
+
+	async function selectWAN(kernelName: string): Promise<void> {
+		if (!settings || !kernelName) return;
+		busy = true;
+		try {
+			await api.singboxRouterPutSettings({
+				...settings,
+				wanAutoDetect: false,
+				wanInterface: kernelName,
+			});
 			await refresh();
 		} catch (e) {
 			notifications.error((e as Error).message);
@@ -138,6 +202,18 @@
 				description: meta,
 			};
 		}),
+	);
+
+	// WAN dropdown options. Up/down is info-only (description suffix);
+	// doesn't gate selection — user picks freely. Surfacing kernel name
+	// in the description so the user understands they're picking a
+	// stable kernel identifier, not the NDMS ID.
+	const wanOptions = $derived<DropdownOption[]>(
+		wanInterfaces.map((iface) => ({
+			value: iface.name,
+			label: iface.label || iface.id || iface.name,
+			description: `${iface.id || iface.name} · ${iface.name} · ${iface.up ? 'up' : 'down'}`,
+		})),
 	);
 
 	const visibleIssues = $derived(status?.issues ?? []);
@@ -246,6 +322,40 @@
 							<Button variant="ghost" size="sm" href="/routing?tab=policy">
 								Управление устройствами →
 							</Button>
+						</div>
+					{/if}
+				</div>
+
+				<div class="wan-block">
+					<div class="control-label">WAN-интерфейс для outbound трафика</div>
+					<div class="wan-row">
+						<Toggle
+							checked={settings.wanAutoDetect}
+							onchange={(v) => setWANAutoDetect(v)}
+							disabled={busy}
+							size="sm"
+						/>
+						<span class="wan-toggle-label">
+							{settings.wanAutoDetect
+								? 'Авто-определение (sing-box выбирает сам)'
+								: 'Использовать конкретный WAN'}
+						</span>
+					</div>
+					{#if !settings.wanAutoDetect}
+						<div class="wan-dropdown">
+							<Dropdown
+								value={settings.wanInterface ?? ''}
+								options={wanOptions}
+								placeholder={wanInterfaces.length === 0
+									? '— нет доступных WAN —'
+									: '— выберите WAN —'}
+								disabled={busy || wanInterfaces.length === 0}
+								onchange={(v) => selectWAN(v)}
+								fullWidth
+							/>
+						</div>
+						<div class="wan-hint">
+							В sing-box передаётся kernel-имя (например, <code>ppp0</code>).
 						</div>
 					{/if}
 				</div>
@@ -409,6 +519,35 @@
 	.setting-description {
 		font-size: 0.85rem;
 		color: var(--color-text-secondary);
+	}
+	.wan-block {
+		margin-top: 1rem;
+		padding-top: 1rem;
+		border-top: 1px solid var(--color-border, rgba(255, 255, 255, 0.08));
+	}
+	.wan-row {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+	}
+	.wan-toggle-label {
+		font-size: 0.85rem;
+		color: var(--color-text-primary);
+	}
+	.wan-dropdown {
+		margin-top: 0.5rem;
+	}
+	.wan-hint {
+		margin-top: 0.375rem;
+		font-size: 0.75rem;
+		color: var(--color-text-muted);
+		line-height: 1.4;
+	}
+	.wan-hint code {
+		font-family: var(--font-mono, ui-monospace, monospace);
+		background: var(--color-bg-tertiary);
+		padding: 1px 6px;
+		border-radius: 3px;
 	}
 	.create-modal-body {
 		display: flex;

@@ -12,7 +12,7 @@ Go-бинарник awg-manager поддерживает встроенный HT
 
 Файл на роутере: `/opt/etc/init.d/S99awg-manager`
 
-Найди блок `start()` и строку `start-stop-daemon`. Добавь два флага после `-web-root "$WEB_ROOT"`:
+Найди блок `start()` и строку `start-stop-daemon`. Добавь флаги после `-web-root "$WEB_ROOT"` (по умолчанию в бинарнике и в штатном init-скрипте профилирование **выключено**):
 
 ```sh
 start-stop-daemon -S -b -m -p "$PID_FILE" -x "$BIN" -- \
@@ -30,7 +30,7 @@ start-stop-daemon -S -b -m -p "$PID_FILE" -x "$BIN" -- \
 |------|----------|
 | `-pprof-listen <addr>` | Отдельный порт только для pprof. Не связан с веб-UI awg-manager. |
 | `-pprof-on-main` | Также подключить pprof к основному HTTP-серверу (не нужен, если задан `-pprof-listen`). |
-| `-slow-request-ms 500` | Логировать в stderr запросы, которые выполняются дольше 500 мс. `0` — отключить. |
+| `-slow-request-ms 500` | Логировать в stderr запросы, которые выполняются дольше 500 мс. `0` — отключить (дефолт бинарника). В UI появится фильтр **Profiling** в журнале (режим expert). |
 
 > **После `opkg upgrade awg-manager`** init-скрипт перезаписывается — правку нужно повторить. Чтобы зафиксировать навсегда — вносить в `entware/files/etc/init.d/S99awg-manager` в репозитории.
 

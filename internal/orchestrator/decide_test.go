@@ -608,18 +608,53 @@ func TestDecide_WANUp_SkipsWithASC(t *testing.T) {
 	}
 }
 
-func TestDecide_WANUp_SkipsAlreadyRunning(t *testing.T) {
+// TestDecide_WANUp_ResumesNativeWGAfterSingleWANFlap covers the single-WAN
+// flap scenario reported on KN-1910 / NDMS 5.0.11. After WAN-down, the
+// orchestrator runs SuspendProxy but keeps Running=true and ActiveWAN
+// preserved (see orchestrator.updateState comment). When that same WAN
+// comes back up, decideWANUp must emit ActionStartNativeWG — otherwise
+// the tunnel hangs in conf=running, link=false, peer=false until the
+// user manually toggles Disable→Enable.
+func TestDecide_WANUp_ResumesNativeWGAfterSingleWANFlap(t *testing.T) {
 	s := newState()
 	s.supportsASC = false
 	s.anyWANUpFn = func() bool { return true }
 	s.tunnels["awg0"] = &tunnelState{
-		ID: "awg0", Backend: "nativewg", Enabled: true, Running: true, NWGIndex: 0,
+		ID:        "awg0",
+		Backend:   "nativewg",
+		Enabled:   true,
+		Running:   true,   // preserved across SuspendProxy
+		ActiveWAN: "ppp0", // matches the iface that's coming back up
+		NWGIndex:  0,
 	}
 
-	actions := decide(Event{Type: EventWANUp, WANIface: "eth3"}, &s)
+	actions := decide(Event{Type: EventWANUp, WANIface: "ppp0"}, &s)
+
+	if !hasAction(actions, ActionStartNativeWG) {
+		t.Error("WAN up on the same iface that the tunnel was suspended on must trigger StartNativeWG")
+	}
+}
+
+// TestDecide_WANUp_SkipsRunningOnDifferentWAN covers the multi-WAN
+// no-churn invariant: tunnel actively running on ppp0; ppp1 comes up
+// — leave the tunnel alone, no peer reconnect needed.
+func TestDecide_WANUp_SkipsRunningOnDifferentWAN(t *testing.T) {
+	s := newState()
+	s.supportsASC = false
+	s.anyWANUpFn = func() bool { return true }
+	s.tunnels["awg0"] = &tunnelState{
+		ID:        "awg0",
+		Backend:   "nativewg",
+		Enabled:   true,
+		Running:   true,
+		ActiveWAN: "ppp0", // tunnel is on ppp0
+		NWGIndex:  0,
+	}
+
+	actions := decide(Event{Type: EventWANUp, WANIface: "ppp1"}, &s)
 
 	if hasAction(actions, ActionStartNativeWG) {
-		t.Error("already running NativeWG should not be restarted on WAN up")
+		t.Error("WAN up on a different iface must NOT restart a tunnel running on another WAN")
 	}
 }
 

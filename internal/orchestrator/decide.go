@@ -288,7 +288,19 @@ func decideWANUp(event Event, state *State) []Action {
 			}
 
 		case "nativewg":
-			if state.supportsASC || t.Running {
+			if state.supportsASC {
+				continue // NDMS handles failover natively via ASC on >= 5.01.A.3
+			}
+			// Skip only when actively running on a DIFFERENT WAN (multi-WAN:
+			// alternate iface just came up — don't churn a healthy tunnel).
+			// After SuspendProxy the tunnel keeps Running=true on purpose
+			// (orchestrator.updateState) AND ActiveWAN matches the iface
+			// that went down — so when that same iface comes back up
+			// (t.ActiveWAN == event.WANIface) we resume via StartNativeWG.
+			// Without this, the tunnel hangs in conf=running, link=false,
+			// peer=false after a single-WAN flap until the user manually
+			// toggles Disable→Enable (KN-1910 NDMS 5.0.11 bug-report).
+			if t.Running && t.ActiveWAN != event.WANIface {
 				continue
 			}
 			actions = append(actions, Action{Type: ActionStartNativeWG, Tunnel: t.ID})

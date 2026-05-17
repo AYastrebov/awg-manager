@@ -6,6 +6,7 @@
   import { api } from '$lib/api/client';
   import { notifications } from '$lib/stores/notifications';
   import { usageLevel, settings } from '$lib/stores/settings';
+  import { systemInfo } from '$lib/stores/system';
   import { copyToClipboard } from '$lib/utils/clipboard';
   import LogRow from './LogRow.svelte';
   import LogsToolbar, { ALL_LEVELS } from './LogsToolbar.svelte';
@@ -76,10 +77,11 @@
   let prevLen = $state(0);
   let pageOffset = $state(0);
 
-  /** Subgroup `profiling` is expert-only UI; discard saved filter once settings say non-expert. */
+  /** Subgroup `profiling` is expert-only and only when -slow-request-ms > 0 at daemon start. */
   $effect(() => {
     if (!$settings) return;
-    if ($usageLevel === 'expert') return;
+    const profilingEnabled = ($systemInfo.data?.slowRequestThresholdMs ?? 0) > 0;
+    if ($usageLevel === 'expert' && profilingEnabled) return;
     if (filter.subgroup !== 'profiling') return;
     void applyFilter({ ...filter, subgroup: '' });
   });

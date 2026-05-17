@@ -48,8 +48,19 @@ type Rule struct {
 	Port         []int    `json:"port,omitempty"`
 	RuleSet      []string `json:"rule_set,omitempty"`
 	Protocol     string   `json:"protocol,omitempty"`
-	Action       string   `json:"action,omitempty"`
-	Outbound     string   `json:"outbound,omitempty"`
+	// IPIsPrivate, when set, matches packets whose destination is an
+	// RFC1918/loopback/link-local/CGNAT/multicast address. Pointer so
+	// the zero value (unset) stays out of JSON — `{"ip_is_private":false}`
+	// would change sing-box semantics. System rule from EnsureSystemRules
+	// uses `*IPIsPrivate = true` as defense-in-depth: even when iptables
+	// PolicyMark filter correctly keeps non-policy traffic out of
+	// AWGM-TPROXY, the `hijack-dns` route action creates a kernel-level
+	// transparent listener on every router LAN IP; a side-effect packet
+	// that slips into sing-box from there gets routed `direct` instead
+	// of ending up at `final: proxy` and being silently dropped.
+	IPIsPrivate *bool  `json:"ip_is_private,omitempty"`
+	Action      string `json:"action,omitempty"`
+	Outbound    string `json:"outbound,omitempty"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler for Rule. It accepts both
@@ -135,6 +146,18 @@ type Route struct {
 	RuleSet []RuleSet `json:"rule_set,omitempty"`
 	Rules   []Rule    `json:"rules,omitempty"`
 	Final   string    `json:"final,omitempty"`
+	// AutoDetectInterface controls whether sing-box picks the outbound
+	// interface from the system default route. Pointer so the unset
+	// value stays out of JSON — an explicit `false` would override the
+	// sing-box default for users who haven't opted in to the new field
+	// (configs written before v2.10.6).
+	AutoDetectInterface *bool `json:"auto_detect_interface,omitempty"`
+	// DefaultInterface pins outbound traffic to a specific kernel
+	// interface (e.g. "ppp0", "eth3"). Mutually exclusive with
+	// AutoDetectInterface in EnsureRouteWAN: setting one clears the
+	// other so the emitted config never carries both. NEVER stores
+	// NDMS interface ID — kernel name is the stable identifier.
+	DefaultInterface string `json:"default_interface,omitempty"`
 }
 
 type DomainResolver struct {
