@@ -3,7 +3,9 @@ package signature
 import (
 	"regexp"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 // The exact default I1 emitted by the docker-amneziawg container
@@ -102,6 +104,54 @@ func TestHasOversizedTag(t *testing.T) {
 	for _, in := range []string{"<r 1000>", "<b 0xc3><r 8>", "", "<t>"} {
 		if HasOversizedTag(in) {
 			t.Errorf("HasOversizedTag(%q) = true, want false", in)
+		}
+	}
+}
+
+// A size beyond MaxSplittableTagBytes must be left alone, not expanded. Without
+// the ceiling, <r 999999999999999999> spins ~10^15 Builder appends and takes
+// the process out on memory — and nothing validates I1-I5 on import, so such a
+// value can reach us from a .conf.
+func TestSplitOversizedTags_LeavesAbsurdSizesAlone(t *testing.T) {
+	for _, in := range []string{
+		"<r 999999999999999999>",
+		"<r 100001>",
+		"<rd 2000000000>",
+		"<r 99999999999999999999999999>", // beyond int64: Atoi fails
+	} {
+		done := make(chan string, 1)
+		go func() { done <- SplitOversizedTags(in) }()
+		select {
+		case got := <-done:
+			if got != in {
+				t.Errorf("SplitOversizedTags(%q)=%q, want unchanged", in, got)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("SplitOversizedTags(%q) did not return — missing size ceiling", in)
+		}
+		if HasOversizedTag(in) {
+			t.Errorf("HasOversizedTag(%q) = true: unrescuable sizes must not be reported as fixable", in)
+		}
+	}
+	// The largest size we still rewrite.
+	if got := SplitOversizedTags("<r 100000>"); !strings.HasPrefix(got, "<r 1000>") {
+		t.Errorf("<r 100000> should still be split, got %q", got)
+	}
+}
+
+// The regex tolerates spacing upstream's parser rejects, so every matched
+// token is re-emitted canonically — not only the oversized ones. Otherwise a
+// config gets "fixed", logged as fixed, and still rejected on another token.
+func TestSplitOversizedTags_CanonicalisesCompliantTokens(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"<r500>", "<r 500>"},
+		{"<r  500 >", "<r 500>"},
+		{"<rc16>", "<rc 16>"},
+		{"<r1178><r500>", "<r 1000><r 178><r 500>"},
+	}
+	for _, c := range cases {
+		if got := SplitOversizedTags(c.in); got != c.want {
+			t.Errorf("SplitOversizedTags(%q)=%q want %q", c.in, got, c.want)
 		}
 	}
 }

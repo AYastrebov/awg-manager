@@ -50,6 +50,17 @@ func splitSignatureTags(iface *storage.AWGInterface) (storage.AWGInterface, stri
 	return out, strings.Join(notes, "; ")
 }
 
+// logSignatureSplit reports a signature rewrite for the given tunnel. The ASC
+// paths run on every start and every param sync, so without this the config
+// NDMS actually runs would differ from the stored one with nothing said —
+// precisely the diagnostic this fixup exists to provide.
+func (o *OperatorNativeWG) logSignatureSplit(stage, name string, iface *storage.AWGInterface) {
+	if _, note := splitSignatureTags(iface); note != "" {
+		o.appLog.Info(stage, name,
+			"сигнатуры разбиты под лимит NDMS в 1000 байт на тег — "+note)
+	}
+}
+
 // ndmsImportConf renders the .conf uploaded to NDMS with oversized signature
 // tokens split, and a description of what was split for the log ("" if
 // nothing). Byte-identical to config.GenerateForExport for any config the

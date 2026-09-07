@@ -291,6 +291,7 @@ func (o *OperatorNativeWG) createViaBatch(ctx context.Context, stored *storage.A
 	// Set AWG obfuscation params via RCI (firmware >= 5.1Alpha4).
 	// Non-fatal: kmod proxy handles actual obfuscation regardless.
 	if o.useASC(&stored.Interface) {
+		o.logSignatureSplit("create", stored.Name, &stored.Interface)
 		if ascJSON, err := buildASCJSON(&stored.Interface); err == nil && ascJSON != nil {
 			if err := o.commands.Wireguard.SetASCParams(ctx, ndmsName, ascJSON); err != nil {
 				o.appLog.Warn("set-asc-params", "", "RCI failed (non-fatal): "+err.Error())
@@ -381,6 +382,7 @@ func (o *OperatorNativeWG) startNative(ctx context.Context, stored *storage.AWGT
 	// Sync ASC params from storage to NDMS — they may have been added/changed
 	// via the edit form after the initial Create (e.g. imported as plain WG, then edited).
 	o.appLog.Full("start", stored.Name, "Syncing ASC params to NDMS")
+	o.logSignatureSplit("start", stored.Name, &stored.Interface)
 	if ascJSON, err := buildASCJSON(&stored.Interface); err == nil && ascJSON != nil {
 		if err := o.commands.Wireguard.SetASCParams(ctx, names.NDMSName, ascJSON); err != nil {
 			o.appLog.Warn("sync-asc", names.NDMSName, err.Error())

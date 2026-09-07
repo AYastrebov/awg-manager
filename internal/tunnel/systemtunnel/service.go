@@ -44,5 +44,5 @@ func (s *ServiceImpl) GetASCParams(ctx context.Context, name string) (json.RawMe
 }
 
 func (s *ServiceImpl) SetASCParams(ctx context.Context, name string, params json.RawMessage) error {
-	return s.commands.Wireguard.SetASCParams(ctx, name, params)
+	return s.commands.Wireguard.SetASCParams(ctx, name, splitASCSignatures(params))
 }

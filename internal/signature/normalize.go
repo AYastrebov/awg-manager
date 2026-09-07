@@ -25,6 +25,20 @@ import (
 // boundary purely for that compatibility.
 const MaxTagBytes = 1000
 
+// MaxSplittableTagBytes bounds what we are willing to rewrite. A size beyond
+// it is not a config we can rescue: awg_proxy.ko's own parser rejects anything
+// over 100000 (parse_int in kmod/awg-proxy/src/cps.c), so such a token is
+// nonsense wherever it ends up.
+//
+// The bound is load-bearing, not cosmetic. Nothing validates I1-I5 on the way
+// in — config.Parse stores the string verbatim and ValidateAWG3 checks only
+// HeaderProtectionKey and S1-S4 — so an imported .conf can carry
+// "<r 999999999999999999>". Expanding that would spin ~10^15 iterations
+// appending to a Builder and take the process out on memory. Oversized beyond
+// rescue is left exactly as it came in, to be rejected downstream as it
+// should be.
+const MaxSplittableTagBytes = 100000
+
 // randTagRe matches one random-padding token. The size is required: <r> with
 // no digits is rejected by the AmneziaWG parser anyway, so leaving it alone is
 // the correct behaviour. Whitespace is tolerated because third-party
@@ -58,12 +72,20 @@ func SplitOversizedTags(spec string) string {
 			return tok
 		}
 		n, err := strconv.Atoi(m[2])
-		// A size we cannot parse (overflow) or one already within the limit is
-		// left exactly as it came in.
-		if err != nil || n <= MaxTagBytes {
+		if err != nil || n > MaxSplittableTagBytes {
 			return tok
 		}
-		return splitPad(n, m[1])
+		if n > MaxTagBytes {
+			return splitPad(n, m[1])
+		}
+		// Within the limit, but still re-emitted in canonical "<kind N>" form.
+		// The regex tolerates "<r500>" and "<r  500 >", which upstream's own
+		// parser does not accept — its parseTag regex,
+		// `([a-zA-Z]+)(?:\s+([^>]+))?>`, requires the whitespace. Rewriting
+		// only the oversized tokens would "fix" a config and leave a
+		// differently-malformed one in it, so every token we match is
+		// normalized.
+		return fmt.Sprintf("<%s %d>", m[1], n)
 	})
 }
 
@@ -72,7 +94,8 @@ func SplitOversizedTags(spec string) string {
 // silently — a config that only imports because we edited it should say so.
 func HasOversizedTag(spec string) bool {
 	for _, m := range randTagRe.FindAllStringSubmatch(spec, -1) {
-		if n, err := strconv.Atoi(m[2]); err == nil && n > MaxTagBytes {
+		n, err := strconv.Atoi(m[2])
+		if err == nil && n > MaxTagBytes && n <= MaxSplittableTagBytes {
 			return true
 		}
 	}
@@ -85,7 +108,7 @@ func DescribeOversizedTags(spec string) string {
 	var parts []string
 	for _, m := range randTagRe.FindAllStringSubmatch(spec, -1) {
 		n, err := strconv.Atoi(m[2])
-		if err != nil || n <= MaxTagBytes {
+		if err != nil || n <= MaxTagBytes || n > MaxSplittableTagBytes {
 			continue
 		}
 		parts = append(parts, fmt.Sprintf("%s → %s", m[0], splitPad(n, m[1])))
