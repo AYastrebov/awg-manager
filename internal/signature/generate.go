@@ -232,16 +232,19 @@ func assertEvenHex(hex string) string {
 	return hex
 }
 
-// splitPad renders n padding bytes as one or more <tag N> tokens, each ≤ 1000
-// bytes — the AmneziaWG kernel per-tag limit.
+// splitPad renders n padding bytes as one or more <tag N> tokens, each within
+// MaxTagBytes. Despite the widespread description of this as a kernel limit, it was
+// only ever an amneziawg-go check, removed upstream in PR #103 — see
+// MaxTagBytes in normalize.go. Kept because stricter third-party parsers
+// (notably Keenetic NDMS ASC) still enforce it.
 func splitPad(n int, tag string) string {
 	if n <= 0 {
 		return ""
 	}
 	var sb strings.Builder
-	for n > 1000 {
-		fmt.Fprintf(&sb, "<%s 1000>", tag)
-		n -= 1000
+	for n > MaxTagBytes {
+		fmt.Fprintf(&sb, "<%s %d>", tag, MaxTagBytes)
+		n -= MaxTagBytes
 	}
 	fmt.Fprintf(&sb, "<%s %d>", tag, n)
 	return sb.String()

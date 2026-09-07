@@ -63,6 +63,7 @@ func (o *OperatorNativeWG) SyncAWGParams(ctx context.Context, stored *storage.AW
 		return nil
 	}
 	names := NewNWGNames(stored.NWGIndex)
+	o.logSignatureSplit("sync-asc", stored.Name, &stored.Interface)
 	ascJSON, err := buildASCJSON(&stored.Interface)
 	if err != nil {
 		return fmt.Errorf("build ASC params: %w", err)

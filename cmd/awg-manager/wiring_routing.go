@@ -50,7 +50,8 @@ func (a *app) setupOrchestrator() {
 	a.ndmsCommands.SetHookNotifier(a.orch)
 
 	// System WireGuard tunnels (read-only + ASC editing) — wired to NDMS CQRS layer.
-	a.systemTunnelSvc = systemtunnel.New(a.ndmsQueries, a.ndmsCommands)
+	a.systemTunnelSvc = systemtunnel.New(a.ndmsQueries, a.ndmsCommands,
+		logging.NewScopedLogger(a.loggingService, logging.GroupTunnel, logging.SubOps))
 
 	// Monitoring service (target × tunnel matrix probing). Constructed here so
 	// it can include Keenetic-native (system) tunnels in the matrix via the

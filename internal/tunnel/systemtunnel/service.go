@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 
+	"github.com/hoaxisr/awg-manager/internal/logging"
 	ndms "github.com/hoaxisr/awg-manager/internal/ndms"
 	"github.com/hoaxisr/awg-manager/internal/ndms/command"
 	"github.com/hoaxisr/awg-manager/internal/ndms/query"
+	"github.com/hoaxisr/awg-manager/internal/signature"
 	"github.com/hoaxisr/awg-manager/internal/sys/osdetect"
 )
 
@@ -24,11 +26,12 @@ type Service interface {
 type ServiceImpl struct {
 	queries  *query.Queries
 	commands *command.Commands
+	appLog   *logging.ScopedLogger
 }
 
 // New creates a new system tunnel service.
-func New(queries *query.Queries, commands *command.Commands) *ServiceImpl {
-	return &ServiceImpl{queries: queries, commands: commands}
+func New(queries *query.Queries, commands *command.Commands, appLog *logging.ScopedLogger) *ServiceImpl {
+	return &ServiceImpl{queries: queries, commands: commands, appLog: appLog}
 }
 
 func (s *ServiceImpl) List(ctx context.Context) ([]ndms.SystemWireguardTunnel, error) {
@@ -44,5 +47,9 @@ func (s *ServiceImpl) GetASCParams(ctx context.Context, name string) (json.RawMe
 }
 
 func (s *ServiceImpl) SetASCParams(ctx context.Context, name string, params json.RawMessage) error {
+	params, note := splitASCSignatures(params)
+	if note != "" {
+		s.appLog.Info("set-asc", name, signature.RewriteLogMessage(note))
+	}
 	return s.commands.Wireguard.SetASCParams(ctx, name, params)
 }
