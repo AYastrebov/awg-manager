@@ -127,8 +127,15 @@ func (o *OperatorNativeWG) Create(ctx context.Context, stored *storage.AWGTunnel
 // createViaImport creates a tunnel by importing a .conf file (firmware >= 5.01.A.3).
 // NDMS fully parses AWG params (Jc, Jmin, S1, H1 etc.) from the .conf file.
 func (o *OperatorNativeWG) createViaImport(ctx context.Context, stored *storage.AWGTunnel) (int, error) {
-	// Generate .conf with all AWG params
-	confData := config.GenerateForExport(stored)
+	// Generate .conf with all AWG params. Oversized <r>/<rc>/<rd> tokens in
+	// I1-I5 are split here: NDMS parses the file with the strict AmneziaWG
+	// parser and rejects the whole import otherwise (see
+	// signature_normalize.go).
+	confData, splitNote := ndmsImportConf(stored)
+	if splitNote != "" {
+		o.appLog.Info("create", stored.Name,
+			"сигнатуры разбиты под лимит NDMS в 1000 байт на тег — "+splitNote)
+	}
 
 	// NDMS RCI-импорт отвергает IPv6-endpoint в .conf («"WireguardN": invalid
 	// endpoint format») и создание падает целиком, а доменное имя он принимает,
@@ -1274,6 +1281,10 @@ func buildASCJSON(iface *storage.AWGInterface) (json.RawMessage, error) {
 	if !config.IsAWGObfuscated(iface) {
 		return nil, nil
 	}
+	// Same per-tag limit as the import path: this payload goes to the very
+	// same NDMS parser, so an oversized token would be rejected here too.
+	split, _ := splitSignatureTags(iface)
+	iface = &split
 
 	ver := config.ClassifyAWGVersion(iface)
 	// awg3 is included here so the extended block (S3/S4, I1-I5) still reaches
