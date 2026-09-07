@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/hoaxisr/awg-manager/internal/obfuscator"
 	"github.com/hoaxisr/awg-manager/internal/orchestrator"
 	"github.com/hoaxisr/awg-manager/internal/response"
 	"github.com/hoaxisr/awg-manager/internal/storage"
@@ -491,6 +492,27 @@ func (h *TunnelsHandler) Update(w http.ResponseWriter, r *http.Request) {
 		response.Error(w, err.Error(), "INVALID_AWG3")
 		return
 	}
+	if err := obfuscator.Validate(merged.Obfuscator); err != nil {
+		response.Error(w, err.Error(), "INVALID_OBFUSCATOR")
+		return
+	}
+	// UI этого не шлёт (endpoint disabled, вкладка «Обфускация» скрыта), а
+	// MCP/curl — может: чужой endpoint увёл бы WG мимо релея, а AWG-параметры
+	// легли бы ASC-обфускацией поверх обфускации релея.
+	if existing.Obfuscator != nil {
+		if merged.Peer.Endpoint != existing.Peer.Endpoint {
+			response.Error(w, "endpoint обфусцированного туннеля не правится", "INVALID_OBFUSCATOR")
+			return
+		}
+		// Сравнение с записью, а не абсолютное состояние: ручной импорт
+		// ClusterM принимает любой .conf, в том числе с AWG-параметрами, и
+		// такой туннель иначе стал бы вечно нередактируемым.
+		if config.IsAWGObfuscated(&merged.Interface) &&
+			merged.Interface.AWGObfuscation != existing.Interface.AWGObfuscation {
+			response.Error(w, "параметры AWG несовместимы с обфускатором", "INVALID_OBFUSCATOR")
+			return
+		}
+	}
 
 	// Validate endpoint resolves (only if changed)
 	if merged.Peer.Endpoint != existing.Peer.Endpoint {
@@ -832,6 +854,9 @@ func (h *TunnelsHandler) Export(w http.ResponseWriter, r *http.Request) {
 	}
 
 	content := config.GenerateForExport(stored)
+	if stored.Obfuscator != nil {
+		content += "\n" + obfuscator.RenderInstance(stored.Obfuscator)
+	}
 	filename := stored.Name + ".conf"
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -1041,6 +1066,13 @@ func applyTunnelUpdate(t *storage.AWGTunnel, req *storage.AWGTunnel) {
 	case req.ISPInterface != "":
 		t.ISPInterface, t.ISPInterfaceLabel = req.ISPInterface, req.ISPInterfaceLabel
 	}
+	// Обфускатор: только пользовательские поля и только у туннеля, который
+	// уже обфусцирован (Q26: обычный туннель в обфусцированный не превращается;
+	// Flavor и LocalPort — не пользовательские).
+	if req.Obfuscator != nil && t.Obfuscator != nil {
+		merged := mergedObfuscator(*t.Obfuscator, *req.Obfuscator)
+		t.Obfuscator = &merged
+	}
 	if req.PingCheck != nil {
 		t.PingCheck = req.PingCheck
 	}
@@ -1073,6 +1105,23 @@ func mergedInterface(base, req storage.AWGInterface) storage.AWGInterface {
 	// AWG obfuscation block (issue #131): editable in the full edit form,
 	// so req is the source of truth — including explicit clears (i1 -> "").
 	base.AWGObfuscation = req.AWGObfuscation
+	return base
+}
+
+// mergedObfuscator накладывает пользовательские поля req на base; Flavor и
+// LocalPort остаются от base. Пустой Target = «не прислали».
+func mergedObfuscator(base, req storage.Obfuscator) storage.Obfuscator {
+	if req.Target == "" {
+		return base
+	}
+	base.Target = req.Target
+	if req.Key != "" {
+		base.Key = req.Key
+	}
+	base.Masking = req.Masking
+	base.MaxDummy = req.MaxDummy
+	base.IdleTimeout = req.IdleTimeout
+	base.ObfuscateBytes = req.ObfuscateBytes
 	return base
 }
 

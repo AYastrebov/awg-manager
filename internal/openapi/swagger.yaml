@@ -147,6 +147,8 @@ definitions:
       name:
         example: My VPN
         type: string
+      obfuscator:
+        $ref: '#/definitions/api.ObfuscatorDTO'
       peer:
         $ref: '#/definitions/api.AWGPeerDTO'
       state:
@@ -1848,8 +1850,18 @@ definitions:
         type: string
       freeTurnClientId:
         type: string
+      installUrl:
+        description: |-
+          InstallURL — ссылка установки Phobos (…/api/install/<token>): роутер сам
+          качает package.tar.gz и берёт из него .conf. TLS панели не проверяется.
+        type: string
       name:
         type: string
+      obfuscator:
+        allOf:
+        - $ref: '#/definitions/api.ObfuscatorImportRequest'
+        description: Obfuscator — параметры релея руками (ClusterM). Несовместимо
+          с [instance] в Content.
       wdttClientId:
         type: string
     type: object
@@ -2482,6 +2494,74 @@ definitions:
       success:
         example: true
         type: boolean
+    type: object
+  api.ObfuscatorDTO:
+    properties:
+      flavor:
+        enum:
+        - phobos
+        - clusterm
+        example: phobos
+        type: string
+      idleTimeout:
+        example: 120
+        type: integer
+      key:
+        example: secret
+        type: string
+      localPort:
+        example: 39000
+        type: integer
+      masking:
+        enum:
+        - STUN
+        - MEDIA
+        - AUTO
+        - NONE
+        example: STUN
+        type: string
+      maxDummy:
+        example: 4
+        type: integer
+      obfuscateBytes:
+        example: 16
+        type: integer
+      target:
+        example: 1.2.3.4:51824
+        type: string
+    type: object
+  api.ObfuscatorImportRequest:
+    properties:
+      flavor:
+        description: '"phobos" | "clusterm" (пусто = clusterm)'
+        type: string
+      idleTimeout:
+        type: integer
+      key:
+        type: string
+      masking:
+        type: string
+      maxDummy:
+        type: integer
+      obfuscateBytes:
+        type: integer
+      target:
+        type: string
+    type: object
+  api.ObfuscatorItemDTO:
+    properties:
+      flavor:
+        enum:
+        - phobos
+        - clusterm
+        example: phobos
+        type: string
+      localPort:
+        example: 39000
+        type: integer
+      target:
+        example: 1.2.3.4:51824
+        type: string
     type: object
   api.OkData:
     properties:
@@ -6428,6 +6508,12 @@ definitions:
       description:
         example: Home Server
         type: string
+      external:
+        description: |-
+          External — "phobos": интерфейс создан установщиком Phobos
+          (description Phobos-…) и установка на месте; не наш, не перенимается.
+        example: phobos
+        type: string
       id:
         example: Wireguard0
         type: string
@@ -6651,6 +6737,8 @@ definitions:
       ndmsName:
         example: Wireguard0
         type: string
+      obfuscator:
+        $ref: '#/definitions/api.ObfuscatorItemDTO'
       pingCheck:
         $ref: '#/definitions/api.TunnelPingCheckStatus'
       resolvedIspInterface:
@@ -6672,6 +6760,9 @@ definitions:
         - error
         - disabled
         example: connected
+        type: string
+      statusDetails:
+        example: обфускатор не запущен
         type: string
       txBytes:
         example: 5242880
