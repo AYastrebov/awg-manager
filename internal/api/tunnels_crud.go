@@ -219,7 +219,7 @@ func (h *TunnelsHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Validate endpoint resolves
-	if err := config.ValidateAWG3(&req.Interface.AWGObfuscation); err != nil {
+	if err := config.ValidateObfuscation(&req.Interface.AWGObfuscation); err != nil {
 		response.Error(w, err.Error(), "INVALID_AWG3")
 		return
 	}
@@ -488,7 +488,7 @@ func (h *TunnelsHandler) Update(w http.ResponseWriter, r *http.Request) {
 		response.Error(w, err.Error(), "INVALID_KEEPALIVE")
 		return
 	}
-	if err := config.ValidateAWG3(&merged.Interface.AWGObfuscation); err != nil {
+	if err := config.ValidateObfuscation(&merged.Interface.AWGObfuscation); err != nil {
 		response.Error(w, err.Error(), "INVALID_AWG3")
 		return
 	}
@@ -998,6 +998,10 @@ func (h *TunnelsHandler) ReplaceConf(w http.ResponseWriter, r *http.Request) {
 		}
 		if strings.Contains(err.Error(), "parse conf") {
 			response.BadRequest(w, err.Error())
+			return
+		}
+		if strings.Contains(err.Error(), "validate conf") {
+			response.Error(w, err.Error(), "INVALID_AWG3")
 			return
 		}
 		response.InternalError(w, err.Error())

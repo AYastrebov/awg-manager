@@ -835,7 +835,7 @@ func (s *ServiceImpl) Import(ctx context.Context, confContent, name, backend str
 	// Тот же гейт, что и на create/update: чужой .conf с битым
 	// HeaderProtectionKey или коротким S1-S4 иначе доедет до ядра и туннель
 	// встанет с выключенной header protection — молча.
-	if err := config.ValidateAWG3(&parsed.Interface.AWGObfuscation); err != nil {
+	if err := config.ValidateObfuscation(&parsed.Interface.AWGObfuscation); err != nil {
 		return nil, err
 	}
 
@@ -1025,6 +1025,11 @@ func (s *ServiceImpl) ReplaceConfig(ctx context.Context, tunnelID, confContent, 
 	parsed, err := config.Parse(confContent)
 	if err != nil {
 		return fmt.Errorf("parse conf: %w", err)
+	}
+	// Тот же гейт, что у импорта, create и update: модуль такой конфиг всё
+	// равно отвергнет на setconf, отказать здесь — честнее.
+	if err := config.ValidateObfuscation(&parsed.Interface.AWGObfuscation); err != nil {
+		return fmt.Errorf("validate conf: %w", err)
 	}
 
 	// Обфусцированный туннель: endpoint остаётся loopback, [instance] из
