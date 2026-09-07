@@ -12,13 +12,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/ndms"
 	"github.com/hoaxisr/awg-manager/internal/ndms/types"
 	"github.com/hoaxisr/awg-manager/internal/pingcheck"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 	"github.com/hoaxisr/awg-manager/internal/sys/exec"
+	"github.com/hoaxisr/awg-manager/internal/sys/kmod"
 	"github.com/hoaxisr/awg-manager/internal/sys/osdetect"
+	"github.com/hoaxisr/awg-manager/internal/sys/routerinfo"
 	"github.com/hoaxisr/awg-manager/internal/tunnel"
 	"github.com/hoaxisr/awg-manager/internal/tunnel/netutil"
 	"github.com/hoaxisr/awg-manager/internal/tunnel/nwg"
@@ -40,9 +41,7 @@ func (r *Runner) collectSystem(ctx context.Context) SystemInfo {
 		TotalMemoryMB: osdetect.GetTotalMemoryMB(),
 	}
 
-	if r.deps.Backend != nil {
-		info.Backend = r.deps.Backend.Type().String()
-	}
+	info.Backend = "kernel"
 
 	// Kernel module status — delegate to Loader (single source of truth)
 	if r.deps.KmodLoader != nil {
@@ -65,6 +64,8 @@ func (r *Runner) collectSystem(ctx context.Context) SystemInfo {
 			}
 		}
 	}
+
+	info.RouterDetails = routerinfo.Collect()
 
 	return info
 }
@@ -205,12 +206,12 @@ func (r *Runner) collectTunnels(ctx context.Context) []TunnelInfo {
 		if pcMap != nil {
 			if ps, ok := pcMap[t.ID]; ok {
 				ti.PingCheck = &PingCheckInfo{
-					Status:          ps.Status,
-					Method:          ps.Method,
-					FailCount:       ps.FailCount,
-					FailThreshold:   ps.FailThreshold,
-					RestartCount:    ps.RestartCount,
-					SuccessCount:    ps.SuccessCount,
+					Status:        ps.Status,
+					Method:        ps.Method,
+					FailCount:     ps.FailCount,
+					FailThreshold: ps.FailThreshold,
+					RestartCount:  ps.RestartCount,
+					SuccessCount:  ps.SuccessCount,
 				}
 			}
 		}
@@ -241,8 +242,6 @@ func (r *Runner) collectKernelConnection(ctx context.Context, ti *TunnelInfo, if
 // collectNativeWGConnection populates Connection from RCI show interface JSON.
 // ndmsJSON is the already-collected JSON from the main loop (avoids duplicate RCI call).
 func (r *Runner) collectNativeWGConnection(ti *TunnelInfo, ndmsJSON string) {
-	ti.Connection.RawOutput = ndmsJSON
-
 	if ndmsJSON == "" {
 		return
 	}
@@ -313,20 +312,28 @@ func (r *Runner) collectProxyInfo(ctx context.Context, stored *storage.AWGTunnel
 	pi.Loaded = true
 	pi.Version = strings.TrimSpace(string(versionData))
 
-	listData, err := os.ReadFile("/proc/awg_proxy/list")
+	// kmod.ReadProc, not os.ReadFile — the list is truncated to 512
+	// bytes on chunked reads with kmod < 1.1.11 (issue #362).
+	listData, err := kmod.ReadProc("/proc/awg_proxy/list")
 	if err != nil {
 		return pi
 	}
 
 	endpointHost, endpointPort, _ := net.SplitHostPort(stored.Peer.Endpoint)
-	if net.ParseIP(endpointHost) == nil {
-		if resolved, err := netutil.ResolveHost(endpointHost); err == nil {
-			endpointHost = resolved
-		}
+	if ip := net.ParseIP(endpointHost); ip != nil {
+		// Normalize user-typed literals (e.g. "[2001:DB8::1]",
+		// "2001:0db8::1") to the canonical RFC 5952 form — the kernel's
+		// %pI6c prints compressed lowercase in /proc list rows, so a
+		// non-canonical spelling would never match below.
+		endpointHost = ip.String()
+	} else if resolved, err := netutil.ResolveHost(endpointHost); err == nil {
+		endpointHost = resolved
 	}
-	targetPrefix := endpointHost + ":" + endpointPort + " "
+	// net.JoinHostPort brackets IPv6 hosts ("[2001:db8::1]:51820") — the
+	// same form awg_proxy.ko >= 1.3.0 prints in /proc list rows.
+	targetPrefix := net.JoinHostPort(endpointHost, endpointPort) + " "
 
-	for _, line := range strings.Split(string(listData), "\n") {
+	for line := range strings.SplitSeq(string(listData), "\n") {
 		if !strings.HasPrefix(line, targetPrefix) {
 			continue
 		}
@@ -450,18 +457,10 @@ func extractRouteGetVia(output string) string {
 	return ""
 }
 
-func (r *Runner) collectLogs() []logging.LogEntry {
-	if r.deps.LogService == nil {
-		return nil
-	}
-	// Get all entries (all categories, all levels)
-	return r.deps.LogService.GetLogs("", "")
-}
-
 // --- Helpers ---
 
 func extractAddr(output, prefix string) string {
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, prefix) {
 			parts := strings.Fields(line)
@@ -474,20 +473,19 @@ func extractAddr(output, prefix string) string {
 }
 
 func extractField(output, field string) string {
-	for _, line := range strings.Split(output, "\n") {
-		if idx := strings.Index(line, field); idx >= 0 {
-			return strings.TrimSpace(line[idx+len(field):])
+	for line := range strings.SplitSeq(output, "\n") {
+		if _, after, ok := strings.Cut(line, field); ok {
+			return strings.TrimSpace(after)
 		}
 	}
 	return ""
 }
 
 func extractTransfer(output, direction string) string {
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		if strings.Contains(line, "transfer:") {
 			// "transfer: 1.2 GiB received, 340 MiB sent"
-			parts := strings.Split(line, ",")
-			for _, p := range parts {
+			for p := range strings.SplitSeq(line, ",") {
 				p = strings.TrimSpace(p)
 				if strings.Contains(p, direction) {
 					return strings.TrimSuffix(strings.TrimSuffix(p, " "+direction), "transfer: ")
@@ -499,11 +497,10 @@ func extractTransfer(output, direction string) string {
 }
 
 func extractEndpointIP(awgShow string) string {
-	for _, line := range strings.Split(awgShow, "\n") {
+	for line := range strings.SplitSeq(awgShow, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "endpoint:") {
-			ep := strings.TrimSpace(strings.TrimPrefix(line, "endpoint:"))
-			host, _, err := net.SplitHostPort(ep)
+		if ep, ok := strings.CutPrefix(line, "endpoint:"); ok {
+			host, _, err := net.SplitHostPort(strings.TrimSpace(ep))
 			if err == nil {
 				return host
 			}
@@ -516,7 +513,7 @@ func extractEndpointRoute(routeTable, endpointIP string) string {
 	if endpointIP == "" {
 		return ""
 	}
-	for _, line := range strings.Split(routeTable, "\n") {
+	for line := range strings.SplitSeq(routeTable, "\n") {
 		line = strings.TrimSpace(line)
 		// Match "IP/32 ..." (DHCP) or "IP dev ..." (PPPoE, no /32 suffix)
 		if strings.HasPrefix(line, endpointIP+"/") || strings.HasPrefix(line, endpointIP+" ") {
@@ -527,7 +524,7 @@ func extractEndpointRoute(routeTable, endpointIP string) string {
 }
 
 func extractDefaultRoute(routeTable, ifaceName string) string {
-	for _, line := range strings.Split(routeTable, "\n") {
+	for line := range strings.SplitSeq(routeTable, "\n") {
 		if strings.HasPrefix(line, "default") && strings.Contains(line, ifaceName) {
 			return strings.TrimSpace(line)
 		}
@@ -537,7 +534,7 @@ func extractDefaultRoute(routeTable, ifaceName string) string {
 
 func filterRules(iptablesOutput, ifaceName string) []string {
 	var rules []string
-	for _, line := range strings.Split(iptablesOutput, "\n") {
+	for line := range strings.SplitSeq(iptablesOutput, "\n") {
 		if strings.Contains(line, ifaceName) {
 			rules = append(rules, strings.TrimSpace(line))
 		}
@@ -563,20 +560,20 @@ func formatRouteTable(routes []ndms.Route) string {
 func sanitizeConfig(stored *storage.AWGTunnel) string {
 	var sb strings.Builder
 	sb.WriteString("[Interface]\n")
-	sb.WriteString(fmt.Sprintf("Address = %s\n", stored.Interface.Address))
+	fmt.Fprintf(&sb, "Address = %s\n", stored.Interface.Address)
 	if stored.Interface.MTU > 0 {
-		sb.WriteString(fmt.Sprintf("MTU = %d\n", stored.Interface.MTU))
+		fmt.Fprintf(&sb, "MTU = %d\n", stored.Interface.MTU)
 	}
 	sb.WriteString("PrivateKey = [REDACTED]\n")
 	sb.WriteString("\n[Peer]\n")
-	sb.WriteString(fmt.Sprintf("PublicKey = %s\n", stored.Peer.PublicKey))
+	fmt.Fprintf(&sb, "PublicKey = %s\n", stored.Peer.PublicKey)
 	if stored.Peer.PresharedKey != "" {
 		sb.WriteString("PresharedKey = [REDACTED]\n")
 	}
-	sb.WriteString(fmt.Sprintf("Endpoint = %s\n", stored.Peer.Endpoint))
-	sb.WriteString(fmt.Sprintf("AllowedIPs = %s\n", strings.Join(stored.Peer.AllowedIPs, ", ")))
-	if stored.Peer.PersistentKeepalive > 0 {
-		sb.WriteString(fmt.Sprintf("PersistentKeepalive = %d\n", stored.Peer.PersistentKeepalive))
+	fmt.Fprintf(&sb, "Endpoint = %s\n", stored.Peer.Endpoint)
+	fmt.Fprintf(&sb, "AllowedIPs = %s\n", strings.Join(stored.Peer.AllowedIPs, ", "))
+	if !stored.Peer.PersistentKeepalive.IsZero() {
+		fmt.Fprintf(&sb, "PersistentKeepalive = %s\n", stored.Peer.PersistentKeepalive)
 	}
 	return sb.String()
 }
@@ -596,10 +593,11 @@ func (r *Runner) collectAWGProxyModule(ctx context.Context) AWGProxyModule {
 	}
 
 	// /proc/awg_proxy/list → RawList + EndpointCount
-	if listData, err := os.ReadFile("/proc/awg_proxy/list"); err == nil {
+	// (kmod.ReadProc — see issue #362, 512-byte truncation on os.ReadFile)
+	if listData, err := kmod.ReadProc("/proc/awg_proxy/list"); err == nil {
 		mod.RawList = string(listData)
 		count := 0
-		for _, line := range strings.Split(mod.RawList, "\n") {
+		for line := range strings.SplitSeq(mod.RawList, "\n") {
 			if strings.TrimSpace(line) != "" {
 				count++
 			}
@@ -613,7 +611,7 @@ func (r *Runner) collectAWGProxyModule(ctx context.Context) AWGProxyModule {
 	if result, err := exec.Shell(ctx, "dmesg | grep -i awg_proxy"); err == nil {
 		raw := strings.TrimSpace(result.Stdout)
 		if raw != "" {
-			for _, line := range strings.Split(raw, "\n") {
+			for line := range strings.SplitSeq(raw, "\n") {
 				line = strings.TrimSpace(line)
 				if line != "" {
 					mod.DmesgLines = append(mod.DmesgLines, line)

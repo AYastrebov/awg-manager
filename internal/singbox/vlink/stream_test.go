@@ -124,3 +124,133 @@ func TestBuildStreamFromQuery_RealitySidTooLong_Rejected(t *testing.T) {
 		t.Errorf("expected error on sid > 16 hex chars")
 	}
 }
+
+func TestBuildStreamFromQuery_XHTTP(t *testing.T) {
+	q := parseQuery(t, "type=xhttp&security=tls&path=/xh&host=cdn.example.com&sni=foo.com&mode=packet-up")
+	s, err := BuildStreamFromQuery(q, "example.com")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if s.Network != "xhttp" {
+		t.Errorf("network=%q, want xhttp", s.Network)
+	}
+	if s.Path != "/xh" {
+		t.Errorf("path=%q, want /xh", s.Path)
+	}
+	if s.Host != "cdn.example.com" {
+		t.Errorf("host=%q, want cdn.example.com", s.Host)
+	}
+	if s.Mode != "packet-up" {
+		t.Errorf("mode=%q, want packet-up", s.Mode)
+	}
+	if s.TLS == nil || s.TLS.ServerName != "foo.com" {
+		t.Errorf("tls=%+v", s.TLS)
+	}
+}
+
+func TestBuildStreamFromQuery_SplitHTTPAlias(t *testing.T) {
+	q := parseQuery(t, "type=splithttp&security=tls&path=/sh")
+	s, err := BuildStreamFromQuery(q, "example.com")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if s.Network != "xhttp" {
+		t.Errorf("network=%q, want xhttp (splithttp alias)", s.Network)
+	}
+}
+
+func TestMergeIntoOutbound_XHTTP(t *testing.T) {
+	s := &StreamBuilder{Network: "xhttp", Path: "/xh", Host: "cdn.example.com", Mode: "auto"}
+	out := map[string]any{}
+	s.MergeIntoOutbound(out)
+	tr, ok := out["transport"].(map[string]any)
+	if !ok {
+		t.Fatalf("no transport block: %v", out)
+	}
+	if tr["type"] != "xhttp" {
+		t.Errorf("type=%v, want xhttp", tr["type"])
+	}
+	if tr["path"] != "/xh" {
+		t.Errorf("path=%v", tr["path"])
+	}
+	if tr["host"] != "cdn.example.com" {
+		t.Errorf("host=%v", tr["host"])
+	}
+	if tr["mode"] != "auto" {
+		t.Errorf("mode=%v", tr["mode"])
+	}
+	// x_padding_bytes is mandatory and non-zero (sing-box rejects 0/missing).
+	if tr["x_padding_bytes"] != "100-1000" {
+		t.Errorf("x_padding_bytes=%v, want default 100-1000", tr["x_padding_bytes"])
+	}
+}
+
+func TestMergeIntoOutbound_XHTTP_KeepsExplicitPadding(t *testing.T) {
+	s := &StreamBuilder{Network: "xhttp", XPaddingBytes: "200-800"}
+	out := map[string]any{}
+	s.MergeIntoOutbound(out)
+	tr := out["transport"].(map[string]any)
+	if tr["x_padding_bytes"] != "200-800" {
+		t.Errorf("x_padding_bytes=%v, want 200-800", tr["x_padding_bytes"])
+	}
+}
+
+// Early data по конвенции экосистемы едет в заголовке Sec-WebSocket-Protocol
+// (mihomo при "?ed=N" ставит именно его). Без имени заголовка sing-box
+// дописывает данные в URL-путь (transport/v2raywebsocket/conn.go), и сервер их
+// не понимает — то есть ws+ed не работал ни на одном пути.
+func TestBuildStreamFromQuery_WSEarlyDataHeader(t *testing.T) {
+	q := parseQuery(t, "type=ws&path=%2Fws%3Fed%3D2048")
+	s, err := BuildStreamFromQuery(q, "example.com")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	out := map[string]any{}
+	s.MergeIntoOutbound(out)
+	tr := out["transport"].(map[string]any)
+	if tr["max_early_data"] != 2048 {
+		t.Errorf("max_early_data=%v", tr["max_early_data"])
+	}
+	if tr["early_data_header_name"] != "Sec-WebSocket-Protocol" {
+		t.Errorf("early_data_header_name=%v, want Sec-WebSocket-Protocol", tr["early_data_header_name"])
+	}
+}
+
+// Без early data имя заголовка не выдумываем.
+func TestBuildStreamFromQuery_WSNoEarlyData(t *testing.T) {
+	q := parseQuery(t, "type=ws&path=%2Fws")
+	s, _ := BuildStreamFromQuery(q, "example.com")
+	out := map[string]any{}
+	s.MergeIntoOutbound(out)
+	tr := out["transport"].(map[string]any)
+	if _, present := tr["early_data_header_name"]; present {
+		t.Errorf("unexpected early_data_header_name: %v", tr)
+	}
+}
+
+// REALITY без uTLS движок не поднимает вовсе ("uTLS is required by reality
+// client"), поэтому ссылка без fp= обязана получить дефолтный отпечаток.
+func TestBuildStreamFromQuery_RealityDefaultFingerprint(t *testing.T) {
+	q := parseQuery(t, "type=tcp&security=reality&sni=a.example.com&pbk=k&sid=ab12")
+	s, err := BuildStreamFromQuery(q, "example.com")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	out := map[string]any{}
+	s.MergeIntoOutbound(out)
+	utls, _ := out["tls"].(map[string]any)["utls"].(map[string]any)
+	if utls == nil || utls["fingerprint"] != "chrome" {
+		t.Errorf("utls=%v, want default chrome", utls)
+	}
+}
+
+// Обычный TLS без fp= отпечаток не требует — дефолт не навязываем.
+func TestBuildStreamFromQuery_PlainTLSNoFingerprint(t *testing.T) {
+	q := parseQuery(t, "type=tcp&security=tls&sni=a.example.com")
+	s, _ := BuildStreamFromQuery(q, "example.com")
+	out := map[string]any{}
+	s.MergeIntoOutbound(out)
+	if _, present := out["tls"].(map[string]any)["utls"]; present {
+		t.Errorf("unexpected utls: %v", out["tls"])
+	}
+}

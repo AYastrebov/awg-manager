@@ -1,11 +1,14 @@
 <script lang="ts">
     import { api } from '$lib/api/client';
+    import { errorMessage } from '$lib/utils/errorMessage';
     import type { ClientRoute, PolicyDevice, RoutingTunnel } from '$lib/types';
     import { ConfirmModal, StoreStatusBadge, Button, Dropdown, type DropdownOption } from '$lib/components/ui';
     import { ClientRouteCard, ClientRouteCreateModal } from '$lib/components/clientroute';
     import { notifications } from '$lib/stores/notifications';
     import { clientRoutesStore } from '$lib/stores/routing';
     import RoutingTabBodySkeleton from './RoutingTabBodySkeleton.svelte';
+    import RoutingCreateButton from '$lib/components/routing/RoutingCreateButton.svelte';
+    import { ERROR_WORDS, pluralForm, pluralize, RULE_WORDS } from '$lib/utils/pluralize';
 
     interface Props {
         clientRoutes: ClientRoute[];
@@ -36,8 +39,8 @@
             clientRouteModalOpen = false;
             editingClientRoute = null;
             notifications.success('Правило создано');
-        } catch (e: any) {
-            notifications.error(e.message || 'Ошибка создания');
+        } catch (e) {
+            notifications.error(errorMessage(e, 'Ошибка создания'));
         } finally {
             clientRouteSaving = false;
         }
@@ -52,8 +55,8 @@
             clientRouteModalOpen = false;
             editingClientRoute = null;
             notifications.success('Правило обновлено');
-        } catch (e: any) {
-            notifications.error(e.message || 'Ошибка обновления');
+        } catch (e) {
+            notifications.error(errorMessage(e, 'Ошибка обновления'));
         } finally {
             clientRouteSaving = false;
         }
@@ -66,8 +69,8 @@
 
             clientRouteDeleteId = null;
             notifications.success('Правило удалено');
-        } catch (e: any) {
-            notifications.error(e.message || 'Ошибка удаления');
+        } catch (e) {
+            notifications.error(errorMessage(e, 'Ошибка удаления'));
         }
     }
 
@@ -77,8 +80,8 @@
             await api.toggleClientRoute(id, enabled);
 
             notifications.success(enabled ? 'VPN включён' : 'VPN отключён');
-        } catch (e: any) {
-            notifications.error(e.message || 'Ошибка переключения');
+        } catch (e) {
+            notifications.error(errorMessage(e, 'Ошибка переключения'));
         } finally {
             clientRouteToggling = null;
         }
@@ -110,8 +113,8 @@
             }
 
             const label = enabled ? 'Включено' : 'Выключено';
-            if (fail > 0) notifications.warning(`${label} ${ok} из ${ok + fail} правил (${fail} ошибок)`);
-            else notifications.success(`${label} ${ok} правил`);
+            if (fail > 0) notifications.warning(`${label} ${ok} из ${ok + fail} ${pluralForm(ok + fail, RULE_WORDS)} (${pluralize(fail, ERROR_WORDS)})`);
+            else notifications.success(`${label} ${pluralize(ok, RULE_WORDS)}`);
         } finally {
             clientBulkLoading = false;
         }
@@ -126,8 +129,8 @@
             }
 
             exitClientSelection();
-            if (fail > 0) notifications.warning(`Удалено ${ok} из ${ok + fail} правил (${fail} ошибок)`);
-            else notifications.success(`Удалено ${ok} правил`);
+            if (fail > 0) notifications.warning(`Удалено ${ok} из ${ok + fail} ${pluralForm(ok + fail, RULE_WORDS)} (${pluralize(fail, ERROR_WORDS)})`);
+            else notifications.success(`Удалено ${pluralize(ok, RULE_WORDS)}`);
         } finally {
             clientBulkLoading = false;
             clientBulkDeleteConfirm = false;
@@ -144,8 +147,8 @@
             }
 
             clientTunnelMode = false;
-            if (fail > 0) notifications.warning(`Туннель изменён для ${ok} из ${ok + fail} правил (${fail} ошибок)`);
-            else notifications.success(`Туннель изменён для ${ok} правил`);
+            if (fail > 0) notifications.warning(`Туннель изменён для ${ok} из ${ok + fail} ${pluralForm(ok + fail, RULE_WORDS)} (${pluralize(fail, ERROR_WORDS)})`);
+            else notifications.success(`Туннель изменён для ${pluralize(ok, RULE_WORDS)}`);
         } finally {
             clientBulkLoading = false;
         }
@@ -158,7 +161,7 @@
             {#if bodyLoading}
                 …
             {:else}
-                {clientRoutes.length} правил
+                {pluralize(clientRoutes.length, RULE_WORDS)}
             {/if}
         </span>
         <div class="section-buttons">
@@ -166,7 +169,13 @@
             {#if clientRoutes.length > 0}
                 <Button variant="ghost" size="sm" disabled={bodyLoading} onclick={() => { clientSelectionMode = true; clientSelected = new Set(); }}>Выбрать</Button>
             {/if}
-            <Button variant="primary" size="sm" disabled={bodyLoading} onclick={() => { editingClientRoute = null; clientRouteModalOpen = true; }}>+ Создать</Button>
+            <RoutingCreateButton
+                disabled={bodyLoading}
+                onclick={() => {
+                    editingClientRoute = null;
+                    clientRouteModalOpen = true;
+                }}
+            />
         </div>
     {:else}
         <div class="bulk-bar">
@@ -252,7 +261,7 @@
     <ConfirmModal
         open={true}
         title="Удаление"
-        message={`Удалить ${clientSelected.size} VPN-правил?`}
+        message={`Удалить ${clientSelected.size} VPN-${pluralForm(clientSelected.size, RULE_WORDS)}?`}
         onConfirm={bulkClientDelete}
         onClose={() => clientBulkDeleteConfirm = false}
     />

@@ -1,11 +1,9 @@
 <script lang="ts">
 	import type { SubscriptionMember } from '$lib/types';
 	import type { SingboxLayoutMode } from '$lib/constants/singboxLayout';
-	import { untrack } from 'svelte';
-	import { singboxDelayHistory, singboxTraffic, triggerDelayCheck } from '$lib/stores/singbox';
-	import { getTrafficRates, subscribeTraffic, loadHistory } from '$lib/stores/traffic';
-	import { TrafficSparkline } from '$lib/components/ui';
-	import { formatBytes } from '$lib/utils/format';
+	import { PingButton } from '$lib/components/ui';
+	import { singboxDelayHistory, triggerDelayCheck } from '$lib/stores/singbox';
+	import { singboxDelayFromHistory } from '$lib/utils/singboxDelay';
 
 	interface Props {
 		member: SubscriptionMember;
@@ -15,15 +13,11 @@
 		onclick: () => void;
 		layout?: SingboxLayoutMode;
 	}
-	let { member, active, switching, disabled, onclick, layout = 'grid' }: Props = $props();
+	let { member, active, switching, disabled, onclick, layout = 'compact' }: Props = $props();
 
 	const history = $derived($singboxDelayHistory.get(member.tag) ?? []);
-	const latest = $derived(history.length > 0 ? history[history.length - 1] : -1);
-	const hasConsecutiveTimeout = $derived(
-		history.length >= 2 &&
-			history[history.length - 1] <= 0 &&
-			history[history.length - 2] <= 0
-	);
+	const delayPresentation = $derived(singboxDelayFromHistory(history));
+	const latest = $derived(delayPresentation.latest ?? -1);
 
 	let testing = $state(false);
 
@@ -37,29 +31,14 @@
 			testing = false;
 		}
 	}
-	function onTestKeydown(e: KeyboardEvent): void {
+	function onSparkKeydown(e: KeyboardEvent): void {
 		if (e.key === 'Enter' || e.key === ' ') {
 			e.preventDefault();
-			runTest(e);
+			void runTest(e);
 		}
 	}
-
-	const DELAY_OK = 200;
-	const DELAY_SLOW = 500;
-
-	const delayState = $derived.by((): 'ok' | 'slow' | 'fail' | 'unknown' => {
-		if (latest < 0) return 'unknown';
-		if (latest <= 0) return hasConsecutiveTimeout ? 'fail' : 'slow';
-		if (latest < DELAY_OK) return 'ok';
-		if (latest < DELAY_SLOW) return 'slow';
-		return 'slow';
-	});
-	const delayText = $derived.by(() => {
-		if (delayState === 'unknown') return '—';
-		if (delayState === 'fail') return 'timeout';
-		if (latest <= 0) return 'проверка...';
-		return `${latest}ms`;
-	});
+	const delayState = $derived(delayPresentation.state);
+	const delayText = $derived(delayPresentation.label);
 
 	const protocolLabel = $derived.by(() => {
 		switch (member.protocol) {
@@ -68,68 +47,31 @@
 			case 'shadowsocks': return 'Shadowsocks';
 			case 'hysteria2': return 'Hysteria2';
 			case 'naive': return 'Naive';
+			case 'mieru': return 'Mieru';
 			default: return member.protocol;
 		}
 	});
 
 	const heading = $derived(member.label || member.server);
-
-	const traffic = $derived($singboxTraffic.get(member.tag));
-
-	const trafficSparkData = $derived.by(() => {
-		const n = Math.min(rxRates.length, txRates.length);
-		if (n === 0) return [];
-		const take = Math.min(36, n);
-		const out: number[] = [];
-		for (let i = n - take; i < n; i++) {
-			out.push(Math.max(0, rxRates[i] ?? 0) + Math.max(0, txRates[i] ?? 0));
-		}
-		return out;
-	});
-
-	let rxRates = $state<number[]>([]);
-	let txRates = $state<number[]>([]);
-	let memberTag = $derived(member.tag);
-
-	$effect(() => {
-		const tag = memberTag;
-		const update = () => {
-			const t = getTrafficRates(tag);
-			rxRates = t.rx;
-			txRates = t.tx;
-		};
-		update();
-		return subscribeTraffic(update);
-	});
-
-	let trafficHistoryLoaded = false;
-	$effect(() => {
-		const tag = memberTag;
-		if (trafficHistoryLoaded) return;
-		trafficHistoryLoaded = true;
-		untrack(() => loadHistory(tag));
-	});
 </script>
 
 {#if layout === 'list'}
 	<div class="mbr-flatten">
-		<div class="c c-delay" data-label="Delay">
-			<span
-				role="button"
-				tabindex="0"
-				class="delay-btn {delayState}"
-				class:is-disabled={testing}
+		<div class="c c-delay">
+			<PingButton
+				label={delayText}
+				state={delayState}
+				checking={testing}
+				size="mid"
+				forceBorder
 				onclick={runTest}
-				onkeydown={onTestKeydown}
-			>
-				{testing ? '...' : delayText}
-			</span>
+			/>
 		</div>
-		<div class="c c-name" data-label="Сервер">
+		<div class="c c-name">
 			<span class="n1" title={heading}>{heading}</span>
 			<span class="n2 mono" title={member.tag}>{member.server}:{member.port}</span>
 		</div>
-	<div class="c c-badges" data-label="Протокол">
+	<div class="c c-badges">
 		<span class="badge proto">{protocolLabel}</span>
 		{#if member.transport && member.transport !== 'tcp'}
 			<span class="badge transport">{member.transport.toUpperCase()}</span>
@@ -140,27 +82,13 @@
 			<span class="badge tls">TLS</span>
 		{/if}
 	</div>
-		<div class="c c-traffic-mini" data-label="Трафик">
-			<div class="traffic-row-list">
-				<TrafficSparkline
-					data={trafficSparkData}
-					width={84}
-					height={22}
-					color={active ? 'var(--color-accent)' : 'var(--color-border-hover)'}
-				/>
-				<div class="traffic-mini-col mono">
-					<span>↓ {formatBytes(traffic?.download ?? 0)}</span>
-					<span>↑ {formatBytes(traffic?.upload ?? 0)}</span>
-				</div>
-			</div>
-		</div>
-		<div class="c c-ping-mini" data-label="Ping">
+		<div class="c c-ping-mini">
 			<div
 				class="spark-mini {delayState}"
 				role="button"
 				tabindex="0"
 				onclick={(e) => runTest(e)}
-				onkeydown={onTestKeydown}
+				onkeydown={onSparkKeydown}
 				title="Клик — обновить delay"
 			>
 				{#if history.length === 0}
@@ -175,8 +103,8 @@
 				{/if}
 			</div>
 		</div>
-		<div class="c mono c-tag" data-label="Тег">{member.tag}</div>
-		<div class="c c-state" data-label="">
+		<div class="c mono c-tag">{member.tag}</div>
+		<div class="c c-state">
 			{#if active}
 				<span class="state-badge active-badge">активен</span>
 			{:else if switching}
@@ -220,18 +148,15 @@
 		</div>
 	{/if}
 	<div class="delay-row">
-		<span
-			role="button"
-			tabindex="0"
-			class="delay-btn {delayState}"
-			class:is-disabled={testing}
-			aria-disabled={testing}
-			onclick={runTest}
-			onkeydown={onTestKeydown}
+		<PingButton
+			label={delayText}
+			state={delayState}
+			checking={testing}
+			size="mid"
+			forceBorder
 			title="Проверить delay"
-		>
-			{testing ? '...' : delayText}
-		</span>
+			onclick={runTest}
+		/>
 		<div class="spark {delayState}">
 			{#if history.length === 0}
 				{#each Array(6) as _, i (i)}<div class="bar empty"></div>{/each}
@@ -292,7 +217,7 @@
 		box-shadow: 0 0 0 3px rgba(63, 185, 80, 0.22);
 	}
 	.title {
-		font-size: 0.92rem;
+		font-size: var(--sbx-card-title);
 		font-weight: 600;
 		flex: 1;
 		min-width: 0;
@@ -305,10 +230,10 @@
 		word-break: break-word;
 		overflow-wrap: anywhere;
 	}
-	.port { font-size: 0.78rem; color: var(--color-text-muted); }
+	.port { font-size: var(--sbx-card-meta); color: var(--color-text-muted); }
 	.badges { display: flex; gap: 0.4rem; flex-wrap: wrap; }
 	.badge {
-		font-size: 0.68rem;
+		font-size: var(--sbx-card-badge);
 		padding: 0.15rem 0.5rem;
 		border-radius: 4px;
 		font-weight: 600;
@@ -326,7 +251,7 @@
 		border-top: 1px solid var(--color-border);
 	}
 	.tag {
-		font-size: 0.68rem;
+		font-size: var(--sbx-card-badge);
 		color: var(--color-text-muted);
 		overflow: hidden;
 		text-overflow: ellipsis;
@@ -334,7 +259,7 @@
 		max-width: 150px;
 	}
 	.state-badge {
-		font-size: 0.7rem;
+		font-size: var(--sbx-card-note);
 		padding: 0.1rem 0.45rem;
 		border-radius: 999px;
 	}
@@ -347,21 +272,6 @@
 		gap: 0.5rem;
 		margin-top: 0.4rem;
 	}
-	.delay-btn {
-		padding: 0.15rem 0.5rem;
-		border-radius: 4px;
-		background: var(--color-bg-tertiary);
-		color: var(--color-text-muted);
-		border: 1px solid var(--color-border);
-		font: inherit;
-		font-size: 0.7rem;
-		font-family: var(--font-mono, ui-monospace, monospace);
-		cursor: pointer;
-	}
-	.delay-btn.is-disabled { opacity: 0.5; cursor: wait; }
-	.delay-btn.ok    { color: #3fb950; }
-	.delay-btn.slow  { color: #d29922; }
-	.delay-btn.fail  { color: #f85149; }
 	.spark {
 		flex: 1;
 		display: flex;
@@ -374,12 +284,12 @@
 		background: var(--color-bg-tertiary);
 		border-radius: 1px;
 	}
-	.spark.ok .bar   { background: #3fb950; }
-	.spark.slow .bar { background: #d29922; }
-	.spark.fail .bar { background: #f85149; }
+	.spark.ok .bar   { background: var(--latency-bar-ok); }
+	.spark.slow .bar { background: var(--latency-bar-slow); }
+	.spark.fail .bar { background: var(--latency-bar-fail); }
 	.bar.empty       { opacity: 0.3; }
 	.server-line {
-		font-size: 0.72rem;
+		font-size: var(--sbx-card-meta);
 		color: var(--color-text-muted);
 		opacity: 0.85;
 		margin: 0.15rem 0 0.35rem;
@@ -391,7 +301,7 @@
 		display: flex;
 		align-items: center;
 		gap: 0.35rem;
-		font-size: 0.7rem;
+		font-size: var(--sbx-card-label);
 		color: var(--color-text-muted);
 		margin-top: -0.15rem;
 	}
@@ -419,7 +329,7 @@
 		align-items: center;
 		min-width: 0;
 		padding: 0.65rem 0;
-		font-size: 0.8125rem;
+		font-size: var(--sbx-card-value);
 		color: var(--color-text-secondary);
 	}
 	.c-name {
@@ -430,14 +340,14 @@
 	.n1 {
 		font-weight: 600;
 		color: var(--color-text-primary);
-		font-size: 0.9rem;
+		font-size: var(--sbx-card-title);
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
 		max-width: 100%;
 	}
 	.n2 {
-		font-size: 0.72rem;
+		font-size: var(--sbx-card-meta);
 		color: var(--color-text-muted);
 		overflow: hidden;
 		text-overflow: ellipsis;
@@ -449,7 +359,7 @@
 		flex-wrap: wrap;
 	}
 	.c-tag {
-		font-size: 0.72rem;
+		font-size: var(--sbx-card-meta);
 		overflow: hidden;
 		text-overflow: ellipsis;
 	}
@@ -474,36 +384,17 @@
 		background: var(--color-bg-tertiary);
 	}
 	.spark-mini.ok .bar {
-		background: #3fb950;
+		background: var(--latency-bar-ok);
 	}
 	.spark-mini.slow .bar {
-		background: #d29922;
+		background: var(--latency-bar-slow);
 	}
 	.spark-mini.fail .bar {
-		background: #f85149;
+		background: var(--latency-bar-fail);
 	}
 	.spark-mini.unknown .bar,
 	.spark-mini .bar.empty {
 		opacity: 0.35;
 		height: 30% !important;
-	}
-	.c-traffic-mini {
-		min-width: 0;
-	}
-	.traffic-row-list {
-		display: flex;
-		align-items: center;
-		gap: 0.45rem;
-		min-width: 0;
-		width: 100%;
-	}
-	.traffic-mini-col {
-		display: flex;
-		flex-direction: column;
-		gap: 0.08rem;
-		font-size: 0.68rem;
-		line-height: 1.15;
-		color: var(--color-text-muted);
-		flex-shrink: 0;
 	}
 </style>

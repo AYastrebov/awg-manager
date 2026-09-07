@@ -9,9 +9,22 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/ndms"
 )
 
-// LatencyNotAvailable is used for NativeWG log entries where NDMS
-// does not provide per-check latency data. Frontend hides the value.
+// LatencyNotAvailable marks a NativeWG log entry whose latency could not be
+// measured: NDMS gives no per-check timing, and the fallback probe either
+// failed or ran a method that does not measure time at all. It is a sentinel,
+// NOT a value — the UI must render it as "unknown" and keep it out of
+// avg/min/max (issue #629). The reason travels separately, in
+// TunnelStatus.LatencyNote.
 const LatencyNotAvailable = -1
+
+// Escalation: NDMS restarts the interface on its own, but its restart brings
+// the tunnel back up with the very same config. When that does not help
+// nwgEscalateAfter times in a row, we do what the user does by hand — a full
+// Stop+Start through the tunnel service (#702).
+const (
+	nwgEscalateAfter   = 3
+	nwgEscalateBackoff = 15 * time.Minute
+)
 
 // nwgPollSource abstracts NDMS polling for testability.
 type nwgPollSource interface {
@@ -27,7 +40,7 @@ type nwgMonitor struct {
 	threshold    int
 	logBuffer    *LogBuffer
 	source       nwgPollSource
-	latencyProbe func(context.Context, string) int
+	latencyProbe func(context.Context, string) (int, string)
 	bus          *events.Bus
 
 	stopCh    chan struct{}
@@ -35,18 +48,67 @@ type nwgMonitor struct {
 	wg        sync.WaitGroup
 
 	// Previous snapshot for delta calculation.
-	initialized  bool
-	prevFail     int
-	prevSuccess  int
-	prevStatus   string
-	prevBound    bool
-	lastLatency  int
-	startupPhase bool
+	initialized bool
+	prevFail    int
+	prevSuccess int
+	prevStatus  string
+	prevBound   bool
+	lastLatency int
+	// lastLatencyNote explains an absent measurement; empty when measured.
+	lastLatencyNote string
+	startupPhase    bool
 
 	// restartDetected is set when nwgMonitor detects that NDMS restarted
 	// the tunnel interface (counters reset after failure). Cleared on first
 	// successful check after restart.
 	restartDetected bool
+
+	// restarter performs a full tunnel restart (Stop+Start through the
+	// tunnel service). nil when escalation is not wired.
+	restarter func(context.Context, string) error
+	// allowRestart mirrors stored.PingCheck.Restart — the user allowed us
+	// to touch the tunnel.
+	allowRestart bool
+	// onFruitlessRestart reports an NDMS restart with no successful check
+	// since the previous one and returns the length of the series.
+	// onCheckSuccess resets it. Both live in the Facade: our own restart
+	// recreates the monitor, so this state must NOT be a monitor field.
+	onFruitlessRestart func(tunnelID string) int
+	onCheckSuccess     func(tunnelID string)
+	// canEscalate is the Facade's backoff gate; on approval it records the
+	// time itself.
+	canEscalate func(tunnelID string) bool
+}
+
+// maybeEscalate restarts the whole tunnel when consecutive NDMS restarts
+// produced no successful check at all. The backoff is held by the Facade —
+// the state must survive monitor recreation caused by our own restart.
+func (m *nwgMonitor) maybeEscalate(series int) {
+	if !m.allowRestart || m.restarter == nil || m.canEscalate == nil {
+		return
+	}
+	if series < nwgEscalateAfter {
+		return
+	}
+	if !m.canEscalate(m.tunnelID) {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := m.restarter(ctx, m.tunnelID); err != nil {
+			m.logBuffer.Add(LogEntry{
+				Timestamp: time.Now(), TunnelID: m.tunnelID, TunnelName: m.tunnelName,
+				Backend: "nativewg", Success: false, StateChange: "restart_failed",
+				Error: err.Error(),
+			})
+			return
+		}
+		m.logBuffer.Add(LogEntry{
+			Timestamp: time.Now(), TunnelID: m.tunnelID, TunnelName: m.tunnelName,
+			Backend: "nativewg", Success: true, StateChange: "escalated_restart",
+		})
+	}()
 }
 
 // publishLog publishes a log entry as an SSE event.
@@ -87,33 +149,46 @@ func (m *nwgMonitor) processDelta(failCount, successCount int, status string, bo
 		m.initialized = true
 		m.startupPhase = true
 
-		success := status != "fail"
-		entry := LogEntry{
-			Timestamp:   time.Now(),
-			TunnelID:    m.tunnelID,
-			TunnelName:  m.tunnelName,
-			Backend:     "nativewg",
-			Success:     success,
-			Latency:     latency,
-			FailCount:   failCount,
-			Threshold:   m.threshold,
-			StateChange: "initial",
+		// Warmup: a freshly started tunnel reports NDMS's provisional fail/0/0
+		// before the check interval has ticked. That is not a real failure, so
+		// emit NO initial log entry (a bogus "✗" would drive the UI to 100% loss
+		// and a red history bar) and publish a neutral "" status so dnsroute
+		// failover does not treat the warmup as down. The first real check
+		// (fail or success counter > 0) flows through the delta path below.
+		warmup := status == "fail" && failCount == 0 && successCount == 0
+		if !warmup {
+			success := status != "fail"
+			entry := LogEntry{
+				Timestamp:   time.Now(),
+				TunnelID:    m.tunnelID,
+				TunnelName:  m.tunnelName,
+				Backend:     "nativewg",
+				Success:     success,
+				Latency:     latency,
+				FailCount:   failCount,
+				Threshold:   m.threshold,
+				StateChange: "initial",
+			}
+			m.logBuffer.Add(entry)
+			m.publishLog(entry)
 		}
-		m.logBuffer.Add(entry)
-		m.publishLog(entry)
 
 		// Still publish current state immediately so internal subscribers
 		// (dnsroute failover) react. Frontend polls the status list; the
 		// invalidation hint below prompts an immediate refetch.
 		if m.bus != nil {
+			publishStatus := status
+			if warmup {
+				publishStatus = "" // pending — not a real fail
+			}
 			m.bus.Publish("pingcheck:state", events.PingCheckStateEvent{
 				TunnelID:     m.tunnelID,
-				Status:       status,
+				Status:       publishStatus,
 				FailCount:    failCount,
 				SuccessCount: successCount,
 			})
 		}
-		publishInvalidatedBus(m.bus, "pingcheck", "state-change")
+		m.bus.PublishInvalidated(events.ResourcePingcheck, "state-change")
 		return
 	}
 
@@ -127,10 +202,18 @@ func (m *nwgMonitor) processDelta(failCount, successCount int, status string, bo
 
 		if countersZeroed && (boundTransition || counterReset) {
 			m.restartDetected = true
+			series := 0
+			if m.onFruitlessRestart != nil {
+				series = m.onFruitlessRestart(m.tunnelID)
+			}
+			m.maybeEscalate(series)
 		}
 		// Clear restart flag once NDMS reports first success after restart.
 		if m.restartDetected && successCount > 0 {
 			m.restartDetected = false
+			if m.onCheckSuccess != nil {
+				m.onCheckSuccess(m.tunnelID)
+			}
 		}
 	}
 
@@ -143,6 +226,18 @@ func (m *nwgMonitor) processDelta(failCount, successCount int, status string, bo
 	successDelta := successCount - m.prevSuccess
 	if successDelta < 0 {
 		successDelta = successCount
+	}
+
+	// Any fresh successful check clears the fruitless-restart series, even
+	// when restartDetected is false: the series lives in the Facade and
+	// survives monitor recreation, while restartDetected does not. Without
+	// this, a monitor recreated between the NDMS restart and the recovery
+	// (settings save, manual restart) would leave a stale series behind and
+	// escalate one restart too early (#702). Must key off the delta, not the
+	// raw successCount — that one keeps a stale non-zero value throughout a
+	// failure streak.
+	if successDelta > 0 && m.onCheckSuccess != nil {
+		m.onCheckSuccess(m.tunnelID)
 	}
 
 	// NDMS can report a transient startup mix where, in one poll window,
@@ -243,7 +338,7 @@ func (m *nwgMonitor) processDelta(failCount, successCount int, status string, bo
 	// would trigger excessive refetches. Initial state is published from
 	// the !m.initialized branch above (which returns early).
 	if status != m.prevStatus {
-		publishInvalidatedBus(m.bus, "pingcheck", "state-change")
+		m.bus.PublishInvalidated(events.ResourcePingcheck, "state-change")
 	}
 
 	m.prevFail = failCount
@@ -265,9 +360,10 @@ func (m *nwgMonitor) pollOnce(ctx context.Context) {
 		return // skip this poll, retry next interval
 	}
 	if m.latencyProbe != nil {
-		m.lastLatency = m.latencyProbe(ctx, m.tunnelID)
+		m.lastLatency, m.lastLatencyNote = m.latencyProbe(ctx, m.tunnelID)
 	} else {
 		m.lastLatency = LatencyNotAvailable
+		m.lastLatencyNote = "проба времени отклика не настроена"
 	}
 
 	// Sync poll interval with actual NDMS check interval on first poll.

@@ -2,8 +2,10 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
+	"github.com/hoaxisr/awg-manager/internal/downloader"
 	"github.com/hoaxisr/awg-manager/internal/events"
 	"github.com/hoaxisr/awg-manager/internal/hydraroute"
 	"github.com/hoaxisr/awg-manager/internal/response"
@@ -43,6 +45,7 @@ type GeoFileEntryDTO struct {
 	Size     int64  `json:"size" example:"3145728"`
 	TagCount int    `json:"tagCount" example:"420"`
 	Updated  string `json:"updated" example:"2024-01-15T02:00:00Z"`
+	External bool   `json:"external,omitempty" example:"true"`
 }
 
 // GeoFilesResponse is the envelope for GET /hydraroute/geo-files.
@@ -63,6 +66,13 @@ type GeoTagsResponse struct {
 	Data    []GeoTagDTO `json:"data"`
 }
 
+// GeoExpandData is the payload for GET /hydraroute/geo-expand.
+type GeoExpandData struct {
+	Lines []string `json:"lines"`
+	Path  string   `json:"path"`
+	Count int      `json:"count"`
+}
+
 // GeoFileResponse is the envelope for endpoints that return a single
 // geo file entry (POST /hydraroute/geo-files/add).
 type GeoFileResponse struct {
@@ -74,7 +84,9 @@ type GeoFileResponse struct {
 // POST /hydraroute/geo-files/update. The shape is the same whether the
 // caller targeted one path or all paths.
 type GeoFileUpdatedData struct {
-	Updated int `json:"updated" example:"1"`
+	Updated int    `json:"updated" example:"1"`
+	Partial bool   `json:"partial,omitempty" example:"true"`
+	Error   string `json:"error,omitempty"`
 }
 
 // GeoFileUpdatedResponse is the envelope for POST /hydraroute/geo-files/update.
@@ -132,14 +144,32 @@ type OversizedTagsResponse struct {
 
 // AddGeoFileRequest is the body for POST /hydraroute/geo-files/add.
 type AddGeoFileRequest struct {
-	Type string `json:"type" example:"geosite"`
-	URL  string `json:"url" example:"https://cdn.example.com/geosite.db"`
+	Type  string            `json:"type" example:"geosite"`
+	URL   string            `json:"url" example:"https://cdn.example.com/geosite.db"`
+	Route *DownloadRouteDTO `json:"route,omitempty"`
 }
 
 // UpdateGeoFileRequest is the body for POST /hydraroute/geo-files/update.
 // Empty path triggers a bulk refresh of every tracked geo file.
 type UpdateGeoFileRequest struct {
-	Path string `json:"path" example:"/opt/etc/hrneo/geosite.db"`
+	Path  string            `json:"path" example:"/opt/etc/hrneo/geosite.db"`
+	Route *DownloadRouteDTO `json:"route,omitempty"`
+}
+
+// TakeGeoFileControlRequest is the body for POST /hydraroute/geo-files/take-control.
+type TakeGeoFileControlRequest struct {
+	Path string `json:"path" example:"/opt/etc/HydraRoute/geosite_GA.dat"`
+}
+
+// GeoFilesRescannedData reports how many new paths were adopted from hrneo.conf.
+type GeoFilesRescannedData struct {
+	Adopted int `json:"adopted" example:"1"`
+}
+
+// GeoFilesRescannedResponse is the envelope for POST /hydraroute/geo-files/rescan.
+type GeoFilesRescannedResponse struct {
+	Success bool                  `json:"success" example:"true"`
+	Data    GeoFilesRescannedData `json:"data"`
 }
 
 // SetPolicyOrderRequest is the body for POST /hydraroute/policy-order.
@@ -149,13 +179,30 @@ type SetPolicyOrderRequest struct {
 
 // HydraRouteHandler handles HydraRoute Neo settings API endpoints.
 type HydraRouteHandler struct {
-	svc *hydraroute.Service
-	bus *events.Bus
+	svc         *hydraroute.Service
+	bus         *events.Bus
+	downloadSvc *downloader.Service
 }
 
 // NewHydraRouteHandler creates a new HydraRoute settings handler.
-func NewHydraRouteHandler(svc *hydraroute.Service) *HydraRouteHandler {
-	return &HydraRouteHandler{svc: svc}
+func NewHydraRouteHandler(svc *hydraroute.Service, downloadSvc *downloader.Service) *HydraRouteHandler {
+	if downloadSvc == nil {
+		downloadSvc = downloader.NewService(downloader.Deps{})
+	}
+	return &HydraRouteHandler{
+		svc:         svc,
+		downloadSvc: downloadSvc,
+	}
+}
+
+func toDownloaderRoute(route *DownloadRouteDTO) *downloader.Route {
+	if route == nil {
+		return nil
+	}
+	return &downloader.Route{
+		Tag:  route.Tag,
+		Kind: route.Kind,
+	}
 }
 
 // SetEventBus wires the SSE bus so HR Neo mutations that touch the DNS
@@ -220,7 +267,7 @@ func (h *HydraRouteHandler) UpdateConfig(w http.ResponseWriter, r *http.Request)
 
 	// WriteConfig schedules a neo restart that flips the running flag,
 	// so the cached hydraroute status becomes stale.
-	publishInvalidated(h.bus, ResourceRoutingHydrarouteStatus, "config-write")
+	h.bus.PublishInvalidated(events.ResourceRoutingHydrarouteStatus, "config-write")
 	response.Success(w, cfg)
 }
 
@@ -266,10 +313,7 @@ func (h *HydraRouteHandler) AddGeoFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
-		Type string `json:"type"`
-		URL  string `json:"url"`
-	}
+	var req AddGeoFileRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		response.Error(w, "invalid request body: "+err.Error(), "BAD_REQUEST")
 		return
@@ -280,10 +324,18 @@ func (h *HydraRouteHandler) AddGeoFile(w http.ResponseWriter, r *http.Request) {
 		response.Error(w, "geo data store not initialized", "NOT_INITIALIZED")
 		return
 	}
-
-	entry, err := gds.Download(req.Type, req.URL)
+	lease, err := h.downloadSvc.ResolveClient(r.Context(), toDownloaderRoute(req.Route))
 	if err != nil {
-		response.Error(w, err.Error(), "GEO_DOWNLOAD_ERROR")
+		response.Error(w, err.Error(), "GEO_DOWNLOAD_ROUTE_ERROR")
+		return
+	}
+	defer lease.Close()
+
+	routeLabel := lease.Route.DisplayName()
+
+	entry, err := gds.DownloadWithClientVia(r.Context(), req.Type, req.URL, lease.Client, routeLabel)
+	if err != nil {
+		response.Error(w, fmt.Sprintf("download via %s: %v", routeLabel, err), "GEO_DOWNLOAD_ERROR")
 		return
 	}
 
@@ -338,6 +390,78 @@ func (h *HydraRouteHandler) DeleteGeoFile(w http.ResponseWriter, r *http.Request
 	response.Success(w, map[string]bool{"ok": true})
 }
 
+// TakeGeoFileControl moves an external HydraRoute file into awg-manager/geo.
+//
+//	@Summary		Take HydraRoute geo file under awg-manager control
+//	@Tags			hydraroute
+//	@Accept			json
+//	@Produce		json
+//	@Security		CookieAuth
+//	@Param			body	body		TakeGeoFileControlRequest	true	"Filesystem path of the external geo file"
+//	@Success		200		{object}	GeoFileResponse
+//	@Failure		400		{object}	APIErrorEnvelope
+//	@Failure		500		{object}	APIErrorEnvelope
+//	@Router			/hydraroute/geo-files/take-control [post]
+func (h *HydraRouteHandler) TakeGeoFileControl(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.MethodNotAllowed(w)
+		return
+	}
+
+	var req TakeGeoFileControlRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "invalid request body: "+err.Error(), "BAD_REQUEST")
+		return
+	}
+	if req.Path == "" {
+		response.Error(w, "path is required", "BAD_REQUEST")
+		return
+	}
+
+	gds := h.svc.GetGeoData()
+	if gds == nil {
+		response.Error(w, "geo data store not initialized", "NOT_INITIALIZED")
+		return
+	}
+
+	entry, err := gds.TakeControl(req.Path)
+	if err != nil {
+		response.Error(w, err.Error(), "GEO_TAKE_CONTROL_ERROR")
+		return
+	}
+
+	if err := h.svc.SyncGeoFilesToConfig(); err != nil {
+		response.Error(w, "moved but failed to sync config: "+err.Error(), "SYNC_ERROR")
+		return
+	}
+
+	response.Success(w, entry)
+}
+
+// RescanGeoFiles adopts geo paths from hrneo.conf not yet in the catalog.
+//
+//	@Summary		Rescan HydraRoute geo files from hrneo.conf
+//	@Tags			hydraroute
+//	@Produce		json
+//	@Security		CookieAuth
+//	@Success		200	{object}	GeoFilesRescannedResponse
+//	@Failure		500	{object}	APIErrorEnvelope
+//	@Router			/hydraroute/geo-files/rescan [post]
+func (h *HydraRouteHandler) RescanGeoFiles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.MethodNotAllowed(w)
+		return
+	}
+
+	n, err := h.svc.RescanGeoFiles()
+	if err != nil {
+		response.Error(w, err.Error(), "GEO_RESCAN_ERROR")
+		return
+	}
+
+	response.Success(w, GeoFilesRescannedData{Adopted: n})
+}
+
 // UpdateGeoFile re-downloads a geo data file (or all files if path is empty).
 //
 //	@Summary		Refresh HydraRoute geo file(s)
@@ -368,29 +492,50 @@ func (h *HydraRouteHandler) UpdateGeoFile(w http.ResponseWriter, r *http.Request
 		response.Error(w, "geo data store not initialized", "NOT_INITIALIZED")
 		return
 	}
+	lease, err := h.downloadSvc.ResolveClient(r.Context(), toDownloaderRoute(req.Route))
+	if err != nil {
+		response.Error(w, err.Error(), "GEO_DOWNLOAD_ROUTE_ERROR")
+		return
+	}
+	defer lease.Close()
 
-	updated := 0
+	routeLabel := lease.Route.DisplayName()
+
+	out := GeoFileUpdatedData{}
 	if req.Path == "" {
-		count, err := gds.UpdateAll()
+		count, err := gds.UpdateAllWithClientVia(r.Context(), lease.Client, routeLabel)
+		out.Updated = count
 		if err != nil {
-			response.Error(w, err.Error(), "GEO_UPDATE_ERROR")
-			return
+			out.Partial = count > 0
+			out.Error = fmt.Sprintf("update via %s: %v", routeLabel, err)
+			if count == 0 {
+				response.Error(w, fmt.Sprintf("update via %s: %v", routeLabel, err), "GEO_UPDATE_ERROR")
+				return
+			}
 		}
-		updated = count
 	} else {
-		if _, err := gds.Update(req.Path); err != nil {
-			response.Error(w, err.Error(), "GEO_UPDATE_ERROR")
+		if _, err := gds.UpdateWithClientVia(r.Context(), req.Path, lease.Client, routeLabel); err != nil {
+			response.Error(w, fmt.Sprintf("update via %s: %v", routeLabel, err), "GEO_UPDATE_ERROR")
 			return
 		}
-		updated = 1
+		out.Updated = 1
 	}
 
 	if err := h.svc.SyncGeoFilesToConfig(); err != nil {
+		if out.Updated > 0 {
+			out.Partial = true
+			if out.Error != "" {
+				out.Error += "; "
+			}
+			out.Error += "sync config: " + err.Error()
+			response.Success(w, out)
+			return
+		}
 		response.Error(w, "updated but failed to sync config: "+err.Error(), "SYNC_ERROR")
 		return
 	}
 
-	response.Success(w, map[string]int{"updated": updated})
+	response.Success(w, out)
 }
 
 // GetGeoTags returns the tag list for a specific geo data file.
@@ -400,7 +545,7 @@ func (h *HydraRouteHandler) UpdateGeoFile(w http.ResponseWriter, r *http.Request
 //	@Produce		json
 //	@Security		CookieAuth
 //	@Param			path	query	string	true	"Geo file path"
-//	@Success		200	{array}	string
+//	@Success		200	{object}	GeoTagsResponse
 //	@Router			/hydraroute/geo-tags [get]
 func (h *HydraRouteHandler) GetGeoTags(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -427,6 +572,48 @@ func (h *HydraRouteHandler) GetGeoTags(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response.Success(w, response.MustNotNil(tags))
+}
+
+// ExpandGeoTag expands a geosite:/geoip: tag into inline rule list lines.
+//
+//	@Summary		HydraRoute geo tag expand
+//	@Tags			hydraroute
+//	@Produce		json
+//	@Security		CookieAuth
+//	@Param			kind	query	string	true	"geosite or geoip"
+//	@Param			tag	query	string	true	"Tag name"
+//	@Success		200	{object}	APIEnvelope{data=GeoExpandData}
+//	@Router			/hydraroute/geo-expand [get]
+func (h *HydraRouteHandler) ExpandGeoTag(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		response.MethodNotAllowed(w)
+		return
+	}
+
+	kind := r.URL.Query().Get("kind")
+	tag := r.URL.Query().Get("tag")
+	if kind == "" || tag == "" {
+		response.Error(w, "kind and tag query parameters are required", "BAD_REQUEST")
+		return
+	}
+
+	gds := h.svc.GetGeoData()
+	if gds == nil {
+		response.Error(w, "geo data store not initialized", "NOT_INITIALIZED")
+		return
+	}
+
+	lines, path, err := gds.ExpandGeoTag(kind, tag)
+	if err != nil {
+		response.Error(w, err.Error(), "GEO_EXPAND_ERROR")
+		return
+	}
+
+	response.Success(w, GeoExpandData{
+		Lines: lines,
+		Path:  path,
+		Count: len(lines),
+	})
 }
 
 // GetIpsetUsage returns the current ipset usage per kernel interface.
@@ -482,9 +669,9 @@ func (h *HydraRouteHandler) SetPolicyOrder(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	publishInvalidated(h.bus, ResourceRoutingDnsRoutes, "policy-order")
+	h.bus.PublishInvalidated(events.ResourceRoutingDnsRoutes, "policy-order")
 	// Policy-order changes trigger a neo restart too.
-	publishInvalidated(h.bus, ResourceRoutingHydrarouteStatus, "policy-order")
+	h.bus.PublishInvalidated(events.ResourceRoutingHydrarouteStatus, "policy-order")
 	response.Success(w, map[string][]string{"order": req.Order})
 }
 

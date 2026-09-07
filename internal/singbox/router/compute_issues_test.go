@@ -94,6 +94,15 @@ func TestComputeIssues(t *testing.T) {
 			wantIssue:        false,
 		},
 		{
+			// Пустой action = route (sing-box исполняет): висячий outbound у
+			// такого правила обязан давать то же предупреждение.
+			name:      "empty action with dangling outbound",
+			outbounds: []Outbound{{Tag: "other", Type: "vless"}},
+			rule:      Rule{Outbound: "ghost"},
+			wantIssue: true,
+			wantTag:   "ghost",
+		},
+		{
 			// Anti-false-negative: when nothing covers the tag the
 			// orphan-rule warn must still fire.
 			name:             "tag missing from every source",
@@ -206,5 +215,100 @@ func TestComputeIssues_NilDepsCatalogs(t *testing.T) {
 	got := svc.computeIssues(cfg)
 	if len(got) != 1 || got[0].RuleIndex != 1 || got[0].Tag != "ghost" {
 		t.Errorf("nil catalogs: want 1 orphan for rule#1 tag=ghost, got %#v", got)
+	}
+}
+
+func TestComputeIssues_DetectsOutboundAndRuleSetRefs(t *testing.T) {
+	svc := &ServiceImpl{deps: Deps{}}
+	cfg := &RouterConfig{
+		Outbounds: []Outbound{{Tag: "ok", Type: "selector", Outbounds: []string{"ghost-member"}, Default: "ghost-default"}},
+		Route: Route{
+			Final:   "ghost-final",
+			RuleSet: []RuleSet{{Tag: "known", DownloadDetour: "ghost-download"}},
+			Rules: []Rule{{
+				Type: "logical", Mode: "or",
+				Rules:  []Rule{{RuleSet: []string{"missing-rs"}, Action: "route", Outbound: "ghost-nested"}},
+				Action: "route", Outbound: "ok",
+			}},
+		},
+		DNS: DNS{
+			Servers: []DNSServer{{Tag: "dns", Type: "udp", Server: "1.1.1.1", Detour: "ghost-detour"}},
+			Rules:   []DNSRule{{RuleSet: []string{"missing-dns-rs"}, Server: "dns"}},
+		},
+	}
+	got := svc.computeIssues(cfg)
+	want := map[string]bool{
+		"ghost-final":    false,
+		"ghost-member":   false,
+		"ghost-default":  false,
+		"ghost-download": false,
+		"ghost-nested":   false,
+		"ghost-detour":   false,
+		"missing-rs":     false,
+		"missing-dns-rs": false,
+	}
+	for _, issue := range got {
+		if _, ok := want[issue.Tag]; ok {
+			want[issue.Tag] = true
+		}
+	}
+	for tag, seen := range want {
+		if !seen {
+			t.Errorf("missing issue for %q in %#v", tag, got)
+		}
+	}
+}
+
+// R2: loadRouterConfig hands computeIssues the raw MATERIALIZED slot (no
+// restoreHTTPClients projection) — a rule_set written by applyHTTPClients
+// carries the detour in HTTPClient.Detour with DownloadDetour empty, and the
+// top-level http_clients entries carry their own detour. Both must still be
+// checked for dangling references, or the orphan-detour warning silently
+// stops firing the moment a slot is migrated to the sing-box 1.14 form.
+func TestComputeIssues_DetectsMaterializedHTTPClientDetour(t *testing.T) {
+	svc := &ServiceImpl{deps: Deps{}}
+	cfg := &RouterConfig{
+		HTTPClients: []HTTPClient{{Tag: "rs-download", Detour: "ghost-http-client"}},
+		Route: Route{
+			Final: "direct",
+			RuleSet: []RuleSet{
+				{Tag: "known", HTTPClient: &RuleSetHTTPClient{Detour: "ghost"}},
+			},
+		},
+	}
+	got := svc.computeIssues(cfg)
+	want := map[string]bool{"ghost": false, "ghost-http-client": false}
+	for _, issue := range got {
+		if _, ok := want[issue.Tag]; ok {
+			want[issue.Tag] = true
+		}
+	}
+	for tag, seen := range want {
+		if !seen {
+			t.Errorf("missing issue for %q in %#v", tag, got)
+		}
+	}
+}
+
+// Строковая ссылка http_client (materialize'ится для detour на пустой
+// direct — applyHTTPClients) не detour: у неё пустой RuleSetHTTPClient.Detour,
+// так что orphan-проверка её не видит — и не должна: сам факт "клиент без
+// detour" не может быть orphan'ом.
+func TestComputeIssues_HTTPClientStringRefNotOrphan(t *testing.T) {
+	svc := &ServiceImpl{deps: Deps{}}
+	cfg := &RouterConfig{
+		HTTPClients: []HTTPClient{{Tag: "rs-download"}, {Tag: "rs-direct:direct"}},
+		Route: Route{
+			Final: "direct",
+			RuleSet: []RuleSet{
+				{Tag: "known", HTTPClient: &RuleSetHTTPClient{Ref: "rs-direct:direct"}},
+			},
+		},
+	}
+	got := svc.computeIssues(cfg)
+	for _, issue := range got {
+		if issue.Kind == "orphan-outbound" {
+			t.Errorf("unexpected orphan-outbound issue: %+v", issue)
+		}
 	}
 }

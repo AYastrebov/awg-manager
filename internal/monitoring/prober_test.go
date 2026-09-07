@@ -3,131 +3,63 @@ package monitoring
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/hoaxisr/awg-manager/internal/sys/exec"
+	"github.com/hoaxisr/awg-manager/internal/icmpprobe"
 )
 
-type stubRunner struct {
-	stdout   string
-	exitCode int
-	err      error
-}
+// HTTPProber: ok=true + positive latency on 2xx/3xx, ok=false on 5xx and on
+// a dead endpoint. No interface binding in tests (empty ifaceName).
+func TestHTTPProber_Probe(t *testing.T) {
+	code := atomic.Int32{}
+	code.Store(http.StatusNoContent)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(int(code.Load()))
+	}))
+	defer srv.Close()
 
-func (s stubRunner) Run(_ context.Context, _ string, _ ...string) (*exec.Result, error) {
-	if s.err != nil {
-		return nil, s.err
+	p := NewHTTPProber()
+	ms, ok := p.Probe(context.Background(), srv.URL+"/generate_204", "", 5*time.Second)
+	if !ok {
+		t.Fatal("Probe() ok = false, want true for 204")
 	}
-	return &exec.Result{Stdout: s.stdout, ExitCode: s.exitCode}, nil
+	if ms < 1 {
+		t.Errorf("latency = %d, want >= 1", ms)
+	}
+
+	code.Store(http.StatusInternalServerError)
+	if _, ok := p.Probe(context.Background(), srv.URL+"/generate_204", "", 5*time.Second); ok {
+		t.Error("Probe() ok = true, want false for 500")
+	}
+
+	dead := srv.URL
+	srv.Close()
+	if _, ok := p.Probe(context.Background(), dead+"/generate_204", "", 2*time.Second); ok {
+		t.Error("Probe() ok = true, want false for closed server")
+	}
 }
 
-// HTTPProber output format: %{http_code}|%{time_namelookup}|%{time_connect}|%{time_total}.
-// Latency = (time_connect - time_namelookup) * 1000 ms.
-func TestHTTPProber_ParseLatency(t *testing.T) {
+func TestICMPProber_Probe(t *testing.T) {
 	cases := []struct {
-		name     string
-		stdout   string
-		exitCode int
-		err      error
-		wantOK   bool
-		wantMs   int
+		name   string
+		res    icmpprobe.Result
+		err    error
+		wantOK bool
+		wantMs int
 	}{
-		{
-			name:     "ok 200, TCP RTT 12ms",
-			stdout:   "200|0.001|0.013|0.020",
-			exitCode: 0,
-			wantOK:   true,
-			wantMs:   12,
-		},
-		{
-			name:     "ok with 404 still reachable, TCP RTT 25ms",
-			stdout:   "404|0.002|0.027|0.030",
-			exitCode: 0,
-			wantOK:   true,
-			wantMs:   25,
-		},
-		{
-			name:     "no response — code 0",
-			stdout:   "000|0.000|0.000|5.000",
-			exitCode: 0,
-			wantOK:   false,
-		},
-		{
-			name:     "fallback to time_total when timings invalid",
-			stdout:   "200|0.020|0.010|0.030",
-			exitCode: 0,
-			wantOK:   true,
-			wantMs:   30,
-		},
-		{
-			name:   "exec error",
-			err:    errors.New("boom"),
-			wantOK: false,
-		},
-		{
-			name:     "garbage output",
-			stdout:   "no separator here",
-			exitCode: 0,
-			wantOK:   false,
-		},
-		{
-			name:     "non-numeric code",
-			stdout:   "abc|0.001|0.013|0.020",
-			exitCode: 0,
-			wantOK:   false,
-		},
+		{name: "success", res: icmpprobe.Result{LatencyMs: 14}, wantOK: true, wantMs: 14},
+		{name: "probe error means failure", err: errors.New("no reply"), wantOK: false},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			p := &HTTPProber{Runner: stubRunner{stdout: c.stdout, exitCode: c.exitCode, err: c.err}}
-			ms, ok := p.Probe(context.Background(), "1.1.1.1", "wg0", 5*time.Second)
-			if ok != c.wantOK {
-				t.Errorf("ok = %v, want %v", ok, c.wantOK)
-			}
-			if c.wantOK && ms != c.wantMs {
-				t.Errorf("latency = %d, want %d", ms, c.wantMs)
-			}
-		})
-	}
-}
-
-// ICMPProber parses `time=NN.N ms` from busybox ping output.
-func TestICMPProber_ParseLatency(t *testing.T) {
-	cases := []struct {
-		name     string
-		stdout   string
-		exitCode int
-		err      error
-		wantOK   bool
-		wantMs   int
-	}{
-		{
-			name:     "stdout with time=14.2 ms",
-			stdout:   "PING 1.1.1.1\n64 bytes from 1.1.1.1: time=14.2 ms",
-			exitCode: 0,
-			wantOK:   true,
-			wantMs:   14,
-		},
-		{
-			name:     "exit code != 0 means failure",
-			stdout:   "request timeout",
-			exitCode: 1,
-			wantOK:   false,
-		},
-		{
-			name:     "exit 0 without timing — floor latency 1ms",
-			stdout:   "PING 8.8.8.8\n64 bytes from 8.8.8.8",
-			exitCode: 0,
-			wantOK:   true,
-			wantMs:   1,
-		},
-	}
-
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			p := &ICMPProber{Runner: stubRunner{stdout: c.stdout, exitCode: c.exitCode, err: c.err}}
+			p := &ICMPProber{Pinger: func(context.Context, string, string, []string) (icmpprobe.Result, error) {
+				return c.res, c.err
+			}}
 			ms, ok := p.Probe(context.Background(), "1.1.1.1", "wg0", 5*time.Second)
 			if ok != c.wantOK {
 				t.Errorf("ok = %v, want %v", ok, c.wantOK)

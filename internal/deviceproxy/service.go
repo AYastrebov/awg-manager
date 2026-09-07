@@ -13,7 +13,7 @@ import (
 
 	"github.com/hoaxisr/awg-manager/internal/events"
 	"github.com/hoaxisr/awg-manager/internal/logging"
-	"github.com/hoaxisr/awg-manager/internal/sys/exec"
+	"github.com/hoaxisr/awg-manager/internal/sys/httpclient"
 )
 
 // Deps groups the external collaborators Service needs. Wired once at
@@ -42,7 +42,6 @@ type AWGOutboundsCatalog interface {
 type AWGTagInfo struct {
 	Tag   string
 	Label string
-	Kind  string
 	Iface string
 }
 
@@ -61,6 +60,28 @@ type SubscriptionOutboundInfo struct {
 	Detail string
 }
 
+// RouterOutboundsCatalog is the narrow contract Service needs from the
+// sing-box router service. It exposes outbounds defined in 20-router.json
+// (composite groups and user direct-binds) that can be used as device-proxy
+// targets. Wired post-construction via SetRouterOutbounds (router service is
+// built after deviceproxy.Service).
+type RouterOutboundsCatalog interface {
+	ListDeviceProxyRouterOutbounds() []RouterOutboundInfo
+}
+
+// RouterOutboundInfo describes one router-defined outbound selectable by
+// device-proxy. DefaultMember/Members mirror the composite definition in
+// 20-router.json (empty for direct-binds) — buildSpec uses them to pick a
+// graceful fallback when the router slot is parked and the composite tag
+// disappears from the merged config (issue #465).
+type RouterOutboundInfo struct {
+	Tag           string
+	Label         string
+	Detail        string
+	DefaultMember string   // selector/urltest default, "" когда не задан
+	Members       []string // члены композита в порядке объявления
+}
+
 // SingboxOperator is the narrow contract Service needs from
 // singbox.Operator. Adapter in singbox_adapter.go binds it to the
 // real Operator.
@@ -72,6 +93,16 @@ type SingboxOperator interface {
 	GetSelectorActive(ctx context.Context, selectorTag string) (string, error)
 	TunnelTags() []string
 	IsRunning() bool
+}
+
+// availableOutboundTagsProvider is the optional extension the production
+// SingboxAdapter implements on top of SingboxOperator: the set of outbound
+// tags declared by ENABLED orchestrator slots (the merged-config visibility
+// rule prune applies before every reload). nil result = "unknown" — the
+// caller keeps legacy behaviour. Optional interface (type assertion, like
+// singboxTunnelOutboundsProvider) so existing fakes stay source-compatible.
+type availableOutboundTagsProvider interface {
+	AvailableOutboundTags() map[string]bool
 }
 
 // NDMSInterfaceQuery resolves an NDMS interface id (e.g. "Bridge0") to
@@ -118,6 +149,15 @@ type Service struct {
 
 	mu          sync.Mutex
 	tunnelPorts TunnelInboundPortsFn
+
+	routerOutbounds RouterOutboundsCatalog
+
+	// lastDegradedWarn: instanceID → пара «selected→fallback» последней
+	// залогированной деградации (issue #465). buildSpec вызывается на каждую
+	// регенерацию каждого инстанса (долгий «движок выключен» + churn туннелей
+	// → шквал одинаковых Warn); логируем только смену состояния деградации и
+	// её снятие. Защищён существующим s.mu (buildSpec всегда под ним).
+	lastDegradedWarn map[string]string
 }
 
 // ErrOutboundUnavailable is returned by SelectRuntimeOutbound when the caller
@@ -201,32 +241,41 @@ func (s *Service) SaveInstance(ctx context.Context, in Instance) error {
 }
 
 // DeleteInstance removes one configured proxy instance.
-// The default instance is preserved by Store.DeleteInstance.
-func (s *Service) DeleteInstance(ctx context.Context, id string) error {
+// Storage is always updated; a sing-box apply failure is logged but does
+// not roll back the deletion — the user should be able to drop an inbound
+// even when the daemon is temporarily unavailable.
+// The returned applied flag is false when storage was updated but sing-box
+// could not be reloaded yet.
+func (s *Service) DeleteInstance(ctx context.Context, id string) (applied bool, err error) {
 	if id == "" {
-		return fmt.Errorf("instance id is empty")
+		return false, fmt.Errorf("instance id is empty")
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	prev := s.d.Store.Snapshot()
-
 	if err := s.d.Store.DeleteInstance(id); err != nil {
-		return err
+		return false, err
 	}
+	// Инстанс удалён — состояние дедупликации Warn'ов деградации больше
+	// не нужно (иначе запись висела бы в map навсегда).
+	delete(s.lastDegradedWarn, id)
 	if err := s.applyInstancesLocked(ctx); err != nil {
-		_ = s.restoreSnapshot(ctx, prev)
-		return err
+		s.appLog.Warn("delete-instance", id, "apply after delete failed: "+err.Error())
+		if s.d.Bus != nil {
+			s.d.Bus.PublishInvalidated(events.ResourceDeviceProxyConfig, "")
+			s.d.Bus.PublishInvalidated(events.ResourceDeviceProxyRuntime, "")
+		}
+		return false, nil
 	}
-	return nil
+	return true, nil
 }
 
 // buildInstanceSpec builds an ExternalInstanceSpec from a stored Instance.
 func (s *Service) buildInstanceSpec(ctx context.Context, in Instance) (ExternalInstanceSpec, error) {
 	cfg := instanceToConfig(in)
 
-	base, err := s.buildSpec(ctx, cfg)
+	base, err := s.buildSpec(ctx, in.ID, cfg)
 	if err != nil {
 		return ExternalInstanceSpec{}, err
 	}
@@ -278,8 +327,8 @@ func (s *Service) applyInstancesLocked(ctx context.Context) error {
 	}
 
 	if s.d.Bus != nil {
-		s.d.Bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.config"})
-		s.d.Bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.runtime"})
+		s.d.Bus.PublishInvalidated(events.ResourceDeviceProxyConfig, "")
+		s.d.Bus.PublishInvalidated(events.ResourceDeviceProxyRuntime, "")
 	}
 	return nil
 }
@@ -331,6 +380,15 @@ func (s *Service) restoreSnapshot(ctx context.Context, snap Snapshot) error {
 func (s *Service) SetTunnelInboundPorts(fn TunnelInboundPortsFn) {
 	s.mu.Lock()
 	s.tunnelPorts = fn
+	s.mu.Unlock()
+}
+
+// SetRouterOutbounds wires the router-outbounds catalog after construction.
+// The router service is built after deviceproxy.Service in main.go, so it
+// cannot be passed via Deps — mirrors SetTunnelInboundPorts.
+func (s *Service) SetRouterOutbounds(c RouterOutboundsCatalog) {
+	s.mu.Lock()
+	s.routerOutbounds = c
 	s.mu.Unlock()
 }
 
@@ -410,7 +468,7 @@ func (s *Service) SaveConfig(ctx context.Context, cfg Config) error {
 
 	oldCfg := s.d.Store.Get()
 
-	spec, err := s.buildSpec(ctx, cfg)
+	spec, err := s.buildSpec(ctx, "default", cfg)
 	if err != nil {
 		return err
 	}
@@ -418,8 +476,8 @@ func (s *Service) SaveConfig(ctx context.Context, cfg Config) error {
 	if s.d.Singbox != nil {
 		// No-reload path only makes sense when the daemon is actually up —
 		// otherwise there's no live selector.now to preserve, AND the
-		// reload path includes a cold-start safety net that ApplyConfigNoReload
-		// deliberately skips. Require both conditions.
+		// reload path includes a cold-start safety net that the no-reload
+		// path deliberately skips. Require both conditions.
 		if onlySelectedOutboundChanged(oldCfg, cfg) && s.d.Singbox.IsRunning() {
 			if err := s.d.Singbox.ApplyDeviceProxyNoReload(ctx, spec); err != nil {
 				return fmt.Errorf("apply to singbox (no-reload): %w", err)
@@ -447,10 +505,10 @@ func (s *Service) SaveConfig(ctx context.Context, cfg Config) error {
 	}
 
 	if s.d.Bus != nil {
-		s.d.Bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.config"})
+		s.d.Bus.PublishInvalidated(events.ResourceDeviceProxyConfig, "")
 		// A default-only change also shifts what the runtime store would
 		// derive "temporarily" against, so invalidate both.
-		s.d.Bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.runtime"})
+		s.d.Bus.PublishInvalidated(events.ResourceDeviceProxyRuntime, "")
 	}
 	return nil
 }
@@ -484,7 +542,7 @@ func (s *Service) ForceApply(ctx context.Context) error {
 		}
 	}
 
-	spec, err := s.buildSpec(ctx, cfg)
+	spec, err := s.buildSpec(ctx, "default", cfg)
 	if err != nil {
 		return err
 	}
@@ -502,8 +560,8 @@ func (s *Service) ForceApply(ctx context.Context) error {
 	}
 
 	if s.d.Bus != nil {
-		s.d.Bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.config"})
-		s.d.Bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.runtime"})
+		s.d.Bus.PublishInvalidated(events.ResourceDeviceProxyConfig, "")
+		s.d.Bus.PublishInvalidated(events.ResourceDeviceProxyRuntime, "")
 	}
 	return nil
 }
@@ -528,7 +586,11 @@ func (s *Service) validateLocked(cfg Config) error {
 	return validateConfigRaw(cfg, s.tunnelPorts, nil)
 }
 
-func (s *Service) buildSpec(ctx context.Context, cfg Config) (ExternalSpec, error) {
+// buildSpec собирает ExternalSpec для одного инстанса. instanceID нужен
+// только для дедупликации логов деградации (map на Service); legacy-пути
+// одиночного конфига (SaveConfig/ForceApply) передают "default".
+// Вызывается строго под s.mu.
+func (s *Service) buildSpec(ctx context.Context, instanceID string, cfg Config) (ExternalSpec, error) {
 	spec := ExternalSpec{
 		Enabled:     cfg.Enabled,
 		Port:        cfg.Port,
@@ -548,6 +610,125 @@ func (s *Service) buildSpec(ctx context.Context, cfg Config) (ExternalSpec, erro
 		spec.ListenAddr = addr
 	}
 
+	sbTags, awgTags, routerInfos, avail := s.collectSelectorMembers(ctx, s.routerOutbounds, s.d.Singbox)
+	spec.SBTags = sbTags
+	spec.AWGTags = awgTags
+
+	// Graceful degradation (issue #465): если выбранный выход — router-
+	// композит, отсутствующий сейчас в merged-конфиге (слот 20-router
+	// припаркован — движок маршрутизации выключен), подставляем в спек
+	// default-член композита (намерение пользователя), а не оставляем
+	// висячую ссылку, которую prune оркестратора вырезал бы молча и
+	// sing-box увёл бы трафик в произвольный выживший член. Хранилище
+	// (SelectedOutbound) НЕ трогаем: при включении движка регенерация
+	// вернёт композит на место.
+	deg := degradationFor(cfg.SelectedOutbound, spec.SBTags, spec.AWGTags, routerInfos, avail)
+	switch {
+	case deg != nil:
+		spec.SelectedTag = deg.FallbackTag
+		s.warnDegradationLocked(instanceID, deg)
+	case avail != nil && !selectedTagEmittable(cfg.SelectedOutbound, spec.SBTags, spec.AWGTags):
+		// Недоступный НЕ-router тег (например, subscription-selector при
+		// припаркованном слоте подписок): default не эмитим — иначе
+		// singbox/config.go записал бы в слот 30 висячий "default", который
+		// prune вычищал бы на каждом reload, ломая инвариант «prune никогда
+		// не трогает свежий слот 30». Selector падает на direct; Reconcile
+		// выключит инстанс при следующем событии.
+		spec.SelectedTag = ""
+		// Не «снова доступен» — состояние дедупликации снимаем молча.
+		delete(s.lastDegradedWarn, instanceID)
+	default:
+		s.clearDegradationLocked(instanceID)
+	}
+	return spec, nil
+}
+
+// selectedTagEmittable reports whether the selected tag will actually be
+// present among the emitted selector members. "" и "direct" эмитимы всегда
+// (direct — встроенный член каждого селектора).
+func selectedTagEmittable(selected string, sbTags, awgTags []string) bool {
+	if selected == "" || selected == "direct" {
+		return true
+	}
+	for _, t := range sbTags {
+		if t == selected {
+			return true
+		}
+	}
+	for _, t := range awgTags {
+		if t == selected {
+			return true
+		}
+	}
+	return false
+}
+
+// degradedWarnSep разделяет selected и fallback в значении lastDegradedWarn.
+// NUL не встречается в тегах sing-box.
+const degradedWarnSep = "\x00"
+
+// warnDegradationLocked логирует деградацию один раз на состояние: повторный
+// buildSpec с той же парой selected→fallback молчит. Caller держит s.mu.
+func (s *Service) warnDegradationLocked(instanceID string, deg *OutboundDegradation) {
+	key := deg.SelectedTag + degradedWarnSep + deg.FallbackTag
+	if s.lastDegradedWarn[instanceID] == key {
+		return
+	}
+	if s.lastDegradedWarn == nil {
+		s.lastDegradedWarn = make(map[string]string)
+	}
+	s.lastDegradedWarn[instanceID] = key
+	s.appLog.Warn("degraded-outbound", deg.SelectedTag,
+		fmt.Sprintf("Выход %q недоступен в текущем конфиге (слот-источник выключен) — прокси временно через %q", deg.SelectedTag, deg.FallbackTag))
+}
+
+// clearDegradationLocked снимает состояние деградации и логирует
+// восстановление (Info) — только если деградация была. Caller держит s.mu.
+func (s *Service) clearDegradationLocked(instanceID string) {
+	prev, ok := s.lastDegradedWarn[instanceID]
+	if !ok {
+		return
+	}
+	delete(s.lastDegradedWarn, instanceID)
+	selected, _, _ := strings.Cut(prev, degradedWarnSep)
+	s.appLog.Info("degraded-outbound", selected,
+		fmt.Sprintf("Выход %q снова доступен — прокси снова идёт через него", selected))
+}
+
+// collectSelectorMembers gathers the member-tag universe for device-proxy
+// selectors: sing-box tunnels + subscription selectors + router-defined
+// outbounds (SB side) and AWG tags, already filtered through the enabled-
+// slot availability oracle when it is known (avail != nil). routerInfos is
+// returned UNfiltered — the fallback resolver needs composite definitions
+// even (especially) when their tags are unavailable. catalog/sb are passed
+// explicitly: buildSpec calls under s.mu with the service fields, runtime
+// paths snapshot them first.
+func (s *Service) collectSelectorMembers(ctx context.Context, catalog RouterOutboundsCatalog, sb SingboxOperator) (sbTags, awgTags []string, routerInfos []RouterOutboundInfo, avail map[string]bool) {
+	if p, ok := sb.(availableOutboundTagsProvider); ok {
+		avail = p.AvailableOutboundTags()
+	}
+
+	// Sing-box tunnel tags
+	if sb != nil {
+		sbTags = append(sbTags, sb.TunnelTags()...)
+	}
+
+	// Sing-box subscription selector/urltest tags
+	if s.d.SubscriptionOutbounds != nil {
+		for _, t := range s.d.SubscriptionOutbounds.ListDeviceProxyOutbounds() {
+			sbTags = append(sbTags, t.Tag)
+		}
+	}
+
+	// Router-defined outbounds (20-router.json) — composite groups and
+	// user direct-binds, exposed as selectable members.
+	if catalog != nil {
+		routerInfos = catalog.ListDeviceProxyRouterOutbounds()
+		for _, ro := range routerInfos {
+			sbTags = append(sbTags, ro.Tag)
+		}
+	}
+
 	// AWG tags — single source of truth is the awgoutbounds package,
 	// which enumerates managed + system tunnels and emits canonical
 	// awg-{id} / awg-sys-{id} tags. We just collect the tags.
@@ -555,31 +736,147 @@ func (s *Service) buildSpec(ctx context.Context, cfg Config) (ExternalSpec, erro
 		tags, err := s.d.AWGOutbounds.ListTags(ctx)
 		if err == nil {
 			for _, t := range tags {
-				spec.AWGTags = append(spec.AWGTags, t.Tag)
+				awgTags = append(awgTags, t.Tag)
 			}
 		}
 	}
 
-	// Sing-box tunnel tags
-	if s.d.Singbox != nil {
-		spec.SBTags = s.d.Singbox.TunnelTags()
+	// Никогда не эмитим член селектора, которого нет в merged-конфиге:
+	// sing-box отвергает селектор с неизвестным членом, а prune оркестратора
+	// вырезал бы его молча уже ПОСЛЕ записи слота (issue #465).
+	if avail != nil {
+		sbTags = keepAvailableTags(sbTags, avail)
+		awgTags = keepAvailableTags(awgTags, avail)
 	}
+	return sbTags, awgTags, routerInfos, avail
+}
 
-	// Sing-box subscription selector/urltest tags
-	if s.d.SubscriptionOutbounds != nil {
-		for _, t := range s.d.SubscriptionOutbounds.ListDeviceProxyOutbounds() {
-			spec.SBTags = append(spec.SBTags, t.Tag)
+// keepAvailableTags filters tags through the enabled-slot oracle.
+func keepAvailableTags(tags []string, avail map[string]bool) []string {
+	kept := make([]string, 0, len(tags))
+	for _, t := range tags {
+		if avail[t] {
+			kept = append(kept, t)
 		}
 	}
-	return spec, nil
+	return kept
+}
+
+// OutboundDegradation describes a generation-time substitution: the
+// user-selected outbound tag is currently absent from the merged config
+// (its slot is parked), so slot 30's selector default was pointed at
+// FallbackTag instead. Present only while the source slot stays disabled;
+// the stored SelectedOutbound is never modified.
+type OutboundDegradation struct {
+	SelectedTag string // выбранный пользователем тег, недоступный сейчас
+	FallbackTag string // через какой член фактически идёт трафик
+}
+
+// degradationFor decides whether the FIX for issue #465 applies: selected
+// references a router composite whose tag is not among the members we can
+// emit. sbTags/awgTags must already be availability-filtered. Non-router
+// unknown tags are left alone — there is no definition to recover intent
+// from (Reconcile disables such instances; prune protects the daemon).
+func degradationFor(selected string, sbTags, awgTags []string, routerInfos []RouterOutboundInfo, avail map[string]bool) *OutboundDegradation {
+	if avail == nil || selected == "" || selected == "direct" {
+		return nil
+	}
+	members := map[string]bool{"direct": true}
+	for _, t := range sbTags {
+		members[t] = true
+	}
+	for _, t := range awgTags {
+		members[t] = true
+	}
+	if members[selected] {
+		return nil
+	}
+	byTag := make(map[string]RouterOutboundInfo, len(routerInfos))
+	for _, ro := range routerInfos {
+		byTag[ro.Tag] = ro
+	}
+	if _, isRouter := byTag[selected]; !isRouter {
+		return nil
+	}
+	return &OutboundDegradation{
+		SelectedTag: selected,
+		FallbackTag: resolveOutboundFallback(selected, byTag, members),
+	}
+}
+
+// resolveOutboundFallback walks the unavailable composite's definition to
+// find the member the user's intent degrades to: the composite's default
+// member first, then the remaining members in declaration order; a member
+// that is itself an unavailable router composite is resolved recursively
+// (visited-set guards cycles). Last resort — "direct".
+func resolveOutboundFallback(selected string, byTag map[string]RouterOutboundInfo, members map[string]bool) string {
+	visited := map[string]bool{selected: true}
+	var walk func(tag string) (string, bool)
+	walk = func(tag string) (string, bool) {
+		info, ok := byTag[tag]
+		if !ok {
+			return "", false
+		}
+		candidates := make([]string, 0, len(info.Members)+1)
+		if info.DefaultMember != "" {
+			candidates = append(candidates, info.DefaultMember)
+		}
+		candidates = append(candidates, info.Members...)
+		for _, c := range candidates {
+			if c == "" || visited[c] {
+				continue
+			}
+			visited[c] = true
+			if members[c] {
+				return c, true
+			}
+			if fb, ok := walk(c); ok {
+				return fb, true
+			}
+		}
+		return "", false
+	}
+	if fb, ok := walk(selected); ok {
+		return fb
+	}
+	return "direct"
+}
+
+// runtimeDegradation recomputes the buildSpec substitution for display:
+// which slot-30 default the generator emits right now for selected. Used
+// by the runtime-state endpoints so the UI can show «выход недоступен —
+// трафик через Y» without trusting the live selector.now. Takes s.mu
+// briefly to snapshot collaborators; safe to call without the lock.
+func (s *Service) runtimeDegradation(ctx context.Context, selected string) *OutboundDegradation {
+	// Быстрый выход ДО collectSelectorMembers: для ""/direct деградация
+	// невозможна (direct — встроенный член каждого селектора), а runtime-
+	// endpoint'ы UI опрашивает постоянно — гонять оракул слотов и каталоги
+	// (туннели/подписки/роутер/awg) на каждый poll дорого на MIPS-роутерах.
+	if selected == "" || selected == "direct" {
+		return nil
+	}
+	s.mu.Lock()
+	catalog := s.routerOutbounds
+	sb := s.d.Singbox
+	s.mu.Unlock()
+
+	sbTags, awgTags, routerInfos, avail := s.collectSelectorMembers(ctx, catalog, sb)
+	return degradationFor(selected, sbTags, awgTags, routerInfos, avail)
 }
 
 // RuntimeState is the UI-facing snapshot of the selector's live state.
 // Not persisted; returned on demand.
+//
+// DegradedOutbound/FallbackTag surface the issue-#465 degradation: the
+// stored SelectedOutbound (== DefaultTag) is a composite whose slot is
+// parked, so the generated selector actually defaults to FallbackTag.
+// Both empty when there is no degradation.
 type RuntimeState struct {
-	Alive      bool   `json:"alive"`
-	ActiveTag  string `json:"activeTag"`
-	DefaultTag string `json:"defaultTag"`
+	Alive            bool   `json:"alive"`
+	ActiveTag        string `json:"activeTag"`
+	DefaultTag       string `json:"defaultTag"`
+	DegradedOutbound string `json:"degradedOutbound,omitempty"`
+	FallbackTag      string `json:"fallbackTag,omitempty"`
 }
 
 // InstanceIPCheckResult contains the direct WAN IP and IP observed through
@@ -601,6 +898,10 @@ func (s *Service) GetRuntimeState(ctx context.Context) RuntimeState {
 	s.mu.Unlock()
 
 	state := RuntimeState{DefaultTag: defaultTag}
+	if deg := s.runtimeDegradation(ctx, defaultTag); deg != nil {
+		state.DegradedOutbound = deg.SelectedTag
+		state.FallbackTag = deg.FallbackTag
+	}
 	if sb == nil || !sb.IsRunning() {
 		return state
 	}
@@ -629,6 +930,10 @@ func (s *Service) GetInstanceRuntimeState(ctx context.Context, id string) (Runti
 	}
 
 	state := RuntimeState{DefaultTag: in.SelectedOutbound}
+	if deg := s.runtimeDegradation(ctx, in.SelectedOutbound); deg != nil {
+		state.DegradedOutbound = deg.SelectedTag
+		state.FallbackTag = deg.FallbackTag
+	}
 	if sb == nil || !sb.IsRunning() {
 		return state, nil
 	}
@@ -643,7 +948,7 @@ func (s *Service) GetInstanceRuntimeState(ctx context.Context, id string) (Runti
 // Outbound describes one selectable proxy target exposed to the UI.
 type Outbound struct {
 	Tag    string `json:"tag"`
-	Kind   string `json:"kind"` // "direct" | "singbox" | "awg"
+	Kind   string `json:"kind"` // "direct" | "singbox" | "subscription" | "awg" | "router"
 	Label  string `json:"label"`
 	Detail string `json:"detail"` // extra info for UI (kernel iface, protocol, etc)
 }
@@ -709,7 +1014,7 @@ func (s *Service) listOutboundsLocked(ctx context.Context) []Outbound {
 		for _, sub := range subs {
 			out = append(out, Outbound{
 				Tag:    sub.Tag,
-				Kind:   "singbox",
+				Kind:   "subscription",
 				Label:  sub.Label,
 				Detail: sub.Detail,
 			})
@@ -727,6 +1032,17 @@ func (s *Service) listOutboundsLocked(ctx context.Context) []Outbound {
 					Detail: t.Iface,
 				})
 			}
+		}
+	}
+
+	if s.routerOutbounds != nil {
+		for _, ro := range s.routerOutbounds.ListDeviceProxyRouterOutbounds() {
+			out = append(out, Outbound{
+				Tag:    ro.Tag,
+				Kind:   "router",
+				Label:  ro.Label,
+				Detail: ro.Detail,
+			})
 		}
 	}
 	return out
@@ -771,7 +1087,7 @@ func (s *Service) SelectRuntimeOutbound(ctx context.Context, tag string) error {
 	// fast-path so the "Активный туннель" card updates sub-second,
 	// without waiting for the 5s runtime polling tick.
 	if bus != nil {
-		bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.runtime"})
+		bus.PublishInvalidated(events.ResourceDeviceProxyRuntime, "")
 	}
 	return nil
 }
@@ -824,7 +1140,7 @@ func (s *Service) SelectInstanceRuntimeOutbound(ctx context.Context, id, tag str
 	s.appLog.Info("select-runtime", tag, fmt.Sprintf("Device proxy instance %s hot-switched outbound", id))
 
 	if bus != nil {
-		bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.runtime"})
+		bus.PublishInvalidated(events.ResourceDeviceProxyRuntime, "")
 	}
 	return nil
 }
@@ -871,8 +1187,8 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		for _, wasTag := range missingTags {
 			s.d.Bus.Publish("deviceproxy:missing-target", map[string]string{"wasTag": wasTag})
 		}
-		s.d.Bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.config"})
-		s.d.Bus.Publish("resource:invalidated", events.ResourceInvalidatedEvent{Resource: "deviceproxy.runtime"})
+		s.d.Bus.PublishInvalidated(events.ResourceDeviceProxyConfig, "")
+		s.d.Bus.PublishInvalidated(events.ResourceDeviceProxyRuntime, "")
 	}
 
 	snap = s.d.Store.Snapshot()
@@ -954,28 +1270,34 @@ func (s *Service) SubscribeBus(ctx context.Context) func() {
 	_, ch, unsub := s.d.Bus.Subscribe()
 	go func() {
 		for ev := range ch {
-			if ev.Type != "resource:invalidated" && ev.Type != "singbox:tunnels-changed" {
+			if ev.Type != events.EventResourceInvalidated &&
+				ev.Type != "singbox:tunnels-changed" &&
+				ev.Type != "singbox-router:outbounds" {
 				continue
 			}
-			if ev.Type == "resource:invalidated" {
+			if ev.Type == events.EventResourceInvalidated {
 				// Only react to invalidations that change our child list.
 				payload, ok := ev.Data.(events.ResourceInvalidatedEvent)
 				if !ok {
 					continue
 				}
-				if payload.Resource != "tunnels" &&
-					payload.Resource != "singbox.tunnels" &&
-					payload.Resource != "singbox.subscriptions" {
+				// Ключа singbox.subscriptions здесь больше нет: его не публиковал
+				// НИКТО, ветка была мертва (F66). Прежний довод «оставить, чтобы
+				// не замаскировать будущего публикатора» обесценен закрытым
+				// набором ключей (F62): новый ключ теперь не пройдёт мимо
+				// events.AllResources и union фронта. CRUD подписок будит
+				// реконсиляцию через tunnels/singbox.tunnels, как и раньше.
+				if payload.Resource != events.ResourceTunnels &&
+					payload.Resource != events.ResourceSingboxTunnels {
 					continue
 				}
 			}
 			if err := s.Reconcile(ctx); err != nil {
-				// Reconcile failure is non-fatal at the subscriber level;
-				// the user-facing flow already has its own error path.
-				// No logger is wired on Service yet (would be added in a
-				// future task); silent swallow matches the project's other
-				// similar subscribers.
-				_ = err
+				// Отказ не фатален для подписчика — он обязан слушать
+				// дальше, — но обязан быть виден: прежде он глотался
+				// молча (F78). Своей дедупликации не нужно, журнал
+				// коалесцирует повторы сам.
+				s.appLog.Warn("reconcile", "", "bus-triggered reconcile failed: "+err.Error())
 			}
 		}
 	}()
@@ -1020,24 +1342,25 @@ func parseIPResult(stdout string) (string, bool) {
 	return ip, net.ParseIP(ip) != nil
 }
 
-func fetchIPViaCurl(ctx context.Context, serviceURL string, extraArgs []string) (string, string, error) {
+func fetchIPViaHTTP(ctx context.Context, serviceURL string, proxyURL string) (string, string, error) {
 	if serviceURL != "" {
-		args := []string{"-s", "--max-time", fmt.Sprintf("%d", instanceIPMaxTimeSec)}
-		args = append(args, extraArgs...)
-		args = append(args, serviceURL)
-		res, err := exec.Run(ctx, "/opt/bin/curl", args...)
+		res, err := httpclient.DefaultClient.Do(ctx, httpclient.CallConfig{
+			URL:      serviceURL,
+			ProxyURL: proxyURL,
+			MaxTime:  instanceIPMaxTimeSec * time.Second,
+		})
 		if err != nil {
-			return "", "", fmt.Errorf("%s: %w", serviceURL, exec.FormatError(res, err))
+			return "", "", fmt.Errorf("%s: %w", serviceURL, err)
 		}
-		if ip, ok := parseIPResult(res.Stdout); ok {
+		if ip, ok := parseIPResult(res.Body); ok {
 			return ip, serviceURL, nil
 		}
-		return "", "", fmt.Errorf("%s: invalid response %q", serviceURL, strings.TrimSpace(res.Stdout))
+		return "", "", fmt.Errorf("%s: invalid response %q", serviceURL, strings.TrimSpace(res.Body))
 	}
 
 	var lastErr error
 	for _, svcURL := range instanceIPCheckServices {
-		ip, usedService, err := fetchIPViaCurl(ctx, svcURL, extraArgs)
+		ip, usedService, err := fetchIPViaHTTP(ctx, svcURL, proxyURL)
 		if err != nil {
 			lastErr = err
 			continue
@@ -1089,14 +1412,14 @@ func (s *Service) CheckInstanceExternalIP(ctx context.Context, id, serviceURL st
 
 	directCtx, directCancel := context.WithTimeout(ctx, instanceIPDirectTimeout)
 	defer directCancel()
-	directIP, _, err := fetchIPViaCurl(directCtx, serviceURL, nil)
+	directIP, _, err := fetchIPViaHTTP(directCtx, serviceURL, "")
 	if err != nil {
 		return InstanceIPCheckResult{}, fmt.Errorf("failed to get WAN IP: %w", err)
 	}
 
 	proxyCtx, proxyCancel := context.WithTimeout(ctx, instanceIPProxyTimeout)
 	defer proxyCancel()
-	proxyIP, usedService, err := fetchIPViaCurl(proxyCtx, serviceURL, []string{"--proxy", proxyURL.String()})
+	proxyIP, usedService, err := fetchIPViaHTTP(proxyCtx, serviceURL, proxyURL.String())
 	if err != nil {
 		return InstanceIPCheckResult{}, fmt.Errorf("failed to get IP through proxy instance %q: %w", id, err)
 	}

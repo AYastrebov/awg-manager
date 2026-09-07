@@ -19,9 +19,16 @@ const (
 	SlotBase          Slot = "base"          // 00-base.json — always on
 	SlotTunnels       Slot = "tunnels"       // 10-tunnels.json
 	SlotAwg           Slot = "awg"           // 15-awg.json
+	SlotAwg3          Slot = "awg3"          // 16-awg3.json
+	SlotDNSRewrites   Slot = "dns-rewrites"  // 17-dns-rewrites.json
+	SlotQoSRoutes     Slot = "qos-routes"    // 18-qos-routes.json
 	SlotRouter        Slot = "router"        // 20-router.json
+	SlotFakeIP        Slot = "fakeip"        // 21-fakeip.json
 	SlotDeviceProxy   Slot = "deviceproxy"   // 30-deviceproxy.json
+	SlotDownloadProxy Slot = "downloadproxy" // 35-download-proxy.json
 	SlotSubscriptions Slot = "subscriptions" // 40-subscriptions.json
+	SlotUser          Slot = "user"          // 90-user.json — эксперт-редактор
+	SlotDefaults      Slot = "defaults"      // 99-defaults.json — дефолты условных скаляров
 )
 
 // SlotMeta describes a producer's contract with the orchestrator.
@@ -63,9 +70,38 @@ func KnownSlots() []SlotMeta {
 		{Slot: SlotBase, Filename: "00-base.json", AlwaysOn: true},
 		{Slot: SlotTunnels, Filename: "10-tunnels.json", AlwaysOn: true},
 		{Slot: SlotAwg, Filename: "15-awg.json", AlwaysOn: true},
+		{Slot: SlotAwg3, Filename: "16-awg3.json", AlwaysOn: true},
+		{Slot: SlotDNSRewrites, Filename: "17-dns-rewrites.json"},
+		// 18 merges BEFORE 20 on purpose: sing-box evaluates route rules
+		// in merged-file order, so managed QoS rules (an explicit per-packet
+		// DSCP policy) win over user rules.
+		{Slot: SlotQoSRoutes, Filename: "18-qos-routes.json"},
 		{Slot: SlotRouter, Filename: "20-router.json"},
+		{Slot: SlotFakeIP, Filename: "21-fakeip.json"},
 		{Slot: SlotDeviceProxy, Filename: "30-deviceproxy.json"},
+		{Slot: SlotDownloadProxy, Filename: "35-download-proxy.json"},
 		{Slot: SlotSubscriptions, Filename: "40-subscriptions.json"},
+		// Пользовательский слот эксперт-редактора. НИКАКОЙ продюсер не
+		// пишет в него — только draft-пайплайн (SaveDraft/ApplyDraft) по
+		// явному действию пользователя; массивы (outbounds/inbounds/
+		// dns.servers/route.rules/…) конкатенируются последними. Скаляры
+		// dns/route отсюда переопределяются только те, которых не несёт
+		// НИ ОДИН слот выше: merge — first-file-wins, и 90 идёт раньше
+		// 99-defaults, но позже 00-base и режимных 20/21.
+		// pruneDanglingSelectorRefsLocked этот файл тоже не мутирует.
+		{Slot: SlotUser, Filename: "90-user.json"},
+		// Дефолты скаляров, которыми владеет то, что окажется выше:
+		// dns.strategy и route.default_domain_resolver. Лежит ПОСЛЕДНИМ
+		// намеренно — в first-file-wins это и есть «проиграть пассивно»:
+		// любой слот со своим ключом перекрывает дефолт сам, без кода,
+		// который вычислял бы владение и переписывал 00-base. Раньше
+		// дефолты жили в 00-base — то есть в выигрывающей позиции, — и
+		// уступать приходилось активно: примирение читало чужие слот-файлы
+		// и мутировало базу на каждом шаге транзакции, давая за один
+		// переход две записи в противоположные стороны и лишний Stop+Start
+		// движка (стенд 2026-08-24). AlwaysOn без HasContent: сам по себе
+		// демона не поднимает, работы в нём нет.
+		{Slot: SlotDefaults, Filename: "99-defaults.json", AlwaysOn: true},
 	}
 }
 

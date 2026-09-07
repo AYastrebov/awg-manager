@@ -22,8 +22,8 @@ func decide(event Event, state *State) []Action {
 		return decideWANUp(event, state)
 	case EventWANDown:
 		return decideWANDown(event, state)
-	case EventPingCheckFailed:
-		return decidePingCheckFailed(event, state)
+	case EventQuiesce:
+		return decideQuiesce(state)
 	default:
 		return nil
 	}
@@ -49,11 +49,25 @@ func decideBoot(state *State) []Action {
 			actions = appendPostStartActions(actions, t)
 
 		case "nativewg":
-			if !state.supportsASC {
-				actions = append(actions,
-					Action{Type: ActionStopNativeWG, Tunnel: t.ID},
-					Action{Type: ActionStartNativeWG, Tunnel: t.ID},
-				)
+			if !state.supportsASC || t.ViaProxy {
+				// Reconcile-to-desired instead of unconditional Stop+Start:
+				// the executor skips the disruptive restart when the tunnel
+				// is already running WITH a handshake, and still re-attaches
+				// the proxy for the #183 case (NDMS brought the interface up
+				// without our kmod proxy → conf=running but no handshake).
+				actions = append(actions, Action{Type: ActionReconcileNativeWG, Tunnel: t.ID})
+				actions = appendPostStartActions(actions, t)
+			} else if t.EndpointMayV6 {
+				// На ASC-прошивке NDMS сам поднимает интерфейс из своего
+				// конфига, и для v4-литерала это самодостаточно (boot ничего
+				// не делает намеренно). Для v6-литерала и hostname'а (мог
+				// резолвиться в v6 — например DDNS только с AAAA) конфиг
+				// NDMS может нести заглушку 127.0.0.1:1 — реальный endpoint
+				// жил только в ядре и после ребута роутера потерян. Полный
+				// Start возвращает его (wg set) и заново регистрирует
+				// endpoint-страж; для hostname→v4 Start безвреден — тот же
+				// resync, что decideReconnect делает для работающих.
+				actions = append(actions, Action{Type: ActionStartNativeWG, Tunnel: t.ID})
 				actions = appendPostStartActions(actions, t)
 			}
 		}
@@ -79,7 +93,7 @@ func decideReconnect(state *State) []Action {
 				// Re-apply NDMS config, firewall, routing around the running process.
 				actions = append(actions, Action{Type: ActionReconcileKernel, Tunnel: t.ID})
 			case "nativewg":
-				if state.supportsASC {
+				if state.supportsASC && !t.ViaProxy {
 					// KeenOS 5+ ASC mode has no kmod proxy to restore. A running
 					// NativeWG interface may still need a full resync after awgm
 					// restart/update so ASC bindings, routes and persistence are
@@ -199,33 +213,6 @@ func decideStop(event Event, state *State) []Action {
 	return actions
 }
 
-// decideExternalStop handles externally-triggered conf=disabled for nativewg tunnels.
-// Unlike decideStop, it does NOT generate ActionPersistStopped — the tunnel stays
-// enabled in storage. Instead it generates ActionExternalRestart which will attempt
-// to bring the tunnel back up.
-//
-// Rate-limited: after externalRestartMaxCount restarts within externalRestartWindow,
-// falls back to normal decideStop (persists disabled) to prevent infinite loops.
-func decideExternalStop(event Event, state *State, t *tunnelState) []Action {
-	if !t.canExternalRestart() {
-		return decideStop(event, state)
-	}
-
-	var actions []Action
-
-	if t.Monitoring {
-		actions = append(actions, Action{Type: ActionStopMonitoring, Tunnel: t.ID})
-	}
-
-	if t.PingCheck != nil && t.PingCheck.Enabled {
-		actions = append(actions, Action{Type: ActionRemovePingCheck, Tunnel: t.ID})
-	}
-
-	actions = append(actions, Action{Type: ActionExternalRestart, Tunnel: t.ID})
-
-	return actions
-}
-
 func decideNDMSHook(event Event, state *State) []Action {
 	if event.Layer != "conf" {
 		return nil
@@ -238,9 +225,15 @@ func decideNDMSHook(event Event, state *State) []Action {
 
 	switch event.Level {
 	case "running":
-		t.ExternalRestartCount = 0
-
-		if t.Running || !t.Enabled || !state.anyWANUp() {
+		// A conf=running edge that reaches decide is genuinely external —
+		// self-induced ones (our own Start) are filtered upstream by
+		// consumeExpectedHook. So an external enable (router web UI, manual
+		// NDMS toggle) must start the tunnel even when our store says
+		// Enabled=false: the user's "on" intent wins, and decideStart's
+		// ActionPersistRunning re-syncs Enabled=true. We deliberately do NOT
+		// guard on !t.Enabled here (issue #183 — router-UI enable left a
+		// NativeWG interface up but without its kmod proxy → dead handshake).
+		if t.Running || !state.anyWANUp() {
 			return nil
 		}
 		return decideStart(Event{Type: EventStart, Tunnel: t.ID}, state)
@@ -249,9 +242,15 @@ func decideNDMSHook(event Event, state *State) []Action {
 		if !t.Running {
 			return nil
 		}
-		if t.Backend == "nativewg" {
-			return decideExternalStop(Event{Type: EventStop, Tunnel: t.ID}, state, t)
+		// Boot-quiescence: ignore a transient conf=disabled that arrives while
+		// we are still bringing this tunnel up. NDMS emits its own disabled→
+		// running churn as it settles its WireGuard; acting on it here tears
+		// down a tunnel we just started (observed at boot: tunnel handshakes,
+		// then a stray disabled kills it ~1s later).
+		if !event.Now.IsZero() && event.Now.Before(t.quiescentUntil) {
+			return nil
 		}
+		// Outside the quiescence window, treat conf=disabled as user intent and stop.
 		return decideStop(Event{Type: EventStop, Tunnel: t.ID}, state)
 	}
 
@@ -288,7 +287,7 @@ func decideWANUp(event Event, state *State) []Action {
 			}
 
 		case "nativewg":
-			if state.supportsASC {
+			if state.supportsASC && !t.ViaProxy {
 				continue // NDMS handles failover natively via ASC on >= 5.01.A.3
 			}
 			// Skip only when actively running on a DIFFERENT WAN (multi-WAN:
@@ -328,7 +327,7 @@ func decideWANDown(event Event, state *State) []Action {
 			actions = append(actions, Action{Type: ActionSuspendKernel, Tunnel: t.ID})
 
 		case "nativewg":
-			if state.supportsASC {
+			if state.supportsASC && !t.ViaProxy {
 				continue // ASC handles failover natively
 			}
 			actions = append(actions, Action{Type: ActionSuspendProxy, Tunnel: t.ID})
@@ -407,6 +406,36 @@ func decideDelete(event Event, state *State) []Action {
 	return actions
 }
 
+// decideQuiesce stops every running tunnel without persisting Enabled=false.
+// Used before full data-dir backup/restore so child processes and config files
+// are quiescent and ports in the archive match on-disk state.
+func decideQuiesce(state *State) []Action {
+	var actions []Action
+	for _, t := range state.tunnels {
+		if !t.Running {
+			continue
+		}
+		actions = appendQuiesceStopActions(actions, t)
+	}
+	return actions
+}
+
+func appendQuiesceStopActions(actions []Action, t *tunnelState) []Action {
+	if t.Monitoring {
+		actions = append(actions, Action{Type: ActionStopMonitoring, Tunnel: t.ID})
+	}
+	if t.Backend == "nativewg" && t.PingCheck != nil && t.PingCheck.Enabled {
+		actions = append(actions, Action{Type: ActionRemovePingCheck, Tunnel: t.ID})
+	}
+	switch t.Backend {
+	case "kernel":
+		actions = append(actions, Action{Type: ActionStopKernel, Tunnel: t.ID})
+	case "nativewg":
+		actions = append(actions, Action{Type: ActionStopNativeWG, Tunnel: t.ID})
+	}
+	return actions
+}
+
 func decideRestart(event Event, state *State) []Action {
 	t := state.tunnels[event.Tunnel]
 	if t == nil {
@@ -417,18 +446,7 @@ func decideRestart(event Event, state *State) []Action {
 
 	// Stop phase (without PersistStopped — restart should not disable)
 	if t.Running {
-		if t.Monitoring {
-			actions = append(actions, Action{Type: ActionStopMonitoring, Tunnel: t.ID})
-		}
-		if t.Backend == "nativewg" && t.PingCheck != nil && t.PingCheck.Enabled {
-			actions = append(actions, Action{Type: ActionRemovePingCheck, Tunnel: t.ID})
-		}
-		switch t.Backend {
-		case "kernel":
-			actions = append(actions, Action{Type: ActionStopKernel, Tunnel: t.ID})
-		case "nativewg":
-			actions = append(actions, Action{Type: ActionStopNativeWG, Tunnel: t.ID})
-		}
+		actions = appendQuiesceStopActions(actions, t)
 		// NOTE: no ActionRemoveStaticRoutes/ClientRoutes — will be re-applied after start
 		// NOTE: no ActionPersistStopped — restart should not toggle Enabled flag
 	}
@@ -443,14 +461,6 @@ func decideRestart(event Event, state *State) []Action {
 	actions = appendPostStartActions(actions, t)
 
 	return actions
-}
-
-func decidePingCheckFailed(event Event, state *State) []Action {
-	t := state.tunnels[event.Tunnel]
-	if t == nil || !t.Running || t.Backend != "kernel" {
-		return nil
-	}
-	return []Action{{Type: ActionLinkToggle, Tunnel: t.ID}}
 }
 
 // appendPostStartActions adds monitoring + routing actions after a tunnel start.

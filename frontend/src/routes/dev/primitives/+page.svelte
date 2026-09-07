@@ -44,7 +44,7 @@
   ];
   let logExpanded = $state<Record<number, boolean>>({});
 
-  let toolbarFilter = $state({ search: '', group: '', subgroup: '', levels: ['error', 'warn', 'info', 'full', 'debug'] });
+  let toolbarFilter = $state({ search: '', groups: [], subgroups: [], levels: ['error', 'warn', 'info', 'full', 'debug'] });
   let toolbarPaused = $state(false);
 </script>
 
@@ -455,7 +455,6 @@
         bind:filter={toolbarFilter}
         onFilterChange={(f) => console.log('filter', f)}
         bucket="app"
-        onBucketChange={(b) => console.log('bucket', b)}
         paused={toolbarPaused}
         bufferCount={0}
         onTogglePause={() => toolbarPaused = !toolbarPaused}
@@ -463,6 +462,8 @@
         onCopy={() => alert('copy')}
         onDownload={() => alert('download')}
         onClear={() => alert('clear')}
+        showFullTimestamp={false}
+        onToggleFullTimestamp={() => alert('toggle timestamp')}
         totalEntries={1234}
         visibleEntries={567}
         bufferStats={{ size: 567, capacity: 5000, oldest: new Date(Date.now() - 1800_000).toISOString() }}

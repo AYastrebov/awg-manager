@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -32,14 +33,16 @@ type Orchestrator struct {
 	configDir string
 	proc      ProcessController
 
+	// appliedPath is where Reload persists the applied-state breadcrumb
+	// ({hash, hasTun} of the config last applied to sing-box). Captured
+	// from the package-level appliedStatePath seam at construction and
+	// immutable afterwards, so Reload (including late debounce-timer
+	// fires) never races a test redirecting the seam.
+	appliedPath string
+
 	mu      sync.Mutex
 	slots   map[Slot]SlotMeta
 	enabled map[Slot]bool
-
-	// dirty signals that on-disk state changed since the last successful
-	// reload. Task 4 wires this into a debounced reloader. For now Save
-	// / SetEnabled just flip it.
-	dirty bool
 
 	// validator runs `sing-box check` on a directory. nil = skip
 	// check (used by tests that don't need it).
@@ -53,6 +56,31 @@ type Orchestrator struct {
 	// For T4 reload coalescing.
 	reloadTimer *time.Timer
 	reloading   bool
+
+	// holds > 0 подавляет debounce-reload: продюсер, записавший слот во время
+	// перехода режима, не должен дёргать движок посреди чужой транзакции (при
+	// живом tun каждый такой reload — полный Stop+Start). Подавленная запись
+	// помечается в pendingReload и применяется одним reload'ом на release.
+	// ReloadNow под hold НЕ подавляется: он явный и сам применяет всё
+	// накопленное, поэтому сбрасывает pendingReload.
+	holds         int
+	pendingReload bool
+
+	// prevHasTun records whether the LAST applied config had a tun
+	// inbound. Reload compares it against the new config's tun presence:
+	// a toggle (added or removed) forces a restart because sing-box
+	// cannot add/remove a tun inbound via SIGHUP. Guarded by o.mu.
+	prevHasTun bool
+
+	// lastReloadValidation stores the ValidationResult of the most
+	// recent Reload that was SKIPPED because validateLocked failed
+	// (engine keeps running on the old config). Cleared on the next
+	// successful validation. Surfaced to the UI via
+	// LastReloadValidation — primarily so a dangling reference inside
+	// the user slot (90-user.json), which prune deliberately does not
+	// self-heal, is visible instead of silently freezing applies.
+	// Guarded by o.mu.
+	lastReloadValidation *ValidationResult
 
 	// shouldRun, when non-nil and returning false, suppresses cold-start
 	// of sing-box during Reload. Used by Operator to enforce the
@@ -81,6 +109,30 @@ func (o *Orchestrator) SetShouldRun(fn func() bool) {
 	o.shouldRun = fn
 }
 
+// LastReloadValidation returns a copy of the validation result that made
+// the most recent Reload skip applying the merged config, or nil when the
+// last validation passed (or no reload happened yet). Safe for concurrent
+// callers; the copy shares no mutable state with the orchestrator.
+func (o *Orchestrator) LastReloadValidation() *ValidationResult {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.lastReloadValidation == nil {
+		return nil
+	}
+	cp := *o.lastReloadValidation
+	cp.Errors = append([]ValidationError(nil), o.lastReloadValidation.Errors...)
+	return &cp
+}
+
+// CurrentHasTun reports whether the LAST applied config had a tun inbound.
+// Consumers (the Process reload path) use it to choose restart-over-SIGHUP:
+// sing-box cannot hot-reload a tun inbound. Safe for concurrent callers.
+func (o *Orchestrator) CurrentHasTun() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.prevHasTun
+}
+
 // log emits via logf if set. Caller may or may not hold the lock.
 func (o *Orchestrator) log(level, msg string) {
 	o.mu.Lock()
@@ -95,12 +147,28 @@ func (o *Orchestrator) log(level, msg string) {
 // /opt/etc/sing-box/config.d). It does NOT touch disk — call Bootstrap
 // after construction to scan/migrate existing files.
 func New(configDir string, proc ProcessController) *Orchestrator {
-	return &Orchestrator{
-		configDir: configDir,
-		proc:      proc,
-		slots:     make(map[Slot]SlotMeta),
-		enabled:   make(map[Slot]bool),
+	return NewWithAppliedPath(configDir, proc, appliedStatePath)
+}
+
+// NewWithAppliedPath — New с явным путём applied-state breadcrumb'а. Тесты
+// других пакетов передают файл в t.TempDir(); прод идёт через New.
+func NewWithAppliedPath(configDir string, proc ProcessController, appliedPath string) *Orchestrator {
+	o := &Orchestrator{
+		configDir:   configDir,
+		proc:        proc,
+		appliedPath: appliedPath,
+		slots:       make(map[Slot]SlotMeta),
+		enabled:     make(map[Slot]bool),
 	}
+	// Seed prevHasTun from the last applied state so a daemon restart
+	// doesn't start from the in-memory zero value (false) and mistake an
+	// already-running tun config for a toggle — the skip gate in Reload
+	// is the primary defense, this seed covers the fallback path where
+	// the skip does not fire for some other reason (e.g. hash mismatch).
+	if st, ok := loadAppliedState(o.appliedPath); ok {
+		o.prevHasTun = st.HasTun
+	}
+	return o
 }
 
 // ConfigDir returns the absolute path the orchestrator is rooted at —
@@ -133,10 +201,16 @@ func (o *Orchestrator) Bootstrap() error {
 	if err := o.ensureDirs(); err != nil {
 		return err
 	}
-	if err := o.sweepStaleApplyCheckDirs(); err != nil {
+	if err := o.sweepStaleCheckDirs(); err != nil {
 		// Sweep failure is non-fatal — log and continue. Stale dirs
 		// are harmless cosmetic noise.
-		o.log("warn", fmt.Sprintf("orchestrator: sweep .apply-check: %v", err))
+		o.log("warn", fmt.Sprintf("orchestrator: sweep check dirs: %v", err))
+	}
+	if err := o.sweepStaleTempFiles(); err != nil {
+		// Same best-effort treatment: a crash between AtomicWrite's temp write
+		// and rename leaves a `*.tmp.<pid>.<nanotime>` file behind. sing-box's
+		// `*.json` glob ignores it, so it is cosmetic flash accumulation.
+		o.log("warn", fmt.Sprintf("orchestrator: sweep .tmp: %v", err))
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -183,10 +257,17 @@ func (o *Orchestrator) removeDisabledCopy(meta SlotMeta) error {
 	return removeIfExists(o.disabledPath(meta))
 }
 
-// sweepStaleApplyCheckDirs removes leftover .apply-check-* directories
-// from crashed Apply runs. Tmpdir creation uses MkdirTemp with a
-// well-known prefix; cleanup is best-effort.
-func (o *Orchestrator) sweepStaleApplyCheckDirs() error {
+// checkDirPrefixes are the MkdirTemp prefixes of every validation tmpdir
+// the orchestrator creates inside configDir (ApplyDraft, CheckMerged /
+// SaveAndValidate, CheckSlotAlone). The sweep must know them all: a crash
+// between MkdirTemp and the deferred RemoveAll strands the dir on flash
+// storage forever otherwise.
+var checkDirPrefixes = []string{".apply-check-", ".save-check-", ".alone-check-"}
+
+// sweepStaleCheckDirs removes leftover validation tmpdirs from crashed
+// check runs. Tmpdir creation uses MkdirTemp with a well-known prefix;
+// cleanup is best-effort.
+func (o *Orchestrator) sweepStaleCheckDirs() error {
 	entries, err := os.ReadDir(o.configDir)
 	if err != nil {
 		return err
@@ -196,7 +277,14 @@ func (o *Orchestrator) sweepStaleApplyCheckDirs() error {
 		if !e.IsDir() {
 			continue
 		}
-		if !strings.HasPrefix(e.Name(), ".apply-check-") {
+		stale := false
+		for _, p := range checkDirPrefixes {
+			if strings.HasPrefix(e.Name(), p) {
+				stale = true
+				break
+			}
+		}
+		if !stale {
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(o.configDir, e.Name())); err != nil && firstErr == nil {
@@ -206,13 +294,141 @@ func (o *Orchestrator) sweepStaleApplyCheckDirs() error {
 	return firstErr
 }
 
+// tempFileMarker is the infix AtomicWritePerm gives its temp files
+// (`<name>.tmp.<pid>.<nanotime>`) before the rename into place.
+const tempFileMarker = ".tmp."
+
+// sweepStaleTempFiles removes leftover AtomicWrite temp files (`*.tmp.<pid>.<n>`)
+// from a crash between the temp write and the rename. It scans the active dir
+// plus disabled/ and pending/, since slot writes land in all three. Best-effort:
+// the first removal error is returned but the sweep continues.
+func (o *Orchestrator) sweepStaleTempFiles() error {
+	dirs := []string{
+		o.configDir,
+		filepath.Join(o.configDir, disabledSubdir),
+		o.pendingDir(),
+	}
+	var firstErr error
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // disabled/ or pending/ may not exist yet
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.Contains(e.Name(), tempFileMarker) {
+				continue
+			}
+			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
 // Save writes the slot's JSON atomically to whichever location matches
-// the slot's CURRENT enabled state. Marks the orchestrator dirty so a
-// later Reload (Task 4) will pick it up.
+// the slot's CURRENT enabled state, then schedules a debounced reload.
+//
+// Байт-в-байт та же запись reload НЕ планирует: продюсеры зовут Save
+// идемпотентно (device-proxy переписывает свой слот 8 раз за один переход
+// режима — стенд 2026-08-24, все восемь с одинаковым sha256), а при живом tun
+// каждый reload это полный Stop+Start движка. Скип-гейт по хешу в Reload такую
+// запись в итоге отсеет, но лишь ценой merged-мержа и `sing-box check` на
+// mipsel; дешевле не будить пайплайн вовсе. Гейт зеркалит уже имевшийся no-op
+// в setEnabledLocked — там повторный toggle тоже не планирует reload.
 func (o *Orchestrator) Save(slot Slot, jsonBytes []byte) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	unchanged, err := o.slotBytesUnchangedLocked(slot, jsonBytes)
+	if err != nil {
+		return err
+	}
+	if unchanged {
+		// На диске уже ровно эти байты: ни записи, ни reload'а. Гейт истинен
+		// только когда файл прочитался и совпал побайтово — отсутствие файла
+		// и любая ошибка чтения дают «изменилось», то есть запись.
+		return nil
+	}
 	if err := o.saveLocked(slot, jsonBytes); err != nil {
+		return err
+	}
+	o.scheduleReload()
+	return nil
+}
+
+// slotBytesUnchangedLocked сообщает, лежит ли на активном пути слота ровно то,
+// что собираются записать. Caller MUST hold o.mu. Отсутствие файла и любая
+// ошибка чтения — «изменилось»: пропустить нужный reload хуже, чем сделать
+// лишний. Сравнение побайтовое: продюсеры сериализуют детерминированно
+// (json.MarshalIndent по тем же структурам), поэтому нормализация не нужна.
+func (o *Orchestrator) slotBytesUnchangedLocked(slot Slot, jsonBytes []byte) (bool, error) {
+	meta, ok := o.slots[slot]
+	if !ok {
+		return false, ErrUnknownSlot
+	}
+	path := o.disabledPath(meta)
+	if o.enabled[slot] {
+		path = o.activePath(meta)
+	}
+	old, err := os.ReadFile(path)
+	if err != nil {
+		return false, nil
+	}
+	return bytes.Equal(old, jsonBytes), nil
+}
+
+// Mutate атомарно правит слот под локом: чтение с того же пути, куда пишет
+// saveLocked → мутатор → запись + debounce reload (unchanged-гейт как у Save).
+// Мутатор получает текущие байты слота и признак его наличия; nil в ответе —
+// «менять нечего», ни записи, ни reload. Ошибка мутатора отменяет запись.
+//
+// Зачем поверх Save: продюсер, читающий файл сам, а потом зовущий Save,
+// работает со снимком, взятым ВНЕ лока, — параллельная правка того же слота
+// теряется (дефект F41, 00-base.json). Приём тот же, что у
+// storage.SettingsStore.Update.
+//
+// Мутатор исполняется ПОД ЛОКОМ оркестратора: он обязан быть чистым и
+// быстрым. Любой метод оркестратора из него — дедлок (mu нерекурсивен),
+// любая блокирующая работа держит на себе всех продюсеров конфига.
+func (o *Orchestrator) Mutate(slot Slot, mut func(cur []byte, exists bool) ([]byte, error)) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	meta, ok := o.slots[slot]
+	if !ok {
+		return ErrUnknownSlot
+	}
+	path := o.disabledPath(meta)
+	if o.enabled[slot] {
+		path = o.activePath(meta)
+	}
+	cur, err := os.ReadFile(path)
+	exists := true
+	switch {
+	case os.IsNotExist(err):
+		cur, exists = nil, false
+	case err != nil:
+		// В отличие от байт-гейта Save, здесь ошибка чтения фатальна: отдать
+		// мутатору пустой cur значило бы дать ему затереть нечитаемый файл.
+		return fmt.Errorf("read %s: %w", meta.Filename, err)
+	}
+	next, err := mut(cur, exists)
+	if err != nil {
+		return err
+	}
+	if next == nil {
+		return nil
+	}
+	if exists && bytes.Equal(cur, next) {
+		// Мутатор вернул то же, что лежит на диске — см. гейт в Save.
+		return nil
+	}
+	if err := o.saveLocked(slot, next); err != nil {
 		return err
 	}
 	o.scheduleReload()
@@ -232,9 +448,9 @@ func (o *Orchestrator) SaveSilent(slot Slot, jsonBytes []byte) error {
 	return o.saveLocked(slot, jsonBytes)
 }
 
-// saveLocked is the shared body. Caller MUST hold o.mu. Marks the
-// orchestrator dirty but does not arm the reload timer — that is the
-// caller's responsibility (Save does, SaveSilent does not).
+// saveLocked is the shared body. Caller MUST hold o.mu. It does not arm
+// the reload timer — that is the caller's responsibility (Save does,
+// SaveSilent does not).
 func (o *Orchestrator) saveLocked(slot Slot, jsonBytes []byte) error {
 	meta, ok := o.slots[slot]
 	if !ok {
@@ -249,16 +465,63 @@ func (o *Orchestrator) saveLocked(slot Slot, jsonBytes []byte) error {
 	if err := writeAtomic(path, jsonBytes); err != nil {
 		return fmt.Errorf("save %s: %w", slot, err)
 	}
-	o.dirty = true
 	return nil
+}
+
+// HoldReloads подавляет debounce-reload'ы до вызова возвращённой функции.
+// Нужен на время перехода режима: teardown и провижининг пишут слоты по
+// нескольку раз и дольше окна debounce, и без hold чужой reload прилетает
+// посреди транзакции. Возвращённый release идемпотентен (sync.Once); когда
+// снят последний hold, накопленная запись применяется одним отложенным
+// reload'ом.
+//
+// Взведённый таймер здесь НЕ отменяется: гасит себя он сам, увидев hold в
+// своём теле (см. scheduleReload). Отмена снаружи не закрывала окно между
+// срабатыванием таймера и взятием mu — Stop() в нём возвращает false, а
+// callback всё равно доходил до Reload уже под hold'ом.
+func (o *Orchestrator) HoldReloads() func() {
+	o.mu.Lock()
+	o.holds++
+	o.mu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			o.mu.Lock()
+			o.holds--
+			resume := o.holds == 0 && o.pendingReload
+			if resume {
+				o.pendingReload = false
+				o.scheduleReload()
+			}
+			o.mu.Unlock()
+		})
+	}
 }
 
 // SetEnabled toggles slot activity by renaming the file between
 // active and disabled locations. AlwaysOn slots reject disable.
-// Marks the orchestrator dirty.
+// Schedules a debounced reload.
 func (o *Orchestrator) SetEnabled(slot Slot, enabled bool) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	return o.setEnabledLocked(slot, enabled, true)
+}
+
+// SetEnabledSilent toggles slot activity without scheduling a debounced reload.
+// Caller is responsible for calling Reload() when it needs the runtime updated.
+func (o *Orchestrator) SetEnabledSilent(slot Slot, enabled bool) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.setEnabledLocked(slot, enabled, false)
+}
+
+// setEnabledLocked is the shared body. Caller MUST hold o.mu. The short-circuit
+// reconciles against the ACTUAL on-disk layout, not just the in-memory map: a
+// map↔disk drift (e.g. saveLocked wrote the active file while the map said
+// disabled) must not let a no-op leave a stray active file that MergeDir would
+// still pick up. renameForToggle already heals the both-locations case.
+func (o *Orchestrator) setEnabledLocked(slot Slot, enabled, scheduleReload bool) error {
 	meta, ok := o.slots[slot]
 	if !ok {
 		return ErrUnknownSlot
@@ -266,15 +529,24 @@ func (o *Orchestrator) SetEnabled(slot Slot, enabled bool) error {
 	if !enabled && meta.AlwaysOn {
 		return ErrSlotAlwaysOn
 	}
-	if o.enabled[slot] == enabled {
-		return nil // already in target state
+	a, d := o.scanDirForSlot(meta)
+	// Disk already in the target shape? enabled → active present, no stray
+	// disabled copy; disabled → no active file (a parked copy may or may not
+	// exist). Only then is a no-op safe.
+	diskMatches := !a
+	if enabled {
+		diskMatches = a && !d
+	}
+	if o.enabled[slot] == enabled && diskMatches {
+		return nil
 	}
 	if err := o.renameForToggle(meta, enabled); err != nil {
 		return fmt.Errorf("toggle %s: %w", slot, err)
 	}
 	o.enabled[slot] = enabled
-	o.dirty = true
-	o.scheduleReload()
+	if scheduleReload {
+		o.scheduleReload()
+	}
 	return nil
 }
 
@@ -314,4 +586,3 @@ func (o *Orchestrator) Snapshot() []SlotState {
 	}
 	return out
 }
-

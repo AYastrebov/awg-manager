@@ -268,7 +268,32 @@ export function parseAWG(raw: string): AwgParsed {
 	return { iface, peer };
 }
 
+const AWG3_KEYS = [
+	'headerprotectionkey', 'contentpaddingaddition', 'rekeyaftertime',
+	'rekeytimeout', 'rejectaftertime', 'keepalivetimeout', 'maxhandshakeattempts',
+] as const;
+
+function hasAnyAwg3Param(iface: AwgIface): boolean {
+	return AWG3_KEYS.some((k) => getStr(iface, k) !== '');
+}
+
 export function detectVersion(iface: AwgIface): AwgVersionInfo {
+	// AWG 3.0 outranks everything — its device params sit on top of AWG 1.x/2.0
+	// obfuscation. Checked first so a header-protection-only config isn't read as
+	// "no obfuscation" (its Jc/S/H may still be defaults).
+	if (hasAnyAwg3Param(iface)) {
+		const hp = getStr(iface, 'headerprotectionkey') !== '';
+		const proto = protocolFromI1(iface);
+		return {
+			ver: 'AWG 3.0',
+			desc: hp
+				? 'AmneziaWG 3.0 — шифрование заголовка (HeaderProtectionKey, ChaCha20) прячет саму сигнатуру WireGuard-заголовка от DPI, поверх обфускации AWG.'
+				: 'AmneziaWG 3.0 — настраиваемые таймеры (rekey/reject/keepalive) и/или padding поверх обфускации AWG.',
+			obfLevel: hp ? 'Header Protection (ChaCha20)' : cpsObfLevelLabel(iface),
+			protocol: proto && proto !== 'Unknown' ? proto : null,
+		};
+	}
+
 	const hasJc = hasKey(iface, 'jc');
 	const hasS1 = hasKey(iface, 's1');
 	const i1Present = !!getStr(iface, 'i1');
@@ -359,6 +384,9 @@ export function mtuCeilingForProfile(version: AwgVersionInfo): number {
 	switch (version.ver) {
 		case 'WireGuard':
 			return 1420;
+		case 'AWG 3.0':
+			// Header protection + content padding add overhead → slightly lower.
+			return 1300;
 		case 'AWG 2.0':
 			return 1320;
 		case 'AWG 1.5':
@@ -440,10 +468,34 @@ export function buildUpgradeHints(iface: AwgIface, version: AwgVersionInfo): str
 		);
 	}
 
+	if (version.ver === 'AWG 2.0') {
+		hints.push(
+			'Для AWG 3.0 (только kernel-режим): включите HeaderProtectionKey — шифрование WG-заголовка прячет саму сигнатуру пакета от DPI.',
+		);
+	}
+
 	return hints;
 }
 
-export function runChecks(iface: AwgIface, peer: AwgIface, version: AwgVersionInfo): AwgCheck[] {
+/**
+ * Анализируемый текст — РОВНО тот conf, который мы построили из выбранного
+ * туннеля (не отредактированный и не подменённый чужим).
+ *
+ * Только в этом случае отсутствие строки PrivateKey означает «бэкенд скрыл
+ * ключ» (F56). Проверять `selectedTunnelId` недостаточно: textarea не
+ * сбрасывает выбор туннеля, поэтому вставленный туда чужой conf без ключа
+ * выдавался за скрытый (F82).
+ */
+export function isUnmodifiedTunnelConf(raw: string, loadedTunnelRaw: string): boolean {
+	return loadedTunnelRaw !== '' && raw.trim() === loadedTunnelRaw;
+}
+
+export function runChecks(
+	iface: AwgIface,
+	peer: AwgIface,
+	version: AwgVersionInfo,
+	opts?: { privateKeyHidden?: boolean },
+): AwgCheck[] {
 	const R: AwgCheck[] = [];
 	const addChk = (
 		cat: string,
@@ -479,15 +531,30 @@ export function runChecks(iface: AwgIface, peer: AwgIface, version: AwgVersionIn
 	const privkey = getStr(iface, 'privatekey');
 	const isBase64 = (s: string) => /^[A-Za-z0-9+/]{43}=?$/.test(s);
 	const pkOk = !!privkey && isBase64(privkey);
-	addChk(
-		'Ключи',
-		'PrivateKey',
-		pkOk ? 'pass' : 'fail',
-		pkOk ? `${privkey.slice(0, 12)}…` : '(отсутствует)',
-		pkOk ? 'Корректный base64 Curve25519 ключ' : 'Приватный ключ отсутствует или невалиден',
-		pkOk ? 10 : 0,
-		10,
-	);
+	if (!pkOk && opts?.privateKeyHidden) {
+		// Ключ не пропал — его не отдаёт API (F56), а при записи конфига
+		// merge оставит прежний. Полные баллы: паритет вердикта с до-F56
+		// временем, допущение — в хранимом туннеле ключ валиден.
+		addChk(
+			'Ключи',
+			'PrivateKey',
+			'info',
+			'(скрыт)',
+			'Ключ не отдаётся API из соображений безопасности; при записи конфига прежний ключ туннеля сохраняется',
+			10,
+			10,
+		);
+	} else {
+		addChk(
+			'Ключи',
+			'PrivateKey',
+			pkOk ? 'pass' : 'fail',
+			pkOk ? `${privkey.slice(0, 12)}…` : '(отсутствует)',
+			pkOk ? 'Корректный base64 Curve25519 ключ' : 'Приватный ключ отсутствует или невалиден',
+			pkOk ? 10 : 0,
+			10,
+		);
+	}
 
 	const pubkey = getStr(peer, 'publickey');
 	const pubOk = !!pubkey && isBase64(pubkey);
@@ -1006,7 +1073,9 @@ export function calcScores(checks: AwgCheck[], iface: AwgIface, version: AwgVers
 	const total = mp > 0 ? Math.round((tp / mp) * 100) : 0;
 
 	let dpi = 95;
-	if (version.ver.includes('2.0')) dpi -= 55;
+	// Header protection encrypts the WG header itself → strongest DPI evasion.
+	if (version.ver.includes('3.0')) dpi -= 70;
+	else if (version.ver.includes('2.0')) dpi -= 55;
 	else if (version.ver.includes('1.5')) dpi -= 40;
 	else if (version.ver.includes('1.0')) dpi -= 25;
 	const Jc = getInt(iface, 'jc', 0) ?? 0;
@@ -1070,6 +1139,10 @@ export function buildFixes(checks: AwgCheck[], iface: AwgIface, peer: AwgIface, 
 		fixes.push('Для максимальной обфускации используйте AWG 2.0 (добавьте параметры S3 и S4).');
 	}
 
+	if (version.ver === 'AWG 2.0') {
+		fixes.push('В kernel-режиме включите AWG 3.0: HeaderProtectionKey шифрует WG-заголовок и скрывает сигнатуру пакета от DPI.');
+	}
+
 	if (H1 === 1 && H2 === 2 && H3 === 3 && H4 === 4) {
 		fixes.push('Измените H1‑H4 — значения 1‑4 являются сигнатурой стандартного WireGuard.');
 	}
@@ -1121,15 +1194,15 @@ export function getVerdict(score: number): AwgVerdict {
 	if (score >= 88) {
 		return {
 			label: 'Максимальная защита',
-			color: 'var(--color-accent, #a855f7)',
-			tint: 'color-mix(in srgb, var(--color-accent, #a855f7) 18%, transparent)',
+			color: 'var(--color-accent, var(--accent))',
+			tint: 'var(--color-accent-tint)',
 			text: 'AWG 2.0 с CPS мимикрией. Трафик неотличим от реального протокола. Высочайшая устойчивость к DPI и глубокому анализу.',
 		};
 	}
 	if (score >= 70) {
 		return {
 			label: 'Хорошая защита',
-			color: 'var(--color-success, #22c55e)',
+			color: 'var(--color-success, var(--success))',
 			tint: 'var(--color-success-tint)',
 			text: 'Надёжная конфигурация AWG. Есть параметры для улучшения — проверьте рекомендации.',
 		};
@@ -1137,7 +1210,7 @@ export function getVerdict(score: number): AwgVerdict {
 	if (score >= 50) {
 		return {
 			label: 'Средняя защита',
-			color: 'var(--color-warning, #f59e0b)',
+			color: 'var(--color-warning, var(--warning))',
 			tint: 'var(--color-warning-tint)',
 			text: 'Базовая обфускация. Продвинутые DPI-системы могут идентифицировать трафик как AWG/WireGuard.',
 		};
@@ -1152,16 +1225,16 @@ export function getVerdict(score: number): AwgVerdict {
 	}
 	return {
 		label: 'Стандартный WireGuard',
-		color: 'var(--color-error, #ef4444)',
+		color: 'var(--color-error, var(--error))',
 		tint: 'var(--color-error-tint)',
 		text: 'Нет обфускации. DPI немедленно идентифицирует и может заблокировать трафик.',
 	};
 }
 
 export function dpiLabel(d: number): { text: string; color: string } {
-	if (d <= 20) return { text: 'LOW', color: 'var(--color-success, #22c55e)' };
-	if (d <= 45) return { text: 'MEDIUM', color: 'var(--color-warning, #f59e0b)' };
-	return { text: 'HIGH', color: 'var(--color-error, #ef4444)' };
+	if (d <= 20) return { text: 'LOW', color: 'var(--color-success, var(--success))' };
+	if (d <= 45) return { text: 'MEDIUM', color: 'var(--color-warning, var(--warning))' };
+	return { text: 'HIGH', color: 'var(--color-error, var(--error))' };
 }
 
 export function camouflageFromI1(iface: AwgIface): AwgCamouflage {

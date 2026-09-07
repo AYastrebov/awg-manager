@@ -258,9 +258,9 @@ func TestInterfaceStore_ResolveSystemName_FromMap(t *testing.T) {
 	if got != "nwg0" {
 		t.Errorf("ResolveSystemName: want nwg0, got %q", got)
 	}
-	// system-name endpoint must not be hit — mapping is in the list response.
-	if got := fg.Calls("/show/interface/system-name?name=Wireguard0"); got != 0 {
-		t.Errorf("system-name endpoint must not be probed, got %d calls", got)
+	// system-name resolver must not be hit — mapping is in the list response.
+	if got := fg.PostSystemNameCalls("Wireguard0"); got != 0 {
+		t.Errorf("system-name resolver must not be probed, got %d calls", got)
 	}
 }
 
@@ -294,7 +294,7 @@ func TestInterfaceStore_ResolveSystemName_FallbackOnEmptyCachedName(t *testing.T
 		"Wireguard0": {"id":"Wireguard0","type":"Wireguard","state":"up"}
 	}`)
 	// Fallback resolver returns the kernel name.
-	fg.SetRaw("/show/interface/system-name?name=Wireguard0", []byte(`"nwg0"`))
+	fg.SetPostSystemName("Wireguard0", `"nwg0"`)
 
 	s := NewInterfaceStore(fg, NopLogger())
 	got := s.ResolveSystemName(context.Background(), "Wireguard0")
@@ -310,14 +310,14 @@ func TestInterfaceStore_ResolveSystemName_FallbackMemoised(t *testing.T) {
 	fg.SetJSON(ifaceListPath, `{
 		"Wireguard0": {"id":"Wireguard0","type":"Wireguard","state":"up"}
 	}`)
-	fg.SetRaw("/show/interface/system-name?name=Wireguard0", []byte(`"nwg0"`))
+	fg.SetPostSystemName("Wireguard0", `"nwg0"`)
 	s := NewInterfaceStore(fg, NopLogger())
 
 	_ = s.ResolveSystemName(context.Background(), "Wireguard0")
 	_ = s.ResolveSystemName(context.Background(), "Wireguard0")
 	_ = s.ResolveSystemName(context.Background(), "Wireguard0")
 
-	if got := fg.Calls("/show/interface/system-name?name=Wireguard0"); got != 1 {
+	if got := fg.PostSystemNameCalls("Wireguard0"); got != 1 {
 		t.Errorf("fallback resolver must be probed once and memoised, got %d calls", got)
 	}
 }
@@ -338,7 +338,7 @@ func TestInterfaceStore_ResolveSystemName_FallbackWhenSystemNameEqualsID(t *test
 		"Wireguard0": {"id":"Wireguard0","interface-name":"Wireguard0","type":"Wireguard","state":"up","link":"up"}
 	}`)
 	// Resolver returns the actual kernel name.
-	fg.SetRaw("/show/interface/system-name?name=Wireguard0", []byte(`"nwg0"`))
+	fg.SetPostSystemName("Wireguard0", `"nwg0"`)
 
 	s := NewInterfaceStore(fg, NopLogger())
 	got := s.ResolveSystemName(context.Background(), "Wireguard0")
@@ -349,7 +349,7 @@ func TestInterfaceStore_ResolveSystemName_FallbackWhenSystemNameEqualsID(t *test
 	// Subsequent calls memoised — only one resolver probe.
 	_ = s.ResolveSystemName(context.Background(), "Wireguard0")
 	_ = s.ResolveSystemName(context.Background(), "Wireguard0")
-	if calls := fg.Calls("/show/interface/system-name?name=Wireguard0"); calls != 1 {
+	if calls := fg.PostSystemNameCalls("Wireguard0"); calls != 1 {
 		t.Errorf("resolver must be probed once and memoised, got %d calls", calls)
 	}
 }
@@ -360,7 +360,7 @@ func TestInterfaceStore_ResolveSystemName_FallbackObjectShape(t *testing.T) {
 	fg.SetJSON(ifaceListPath, `{
 		"Wireguard0": {"id":"Wireguard0","type":"Wireguard","state":"up"}
 	}`)
-	fg.SetRaw("/show/interface/system-name?name=Wireguard0", []byte(`{"result":"nwg0"}`))
+	fg.SetPostSystemName("Wireguard0", `{"result":"nwg0"}`)
 	s := NewInterfaceStore(fg, NopLogger())
 
 	if got := s.ResolveSystemName(context.Background(), "Wireguard0"); got != "nwg0" {
@@ -384,7 +384,7 @@ func TestInterfaceStore_ResolveSystemName_DropsNonKernelInterfaceName(t *testing
 	fg.SetJSON(ifaceListPath, `{
 		"GigabitEthernet1": {"id":"GigabitEthernet1","interface-name":"ISP","type":"GigabitEthernet","state":"up","link":"up"}
 	}`)
-	fg.SetRaw("/show/interface/system-name?name=GigabitEthernet1", []byte(`"eth3"`))
+	fg.SetPostSystemName("GigabitEthernet1", `"eth3"`)
 
 	s := NewInterfaceStore(fg, NopLogger())
 	got := s.ResolveSystemName(context.Background(), "GigabitEthernet1")
@@ -414,7 +414,7 @@ func TestInterfaceStore_ResolveSystemName_RejectsMissingKernelIface(t *testing.T
 	fg.SetJSON(ifaceListPath, `{
 		"WeirdPort": {"id":"WeirdPort","interface-name":"ghost0","type":"Ethernet","state":"up"}
 	}`)
-	fg.SetRaw("/show/interface/system-name?name=WeirdPort", []byte(`"eth3"`))
+	fg.SetPostSystemName("WeirdPort", `"eth3"`)
 
 	s := NewInterfaceStore(fg, NopLogger())
 	if got := s.ResolveSystemName(context.Background(), "WeirdPort"); got != "eth3" {
@@ -433,16 +433,16 @@ func TestLooksLikeKernelIfname(t *testing.T) {
 		}
 	}
 	bad := []string{
-		"",               // empty
-		"ISP",            // upper-case
-		"Wireguard0",     // NDMS id
-		"PPPoE0",         // NDMS id
-		"GigabitEthernet1", // 16 chars AND upper-case
-		"AccessPoint",    // upper-case
-		"0eth",           // starts with digit
-		".eth",           // starts with punctuation
-		"eth/0",          // forbidden char
-		"a b",            // space
+		"",                   // empty
+		"ISP",                // upper-case
+		"Wireguard0",         // NDMS id
+		"PPPoE0",             // NDMS id
+		"GigabitEthernet1",   // 16 chars AND upper-case
+		"AccessPoint",        // upper-case
+		"0eth",               // starts with digit
+		".eth",               // starts with punctuation
+		"eth/0",              // forbidden char
+		"a b",                // space
 		"thisifnametoolong1", // 18 chars > IFNAMSIZ-1
 	}
 	for _, s := range bad {
@@ -808,10 +808,10 @@ func TestInterfaceStore_OnLayerChanged_UnknownInterfaceIgnored(t *testing.T) {
 
 func TestInterfaceStore_OnIPChanged_PatchesAddressOnly(t *testing.T) {
 	// OnIPChanged must NOT touch State or Connected — those are owned
-	// by the ctrl layer. The hook payload's `up`/`connected` flags are
-	// not always populated by the NDMS event-script forwarder, and a
-	// spurious "down"/"no" overwrite of an actually-running interface
-	// blocks the state matrix.
+	// by the ctrl layer. Состояние линка сюда больше и не приходит:
+	// параметры up/connected сняты, потому что форвардер событий NDMS
+	// заполняет их не всегда, а ложные "down"/"no" затирали живой
+	// интерфейс и блокировали матрицу состояний.
 	fg := newFakeGetter()
 	fg.SetJSON(ifaceListPath, sampleIfaceList)
 	s := NewInterfaceStore(fg, NopLogger())
@@ -823,9 +823,8 @@ func TestInterfaceStore_OnIPChanged_PatchesAddressOnly(t *testing.T) {
 	preState := pre.State
 	preConnected := pre.Connected
 
-	// Hook with up=false, connected=false (default zero values when
-	// the forwarder doesn't fill them) MUST NOT corrupt State/Connected.
-	s.OnIPChanged("Wireguard0", "192.168.5.5", false, false)
+	// Событие смены адреса не имеет права тронуть State/Connected.
+	s.OnIPChanged("Wireguard0", "192.168.5.5")
 	got, _ := s.Get(context.Background(), "Wireguard0")
 	if got == nil {
 		t.Fatalf("expected Wireguard0 still present")
@@ -883,7 +882,7 @@ func TestInterfaceStore_Concurrent_ReadWrite(t *testing.T) {
 					return
 				default:
 					s.OnLayerChanged("Wireguard0", "link", "up")
-					s.OnIPChanged("Wireguard0", "10.0.0.2", true, true)
+					s.OnIPChanged("Wireguard0", "10.0.0.2")
 				}
 			}
 		}()
@@ -895,7 +894,7 @@ func TestInterfaceStore_Concurrent_ReadWrite(t *testing.T) {
 
 // === ListAll dedup ===
 
-// dedupCaptureLogger records every Warnf call so tests can assert
+// dedupCaptureLogger records every Warnf/Debugf call so tests can assert
 // observability of duplicate-kernel-name collisions.
 type dedupCaptureLogger struct {
 	mu   sync.Mutex
@@ -903,6 +902,12 @@ type dedupCaptureLogger struct {
 }
 
 func (c *dedupCaptureLogger) Warnf(format string, args ...any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.msgs = append(c.msgs, fmt.Sprintf(format, args...))
+}
+
+func (c *dedupCaptureLogger) Debugf(format string, args ...any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.msgs = append(c.msgs, fmt.Sprintf(format, args...))
@@ -964,6 +969,69 @@ func TestInterfaceStore_ListAll_DeduplicatesByKernelName_UpWins(t *testing.T) {
 	}
 }
 
+// === ListLANBridges ===
+
+func TestListLANBridges(t *testing.T) {
+	fg := newFakeGetter()
+	fg.SetJSON(ifaceListPath, `{
+		"Home": {
+			"id": "Home",
+			"interface-name": "br0",
+			"type": "Bridge",
+			"state": "up",
+			"address": "10.10.10.1",
+			"mask": "255.255.255.0"
+		},
+		"Wireguard0": {
+			"id": "Wireguard0",
+			"interface-name": "nwg0",
+			"type": "Wireguard",
+			"state": "up",
+			"address": "10.0.0.2",
+			"mask": "255.255.255.255"
+		}
+	}`)
+	s := NewInterfaceStore(fg, NopLogger())
+
+	got, err := s.ListLANBridges(context.Background())
+	if err != nil {
+		t.Fatalf("ListLANBridges: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ListLANBridges len: want 1, got %d: %+v", len(got), got)
+	}
+	b := got[0]
+	if b.Name != "Home" {
+		t.Errorf("Name: want %q, got %q", "Home", b.Name)
+	}
+	if b.Address != "10.10.10.1" {
+		t.Errorf("Address: want %q, got %q", "10.10.10.1", b.Address)
+	}
+	if b.Mask != "255.255.255.0" {
+		t.Errorf("Mask: want %q, got %q", "255.255.255.0", b.Mask)
+	}
+}
+
+func TestListLANBridges_SkipsNoAddress(t *testing.T) {
+	fg := newFakeGetter()
+	fg.SetJSON(ifaceListPath, `{
+		"Guest": {
+			"id": "Guest",
+			"type": "Bridge",
+			"state": "up"
+		}
+	}`)
+	s := NewInterfaceStore(fg, NopLogger())
+
+	got, err := s.ListLANBridges(context.Background())
+	if err != nil {
+		t.Fatalf("ListLANBridges: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("want 0 (bridge without address skipped), got %d: %+v", len(got), got)
+	}
+}
+
 // Both candidates are fully Up; tie-break keeps the first-seen entry,
 // but List() iterates a map so insertion order is undefined. Assert
 // only that dedup collapses to one entry and that the collision is
@@ -1006,5 +1074,51 @@ func TestInterfaceStore_ListAll_DeduplicatesByKernelName_TieKeepsOne(t *testing.
 	}
 	if len(log.msgs) != 1 {
 		t.Fatalf("expected 1 warn-log, got %d: %v", len(log.msgs), log.msgs)
+	}
+}
+
+func TestFetchSummary_ViaPost(t *testing.T) {
+	g := NewFakeGetter()
+	g.SetPostInterface("OpkgTun0", `{"show":{"interface":{
+		"id":"OpkgTun0","state":"up","link":"up","conf-layer":"running",
+		"summary":{"layer":{"conf":"running","link":"running","ctrl":"running"}}
+	}}}`)
+	s := NewInterfaceStore(g, NopLogger())
+
+	d, err := s.FetchSummary(context.Background(), "OpkgTun0")
+	if err != nil || d == nil {
+		t.Fatalf("d=%v err=%v", d, err)
+	}
+	if d.ConfLayer != "running" || d.Link != "up" || d.State != "up" {
+		t.Fatalf("details = %+v, want conf=running link=up state=up", d)
+	}
+}
+
+func TestFetchSummary_FallbackTopLevelFields(t *testing.T) {
+	g := NewFakeGetter()
+	g.SetPostInterface("OpkgTun0", `{"show":{"interface":{
+		"id":"OpkgTun0","state":"up","link":"up","conf-layer":"running"
+	}}}`)
+	s := NewInterfaceStore(g, NopLogger())
+
+	d, err := s.FetchSummary(context.Background(), "OpkgTun0")
+	if err != nil || d == nil {
+		t.Fatalf("d=%v err=%v", d, err)
+	}
+	if d.ConfLayer != "running" || d.Link != "up" || d.State != "up" {
+		t.Fatalf("details = %+v", d)
+	}
+}
+
+func TestFetchSummary_NoDataMeansNilDetails(t *testing.T) {
+	g := NewFakeGetter()
+	g.SetPostInterface("OpkgTun9", `{"show":{"interface":{
+		"status":[{"status":"error","code":"6553619","message":"unable to find"}]
+	}}}`)
+	s := NewInterfaceStore(g, NopLogger())
+
+	d, err := s.FetchSummary(context.Background(), "OpkgTun9")
+	if err != nil || d != nil {
+		t.Fatalf("want (nil, nil), got d=%+v err=%v", d, err)
 	}
 }

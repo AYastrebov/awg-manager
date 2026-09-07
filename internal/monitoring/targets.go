@@ -13,7 +13,7 @@ package monitoring
 // /proxies/<tag>/delay). HTTP is unsafe — sing-box upstream
 // forces HTTPS in this endpoint (sagernet/sing-box#3604) — so
 // callers must pass HTTPS URLs only. AWG rows ignore URL and
-// probe Host directly via curl bound to the tunnel interface.
+// probe Host directly via HTTP bound to the tunnel interface.
 type Target struct {
 	ID   string `json:"id"`
 	Host string `json:"host"`
@@ -29,11 +29,26 @@ type Tunnel struct {
 	IfaceName       string `json:"ifaceName"`
 	PingcheckTarget string `json:"pingcheckTarget"` // empty when restart pingcheck disabled
 	SelfTarget      string `json:"selfTarget"`      // host the connectivity-check probes; empty when method=disabled/handshake
+	SelfURL         string `json:"-"`               // full connectivity-check URL probed for method=http (SelfTarget is its host); empty for ping
 	SelfMethod      string `json:"selfMethod"`      // "http", "ping", "handshake", "disabled"
 
 	// Source identifies which lister produced this tunnel: "awg",
 	// "system", "singbox". Drives row visual hints in the matrix UI.
 	Source string `json:"source,omitempty"`
+	// Backend is the AWG backend kind for managed tunnels: "kernel" or
+	// "nativewg". Empty for non-AWG rows.
+	Backend string `json:"backend,omitempty"`
+	// AWGVersion is derived from the managed tunnel interface obfuscation
+	// params: "awg2.0" | "awg1.5" | "awg1.0" | "wg". Empty for non-AWG rows.
+	AWGVersion string `json:"awgVersion,omitempty"`
+	// DefaultRoute marks managed AWG tunnels configured as default route.
+	DefaultRoute bool `json:"defaultRoute,omitempty"`
+	// Subscription marks sing-box rows sourced from subscription members.
+	Subscription bool `json:"subscription,omitempty"`
+	// Sing-box protocol/security/transport hints used by monitoring badges.
+	Protocol  string `json:"protocol,omitempty"`
+	Security  string `json:"security,omitempty"`
+	Transport string `json:"transport,omitempty"`
 	// SingboxTag is the sing-box outbound tag (e.g. "veesp") for
 	// Source=="singbox" tunnels; empty otherwise. Lets the frontend
 	// reach into the per-member latency history map keyed by tag.
@@ -47,43 +62,22 @@ type Tunnel struct {
 	UrltestGroup string `json:"urltestGroup,omitempty"`
 }
 
-// BaseTargets is the hardcoded base list. Extend by code change only — there
-// is no CRUD UI for targets.
-var BaseTargets = []Target{
-	{ID: "cf-1.1.1.1", Host: "1.1.1.1", Name: "Cloudflare DNS", URL: "https://1.1.1.1/"},
-	{ID: "g-8.8.8.8", Host: "8.8.8.8", Name: "Google DNS", URL: "https://8.8.8.8/"},
-	{ID: "q-9.9.9.9", Host: "9.9.9.9", Name: "Quad9 DNS", URL: "https://9.9.9.9/"},
-}
-
-// EffectiveTargets returns BaseTargets ∪ unique pingcheck targets ∪ unique
-// self-check targets from tunnels. Synthesised entries get id "pc-<host>"
-// (restart pingcheck target) or "cc-<host>" (connectivity-check self
-// target). Base order is preserved; dynamic entries appended in tunnel-
-// iteration order, deduplicated by Host.
+// EffectiveTargets returns one connectivity-check (self) target per unique
+// SelfTarget host. Cross-target probing was removed with the matrix UI;
+// only the self-check cell feeds the per-tunnel connectivity indicator.
 func EffectiveTargets(tunnels []Tunnel) []Target {
-	seen := make(map[string]bool, len(BaseTargets))
-	for _, t := range BaseTargets {
-		seen[t.Host] = true
-	}
-	out := make([]Target, 0, len(BaseTargets)+len(tunnels)*2)
-	out = append(out, BaseTargets...)
+	seen := make(map[string]bool)
+	out := make([]Target, 0, len(tunnels))
 	for _, tun := range tunnels {
-		if tun.PingcheckTarget != "" && !seen[tun.PingcheckTarget] {
-			seen[tun.PingcheckTarget] = true
-			out = append(out, Target{
-				ID:   "pc-" + tun.PingcheckTarget,
-				Host: tun.PingcheckTarget,
-				Name: tun.PingcheckTarget,
-			})
+		if tun.SelfTarget == "" || seen[tun.SelfTarget] {
+			continue
 		}
-		if tun.SelfTarget != "" && !seen[tun.SelfTarget] {
-			seen[tun.SelfTarget] = true
-			out = append(out, Target{
-				ID:   "cc-" + tun.SelfTarget,
-				Host: tun.SelfTarget,
-				Name: tun.SelfTarget,
-			})
-		}
+		seen[tun.SelfTarget] = true
+		out = append(out, Target{
+			ID:   "cc-" + tun.SelfTarget,
+			Host: tun.SelfTarget,
+			Name: tun.SelfTarget,
+		})
 	}
 	return out
 }

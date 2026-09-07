@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"strings"
 
-	"github.com/hoaxisr/awg-manager/internal/logger"
 	"github.com/hoaxisr/awg-manager/internal/logging"
+	"github.com/hoaxisr/awg-manager/internal/ndms"
 	"github.com/hoaxisr/awg-manager/internal/ndms/transport"
+	"github.com/hoaxisr/awg-manager/internal/sys/netif"
 )
 
 const probeDomain = "awgm-dnscheck.test"
@@ -24,34 +24,69 @@ type TunnelStateProvider interface {
 	RunningTunnelNames(ctx context.Context) []string
 }
 
-// ndmsClient is the subset of *transport.Client used by this service.
+// ndmsClient is the subset of *transport.Client used for write paths only
+// (createIPHost POSTs). Read paths flow through the cached Query stores
+// below so we don't bypass the TTL/SingleFlight layer.
 type ndmsClient interface {
 	Post(ctx context.Context, payload any) (json.RawMessage, error)
-	GetRaw(ctx context.Context, path string) ([]byte, error)
 }
 
 // compile-time check: *transport.Client must satisfy ndmsClient
 var _ ndmsClient = (*transport.Client)(nil)
 
+// hotspotStore is the cached /show/ip/hotspot reader (see ndms/query).
+type hotspotStore interface {
+	List(ctx context.Context) ([]ndms.Device, error)
+}
+
+// ipHostStore is the cached /show/rc/ip/host reader with explicit
+// invalidation for use after createIPHost writes.
+type ipHostStore interface {
+	Lookup(ctx context.Context, domain string) (string, bool)
+	Invalidate()
+}
+
+// dnsProxyConfigStore answers "is encrypted DNS configured?" off cached
+// /show/rc/dns-proxy bytes.
+type dnsProxyConfigStore interface {
+	HasEncryptedTransport(ctx context.Context) (bool, error)
+}
+
 // Service runs DNS routing diagnostic checks.
 type Service struct {
-	ndms    ndmsClient
-	dns     DnsRouteProvider
-	tunnels TunnelStateProvider
-	log     *logger.Logger
-	appLog  *logging.ScopedLogger
+	ndms           ndmsClient
+	hotspot        hotspotStore
+	ipHost         ipHostStore
+	dnsProxyConfig dnsProxyConfigStore
+	dns            DnsRouteProvider
+	tunnels        TunnelStateProvider
+	appLog         *logging.ScopedLogger
 }
 
 // NewService creates a new DNS check service.
-func NewService(ndmsClient ndmsClient, dns DnsRouteProvider, tunnels TunnelStateProvider, log *logger.Logger, appLogger logging.AppLogger) *Service {
+func NewService(
+	ndmsClient ndmsClient,
+	hotspot hotspotStore,
+	ipHost ipHostStore,
+	dnsProxyConfig dnsProxyConfigStore,
+	dns DnsRouteProvider,
+	tunnels TunnelStateProvider,
+	appLogger logging.AppLogger,
+) *Service {
 	return &Service{
-		ndms:    ndmsClient,
-		dns:     dns,
-		tunnels: tunnels,
-		log:     log,
-		appLog:  logging.NewScopedLogger(appLogger, logging.GroupSystem, logging.SubDnsCheck),
+		ndms:           ndmsClient,
+		hotspot:        hotspot,
+		ipHost:         ipHost,
+		dnsProxyConfig: dnsProxyConfig,
+		dns:            dns,
+		tunnels:        tunnels,
+		appLog:         logging.NewScopedLogger(appLogger, logging.GroupSystem, logging.SubDnsCheck),
 	}
 }
+
+// firstIPv4 — шов над чтением адреса интерфейса: тесты подменяют, прод зовёт
+// netif.FirstIPv4.
+var firstIPv4 = netif.FirstIPv4
 
 // EnsureIPHost creates a permanent ip host entry for the probe domain.
 // Called once at startup. The entry maps awgm-dnscheck.test to the router's
@@ -62,9 +97,8 @@ func NewService(ndmsClient ndmsClient, dns DnsRouteProvider, tunnels TunnelState
 // 'Core::Configurator: not found: "ip/host/awgm-dnscheck.test"' because
 // it resolved the leaf path before creating.
 func (s *Service) EnsureIPHost(ctx context.Context) {
-	routerIP := getBr0IP()
+	routerIP := firstIPv4("br0")
 	if routerIP == "" {
-		s.log.Warnf("dnscheck: br0 has no IPv4, skipping ip host setup")
 		s.appLog.Warn("ensure-ip-host", probeDomain, "br0 has no IPv4, skipping")
 		return
 	}
@@ -72,11 +106,9 @@ func (s *Service) EnsureIPHost(ctx context.Context) {
 		return
 	}
 	if err := s.createIPHost(ctx, probeDomain, routerIP); err != nil {
-		s.log.Warnf("dnscheck: failed to create ip host %s -> %s: %v", probeDomain, routerIP, err)
 		s.appLog.Warn("ensure-ip-host", probeDomain, fmt.Sprintf("failed to create %s -> %s: %v", probeDomain, routerIP, err))
 		return
 	}
-	s.log.Infof("dnscheck: ip host %s -> %s", probeDomain, routerIP)
 	s.appLog.Info("ensure-ip-host", probeDomain, fmt.Sprintf("created %s -> %s", probeDomain, routerIP))
 }
 
@@ -85,23 +117,7 @@ func (s *Service) EnsureIPHost(ctx context.Context) {
 // entry is indistinguishable from a transient NDMS hiccup at this level —
 // the caller retries via createIPHost either way.
 func (s *Service) lookupIPHost(ctx context.Context, domain string) (string, bool) {
-	raw, err := s.ndms.GetRaw(ctx, "/show/rc/ip/host")
-	if err != nil {
-		return "", false
-	}
-	var entries []struct {
-		Domain  string `json:"domain"`
-		Address string `json:"address"`
-	}
-	if err := json.Unmarshal(raw, &entries); err != nil {
-		return "", false
-	}
-	for _, e := range entries {
-		if e.Domain == domain {
-			return e.Address, true
-		}
-	}
-	return "", false
+	return s.ipHost.Lookup(ctx, domain)
 }
 
 // Start runs server-side checks (tunnel, routes, policy, encryption) and returns
@@ -135,6 +151,17 @@ func (s *Service) Start(ctx context.Context, clientIP string) (*StartResponse, e
 		ClientIP: clientIP,
 		Hostname: hostname,
 		Checks:   checks,
+	}, nil
+}
+
+// ClientContext returns the caller's LAN identity and access-policy assignment
+// without running the full DNS diagnostic suite (tunnel/routes/encryption checks).
+func (s *Service) ClientContext(ctx context.Context, clientIP string) (*StartResponse, error) {
+	hostname := s.resolveHostname(ctx, clientIP)
+	return &StartResponse{
+		ClientIP: clientIP,
+		Hostname: hostname,
+		Checks:   []CheckResult{s.checkPolicy(ctx, clientIP)},
 	}, nil
 }
 
@@ -180,7 +207,7 @@ func (s *Service) checkRoutes(ctx context.Context) CheckResult {
 
 // checkPolicy checks if the client IP is assigned an alternative access policy.
 func (s *Service) checkPolicy(ctx context.Context, clientIP string) CheckResult {
-	raw, err := s.ndms.GetRaw(ctx, "/show/ip/hotspot")
+	hosts, err := s.hotspot.List(ctx)
 	if err != nil {
 		return CheckResult{
 			ID:      "client_policy",
@@ -191,40 +218,28 @@ func (s *Service) checkPolicy(ctx context.Context, clientIP string) CheckResult 
 		}
 	}
 
-	var hotspot struct {
-		Host []struct {
-			IP     string `json:"ip"`
-			Access string `json:"access"`
-			Name   string `json:"name"`
-		} `json:"host"`
-	}
-	if err := json.Unmarshal(raw, &hotspot); err != nil {
+	for _, h := range hosts {
+		if h.IP != clientIP {
+			continue
+		}
+		assigned := h.Access
+		if assigned == "" {
+			assigned = h.Policy
+		}
+		if assigned != "" {
+			return CheckResult{
+				ID:      "client_policy",
+				Status:  "ok",
+				Title:   "Политика доступа клиента",
+				Message: fmt.Sprintf("Клиент использует политику: %s", assigned),
+			}
+		}
 		return CheckResult{
 			ID:      "client_policy",
 			Status:  "warning",
 			Title:   "Политика доступа клиента",
-			Message: "Не удалось разобрать список клиентов",
-			Detail:  err.Error(),
-		}
-	}
-
-	for _, h := range hotspot.Host {
-		if h.IP == clientIP {
-			if h.Access != "" {
-				return CheckResult{
-					ID:      "client_policy",
-					Status:  "ok",
-					Title:   "Политика доступа клиента",
-					Message: fmt.Sprintf("Клиент использует политику: %s", h.Access),
-				}
-			}
-			return CheckResult{
-				ID:      "client_policy",
-				Status:  "warning",
-				Title:   "Политика доступа клиента",
-				Message: "Клиент использует политику по умолчанию",
-				Detail:  "Назначьте альтернативную политику для маршрутизации трафика через туннель",
-			}
+			Message: "Клиент использует политику по умолчанию",
+			Detail:  "Назначьте альтернативную политику для маршрутизации трафика через туннель",
 		}
 	}
 
@@ -239,7 +254,7 @@ func (s *Service) checkPolicy(ctx context.Context, clientIP string) CheckResult 
 
 // checkEncryption checks if the DNS proxy uses encrypted DNS (DoT/DoH/TLS).
 func (s *Service) checkEncryption(ctx context.Context) CheckResult {
-	raw, err := s.ndms.GetRaw(ctx, "/show/rc/dns-proxy")
+	encrypted, err := s.dnsProxyConfig.HasEncryptedTransport(ctx)
 	if err != nil {
 		return CheckResult{
 			ID:      "dns_encryption",
@@ -249,20 +264,14 @@ func (s *Service) checkEncryption(ctx context.Context) CheckResult {
 			Detail:  err.Error(),
 		}
 	}
-
-	lower := strings.ToLower(string(raw))
-	keywords := []string{"dot", "tls", "doh", "https"}
-	for _, kw := range keywords {
-		if strings.Contains(lower, kw) {
-			return CheckResult{
-				ID:      "dns_encryption",
-				Status:  "ok",
-				Title:   "Шифрование DNS",
-				Message: "DNS-прокси использует зашифрованный транспорт",
-			}
+	if encrypted {
+		return CheckResult{
+			ID:      "dns_encryption",
+			Status:  "ok",
+			Title:   "Шифрование DNS",
+			Message: "DNS-прокси использует зашифрованный транспорт",
 		}
 	}
-
 	return CheckResult{
 		ID:      "dns_encryption",
 		Status:  "warning",
@@ -290,26 +299,19 @@ func (s *Service) createIPHost(ctx context.Context, domain, address string) erro
 		},
 	}
 	_, err := s.ndms.Post(ctx, payload)
+	if err == nil {
+		s.ipHost.Invalidate()
+	}
 	return err
 }
 
 // resolveHostname looks up the client hostname from the hotspot list.
 func (s *Service) resolveHostname(ctx context.Context, ip string) string {
-	raw, err := s.ndms.GetRaw(ctx, "/show/ip/hotspot")
+	hosts, err := s.hotspot.List(ctx)
 	if err != nil {
 		return ip
 	}
-	var hotspot struct {
-		Host []struct {
-			IP       string `json:"ip"`
-			Name     string `json:"name"`
-			Hostname string `json:"hostname"`
-		} `json:"host"`
-	}
-	if err := json.Unmarshal(raw, &hotspot); err != nil {
-		return ip
-	}
-	for _, h := range hotspot.Host {
+	for _, h := range hosts {
 		if h.IP == ip {
 			if h.Name != "" {
 				return h.Name
@@ -320,29 +322,4 @@ func (s *Service) resolveHostname(ctx context.Context, ip string) string {
 		}
 	}
 	return ip
-}
-
-// getBr0IP returns the first IPv4 address of the br0 interface.
-func getBr0IP() string {
-	iface, err := net.InterfaceByName("br0")
-	if err != nil {
-		return ""
-	}
-	addrs, err := iface.Addrs()
-	if err != nil {
-		return ""
-	}
-	for _, addr := range addrs {
-		var ip net.IP
-		switch v := addr.(type) {
-		case *net.IPNet:
-			ip = v.IP
-		case *net.IPAddr:
-			ip = v.IP
-		}
-		if ip != nil && ip.To4() != nil {
-			return ip.To4().String()
-		}
-	}
-	return ""
 }

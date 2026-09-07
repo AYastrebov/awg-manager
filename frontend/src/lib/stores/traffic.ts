@@ -42,8 +42,16 @@ const listeners = new Set<() => void>();
 /** Tracks tunnels that have completed initial loadHistory to avoid duplicate fetches. */
 const initialized = new Set<string>();
 
+let notifyScheduled = false;
+
+/** Коалесцирует пачку feedTraffic (N SSE-сообщений/сек) в одно уведомление. */
 function notify() {
-	for (const fn of listeners) fn();
+	if (notifyScheduled) return;
+	notifyScheduled = true;
+	queueMicrotask(() => {
+		notifyScheduled = false;
+		for (const fn of listeners) fn();
+	});
 }
 
 /**
@@ -201,6 +209,21 @@ export function getTrafficRates(tunnelId: string): { rx: number[]; tx: number[] 
 	return {
 		rx: downsampleMax(rxRaw, CARD_DISPLAY_POINTS),
 		tx: downsampleMax(txRaw, CARD_DISPLAY_POINTS)
+	};
+}
+
+/** Aligned RX/TX slices for inline sparklines (list rows, compact headers). */
+export function getTrafficSparklineSeries(
+	tunnelId: string,
+	maxPoints = 28,
+): { rx: number[]; tx: number[] } {
+	const { rx, tx } = getTrafficRates(tunnelId);
+	const n = Math.min(rx.length, tx.length);
+	if (n === 0) return { rx: [], tx: [] };
+	const start = n - Math.min(maxPoints, n);
+	return {
+		rx: rx.slice(start, n),
+		tx: tx.slice(start, n),
 	};
 }
 

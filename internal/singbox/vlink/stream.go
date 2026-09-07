@@ -12,13 +12,17 @@ import (
 // when plugin involves transport). Each scheme maps these into its
 // protocol-specific outbound JSON via MergeIntoOutbound.
 type StreamBuilder struct {
-	Network             string // "tcp" | "ws" | "grpc" | "http"
+	Network             string // "tcp" | "ws" | "grpc" | "http" | "httpupgrade" | "xhttp"
 	TLS                 *outboundTLS
 	Path                string
-	Host                string // ws Host header / http hosts
+	Host                string // ws Host header / http hosts / xhttp host
 	EarlyData           int
 	EarlyDataHeaderName string
 	ServiceName         string
+	Mode                string         // xhttp mode: auto | packet-up | stream-up | stream-one
+	XPaddingBytes       string         // xhttp x_padding_bytes (mandatory, non-zero); defaulted in MergeIntoOutbound
+	XHTTPExtra          map[string]any // xhttp fields from ?extra=, already in sing-box snake_case (#797)
+	BindInterface       string         // egress kernel interface for dial (#709)
 }
 
 // outboundTLS is the parsed TLS / Reality block ready to be emitted as
@@ -41,6 +45,27 @@ type outboundRTLS struct {
 // BuildStreamFromQuery parses transport+security parameters from a URL
 // query and returns a normalized StreamBuilder. defaultHost is used as
 // the WS Host header / HTTP hosts when the query doesn't specify host=.
+//
+// Эта функция — единственный сборщик транспорта и TLS в пакете. Форматы, у
+// которых своего query нет (Clash YAML, Xray JSON, Amnezia), приводят свои
+// поля к нему же — clashFieldsToValues и xrayStreamToValues, — и потому
+// получают ровно те же возможности. Тест эквивалентности следит, чтобы это
+// оставалось правдой.
+//
+// Набор понимаемых параметров шире, чем у share-ссылок: часть введена как
+// общий язык между форматами и в самих ссылках почти не встречается.
+//
+//	type, security, sni, alpn, fp/fingerprint, insecure, pbk, sid — как в ссылке
+//	path, host, serviceName, mode                                 — как в ссылке
+//	ed, eh          — ранние данные ws: размер и имя заголовка. Форма "?ed=N"
+//	                  внутри path эквивалентна ed=N с заголовком
+//	                  Sec-WebSocket-Protocol; пустой eh означает ранние данные
+//	                  прямо в пути. При обоих формах побеждает ed=.
+//	extra           — объект xhttp-настроек Xray (xmux и прочее), см. #797
+//	bind_interface  — исходящий интерфейс (#709)
+//
+// Добавляя поле в StreamBuilder, заводите ему параметр здесь: иначе форматы,
+// приходящие через этот вход, снова начнут расходиться в возможностях.
 func BuildStreamFromQuery(q url.Values, defaultHost string) (*StreamBuilder, error) {
 	s := &StreamBuilder{}
 
@@ -58,8 +83,12 @@ func BuildStreamFromQuery(q url.Values, defaultHost string) (*StreamBuilder, err
 		s.Network = "http"
 	case "http":
 		s.Network = "http"
+	case "httpupgrade":
+		s.Network = "httpupgrade"
 	case "tcp":
 		s.Network = "tcp"
+	case "xhttp", "splithttp":
+		s.Network = "xhttp"
 	default:
 		return nil, fmt.Errorf("vlink: unsupported transport %q", netRaw)
 	}
@@ -83,14 +112,32 @@ func BuildStreamFromQuery(q url.Values, defaultHost string) (*StreamBuilder, err
 				}
 			}
 			rawPath = rawPath[:idx]
+			if s.EarlyData > 0 {
+				s.EarlyDataHeaderName = "Sec-WebSocket-Protocol"
+			}
 		}
 		s.Path = rawPath
+	}
+	if n, err := strconv.Atoi(q.Get("ed")); err == nil && n > 0 {
+		s.EarlyData = n
+		s.EarlyDataHeaderName = q.Get("eh")
 	}
 	s.Host = q.Get("host")
 	if s.Host == "" {
 		s.Host = defaultHost
 	}
 	s.ServiceName = q.Get("serviceName")
+	s.Mode = q.Get("mode")
+	if s.Network == "xhttp" {
+		// The option layer refuses anything else and takes the whole config
+		// down with it, so the bad link is rejected on its own instead.
+		switch s.Mode {
+		case "", "auto", "packet-up", "stream-up", "stream-one":
+		default:
+			return nil, fmt.Errorf("vlink: unsupported xhttp mode %q", s.Mode)
+		}
+		s.XHTTPExtra = parseXHTTPExtra(q.Get("extra"))
+	}
 
 	// TLS / Reality
 	sec := strings.ToLower(q.Get("security"))
@@ -117,7 +164,7 @@ func BuildStreamFromQuery(q url.Values, defaultHost string) (*StreamBuilder, err
 		s.TLS = &outboundTLS{
 			Enabled:         true,
 			ServerName:      q.Get("sni"),
-			UTLSFingerprint: firstNonEmpty(q.Get("fp"), q.Get("fingerprint")),
+			UTLSFingerprint: firstNonEmpty(q.Get("fp"), q.Get("fingerprint"), "chrome"),
 			Reality: &outboundRTLS{
 				PublicKey: q.Get("pbk"),
 				ShortID:   sid,
@@ -130,6 +177,12 @@ func BuildStreamFromQuery(q url.Values, defaultHost string) (*StreamBuilder, err
 		// no TLS
 	default:
 		return nil, fmt.Errorf("vlink: unknown security %q", sec)
+	}
+
+	// Только каноническое имя поля sing-box: алиасы (bindInterface, bind)
+	// ничем не подтверждены и угадывают чужой формат.
+	if b := strings.TrimSpace(q.Get("bind_interface")); b != "" {
+		s.BindInterface = b
 	}
 
 	return s, nil
@@ -202,6 +255,9 @@ func (s *StreamBuilder) MergeIntoOutbound(out map[string]any) {
 			if s.EarlyData > 0 {
 				transport["max_early_data"] = s.EarlyData
 			}
+			if s.EarlyDataHeaderName != "" {
+				transport["early_data_header_name"] = s.EarlyDataHeaderName
+			}
 		case "grpc":
 			transport["type"] = "grpc"
 			if s.ServiceName != "" {
@@ -216,6 +272,38 @@ func (s *StreamBuilder) MergeIntoOutbound(out map[string]any) {
 			}
 			if s.Path != "" {
 				transport["path"] = s.Path
+			}
+		case "httpupgrade":
+			// httpupgrade carries host as a top-level string (not headers.Host
+			// like ws) and has no max_early_data.
+			transport["type"] = "httpupgrade"
+			if s.Host != "" {
+				transport["host"] = s.Host
+			}
+			if s.Path != "" {
+				transport["path"] = s.Path
+			}
+		case "xhttp":
+			// host is a separate top-level field (the option layer rejects a
+			// headers key named "host"). x_padding_bytes is mandatory and must
+			// be non-zero, so always emit a default when unset.
+			transport["type"] = "xhttp"
+			if s.Path != "" {
+				transport["path"] = s.Path
+			}
+			if s.Host != "" {
+				transport["host"] = s.Host
+			}
+			if s.Mode != "" {
+				transport["mode"] = s.Mode
+			}
+			for k, v := range s.XHTTPExtra {
+				transport[k] = v
+			}
+			if s.XPaddingBytes != "" {
+				transport["x_padding_bytes"] = s.XPaddingBytes
+			} else if transport["x_padding_bytes"] == nil {
+				transport["x_padding_bytes"] = "100-1000"
 			}
 		}
 		out["transport"] = transport
@@ -246,5 +334,9 @@ func (s *StreamBuilder) MergeIntoOutbound(out map[string]any) {
 			}
 		}
 		out["tls"] = tls
+	}
+
+	if s.BindInterface != "" {
+		out["bind_interface"] = s.BindInterface
 	}
 }

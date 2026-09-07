@@ -11,16 +11,17 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/sys/httpdownload"
+	"github.com/hoaxisr/awg-manager/internal/sys/routerinfo"
 )
 
 // DefaultBinaryPath is where the managed sing-box binary is placed on disk.
@@ -34,6 +35,7 @@ type BinarySpec struct {
 	Version string
 	URL     string
 	SHA256  string
+	Size    int64 // bytes (uncompressed); 0 → disk-gate skipped (backwards-compatible)
 }
 
 // Installer downloads, verifies, and activates sing-box binaries.
@@ -41,7 +43,7 @@ type Installer struct {
 	binaryPath string
 	arch       string
 	spec       BinarySpec
-	httpClient *http.Client
+	downloader Downloader
 	appLog     *logging.ScopedLogger
 
 	// opkgRemove is overridable for tests; production uses defaultOpkgRemove.
@@ -49,6 +51,62 @@ type Installer struct {
 	// inject its own.
 	opkgRemove        func(context.Context) error
 	opkgListInstalled func(context.Context) (string, error)
+
+	freeDisk func(path string) (int64, bool) // overridable for tests; defaults to routerinfo.FreeBytes
+
+	// SHA256 of the live binary, cached by (size, mtime). Generic SHA256 of a
+	// ~80MB binary costs ~13s CPU on softfloat MIPS, and GetStatus needs the
+	// checksum on every 30s poll — without the cache the router burns a full
+	// core just serving /api/singbox/status. Activate() replaces the file via
+	// rename, so a stat mismatch self-invalidates the cache.
+	shaMu   sync.Mutex
+	shaVal  string
+	shaSize int64
+	shaMod  time.Time
+}
+
+type Downloader interface {
+	DownloadFile(ctx context.Context, req DownloadFileRequest) (DownloadFileResult, error)
+}
+
+// binaryMaxBytes is the fallback download ceiling used only when free disk
+// space can't be queried. Normally the limit is dynamic — actual free space
+// minus diskReserveBytes — so large (uncompressed) binaries download fine on
+// routers with roomy /opt (e.g. entware on external storage) while tiny-disk
+// routers are still protected. 128 MiB covers current uncompressed develop
+// builds (~70-86 MB per arch) even on the statfs-unavailable fallback path.
+const binaryMaxBytes = 128 << 20
+
+// diskReserveBytes is kept free after the download so activation/other writes
+// don't fill the filesystem completely.
+const diskReserveBytes = 16 << 20
+
+// downloadByteLimit returns the max download size: free disk space minus a
+// reserve margin, or the static fallback when free space is unknown. Clamped
+// to be non-negative.
+func downloadByteLimit(freeBytes int64, freeOK bool, fallback, reserve int64) int64 {
+	if !freeOK {
+		return fallback
+	}
+	avail := freeBytes - reserve
+	if avail < 0 {
+		avail = 0
+	}
+	return avail
+}
+
+type DownloadFileRequest struct {
+	URL          string
+	DestPath     string
+	Timeout      time.Duration
+	MaxFileBytes int64
+	Mode         os.FileMode
+	Progress     httpdownload.ProgressFn
+}
+
+type DownloadFileResult struct {
+	Path string
+	Size int64
 }
 
 // New builds an Installer. arch maps into EmbeddedBinaries; spec is what
@@ -58,9 +116,13 @@ func New(binaryPath, arch string, spec BinarySpec, appLogger logging.AppLogger) 
 		binaryPath: binaryPath,
 		arch:       arch,
 		spec:       spec,
-		httpClient: &http.Client{Timeout: 5 * time.Minute},
 		appLog:     logging.NewScopedLogger(appLogger, logging.GroupSingbox, logging.SubSBProcess),
+		freeDisk:   routerinfo.FreeBytes,
 	}
+}
+
+func (i *Installer) SetDownloader(dl Downloader) {
+	i.downloader = dl
 }
 
 // BinaryPath is the absolute filesystem path where the managed binary
@@ -69,6 +131,55 @@ func (i *Installer) BinaryPath() string { return i.binaryPath }
 
 // RequiredVersion is the version this awg-manager build is pinned to.
 func (i *Installer) RequiredVersion() string { return i.spec.Version }
+
+// RequiredSHA256 is the checksum this awg-manager build is pinned to.
+func (i *Installer) RequiredSHA256() string { return i.spec.SHA256 }
+
+// RequiredSize is the expected size of the pinned binary (bytes, uncompressed).
+// Zero means unknown — disk-gate is skipped.
+func (i *Installer) RequiredSize() int64 { return i.spec.Size }
+
+// CurrentSHA256 returns the checksum of the installed managed binary,
+// served from the (size, mtime) cache when the file is unchanged.
+func (i *Installer) CurrentSHA256() (string, error) {
+	return i.binarySHA256()
+}
+
+// binarySHA256 returns the cached checksum of binaryPath, rehashing only
+// when the file's size or mtime differs from the cached snapshot. The
+// mutex serializes concurrent polls so they don't hash the same file twice.
+func (i *Installer) binarySHA256() (string, error) {
+	i.shaMu.Lock()
+	defer i.shaMu.Unlock()
+
+	fi, err := os.Stat(i.binaryPath)
+	if err != nil {
+		return "", err
+	}
+	if i.shaVal != "" && fi.Size() == i.shaSize && fi.ModTime().Equal(i.shaMod) {
+		return i.shaVal, nil
+	}
+	sha, err := sha256File(i.binaryPath)
+	if err != nil {
+		return "", err
+	}
+	i.shaVal = sha
+	i.shaSize = fi.Size()
+	i.shaMod = fi.ModTime()
+	return sha, nil
+}
+
+// MatchesRequired reports whether the installed binary matches both the
+// pinned version and pinned bytes. The SHA256 check is intentional: custom
+// sing-box rebuilds can keep the same upstream version while fixing target-
+// specific binary contents.
+func (i *Installer) MatchesRequired(ctx context.Context) bool {
+	if i.CurrentVersion(ctx) != i.RequiredVersion() {
+		return false
+	}
+	currentSHA, err := i.CurrentSHA256()
+	return err == nil && strings.EqualFold(currentSHA, i.RequiredSHA256())
+}
 
 // Download fetches the binary to <binaryPath>.tmp and verifies SHA256.
 // On verification failure or HTTP error the tmp file is removed so the
@@ -85,42 +196,37 @@ func (i *Installer) Download(ctx context.Context, onProgress httpdownload.Progre
 	}
 	_ = os.Remove(tmp)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, i.spec.URL, nil)
-	if err != nil {
-		return "", fmt.Errorf("build request: %w", err)
-	}
-	resp, err := i.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("download %s: %w", i.spec.URL, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download %s: status %d", i.spec.URL, resp.StatusCode)
+	dl := i.downloader
+	if dl == nil {
+		return "", fmt.Errorf("downloader is not configured")
 	}
 
-	out, err := os.Create(tmp)
-	if err != nil {
-		return "", fmt.Errorf("create %s: %w", tmp, err)
-	}
-	hasher := sha256.New()
-	src := httpdownload.NewReader(resp.Body, resp.ContentLength, onProgress)
-	written, err := io.Copy(io.MultiWriter(out, hasher), src)
-	closeErr := out.Close()
+	free, freeOK := routerinfo.FreeBytes(filepath.Dir(i.binaryPath))
+	maxBytes := downloadByteLimit(free, freeOK, binaryMaxBytes, diskReserveBytes)
+
+	res, err := dl.DownloadFile(ctx, DownloadFileRequest{
+		URL:          i.spec.URL,
+		DestPath:     tmp,
+		Timeout:      5 * time.Minute,
+		MaxFileBytes: maxBytes,
+		Mode:         0o644,
+		Progress:     onProgress,
+	})
 	if err != nil {
 		_ = os.Remove(tmp)
-		return "", fmt.Errorf("read body: %w", err)
+		return "", fmt.Errorf("download %s: %w", i.spec.URL, err)
 	}
-	if closeErr != nil {
+	got, err := sha256File(tmp)
+	if err != nil {
 		_ = os.Remove(tmp)
-		return "", fmt.Errorf("close %s: %w", tmp, closeErr)
+		return "", fmt.Errorf("sha256 %s: %w", tmp, err)
 	}
-	got := hex.EncodeToString(hasher.Sum(nil))
 	if !strings.EqualFold(got, i.spec.SHA256) {
 		_ = os.Remove(tmp)
 		i.appLog.Warn("download", i.spec.URL, fmt.Sprintf("sha256 mismatch: got %s, want %s", got, i.spec.SHA256))
-		return "", fmt.Errorf("sha256 mismatch (downloaded %d bytes): got %s, want %s", written, got, i.spec.SHA256)
+		return "", fmt.Errorf("sha256 mismatch (downloaded %d bytes): got %s, want %s", res.Size, got, i.spec.SHA256)
 	}
-	i.appLog.Info("download", i.spec.URL, fmt.Sprintf("downloaded %d bytes, sha256 verified", written))
+	i.appLog.Info("download", i.spec.URL, fmt.Sprintf("downloaded %d bytes, sha256 verified", res.Size))
 	return tmp, nil
 }
 
@@ -168,4 +274,88 @@ func (i *Installer) CurrentVersion(ctx context.Context) string {
 		}
 	}
 	return ""
+}
+
+// FreeBytes wraps the freeDisk probe so callers (Operator.GetStatus) don't
+// recompute install-dir. Returns (0, false) when probe unavailable.
+func (i *Installer) FreeBytes() (int64, bool) {
+	if i.freeDisk == nil {
+		return 0, false
+	}
+	return i.freeDisk(filepath.Dir(i.binaryPath))
+}
+
+// SetFreeDiskFn overrides the free-disk probe (tests only).
+func (i *Installer) SetFreeDiskFn(fn func(string) (int64, bool)) {
+	i.freeDisk = fn
+}
+
+// isExecutable reports whether path is a regular executable file.
+func isExecutable(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir() && info.Mode()&0o111 != 0
+}
+
+// safetyMargin is added on top of spec.Size for the disk-gate, covering
+// tmp download file, logs, and slack. ~5 MiB.
+const safetyMargin = 5 << 20
+
+// SafetyMargin is the disk-gate slack added to spec.Size (bytes).
+const SafetyMargin = safetyMargin
+
+// EvaluateInstallState reports the install state vs pinned spec, gated by
+// free disk. Pure file ops: isExecutable + cached binarySHA256 (no
+// `sing-box version` subprocess), so safe to call on every status-poll.
+//
+// Returns Installed/Missing/MissingNoSpace/OutdatedNoSpace. Free-disk unknown
+// OR spec.Size==0 → gate skipped (Missing instead of NoSpace).
+//
+// Note: возвращает Missing и для clean install, и для outdated-with-space —
+// EvaluateInstallState отвечает только на «можно ли проходить gate»;
+// различение install vs update делается через UpdateAvailable в GetStatus.
+func (i *Installer) EvaluateInstallState() InstallState {
+	installed := isExecutable(i.binaryPath)
+
+	matches := false
+	if installed {
+		sha, err := i.binarySHA256()
+		matches = err == nil && strings.EqualFold(sha, i.spec.SHA256)
+	}
+	if matches {
+		return InstallStateInstalled
+	}
+
+	required := i.spec.Size + safetyMargin
+	freeBytes, ok := int64(0), false
+	if i.freeDisk != nil {
+		freeBytes, ok = i.freeDisk(filepath.Dir(i.binaryPath))
+	}
+	gate := ok && i.spec.Size > 0
+	avail := freeBytes - diskReserveBytes
+
+	if !installed {
+		if gate && avail < required {
+			return InstallStateMissingNoSpace
+		}
+		return InstallStateMissing
+	}
+	// installed && !matches → upgrade
+	if gate && avail < required {
+		return InstallStateOutdatedNoSpace
+	}
+	return InstallStateMissing
+}
+
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }

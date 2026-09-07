@@ -8,7 +8,6 @@ import (
 
 	"github.com/hoaxisr/awg-manager/internal/ndms"
 	"github.com/hoaxisr/awg-manager/internal/tunnel"
-	"github.com/hoaxisr/awg-manager/internal/tunnel/backend"
 	"github.com/hoaxisr/awg-manager/internal/tunnel/wg"
 )
 
@@ -55,6 +54,16 @@ func (m *MockNDMSClient) GetDetails(_ context.Context, _ string) (*ndms.Interfac
 	return m.details, nil
 }
 
+// FetchSummary mirrors GetDetails — tests use the same fixture for both
+// the cache-backed and direct-RCI paths. Production: InterfaceStore
+// reaches NDMS via direct GET on every call.
+func (m *MockNDMSClient) FetchSummary(_ context.Context, _ string) (*ndms.InterfaceDetails, error) {
+	if m.details == nil {
+		return nil, errors.New("show interface failed")
+	}
+	return m.details, nil
+}
+
 // MockWGClient is a mock WireGuard client for testing.
 type MockWGClient struct {
 	hasPeer       bool
@@ -90,7 +99,6 @@ type MockBackend struct {
 	pid     int
 }
 
-func (m *MockBackend) Type() backend.Type { return backend.TypeKernel }
 func (m *MockBackend) Start(ctx context.Context, ifaceName string) error {
 	return nil
 }
@@ -102,12 +110,22 @@ func (m *MockBackend) WaitReady(ctx context.Context, ifaceName string, timeout t
 	return nil
 }
 
+// newTestManager builds a ManagerImpl via New(...) and stubs deviceExists so
+// the test doesn't read /sys/class/net/opkgtun0 from the test host. On a dev
+// machine without that device the sysfs default already returns false, so
+// this preserves the existing behavior of the tests below.
+func newTestManager(t *testing.T, ifaces InterfaceQueries, wgClient wg.Client, backendImpl Backend) *ManagerImpl {
+	t.Helper()
+	mgr := New(ifaces, wgClient, backendImpl, nil)
+	mgr.deviceExists = func(string) bool { return false }
+	return mgr
+}
+
 func TestManagerImpl_GetState_NotCreated(t *testing.T) {
-	mgr := New(
+	mgr := newTestManager(t,
 		&MockNDMSClient{opkgTunExists: false},
 		&MockWGClient{},
 		&MockBackend{},
-		nil,
 	)
 
 	state := mgr.GetState(context.Background(), "awg0")
@@ -123,11 +141,10 @@ func TestManagerImpl_GetState_NotCreated(t *testing.T) {
 // TestManagerImpl_GetState_Disabled tests: OpkgTun exists, conf: disabled, no process.
 // v1 called this "Stopped". v2 calls it "Disabled" (NDMS intent = down).
 func TestManagerImpl_GetState_Disabled(t *testing.T) {
-	mgr := New(
+	mgr := newTestManager(t,
 		&MockNDMSClient{opkgTunExists: true, details: detailsDisabled},
 		&MockWGClient{},
 		&MockBackend{running: false},
-		nil,
 	)
 
 	state := mgr.GetState(context.Background(), "awg0")
@@ -189,11 +206,10 @@ func TestManagerImpl_GetState_Running(t *testing.T) {
 // TestManagerImpl_GetState_Starting tests: conf: running, process alive, link not up yet.
 // v1 called this "Broken". v2 calls it "Starting".
 func TestManagerImpl_GetState_Starting(t *testing.T) {
-	mgr := New(
+	mgr := newTestManager(t,
 		&MockNDMSClient{opkgTunExists: true, details: detailsNeedsStart},
 		&MockWGClient{},
 		&MockBackend{running: true, pid: 12345},
-		nil,
 	)
 
 	state := mgr.GetState(context.Background(), "awg0")
@@ -213,11 +229,10 @@ func TestManagerImpl_GetState_Starting(t *testing.T) {
 // v1 called this "Broken" (interfaceUp=true from stale NDMS, process=false).
 // v2 correctly identifies this as NeedsStart via conf layer.
 func TestManagerImpl_GetState_NeedsStart(t *testing.T) {
-	mgr := New(
+	mgr := newTestManager(t,
 		&MockNDMSClient{opkgTunExists: true, details: detailsNeedsStart},
 		&MockWGClient{},
 		&MockBackend{running: false},
-		nil,
 	)
 
 	state := mgr.GetState(context.Background(), "awg0")
@@ -230,11 +245,10 @@ func TestManagerImpl_GetState_NeedsStart(t *testing.T) {
 // TestManagerImpl_GetState_NeedsStop tests: conf: disabled, process still alive.
 // Happens when user toggles off in router UI.
 func TestManagerImpl_GetState_NeedsStop(t *testing.T) {
-	mgr := New(
+	mgr := newTestManager(t,
 		&MockNDMSClient{opkgTunExists: true, details: detailsDisabled},
 		&MockWGClient{},
 		&MockBackend{running: true, pid: 12345},
-		nil,
 	)
 
 	state := mgr.GetState(context.Background(), "awg0")
@@ -266,11 +280,10 @@ func TestManagerImpl_GetState_RunningNoPeer(t *testing.T) {
 // when ShowInterface fails, intent defaults to IntentDown (safe),
 // so with no process → Disabled.
 func TestManagerImpl_GetState_ShowInterfaceFails(t *testing.T) {
-	mgr := New(
+	mgr := newTestManager(t,
 		&MockNDMSClient{opkgTunExists: true, details: nil},
 		&MockWGClient{},
 		&MockBackend{running: false},
-		nil,
 	)
 
 	state := mgr.GetState(context.Background(), "awg0")
@@ -353,6 +366,47 @@ func TestManagerImpl_GetState_NamesConversion(t *testing.T) {
 		t.Errorf("IfaceName = %q, want opkgtun0", names.IfaceName)
 	}
 
-	mgr := New(&MockNDMSClient{opkgTunExists: true}, &MockWGClient{}, &MockBackend{}, nil)
+	mgr := newTestManager(t, &MockNDMSClient{opkgTunExists: true}, &MockWGClient{}, &MockBackend{})
 	_ = mgr.GetState(context.Background(), "awg0")
+}
+
+// OS4-путь GetState (запись без NDMS-имени — awgm5) берёт состояние линка из
+// sysfs через шов, а не с хоста. linkUp входит в матрицу (matrix_v2.go:39-47):
+// процесс жив + линк поднят + пир есть → Running; линк опущен → Starting; и
+// доезжает до StateInfo.InterfaceUp (раньше на OS4 поле не заполнялось —
+// «мёртвое поле» трекера). deviceExists тоже стаб: иначе GetState читает
+// /sys/class/net/awgm5 хоста.
+func TestGetState_OS4LinkUpComesThroughSeam(t *testing.T) {
+	for _, tc := range []struct {
+		up   bool
+		want tunnel.State
+	}{{true, tunnel.StateRunning}, {false, tunnel.StateStarting}} {
+		mgr := New(&MockNDMSClient{}, &MockWGClient{hasPeer: true}, &MockBackend{running: true, pid: 4242}, nil)
+		mgr.deviceExists = func(string) bool { return true }
+		mgr.linkUp = func(string) bool { return tc.up }
+		st := mgr.GetState(context.Background(), "awgm5")
+		if st.State != tc.want {
+			t.Errorf("linkUp=%v → State=%v, ждали %v", tc.up, st.State, tc.want)
+		}
+		if st.InterfaceUp != tc.up {
+			t.Errorf("linkUp=%v → InterfaceUp=%v", tc.up, st.InterfaceUp)
+		}
+	}
+}
+
+// TestNew_LinkUpAndDeviceExistsDefaultsSet пинует дефолты швов, заданные в
+// New: удаление любого из двух присваиваний оставляет nil-функцию, и любой
+// вызов GetState на реальном OS4-пути паникует на nil linkUp/deviceExists.
+func TestNew_LinkUpAndDeviceExistsDefaultsSet(t *testing.T) {
+	mgr := New(&MockNDMSClient{}, &MockWGClient{}, &MockBackend{}, nil)
+	if mgr.linkUp == nil {
+		t.Error("linkUp должен быть установлен дефолтом (sysfsLinkUp)")
+	}
+	if mgr.deviceExists == nil {
+		t.Error("deviceExists должен быть установлен дефолтом (sysfsDeviceExists)")
+	}
+}
+
+func (m *MockWGClient) LatestHandshake(_ context.Context, _ string) (time.Time, error) {
+	return time.Time{}, nil
 }

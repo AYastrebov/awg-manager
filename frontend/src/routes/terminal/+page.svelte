@@ -4,16 +4,24 @@
 	import { notifications } from '$lib/stores/notifications';
 	import { PageContainer } from '$lib/components/layout';
 	import { Button } from '$lib/components/ui';
-	import { TerminalInstall, TerminalView } from '$lib/components/terminal';
+	import { TerminalInstall, TerminalView, TerminalCredentialsBar } from '$lib/components/terminal';
 	import type { TerminalStatus } from '$lib/types';
+	import { errorMessage } from '$lib/utils/errorMessage';
+	import { usageLevel } from '$lib/stores/settings';
+	import {
+		loadTerminalAutoLogin,
+		type TerminalAutoLogin,
+	} from '$lib/utils/terminalCredentials';
 
 	type PageState = 'loading' | 'not-installed' | 'starting' | 'active' | 'session-busy' | 'error';
 
 	let pageState: PageState = $state('loading');
 	let installing = $state(false);
 	let installError: string | null = $state(null);
+	let autoLogin = $state<Pick<TerminalAutoLogin, 'login' | 'password'> | null>(null);
 
 	onMount(async () => {
+		autoLogin = loadTerminalAutoLogin();
 		await checkStatus();
 	});
 
@@ -45,8 +53,8 @@
 			await api.terminalInstall();
 			notifications.success('ttyd установлен');
 			await startTerminal();
-		} catch (e: any) {
-			installError = e.message || 'Неизвестная ошибка';
+		} catch (e) {
+			installError = errorMessage(e, 'Неизвестная ошибка');
 		} finally {
 			installing = false;
 		}
@@ -57,14 +65,18 @@
 		try {
 			await api.terminalStart();
 			pageState = 'active';
-		} catch (e: any) {
-			notifications.error('Не удалось запустить терминал: ' + (e.message || ''));
+		} catch (e) {
+			notifications.error('Не удалось запустить терминал: ' + (errorMessage(e, '')));
 			pageState = 'error';
 		}
 	}
 
 	function handleTerminalClose() {
 		api.terminalStop().catch(() => {});
+	}
+
+	async function handleTerminalReconnect() {
+		await api.terminalStart();
 	}
 
 	function handleTerminalError(msg: string) {
@@ -97,7 +109,18 @@
 	</PageContainer>
 {:else if pageState === 'active'}
 	<div class="terminal-page">
-		<TerminalView onclose={handleTerminalClose} onerror={handleTerminalError} />
+		<div class="terminal-stack">
+			{#if $usageLevel === 'expert'}
+				<TerminalCredentialsBar onchange={(v) => (autoLogin = v)} />
+			{/if}
+			<TerminalView
+				{autoLogin}
+				compact={false}
+				onclose={handleTerminalClose}
+				onerror={handleTerminalError}
+				onreconnect={handleTerminalReconnect}
+			/>
+		</div>
 	</div>
 {:else}
 	<PageContainer>
@@ -111,8 +134,19 @@
 <style>
 	.terminal-page {
 		height: calc(100vh - var(--header-height, 56px));
-		padding: 0.5rem;
+		padding: 0.75rem;
 		box-sizing: border-box;
+	}
+	.terminal-stack {
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+		height: 100%;
+		min-height: 0;
+	}
+	.terminal-stack :global(.mac-window) {
+		flex: 1;
+		min-height: 0;
 	}
 	.terminal-loading {
 		display: flex;

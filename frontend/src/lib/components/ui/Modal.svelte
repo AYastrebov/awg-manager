@@ -5,9 +5,12 @@
     interface Props {
         open: boolean;
         title: string;
-        size?: 'sm' | 'md' | 'lg' | 'xl';
+        size?: 'sm' | 'md' | 'lg' | 'xl' | 'wide';
+        /** When `fill`, body does not scroll — children manage their own scroll regions. */
+        bodyLayout?: 'default' | 'fill';
         onclose: () => void;
-        children: Snippet;
+        /** Omitted = no body: the section is skipped so it can't leave an empty padded strip. */
+        children?: Snippet;
         actions?: Snippet;
         /**
          * Close the modal when the user clicks the dimmed backdrop.
@@ -24,24 +27,34 @@
          * the click as the user's deliberate discard gesture.
          */
         hasUnsavedChanges?: () => boolean;
+        /**
+         * Explicit body min-height (CSS length). The default body is
+         * `flex:1; min-height:0`, which lets it collapse to ~padding height when
+         * its content streams in AFTER open (e.g. the switch-progress step list).
+         * Set this to pin a minimum so such content can't be clipped to a strip.
+         */
+        bodyMinHeight?: string;
     }
 
     let {
         open = $bindable(false),
         title,
         size = 'md',
+        bodyLayout = 'default',
         onclose,
         children,
         actions,
         closeOnBackdrop = true,
         hasUnsavedChanges,
+        bodyMinHeight,
     }: Props = $props();
 
     const sizeClasses = {
         sm: 'max-w-sm',
         md: 'max-w-md',
         lg: 'max-w-lg',
-        xl: 'max-w-xl'
+        xl: 'max-w-xl',
+        wide: 'max-w-wide',
     };
 
     function attemptClose() {
@@ -150,9 +163,15 @@
                 </button>
             </header>
 
-            <section class="modal-body">
-                {@render children()}
-            </section>
+            {#if children}
+                <section
+                    class="modal-body"
+                    class:modal-body-fill={bodyLayout === 'fill'}
+                    style={bodyMinHeight ? `min-height: ${bodyMinHeight}` : undefined}
+                >
+                    {@render children()}
+                </section>
+            {/if}
 
             {#if actions}
                 <footer class="modal-footer">
@@ -216,6 +235,15 @@
     .max-w-md { max-width: min(32rem, calc(100vw - 2rem)); }
     .max-w-lg { max-width: min(40rem, calc(100vw - 2rem)); }
     .max-w-xl { max-width: min(48rem, calc(100vw - 2rem)); }
+    .max-w-wide { max-width: min(960px, calc(100vw - 2rem)); }
+
+    .modal-body-fill {
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        padding: 0 8px;
+        min-height: 0;
+    }
 
     .modal-header {
         display: flex;
@@ -281,5 +309,20 @@
         gap: 0.5rem;
         padding: 1rem;
         border-top: 1px solid var(--border);
+    }
+
+    @media (max-width: 640px) {
+        .modal-footer {
+            justify-content: stretch;
+            align-items: stretch;
+        }
+
+        .modal-footer :global(button),
+        .modal-footer :global(a),
+        .modal-footer :global(.btn) {
+            flex: 1 1 0;
+            min-width: 0;
+            width: 100%;
+        }
     }
 </style>

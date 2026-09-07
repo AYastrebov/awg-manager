@@ -1,9 +1,14 @@
-import { writable, derived } from 'svelte/store';
+import { writable, derived, get } from 'svelte/store';
 import { api } from '$lib/api/client';
 import { awgTags } from './awgTags';
 import { subscriptionsStore } from './subscriptions';
 import { singboxTunnels } from './singbox';
 import { buildOutboundOptions, type OutboundGroup } from '$lib/components/routing/singboxRouter/outboundOptions';
+import { reconcileRuleUiKeys } from '$lib/utils/ruleUiKeys';
+import {
+	normalizeRulesForUI,
+	normalizeRuleSetsForUI,
+} from '$lib/utils/singboxInlineRules';
 import type {
 	SingboxRouterStatus,
 	SingboxRouterSettings,
@@ -13,6 +18,7 @@ import type {
 	SingboxRouterPreset,
 	SingboxRouterDNSServer,
 	SingboxRouterDNSRule,
+	SingboxRouterDNSRewrite,
 	SingboxRouterDNSGlobals,
 	RouterStagingStatusResponse,
 } from '$lib/types';
@@ -21,14 +27,17 @@ function createSingboxRouterStore() {
 	const status = writable<SingboxRouterStatus | null>(null);
 	const settings = writable<SingboxRouterSettings | null>(null);
 	const rules = writable<SingboxRouterRule[]>([]);
+	const ruleUiKeys = writable<string[]>([]);
 	const ruleSets = writable<SingboxRouterRuleSet[]>([]);
 	const outbounds = writable<SingboxRouterOutbound[]>([]);
 	const presets = writable<SingboxRouterPreset[]>([]);
 	const dnsServers = writable<SingboxRouterDNSServer[]>([]);
 	const dnsRules = writable<SingboxRouterDNSRule[]>([]);
+	const dnsRewrites = writable<SingboxRouterDNSRewrite[]>([]);
 	const dnsGlobals = writable<SingboxRouterDNSGlobals>({ final: '', strategy: '' });
 	const staging = writable<RouterStagingStatusResponse | null>(null);
 	const loading = writable(false);
+	const initialized = writable(false);
 	const error = writable<string | null>(null);
 
 	// options — unified outbound dropdown groups for sub-tabs and wizard.
@@ -61,11 +70,23 @@ function createSingboxRouterStore() {
 		},
 	);
 
+	function setRulesWithKeys(nextRules: SingboxRouterRule[]): void {
+		const normalized = normalizeRulesForUI(nextRules);
+		const prevRules = get(rules);
+		const prevKeys = get(ruleUiKeys);
+		ruleUiKeys.set(reconcileRuleUiKeys(normalized, prevRules, prevKeys));
+		rules.set(normalized);
+	}
+
+	function setRuleSetsForUI(next: SingboxRouterRuleSet[]): void {
+		ruleSets.set(normalizeRuleSetsForUI(next));
+	}
+
 	async function loadAll(): Promise<void> {
 		loading.set(true);
 		error.set(null);
 		try {
-			const [st, s, r, rs, o, p, ds, dr, dg] = await Promise.all([
+			const [st, s, r, rs, o, p, ds, dr, drw, dg] = await Promise.all([
 				api.singboxRouterStatus(),
 				api.singboxRouterGetSettings(),
 				api.singboxRouterListRules(),
@@ -74,21 +95,24 @@ function createSingboxRouterStore() {
 				api.singboxRouterListPresets(),
 				api.singboxRouterListDNSServers(),
 				api.singboxRouterListDNSRules(),
+				api.singboxRouterListDNSRewrites(),
 				api.singboxRouterGetDNSGlobals(),
 			]);
 			status.set(st);
 			settings.set(s);
-			rules.set(r);
-			ruleSets.set(rs);
+			setRulesWithKeys(r);
+			setRuleSetsForUI(rs);
 			outbounds.set(o);
 			presets.set(p);
 			dnsServers.set(ds);
 			dnsRules.set(dr);
+			dnsRewrites.set(drw);
 			dnsGlobals.set(dg);
 		} catch (e) {
 			error.set(e instanceof Error ? e.message : 'Не удалось загрузить singbox-router');
 		} finally {
 			loading.set(false);
+			initialized.set(true);
 		}
 		void loadStaging();
 	}
@@ -112,8 +136,8 @@ function createSingboxRouterStore() {
 				api.singboxRouterListOutbounds(),
 				api.singboxRouterStatus(),
 			]);
-			rules.set(r);
-			ruleSets.set(rs);
+			setRulesWithKeys(r);
+			setRuleSetsForUI(rs);
 			outbounds.set(o);
 			status.set(st);
 		} catch {
@@ -129,16 +153,28 @@ function createSingboxRouterStore() {
 		}
 	}
 
+	// reloadSettings is the settings counterpart of reloadStatus: a light
+	// primer for consumers that need routingMode before any sing-box tab has
+	// run loadAll (issue #420 — the tab bar mutes the dormant TProxy/FakeIP
+	// chip from `enabled && routingMode`, so both must be primed on page load).
+	async function reloadSettings(): Promise<void> {
+		try {
+			settings.set(await api.singboxRouterGetSettings());
+		} catch {
+			return;
+		}
+	}
+
 	function applyStatus(data: SingboxRouterStatus): void {
 		status.set(data);
 	}
 
 	function applyRules(data: SingboxRouterRule[]): void {
-		rules.set(data);
+		setRulesWithKeys(data);
 	}
 
 	function applyRuleSets(data: SingboxRouterRuleSet[]): void {
-		ruleSets.set(data);
+		setRuleSetsForUI(data);
 	}
 
 	function applyOutbounds(data: SingboxRouterOutbound[]): void {
@@ -153,6 +189,10 @@ function createSingboxRouterStore() {
 		dnsRules.set(data);
 	}
 
+	function applyDNSRewrites(data: SingboxRouterDNSRewrite[]): void {
+		dnsRewrites.set(data);
+	}
+
 	function applyDNSGlobals(data: SingboxRouterDNSGlobals): void {
 		dnsGlobals.set(data);
 	}
@@ -161,19 +201,23 @@ function createSingboxRouterStore() {
 		status: { subscribe: status.subscribe },
 		settings: { subscribe: settings.subscribe },
 		rules: { subscribe: rules.subscribe },
+		ruleUiKeys: { subscribe: ruleUiKeys.subscribe },
 		ruleSets: { subscribe: ruleSets.subscribe },
 		outbounds: { subscribe: outbounds.subscribe },
 		presets: { subscribe: presets.subscribe },
 		dnsServers: { subscribe: dnsServers.subscribe },
 		dnsRules: { subscribe: dnsRules.subscribe },
+		dnsRewrites: { subscribe: dnsRewrites.subscribe },
 		dnsGlobals: { subscribe: dnsGlobals.subscribe },
 		staging: { subscribe: staging.subscribe } as import('svelte/store').Readable<RouterStagingStatusResponse | null>,
 		options: { subscribe: options.subscribe },
 		optionsReady: { subscribe: optionsReady.subscribe },
 		loading: { subscribe: loading.subscribe },
+		initialized: { subscribe: initialized.subscribe },
 		error: { subscribe: error.subscribe },
 		loadAll,
 		reloadStatus,
+		reloadSettings,
 		loadStaging,
 		loadRulesSnapshot,
 		applyStatus,
@@ -182,6 +226,7 @@ function createSingboxRouterStore() {
 		applyOutbounds,
 		applyDNSServers,
 		applyDNSRules,
+		applyDNSRewrites,
 		applyDNSGlobals,
 		setSettings: settings.set,
 	};

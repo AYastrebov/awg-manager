@@ -54,7 +54,7 @@ func newTestQueries() (*query.Queries, *query.FakeGetter) {
 // newTestPolicyCommands builds a real *command.PolicyCommands wired to a fakePoster.
 func newTestPolicyCommands(q *query.Queries) (*command.PolicyCommands, *fakePoster) {
 	poster := &fakePoster{}
-	sc := command.NewSaveCoordinator(poster, nopPublisher{}, 500*time.Millisecond, 5*time.Second)
+	sc := command.NewSaveCoordinator(poster, nopPublisher{}, 500*time.Millisecond, 5*time.Second, 0, nil)
 	return command.NewPolicyCommands(poster, sc, q, nil), poster
 }
 

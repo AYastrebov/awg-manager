@@ -83,6 +83,30 @@ func TestApplyPatch_AppliesAllFieldsInOnePass(t *testing.T) {
 	}
 }
 
+func TestApplyPatch_DownloadSettingsPatch_PartialKindPreservesTag(t *testing.T) {
+	dst := Settings{
+		Download: DownloadSettings{
+			RouteTag:  "awg-1",
+			RouteKind: "awg",
+		},
+	}
+	kind := "singbox"
+	patch := SettingsPatch{
+		Download: &DownloadSettingsPatch{
+			RouteKind: &kind,
+		},
+	}
+
+	ApplyPatch(&dst, &patch)
+
+	if dst.Download.RouteTag != "awg-1" {
+		t.Fatalf("routeTag = %q, want awg-1", dst.Download.RouteTag)
+	}
+	if dst.Download.RouteKind != "singbox" {
+		t.Fatalf("routeKind = %q, want singbox", dst.Download.RouteKind)
+	}
+}
+
 type tSliceDst struct {
 	Items []string
 }
@@ -296,10 +320,56 @@ func containsSubstr(s, sub string) bool {
 	return false
 }
 
+// nonPatchableSettings are Settings fields intentionally kept OUT of the
+// SettingsPatch wire surface. They are server-internal bookkeeping written
+// only through dedicated atomic store methods (UpdateServerInterfaceMeta,
+// SetServerPeerSecret), never through /settings/update. serverPeerSecrets in
+// particular holds client WireGuard private keys, so exposing it on the
+// generic PATCH would let an authenticated caller overwrite or wipe key
+// material — see TestSettingsPatch_ExcludesServerSecrets.
+var nonPatchableSettings = map[string]struct{}{
+	"serverInterfaceMeta": {},
+	"serverPeerSecrets":   {},
+	// fakeip is backend-managed fakeip-tun operational state written ONLY via
+	// SettingsStore.SetOpkgTunState (the single-writer lifecycle). Exposing it on
+	// the generic PATCH surface would let an authenticated client PUT clobber
+	// the allocated OpkgTun index / provisioned flag — the exact race this
+	// design eliminates by keeping the state off the settings API.
+	"fakeip": {},
+	// policyTun is backend-managed policy-tun operational state written ONLY via
+	// SettingsStore.SetOpkgTunState — same single-writer reasoning as fakeip.
+	"policyTun": {},
+	// dnsChainPreset is backend-managed DNS-preset state written ONLY via
+	// SettingsStore.SetDNSChainPresetState — same single-writer reasoning as
+	// fakeip: a generic PUT must not silently switch/clear the preset.
+	"dnsChainPreset": {},
+	// opkgTun — единая backend-managed запись владения OpkgTun, пишется ТОЛЬКО
+	// SetOpkgTunState/SetOpkgTunNATSegments — та же single-writer логика, что у
+	// fakeip/policyTun (легаси-ключи остаются в списке: PATCH не должен уметь
+	// подсунуть их и после миграции).
+	"opkgTun": {},
+}
+
+// TestSettingsPatch_ExcludesServerSecrets pins the intentional exclusion: a
+// future change that "mirrors" these fields into SettingsPatch (the obvious
+// way to green the mirror test) would be a security regression, so assert
+// they are absent from the patch DTO.
+func TestSettingsPatch_ExcludesServerSecrets(t *testing.T) {
+	patchT := reflect.TypeOf(SettingsPatch{})
+	for tag := range nonPatchableSettings {
+		for i := 0; i < patchT.NumField(); i++ {
+			if strings.Split(patchT.Field(i).Tag.Get("json"), ",")[0] == tag {
+				t.Errorf("SettingsPatch must not expose %q (server-internal secret/bookkeeping)", tag)
+			}
+		}
+	}
+}
+
 // TestSettingsPatchMirrorsSettings enforces that every exported field in
 // Settings has a matching pointer field in SettingsPatch with the same
-// json tag. Catches drift at test time when a new Settings field lands
-// without a corresponding SettingsPatch entry.
+// json tag (except deliberately nonPatchableSettings). Catches drift at test
+// time when a new Settings field lands without a corresponding SettingsPatch
+// entry.
 func TestSettingsPatchMirrorsSettings(t *testing.T) {
 	settingsT := reflect.TypeOf(Settings{})
 	patchT := reflect.TypeOf(SettingsPatch{})
@@ -323,6 +393,11 @@ func TestSettingsPatchMirrorsSettings(t *testing.T) {
 		if tag == "" || tag == "-" {
 			continue
 		}
+		if _, skip := nonPatchableSettings[tag]; skip {
+			// Deliberately excluded from the wire PATCH surface — see
+			// nonPatchableSettings and TestSettingsPatch_ExcludesServerSecrets.
+			continue
+		}
 		patchF, ok := patchByTag[tag]
 		if !ok {
 			t.Errorf("Settings.%s (json:%q) has no corresponding field in SettingsPatch", f.Name, tag)
@@ -341,8 +416,51 @@ func TestSettingsPatchMirrorsSettings(t *testing.T) {
 			}
 		} else {
 			if patchF.Type.Elem() != f.Type {
+				// Nested patch struct is allowed (e.g. LoggingSettingsPatch
+				// for LoggingSettings) as long as both sides are structs.
+				if patchF.Type.Elem().Kind() == reflect.Struct && f.Type.Kind() == reflect.Struct {
+					continue
+				}
 				t.Errorf("SettingsPatch.%s: expected *%s, got %s", patchF.Name, f.Type, patchF.Type)
 			}
+		}
+	}
+}
+
+func TestLoggingSettingsPatchMirrorsLoggingSettings(t *testing.T) {
+	loggingT := reflect.TypeOf(LoggingSettings{})
+	patchT := reflect.TypeOf(LoggingSettingsPatch{})
+
+	patchByTag := map[string]reflect.StructField{}
+	for i := 0; i < patchT.NumField(); i++ {
+		f := patchT.Field(i)
+		tag := strings.Split(f.Tag.Get("json"), ",")[0]
+		if tag == "" || tag == "-" {
+			continue
+		}
+		patchByTag[tag] = f
+	}
+
+	for i := 0; i < loggingT.NumField(); i++ {
+		f := loggingT.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		tag := strings.Split(f.Tag.Get("json"), ",")[0]
+		if tag == "" || tag == "-" {
+			continue
+		}
+		patchF, ok := patchByTag[tag]
+		if !ok {
+			t.Errorf("LoggingSettings.%s (json:%q) has no corresponding field in LoggingSettingsPatch", f.Name, tag)
+			continue
+		}
+		if patchF.Type.Kind() != reflect.Pointer {
+			t.Errorf("LoggingSettingsPatch.%s (json:%q) must be a pointer, got %s", patchF.Name, tag, patchF.Type)
+			continue
+		}
+		if patchF.Type.Elem() != f.Type {
+			t.Errorf("LoggingSettingsPatch.%s: expected *%s, got %s", patchF.Name, f.Type, patchF.Type)
 		}
 	}
 }

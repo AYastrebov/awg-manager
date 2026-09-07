@@ -134,6 +134,11 @@ func TestParseRCIResponse_NoPeers(t *testing.T) {
 	if state.PeerOnline {
 		t.Error("expected PeerOnline=false with no peers")
 	}
+	// Нет peer-блока — значит хендшейка не было ни разу: ноль прочитался бы
+	// как «хендшейк только что» и спрятал бы залипший туннель (#702).
+	if state.LastHandshake != neverHandshake {
+		t.Errorf("LastHandshake = %d, want %d (never)", state.LastHandshake, neverHandshake)
+	}
 }
 
 func TestParseRCIResponse_NoWireguardSection(t *testing.T) {
@@ -156,45 +161,31 @@ func TestParseRCIResponse_NoWireguardSection(t *testing.T) {
 	}
 }
 
-func TestParseRCIInterfaceList(t *testing.T) {
-	data := []byte(`{
-		"ISP": {"id": "ISP", "type": "PPPoE"},
-		"Wireguard0": {"id": "Wireguard0", "type": "Wireguard"},
-		"OpkgTun10": {"id": "OpkgTun10", "type": "OpkgTun"},
-		"Wireguard1": {"id": "Wireguard1", "type": "Wireguard"}
-	}`)
-
-	names, err := parseRCIInterfaceList(data)
+func TestParseRCIInterfaceResponse_PeerEndpoint(t *testing.T) {
+	const j = `{
+      "id": "Wireguard0",
+      "link": "up",
+      "wireguard": {
+        "listen-port": 42109,
+        "status": "up",
+        "peer": [{
+          "public-key": "k",
+          "remote-port": 51958,
+          "remote-endpoint-address": "127.0.0.1",
+          "online": false,
+          "last-handshake": 200
+        }]
+      },
+      "summary": { "layer": { "conf": "running" } }
+    }`
+	state, err := parseRCIInterfaceResponse([]byte(j))
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("parse error: %v", err)
 	}
-	if len(names) != 2 {
-		t.Fatalf("expected 2 Wireguard interfaces, got %d", len(names))
+	if state.PeerRemoteAddr != "127.0.0.1" {
+		t.Errorf("PeerRemoteAddr = %q, want 127.0.0.1", state.PeerRemoteAddr)
 	}
-}
-
-func TestParseRCIInterfaceList_Empty(t *testing.T) {
-	data := []byte(`{}`)
-	names, err := parseRCIInterfaceList(data)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(names) != 0 {
-		t.Errorf("expected 0 names, got %d", len(names))
-	}
-}
-
-func TestParseRCIInterfaceList_NoWireguard(t *testing.T) {
-	data := []byte(`{
-		"ISP": {"id": "ISP", "type": "PPPoE"},
-		"OpkgTun10": {"id": "OpkgTun10", "type": "OpkgTun"}
-	}`)
-
-	names, err := parseRCIInterfaceList(data)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(names) != 0 {
-		t.Errorf("expected 0 names, got %d", len(names))
+	if state.PeerRemotePort != 51958 {
+		t.Errorf("PeerRemotePort = %d, want 51958", state.PeerRemotePort)
 	}
 }

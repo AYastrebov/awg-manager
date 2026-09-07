@@ -18,10 +18,16 @@ type fakeProber struct {
 	calls   atomic.Int64
 	latency int
 	ok      bool
+
+	mu    sync.Mutex
+	hosts []string
 }
 
-func (f *fakeProber) Probe(_ context.Context, _, _ string, _ time.Duration) (int, bool) {
+func (f *fakeProber) Probe(_ context.Context, host, _ string, _ time.Duration) (int, bool) {
 	f.calls.Add(1)
+	f.mu.Lock()
+	f.hosts = append(f.hosts, host)
+	f.mu.Unlock()
 	return f.latency, f.ok
 }
 
@@ -51,16 +57,16 @@ func TestScheduler_RunOnce_NoTunnels(t *testing.T) {
 	if len(snap.Tunnels) != 0 {
 		t.Errorf("expected 0 tunnels in snapshot, got %d", len(snap.Tunnels))
 	}
-	// Targets must include base 3 even with no tunnels.
-	if len(snap.Targets) != 3 {
-		t.Errorf("expected 3 base targets, got %d", len(snap.Targets))
+	// Self-only: no tunnels means no self-targets.
+	if len(snap.Targets) != 0 {
+		t.Errorf("expected 0 targets with no tunnels, got %d", len(snap.Targets))
 	}
 	if len(snap.Cells) != 0 {
 		t.Errorf("expected 0 cells with no tunnels, got %d", len(snap.Cells))
 	}
 }
 
-func TestScheduler_RunOnce_TwoTunnelsThreeBaseTargets(t *testing.T) {
+func TestScheduler_RunOnce_TwoTunnelsSelfOnly(t *testing.T) {
 	prober := &fakeProber{ok: true, latency: 14}
 	hist := NewHistory()
 	sched := NewScheduler(SchedulerDeps{
@@ -74,19 +80,19 @@ func TestScheduler_RunOnce_TwoTunnelsThreeBaseTargets(t *testing.T) {
 
 	sched.RunOnce(context.Background())
 
-	// Targets: 3 base + 1 shared self-target (gstatic) deduplicated by host
-	// because both tunnels default to method=http with no explicit pingTarget.
-	// Cells: 4 targets × 2 tunnels = 8.
-	expected := int64(4 * 2)
+	// Self-only: 1 shared self-target (gstatic) deduplicated by host because
+	// both tunnels default to method=http. Each tunnel probes only its own
+	// self-cell → 2 cells, 2 probes.
+	expected := int64(2)
 	if prober.calls.Load() != expected {
 		t.Errorf("expected %d probes, got %d", expected, prober.calls.Load())
 	}
 	snap := sched.LatestSnapshot()
-	if len(snap.Targets) != 4 {
-		t.Errorf("expected 4 targets (3 base + 1 self), got %d", len(snap.Targets))
+	if len(snap.Targets) != 1 {
+		t.Errorf("expected 1 self target (deduped gstatic), got %d", len(snap.Targets))
 	}
-	if len(snap.Cells) != 8 {
-		t.Errorf("expected 8 cells, got %d", len(snap.Cells))
+	if len(snap.Cells) != 2 {
+		t.Errorf("expected 2 cells (one self-cell per tunnel), got %d", len(snap.Cells))
 	}
 	selfCells := 0
 	for _, c := range snap.Cells {
@@ -103,8 +109,8 @@ func TestScheduler_RunOnce_TwoTunnelsThreeBaseTargets(t *testing.T) {
 	if selfCells != 2 {
 		t.Errorf("expected 2 IsSelf cells (one per tunnel), got %d", selfCells)
 	}
-	if len(hist.Get("cf-1.1.1.1", "tn-A", 0)) != 1 {
-		t.Errorf("expected 1 history sample for cf × tn-A")
+	if len(hist.Get("cc-connectivitycheck.gstatic.com", "tn-A", 0)) != 1 {
+		t.Errorf("expected 1 history sample for self-cell × tn-A")
 	}
 }
 
@@ -124,8 +130,8 @@ func TestScheduler_RunOnce_PrunesStaleHistory(t *testing.T) {
 	if len(hist.Get("cf-1.1.1.1", "tn-old", 0)) != 0 {
 		t.Errorf("stale history for tn-old should be pruned")
 	}
-	if len(hist.Get("cf-1.1.1.1", "tn-A", 0)) != 1 {
-		t.Errorf("history for tn-A should be present")
+	if len(hist.Get("cc-connectivitycheck.gstatic.com", "tn-A", 0)) != 1 {
+		t.Errorf("history for tn-A self-cell should be present")
 	}
 }
 
@@ -155,7 +161,7 @@ func TestScheduler_RunOnce_ExcludesConfiguredTunnels(t *testing.T) {
 		t.Fatalf("load settings: %v", err)
 	}
 	settings.MonitoringExcludedTunnels = []string{"tn-B"}
-	if err := settingsStore.Save(settings); err != nil {
+	if err := settingsStore.Update(func(cur *storage.Settings) error { *cur = *settings; return nil }); err != nil {
 		t.Fatalf("save settings: %v", err)
 	}
 
@@ -178,6 +184,40 @@ func TestScheduler_RunOnce_ExcludesConfiguredTunnels(t *testing.T) {
 		if c.TunnelID == "tn-B" {
 			t.Fatalf("excluded tunnel tn-B must not appear in cells, got %+v", c)
 		}
+	}
+}
+
+// HTTP-метод: зонд получает настроенный URL проверки связи целиком, а не
+// зашитый gstatic:443 — иначе индикатор карточки и кнопка «Тест» проверяют
+// разные вещи и спорят друг с другом.
+func TestScheduler_RunOnce_SelfTargetFromConnectivityCheckURL(t *testing.T) {
+	prober := &fakeProber{ok: true, latency: 12}
+	hist := NewHistory()
+	settingsStore := storage.NewSettingsStore(t.TempDir())
+	if err := settingsStore.Update(func(cur *storage.Settings) error {
+		cur.ConnectivityCheckURL = "http://cp.cloudflare.com/generate_204"
+		return nil
+	}); err != nil {
+		t.Fatalf("save settings: %v", err)
+	}
+
+	sched := NewScheduler(SchedulerDeps{
+		TunnelLister:  &fakeLister{tunnels: []traffic.RunningTunnel{{ID: "tn-A", IfaceName: "wg0"}}},
+		SettingsStore: settingsStore,
+		Prober:        prober,
+	}, hist)
+
+	sched.RunOnce(context.Background())
+
+	snap := sched.LatestSnapshot()
+	if len(snap.Targets) != 1 || snap.Targets[0].Host != "cp.cloudflare.com" {
+		t.Fatalf("expected self target host from settings URL, got %+v", snap.Targets)
+	}
+	prober.mu.Lock()
+	hosts := append([]string(nil), prober.hosts...)
+	prober.mu.Unlock()
+	if len(hosts) != 1 || hosts[0] != "http://cp.cloudflare.com/generate_204" {
+		t.Fatalf("expected probe of the configured URL, got %v", hosts)
 	}
 }
 
@@ -210,7 +250,7 @@ func TestScheduler_RunOnce_ExcludesConfiguredSystemAndSingboxTunnels(t *testing.
 	// sys-* ids are formed as "sys-"+SystemTunnelInfo.ID in collectTunnels;
 	// sing-box ids are raw outbound tags.
 	settings.MonitoringExcludedTunnels = []string{"sys-Wireguard2", "veesp"}
-	if err := settingsStore.Save(settings); err != nil {
+	if err := settingsStore.Update(func(cur *storage.Settings) error { *cur = *settings; return nil }); err != nil {
 		t.Fatalf("save settings: %v", err)
 	}
 
@@ -323,7 +363,7 @@ type fakeSingboxDelay struct {
 	err     error
 }
 
-func (f *fakeSingboxDelay) TestDelay(outboundTag, testURL string, _ time.Duration) (int, error) {
+func (f *fakeSingboxDelay) TestDelay(_ context.Context, outboundTag, testURL string, _ time.Duration) (int, error) {
 	f.calls.Add(1)
 	f.mu.Lock()
 	f.lastTag = outboundTag
@@ -335,7 +375,9 @@ func (f *fakeSingboxDelay) TestDelay(outboundTag, testURL string, _ time.Duratio
 	return f.delay, nil
 }
 
-func TestScheduler_RunOnce_SingboxRowsUseClashDelay(t *testing.T) {
+func TestScheduler_RunOnce_SingboxRowsHaveNoSelfCells(t *testing.T) {
+	// Sing-box tunnels carry no SelfTarget, so under the self-only contract
+	// they produce no matrix cells. The AWG tunnel still gets its self-cell.
 	httpProber := &fakeProber{ok: true, latency: 14}
 	clashDelay := &fakeSingboxDelay{delay: 87}
 	hist := NewHistory()
@@ -356,69 +398,32 @@ func TestScheduler_RunOnce_SingboxRowsUseClashDelay(t *testing.T) {
 	awgCells := 0
 	sbCells := 0
 	for _, c := range snap.Cells {
-		if c.TunnelID == "veesp" {
+		switch c.TunnelID {
+		case "veesp":
 			sbCells++
-			if !c.OK || c.LatencyMs == nil || *c.LatencyMs != 87 {
-				t.Errorf("sing-box cell expected latency=87 ok=true, got %+v", c)
-			}
-		}
-		if c.TunnelID == "tn-A" {
+		case "tn-A":
 			awgCells++
 			if !c.OK || c.LatencyMs == nil || *c.LatencyMs != 14 {
-				t.Errorf("awg cell expected latency=14 ok=true, got %+v", c)
+				t.Errorf("awg self-cell expected latency=14 ok=true, got %+v", c)
+			}
+			if !c.IsSelf {
+				t.Errorf("awg cell expected IsSelf=true, got %+v", c)
 			}
 		}
 	}
-	if sbCells == 0 || awgCells == 0 {
-		t.Fatalf("expected cells for both rows, got sb=%d awg=%d", sbCells, awgCells)
+	if sbCells != 0 {
+		t.Errorf("expected 0 sing-box cells (no SelfTarget), got %d", sbCells)
 	}
-	// 3 BaseTargets + 1 default self-target for the AWG tunnel = 4 targets
-	// shared with sing-box; sing-box probes only the 3 base ones (no self).
-	// Probe count for HTTPProber should be awg-only (4 cells × 1 awg tunnel).
-	if httpProber.calls.Load() != int64(awgCells) {
-		t.Errorf("HTTPProber called %d times, expected %d (awg cells only)",
-			httpProber.calls.Load(), awgCells)
+	if awgCells != 1 {
+		t.Errorf("expected 1 awg self-cell, got %d", awgCells)
 	}
-	// SingboxDelay called once per sing-box cell.
-	if clashDelay.calls.Load() != int64(sbCells) {
-		t.Errorf("SingboxDelay called %d times, expected %d (sb cells)",
-			clashDelay.calls.Load(), sbCells)
+	// HTTPProber probes only the AWG self-cell; SingboxDelay is never reached
+	// because no sing-box cell is created.
+	if httpProber.calls.Load() != 1 {
+		t.Errorf("HTTPProber called %d times, expected 1 (awg self-cell only)", httpProber.calls.Load())
 	}
-	// Confirm the URL passed to SingboxDelay matches a BaseTarget URL.
-	clashDelay.mu.Lock()
-	gotTag := clashDelay.lastTag
-	gotURL := clashDelay.lastURL
-	clashDelay.mu.Unlock()
-	if gotTag != "veesp" {
-		t.Errorf("SingboxDelay tag = %q, want veesp", gotTag)
-	}
-	if gotURL == "" || gotURL[:5] != "https" {
-		t.Errorf("SingboxDelay URL = %q, want https://...", gotURL)
-	}
-}
-
-func TestScheduler_RunOnce_SingboxDelayErrorMarksCellNotOK(t *testing.T) {
-	httpProber := &fakeProber{ok: true, latency: 14}
-	clashDelay := &fakeSingboxDelay{err: errFakeDelay}
-	hist := NewHistory()
-	sched := NewScheduler(SchedulerDeps{
-		TunnelLister: &fakeLister{},
-		SingboxTunnels: &fakeSingboxTunnels{items: []SingboxTunnelInfo{
-			{Tag: "veesp", Name: "veesp", InterfaceName: "t2s0"},
-		}},
-		Prober:       httpProber,
-		SingboxDelay: clashDelay,
-	}, hist)
-
-	sched.RunOnce(context.Background())
-
-	for _, c := range sched.LatestSnapshot().Cells {
-		if c.TunnelID == "veesp" && (c.OK || c.LatencyMs != nil) {
-			t.Errorf("expected sing-box cell to be not-OK on TestDelay error, got %+v", c)
-		}
-	}
-	if httpProber.calls.Load() != 0 {
-		t.Errorf("HTTPProber must NOT be called for sing-box rows when SingboxDelay is wired, got %d", httpProber.calls.Load())
+	if clashDelay.calls.Load() != 0 {
+		t.Errorf("SingboxDelay called %d times, expected 0 (no sing-box cells)", clashDelay.calls.Load())
 	}
 }
 

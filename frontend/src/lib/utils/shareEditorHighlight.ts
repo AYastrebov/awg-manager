@@ -7,7 +7,7 @@ function escapeHtml(text: string): string {
 }
 
 const PROTO_CORE =
-	'naive\\+https://|naive\\+http://|hysteria2://|vless://|hy2://|trojan://|ss://';
+	'naive\\+https://|naive\\+http://|hysteria2://|vless://|hy2://|trojan://|ss://|mierus://|mieru://';
 
 /** Match scheme at line start / after indent / after whitespace (not inside HTML). */
 const PROTO_IN_ESCAPED = new RegExp(
@@ -49,7 +49,45 @@ function looksJsonStructure(raw: string): boolean {
 	return t.startsWith('{') || t.startsWith('[');
 }
 
-function highlightJson(src: string): string {
+/** `"key"` before `:` is an object property name, not a string value. */
+function isJsonObjectKeyAfter(src: string, indexAfterCloseQuote: number): boolean {
+	let j = indexAfterCloseQuote;
+	while (j < src.length && (src[j] === ' ' || src[j] === '\t' || src[j] === '\n' || src[j] === '\r')) {
+		j++;
+	}
+	return j < src.length && src[j] === ':';
+}
+
+function highlightJsonQuotedString(src: string, openIndex: number): { html: string; nextIndex: number } {
+	let i = openIndex + 1;
+	const n = src.length;
+	let inner = '';
+	let closed = false;
+
+	while (i < n) {
+		const d = src[i];
+		if (d === '\\' && i + 1 < n) {
+			inner += escapeHtml(d) + escapeHtml(src[i + 1]);
+			i += 2;
+			continue;
+		}
+		if (d === '"') {
+			i++;
+			closed = true;
+			break;
+		}
+		inner += escapeHtml(d);
+		i++;
+	}
+
+	const cls = closed && isJsonObjectKeyAfter(src, i) ? 'hl-json-key' : 'hl-json-str';
+	let html = `<span class="${cls}">"${inner}`;
+	if (closed) html += '"</span>';
+	else html += '</span>';
+	return { html, nextIndex: i };
+}
+
+export function highlightJson(src: string): string {
 	let i = 0;
 	const n = src.length;
 	let out = '';
@@ -64,29 +102,9 @@ function highlightJson(src: string): string {
 			continue;
 		}
 		if (c === '"') {
-			out += '<span class="hl-json-str">';
-			out += '"';
-			i++;
-			let closed = false;
-			while (i < n) {
-				const d = src[i];
-				if (d === '\\' && i + 1 < n) {
-					out += escapeHtml(d) + escapeHtml(src[i + 1]);
-					i += 2;
-					continue;
-				}
-				if (d === '"') {
-					out += '"</span>';
-					i++;
-					closed = true;
-					break;
-				}
-				out += escapeHtml(d);
-				i++;
-			}
-			if (!closed) {
-				out += '</span>';
-			}
+			const quoted = highlightJsonQuotedString(src, i);
+			out += quoted.html;
+			i = quoted.nextIndex;
 			continue;
 		}
 		if (punct.has(c)) {
@@ -183,7 +201,7 @@ function highlightMixedYamlAndLinks(raw: string): string {
 	const lines = raw.split('\n');
 	const parts: string[] = [];
 	for (let li = 0; li < lines.length; li++) {
-		parts.push(highlightYamlOrPlainLine(lines[li]!));
+		parts.push(highlightYamlOrPlainLine(lines[li]));
 		if (li < lines.length - 1) parts.push('\n');
 	}
 	return parts.join('');

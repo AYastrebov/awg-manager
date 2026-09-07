@@ -1,7 +1,9 @@
 <script lang="ts">
 	import { Modal } from '$lib/components/ui';
+	import SettingsSectionLabel from './SettingsSectionLabel.svelte';
 	import type { UsageLevel } from '$lib/types/usageLevel';
 	import { USAGE_LEVEL_LABELS } from '$lib/types/usageLevel';
+	import { SlidersHorizontal, ChevronDown, Info, Check } from 'lucide-svelte';
 
 	interface Props {
 		value: UsageLevel;
@@ -29,7 +31,7 @@
 				'AmneziaWG-туннели',
 				'Системные WireGuard-туннели',
 				'Диагностика и проверки',
-				'Маршрутизация: VPN для устройств и политики доступа',
+				'Маршрутизация: NDMS и VPN для устройств',
 				'Карточка «Система»: базовые данные',
 			],
 		},
@@ -41,10 +43,12 @@
 				'Всё из уровня "Базовый"',
 				'SingBox-туннели и подписки',
 				'Серверы WireGuard и DeviceProxy',
-				'Маршрутизация: DNS, IP-адреса, Sing-box Router',
+				'Маршрутизация: политики доступа, IP-адреса, Sing-box Router',
 				'Веб-терминал и режим списка для AWG',
 				'Системный мониторинг',
 				'Карточка «Система»: добавляются данные по железу',
+				'Настройка цветовой схемы',
+				'Компактная ширина интерфейса (опционально)',
 			],
 		},
 		{
@@ -56,7 +60,6 @@
 			    'HydraRoute Neo', 
 				'Sing-box Router', 
 				'Проверка конфигурации AWG',
-				'Настройка цветовой схемы',
 				'Создание API-ключа',
 				'Карточка «Система»: полные подробные данные + спойлер',
 			],
@@ -82,37 +85,31 @@
 	}
 </script>
 
-<div class="card" class:highlighted>
-	<button
-		type="button"
-		class="collapsible-header"
-		aria-expanded={expanded}
-		aria-controls="usage-level-body"
-		onclick={() => (expanded = !expanded)}
-	>
-		<span class="section-label">Уровень использования</span>
-		<span class="header-meta">
+<div class="settings-block">
+	<div class="card" class:highlighted>
+	<SettingsSectionLabel label="Общие" icon={SlidersHorizontal} tone="slate" header />
+	<div class="setting-row level-header-row">
+		<div class="flex flex-col gap-1">
+			<span class="font-medium">Уровень использования</span>
+			<span class="setting-description">
+				Скрывает разделы, которые вам не нужны. Данные при понижении уровня не удаляются.
+			</span>
+		</div>
+		<button
+			type="button"
+			class="level-expand-control"
+			aria-expanded={expanded}
+			aria-controls="usage-level-picker"
+			aria-label="Показать или скрыть выбор уровня"
+			onclick={() => (expanded = !expanded)}
+		>
 			<span class="current-level">{USAGE_LEVEL_LABELS[value]}</span>
-			<svg
-				class="chevron"
-				class:open={expanded}
-				viewBox="0 0 24 24"
-				fill="none"
-				stroke="currentColor"
-				stroke-width="2"
-				aria-hidden="true"
-			>
-				<polyline points="6 9 12 15 18 9" />
-			</svg>
-		</span>
-	</button>
+			<span class="chevron" class:open={expanded} aria-hidden="true"><ChevronDown size={14} strokeWidth={2} /></span>
+		</button>
+	</div>
 
 	{#if expanded}
-		<div id="usage-level-body" class="collapsible-body">
-			<p class="card-hint">
-				Скрывает разделы, которые вам не нужны. Данные при понижении уровня не удаляются.
-			</p>
-
+		<div id="usage-level-picker" class="level-picker">
 			<div
 				class="level-grid"
 				role="radiogroup"
@@ -142,18 +139,14 @@
 								}
 							}}
 						>
-							<svg viewBox="0 0 24 24" aria-hidden="true">
-								<circle cx="12" cy="12" r="10" />
-								<line x1="12" y1="11" x2="12" y2="17" />
-								<circle cx="12" cy="7.5" r="0.8" />
-							</svg>
+							<Info size={12} strokeWidth={2} aria-hidden="true" />
 						</span>
 
 						<div class="level-title">{opt.title}</div>
 
 						{#if selected}
 							<span class="level-check" aria-hidden="true">
-								<svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+								<Check size={14} strokeWidth={2} />
 							</span>
 						{/if}
 					</button>
@@ -161,6 +154,7 @@
 			</div>
 		</div>
 	{/if}
+	</div>
 </div>
 
 <Modal
@@ -182,9 +176,7 @@
 					{#each infoOpt.includes as item}
 						<li class="level-info-item">
 							<span class="level-info-bullet" aria-hidden="true">
-								<svg viewBox="0 0 24 24">
-									<path d="M20 6 9 17l-5-5" />
-								</svg>
+								<Check size={14} strokeWidth={2} />
 							</span>
 							<span>{item}</span>
 						</li>
@@ -196,38 +188,44 @@
 </Modal>
 
 <style>
-	.collapsible-header {
-		display: flex;
+	.level-header-row {
 		align-items: center;
-		justify-content: space-between;
-		width: 100%;
-		min-width: 0;
+	}
+
+	@media (max-width: 640px) {
+		.level-header-row {
+			flex-direction: row;
+			align-items: center;
+			flex-wrap: nowrap;
+			gap: 0.75rem;
+		}
+
+		.level-header-row > *:first-child {
+			flex: 1 1 auto;
+			min-width: 0;
+		}
+	}
+
+	.level-expand-control {
+		display: inline-flex;
+		align-items: center;
 		gap: 0.5rem;
+		flex-shrink: 0;
 		background: transparent;
 		border: 0;
 		padding: 0;
 		margin: 0;
-		color: inherit;
-		font: inherit;
+		color: var(--color-text-muted);
+		font-size: 0.8125rem;
 		cursor: pointer;
-		text-align: left;
 	}
-	.collapsible-header > .section-label {
-		min-width: 0;
-		flex-shrink: 1;
-	}
-	.collapsible-header:focus-visible {
+
+	.level-expand-control:focus-visible {
 		outline: 2px solid var(--color-accent);
 		outline-offset: 2px;
 		border-radius: var(--radius-sm);
 	}
-	.header-meta {
-		display: inline-flex;
-		align-items: center;
-		gap: 0.5rem;
-		color: var(--color-text-muted);
-		font-size: 0.8125rem;
-	}
+
 	.current-level {
 		color: var(--color-text-secondary);
 		white-space: nowrap;
@@ -235,22 +233,24 @@
 		text-overflow: ellipsis;
 		max-width: 8rem;
 	}
+
 	.chevron {
+		display: inline-flex;
 		width: 14px;
 		height: 14px;
 		transition: transform var(--t-fast) ease;
 	}
+
 	.chevron.open {
 		transform: rotate(180deg);
 	}
 
-	.collapsible-body {
-		margin-top: 0.75rem;
+	.level-picker {
+		border-top: 1px solid var(--color-border);
 	}
-	.card-hint {
-		color: var(--color-text-muted);
-		font-size: 0.8125rem;
-		margin: 0 0 0.75rem 0;
+
+	.level-picker .level-grid {
+		padding-top: 0.875rem;
 	}
 
 	.level-grid {
@@ -268,7 +268,7 @@
 		position: relative;
 		text-align: center;
 		padding: 0.625rem 0.5rem;
-		background: var(--color-bg-tertiary);
+		background: var(--color-settings-control-bg);
 		border: 1px solid var(--color-border);
 		border-radius: var(--radius-md);
 		color: inherit;
@@ -312,14 +312,6 @@
 		height: 14px;
 		color: var(--color-accent);
 	}
-	.level-check svg {
-		width: 100%;
-		height: 100%;
-		fill: none;
-		stroke: currentColor;
-		stroke-width: 2;
-	}
-
 	.info-btn {
 		position: absolute;
 		top: 0.375rem;
@@ -340,14 +332,6 @@
 		outline: 2px solid var(--color-accent);
 		outline-offset: 2px;
 	}
-	.info-btn svg {
-		width: 12px;
-		height: 12px;
-		fill: none;
-		stroke: currentColor;
-		stroke-width: 2;
-	}
-
 	.level-info-panel {
 		display: flex;
 		flex-direction: column;
@@ -356,7 +340,7 @@
 
 	.level-info-summary {
 		padding: 0.875rem 1rem;
-		background: var(--color-bg-tertiary);
+		background: var(--color-settings-control-bg);
 		border: 1px solid var(--color-border);
 		border-radius: var(--radius-md);
 	}
@@ -399,7 +383,7 @@
 		align-items: flex-start;
 		gap: 0.75rem;
 		padding: 0.75rem 0.875rem;
-		background: var(--color-bg-tertiary);
+		background: var(--color-settings-control-bg);
 		border: 1px solid var(--color-border);
 		border-radius: var(--radius-md);
 		line-height: 1.45;
@@ -419,15 +403,7 @@
 		color: var(--color-accent);
 	}
 
-	.level-info-bullet svg {
-		width: 0.875rem;
-		height: 0.875rem;
-		fill: none;
-		stroke: currentColor;
-		stroke-linecap: round;
-		stroke-linejoin: round;
-		stroke-width: 2;
-	}
+
 
 	.card.highlighted {
 		animation: usage-level-glow 2.8s ease-out forwards;
@@ -441,5 +417,59 @@
 		65%  { box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent) 15%, transparent); }
 		82%  { box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-accent) 22%, transparent), 0 0 8px 1px color-mix(in srgb, var(--color-accent) 10%, transparent); }
 		100% { box-shadow: none; }
+	}
+
+	@media (max-width: 640px) {
+		.level-header-row {
+			flex-direction: column;
+			align-items: stretch;
+			flex-wrap: nowrap;
+			gap: 0.625rem;
+		}
+
+		.level-header-row > *:first-child {
+			width: 100%;
+		}
+
+		.level-expand-control {
+			width: 100%;
+			box-sizing: border-box;
+			justify-content: space-between;
+			padding: 0.45rem 0.625rem;
+			border: 1px solid var(--color-border);
+			border-radius: var(--radius-sm);
+			background: var(--color-settings-control-bg);
+		}
+
+		.current-level {
+			max-width: none;
+		}
+	}
+
+	@media (min-width: 641px) {
+		.level-header-row {
+			display: grid;
+			grid-template-columns: minmax(0, 1fr);
+			align-items: stretch;
+			gap: 0.75rem;
+		}
+
+		.level-header-row > *:first-child {
+			width: 100%;
+		}
+
+		.level-expand-control {
+			width: 100%;
+			box-sizing: border-box;
+			justify-content: space-between;
+			padding: 0.45rem 0.625rem;
+			border: 1px solid var(--color-border);
+			border-radius: var(--radius-sm);
+			background: var(--color-settings-control-bg);
+		}
+
+		.current-level {
+			max-width: none;
+		}
 	}
 </style>

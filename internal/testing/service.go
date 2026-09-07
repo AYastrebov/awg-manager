@@ -6,7 +6,6 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/hoaxisr/awg-manager/internal/logger"
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 	"github.com/hoaxisr/awg-manager/internal/tunnel"
@@ -26,17 +25,26 @@ func IsAWGID(id string) bool {
 // Service provides tunnel testing operations.
 type Service struct {
 	awgStore *storage.AWGTunnelStore
-	log      *logger.Logger
+	settings *storage.SettingsStore
 	appLog   *logging.ScopedLogger
+	// connTracker классифицирует исходы connectivity-проверок по туннелям:
+	// в журнал попадают переходы (Warn на отказ, Info на восстановление),
+	// повторы одного и того же исхода — только Debug.
+	connTracker *logging.TransitionTracker
 }
 
 // NewService creates a new testing service.
-func NewService(awgStore *storage.AWGTunnelStore, log *logger.Logger, appLogger logging.AppLogger) *Service {
+func NewService(awgStore *storage.AWGTunnelStore, appLogger logging.AppLogger) *Service {
 	return &Service{
-		awgStore: awgStore,
-		log:      log,
-		appLog:   logging.NewScopedLogger(appLogger, logging.GroupTunnel, logging.SubTest),
+		awgStore:    awgStore,
+		appLog:      logging.NewScopedLogger(appLogger, logging.GroupTunnel, logging.SubTest),
+		connTracker: logging.NewTransitionTracker(),
 	}
+}
+
+// SetSettingsStore wires global settings for runtime test defaults.
+func (s *Service) SetSettingsStore(settings *storage.SettingsStore) {
+	s.settings = settings
 }
 
 // GetAWG returns an AWG tunnel by ID, or nil if not found.
@@ -51,26 +59,17 @@ func (s *Service) InterfaceExists(iface string) bool {
 	return err == nil
 }
 
-// GetInterface returns the network interface name for a tunnel.
-func (s *Service) GetInterface(id string) (string, error) {
-	if !IsAWGID(id) {
+// GetInterfaceName returns the kernel interface name for a tunnel.
+func (s *Service) GetInterfaceName(id string) (string, error) {
+	if !s.isManagedTestTunnel(id) {
 		return "", ErrInvalidTunnelID
 	}
 	return s.resolveIfaceName(id), nil
 }
 
-// GetCurlOptions returns curl command-line arguments for routing traffic through the tunnel.
-func (s *Service) GetCurlOptions(id string) ([]string, error) {
-	if !IsAWGID(id) {
-		return nil, ErrInvalidTunnelID
-	}
-	iface := s.resolveIfaceName(id)
-	return []string{"--interface", iface}, nil
-}
-
 // CheckTunnelRunning validates that the tunnel is available for testing.
 func (s *Service) CheckTunnelRunning(id string) error {
-	if !IsAWGID(id) {
+	if !s.isManagedTestTunnel(id) {
 		return ErrInvalidTunnelID
 	}
 
@@ -83,16 +82,32 @@ func (s *Service) CheckTunnelRunning(id string) error {
 }
 
 // resolveIfaceName returns the kernel interface name for a tunnel,
-// using NativeWG names (nwgN) for nativewg backend, kernel names (opkgtunN) otherwise.
+// using NativeWG names (nwgN) for nativewg backend, wdtt-raw live iface otherwise.
 func (s *Service) resolveIfaceName(id string) string {
-	if stored := s.GetAWG(id); stored != nil && stored.Backend == "nativewg" {
-		return nwg.NewNWGNames(stored.NWGIndex).IfaceName
+	if stored := s.GetAWG(id); stored != nil {
+		if stored.Backend == "nativewg" {
+			return nwg.NewNWGNames(stored.NWGIndex).IfaceName
+		}
+		if stored.Backend == "wdtt-raw" && strings.TrimSpace(stored.RawKernelIface) != "" {
+			return strings.TrimSpace(stored.RawKernelIface)
+		}
 	}
 	return tunnel.NewNames(id).IfaceName
 }
 
+// isManagedTestTunnel reports whether id refers to an AWG-manager tunnel we can test.
+func (s *Service) isManagedTestTunnel(id string) bool {
+	if IsAWGID(id) {
+		return true
+	}
+	if stored := s.GetAWG(id); stored != nil && stored.Backend == "wdtt-raw" {
+		return true
+	}
+	return false
+}
+
 // GetWANInterface returns the active WAN kernel interface for a tunnel.
-// Returns empty string if unknown (will fall back to unbound curl).
+// Returns empty string if unknown (will fall back to default route).
 func (s *Service) GetWANInterface(tunnelID string) string {
 	t := s.GetAWG(tunnelID)
 	if t == nil {

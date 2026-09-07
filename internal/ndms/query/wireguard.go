@@ -89,6 +89,7 @@ type rciWireguardDetail struct {
 type rciWireguardPeer struct {
 	PublicKey             string `json:"public-key"`
 	Description           string `json:"description"`
+	Comment               string `json:"comment"`
 	RemoteEndpointAddress string `json:"remote-endpoint-address"`
 	RemotePort            int    `json:"remote-port"`
 	Via                   string `json:"via"`
@@ -140,16 +141,11 @@ type WGServerStore struct {
 	interfaces *InterfaceStore // for ResolveSystemName (memoised)
 
 	// per-name server snapshot (runtime only).
-	items   *cache.TTL[string, *ndms.WireguardServer]
-	itemsSF *cache.SingleFlight[string, *ndms.WireguardServer]
-
+	items *cache.KeyedStore[string, *ndms.WireguardServer]
 	// per-name RC config.
-	rc   *cache.TTL[string, *ndms.WireguardServerConfig]
-	rcSF *cache.SingleFlight[string, *ndms.WireguardServerConfig]
-
-	// ASC params (raw JSON, per-name, encoded for the caller-selected shape).
-	asc   *cache.TTL[string, json.RawMessage]
-	ascSF *cache.SingleFlight[string, json.RawMessage]
+	rc *cache.KeyedStore[string, *ndms.WireguardServerConfig]
+	// ASC params (raw JSON, per-name, keyed by name+shape).
+	asc *cache.KeyedStore[string, json.RawMessage]
 }
 
 // NewWGServerStore constructs the store with production TTLs. Takes
@@ -168,53 +164,37 @@ func NewWGServerStoreWithTTL(g Getter, log Logger, ifaces *InterfaceStore, listT
 		getter:     g,
 		log:        log,
 		interfaces: ifaces,
-		items:      cache.NewTTL[string, *ndms.WireguardServer](itemTTL),
-		itemsSF:    cache.NewSingleFlight[string, *ndms.WireguardServer](),
-		rc:         cache.NewTTL[string, *ndms.WireguardServerConfig](rcTTL),
-		rcSF:       cache.NewSingleFlight[string, *ndms.WireguardServerConfig](),
-		asc:        cache.NewTTL[string, json.RawMessage](rcTTL),
-		ascSF:      cache.NewSingleFlight[string, json.RawMessage](),
 	}
+	s.items = cache.NewKeyedStore(itemTTL, log, "wg server", s.fetchItem)
+	s.rc = cache.NewKeyedStore(rcTTL, log, "wg server config", s.fetchConfig)
+	s.asc = cache.NewKeyedStore(rcTTL, log, "wg asc", s.fetchASCByKey)
 	s.ListStore = cache.NewListStore(listTTL, log, "wg server list", s.fetchAll)
 	return s
 }
 
+// ascKey encodes the (name, shape) pair used as the ASC cache key.
+func ascKey(name string, extended bool) string {
+	if extended {
+		return name + ":ext"
+	}
+	return name + ":base"
+}
+
+// fetchASCByKey adapts fetchASC to the KeyedStore fetch shape, decoding the
+// composite name:shape key.
+func (s *WGServerStore) fetchASCByKey(ctx context.Context, key string) (json.RawMessage, error) {
+	i := strings.LastIndex(key, ":")
+	return s.fetchASC(ctx, key[:i], key[i+1:] == "ext")
+}
+
 // Get returns a single WG server's runtime snapshot.
 func (s *WGServerStore) Get(ctx context.Context, name string) (*ndms.WireguardServer, error) {
-	if v, ok := s.items.Get(name); ok {
-		return v, nil
-	}
-	return s.itemsSF.Do(name, func() (*ndms.WireguardServer, error) {
-		v, err := s.fetchItem(ctx, name)
-		if err != nil {
-			if stale, ok := s.items.Peek(name); ok {
-				s.log.Warnf("wg server %s fetch failed, serving stale cache: %v", name, err)
-				return stale, nil
-			}
-			return nil, err
-		}
-		s.items.Set(name, v)
-		return v, nil
-	})
+	return s.items.Get(ctx, name)
 }
 
 // GetConfig returns the merged (runtime + RC) WG server config.
 func (s *WGServerStore) GetConfig(ctx context.Context, name string) (*ndms.WireguardServerConfig, error) {
-	if v, ok := s.rc.Get(name); ok {
-		return v, nil
-	}
-	return s.rcSF.Do(name, func() (*ndms.WireguardServerConfig, error) {
-		v, err := s.fetchConfig(ctx, name)
-		if err != nil {
-			if stale, ok := s.rc.Peek(name); ok {
-				s.log.Warnf("wg server config %s fetch failed, serving stale cache: %v", name, err)
-				return stale, nil
-			}
-			return nil, err
-		}
-		s.rc.Set(name, v)
-		return v, nil
-	})
+	return s.rc.Get(ctx, name)
 }
 
 // FindFreeIndex returns the next free WireguardN slot in [1,99].
@@ -231,7 +211,8 @@ func (s *WGServerStore) FindFreeIndex(ctx context.Context) (int, error) {
 			}
 		}
 	}
-	for i := 1; i < 100; i++ {
+	// Scan from 0: on a fresh device the first server must be Wireguard0 (#308).
+	for i := 0; i < 100; i++ {
 		if !used[i] {
 			return i, nil
 		}
@@ -244,27 +225,7 @@ func (s *WGServerStore) FindFreeIndex(ctx context.Context) (int, error) {
 // the 9-field ASCParams shape. The caller is responsible for the firmware
 // gate (e.g. osdetect.AtLeast(5, 1)).
 func (s *WGServerStore) GetASCParams(ctx context.Context, name string, extended bool) (json.RawMessage, error) {
-	key := name + ":"
-	if extended {
-		key += "ext"
-	} else {
-		key += "base"
-	}
-	if v, ok := s.asc.Get(key); ok {
-		return v, nil
-	}
-	return s.ascSF.Do(key, func() (json.RawMessage, error) {
-		v, err := s.fetchASC(ctx, name, extended)
-		if err != nil {
-			if stale, ok := s.asc.Peek(key); ok {
-				s.log.Warnf("wg asc %s fetch failed, serving stale cache: %v", name, err)
-				return stale, nil
-			}
-			return nil, err
-		}
-		s.asc.Set(key, v)
-		return v, nil
-	})
+	return s.asc.Get(ctx, ascKey(name, extended))
 }
 
 // ListSystemTunnels returns all system WG tunnels (excluding the built-in VPN server).
@@ -323,8 +284,8 @@ func (s *WGServerStore) GetSystemTunnel(ctx context.Context, name string) (*ndms
 func (s *WGServerStore) Invalidate(name string) {
 	s.items.Invalidate(name)
 	s.rc.Invalidate(name)
-	s.asc.Invalidate(name + ":ext")
-	s.asc.Invalidate(name + ":base")
+	s.asc.Invalidate(ascKey(name, true))
+	s.asc.Invalidate(ascKey(name, false))
 	s.ListStore.InvalidateAll()
 }
 
@@ -369,45 +330,32 @@ func (s *WGServerStore) fetchAll(ctx context.Context) ([]ndms.WireguardServer, e
 	}
 	sort.Slice(servers, func(i, j int) bool { return servers[i].ID < servers[j].ID })
 
-	// Enrich peers with AllowedIPs from RC in parallel. Transport-layer
-	// semaphore bounds concurrency; we only coordinate completion.
+	// Enrich peers with RC fields (allowed-ips, comment) in parallel.
+	// Transport-layer semaphore bounds concurrency; we only coordinate completion.
 	if len(servers) > 0 {
 		var wg sync.WaitGroup
-		type rcResult struct {
+		type enrichResult struct {
 			idx int
-			rc  rciRCInterface
+			m   map[string]peerRCFields
 			err error
 		}
-		results := make(chan rcResult, len(servers))
+		results := make(chan enrichResult, len(servers))
 		for i := range servers {
 			wg.Add(1)
 			go func(idx int, name string) {
 				defer wg.Done()
-				var rc rciRCInterface
-				err := s.getter.Get(ctx, "/show/rc/interface/"+name, &rc)
-				results <- rcResult{idx: idx, rc: rc, err: err}
+				allowedByKey, err := s.fetchPeerRCByKey(ctx, name)
+				results <- enrichResult{idx: idx, m: allowedByKey, err: err}
 			}(i, servers[i].ID)
 		}
 		go func() { wg.Wait(); close(results) }()
 		for r := range results {
-			if r.err != nil || r.rc.Wireguard == nil {
+			if r.err != nil {
 				continue
 			}
-			allowedByKey := make(map[string][]string)
-			for _, rp := range r.rc.Wireguard.Peer {
-				var ips []string
-				for _, a := range rp.AllowIPs {
-					if a.Mask != "" {
-						ips = append(ips, a.Address+"/"+a.Mask)
-					} else {
-						ips = append(ips, a.Address)
-					}
-				}
-				allowedByKey[rp.Key] = ips
-			}
 			for j := range servers[r.idx].Peers {
-				if ips, ok := allowedByKey[servers[r.idx].Peers[j].PublicKey]; ok {
-					servers[r.idx].Peers[j].AllowedIPs = ips
+				if rc, ok := r.m[servers[r.idx].Peers[j].PublicKey]; ok {
+					applyPeerRCFields(&servers[r.idx].Peers[j], rc)
 				}
 			}
 		}
@@ -423,7 +371,52 @@ func (s *WGServerStore) fetchItem(ctx context.Context, name string) (*ndms.Wireg
 	srv := rciToWireguardServer(detail)
 	srv.ID = name
 	srv.InterfaceName = s.resolveSystemName(ctx, name)
+	if rcByKey, err := s.fetchPeerRCByKey(ctx, name); err == nil {
+		for j := range srv.Peers {
+			if rc, ok := rcByKey[srv.Peers[j].PublicKey]; ok {
+				applyPeerRCFields(&srv.Peers[j], rc)
+			}
+		}
+	}
 	return &srv, nil
+}
+
+type peerRCFields struct {
+	allowedIPs []string
+	comment    string
+}
+
+func applyPeerRCFields(peer *ndms.WireguardServerPeer, rc peerRCFields) {
+	if len(rc.allowedIPs) > 0 {
+		peer.AllowedIPs = rc.allowedIPs
+	}
+	if peer.Description == "" && rc.comment != "" {
+		peer.Description = rc.comment
+	}
+}
+
+func (s *WGServerStore) fetchPeerRCByKey(ctx context.Context, name string) (map[string]peerRCFields, error) {
+	var rc rciRCInterface
+	if err := s.getter.Get(ctx, "/show/rc/interface/"+name, &rc); err != nil {
+		return nil, err
+	}
+	out := make(map[string]peerRCFields)
+	if rc.Wireguard == nil {
+		return out, nil
+	}
+	for _, rp := range rc.Wireguard.Peer {
+		var ips []string
+		for _, a := range rp.AllowIPs {
+			ones := ipMaskToPrefix(a.Mask)
+			if ones < 0 {
+				s.log.Warnf("wg server %s peer %s has invalid allow-ips mask %q for %q", name, rp.Key, a.Mask, a.Address)
+				continue
+			}
+			ips = append(ips, fmt.Sprintf("%s/%d", a.Address, ones))
+		}
+		out[rp.Key] = peerRCFields{allowedIPs: ips, comment: rp.Comment}
+	}
+	return out, nil
 }
 
 func (s *WGServerStore) fetchConfig(ctx context.Context, name string) (*ndms.WireguardServerConfig, error) {
@@ -515,6 +508,13 @@ func (s *WGServerStore) resolveSystemName(ctx context.Context, ndmsID string) st
 // callers can detect empty decodes without reaching into the embedded struct.
 func (d rciWireguardDetail) ID() string { return d.InterfaceName }
 
+func peerRuntimeDescription(p rciWireguardPeer) string {
+	if p.Description != "" {
+		return p.Description
+	}
+	return p.Comment
+}
+
 func formatPeerEndpoint(p rciWireguardPeer) string {
 	if p.RemoteEndpointAddress == "" && p.RemotePort == 0 {
 		return ""
@@ -573,7 +573,7 @@ func rciToWireguardServer(iface rciWireguardDetail) ndms.WireguardServer {
 		for _, p := range iface.Wireguard.Peer {
 			server.Peers = append(server.Peers, ndms.WireguardServerPeer{
 				PublicKey:     p.PublicKey,
-				Description:   p.Description,
+				Description:   peerRuntimeDescription(p),
 				Endpoint:      formatPeerEndpoint(p),
 				RxBytes:       p.RxBytes,
 				TxBytes:       p.TxBytes,
@@ -622,9 +622,26 @@ func rciRCToServerConfig(rc rciRCInterface, publicKey string) ndms.WireguardServ
 	return cfg
 }
 
-// ipMaskToPrefix converts a dotted-quad mask (e.g. "255.255.255.255") to a
-// prefix length. Returns -1 on parse failure.
+// ipMaskToPrefix converts an NDMS allow-ips mask field to a CIDR prefix
+// length. NDMS emits two formats interchangeably:
+//
+//   - IPv4: dotted-quad mask (e.g. "255.255.255.0") — historical CLI form.
+//   - IPv6: decimal prefix-length string (e.g. "0", "64", "128") — the
+//     "::/0" default route arrives as mask="0" address="::", which the
+//     previous IPv4-only parser rejected as invalid (issue #216).
+//
+// Returns -1 on parse failure (unknown shape / out-of-range).
 func ipMaskToPrefix(mask string) int {
+	mask = strings.TrimSpace(mask)
+	// Decimal-only string — treat as prefix length. Covers IPv6 masks
+	// and any IPv4 entries NDMS chose to encode the same way.
+	if n, err := strconv.Atoi(mask); err == nil {
+		if n < 0 || n > 128 {
+			return -1
+		}
+		return n
+	}
+	// Dotted-quad IPv4 mask — original behaviour.
 	ip := net.ParseIP(mask)
 	if ip == nil {
 		return -1
@@ -633,7 +650,10 @@ func ipMaskToPrefix(mask string) int {
 	if ip4 == nil {
 		return -1
 	}
-	ones, _ := net.IPMask(ip4).Size()
+	ones, bits := net.IPMask(ip4).Size()
+	if bits != 32 {
+		return -1
+	}
 	return ones
 }
 

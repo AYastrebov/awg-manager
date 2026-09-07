@@ -14,11 +14,18 @@ type Queries struct {
 	Routes           *RouteStore
 	ObjectGroups     *ObjectGroupStore
 	DNSProxy         *DNSProxyStore
+	DNSProxyConfig   *DNSProxyConfigStore
+	DNSProxyStatus   *DNSProxyStatusStore
+	IPHost           *IPHostStore
 	PingCheckProfile *PingCheckProfileStore
 	PingCheckStatus  *PingCheckStatusStore
 	RunningConfig    *RunningConfigStore
 	SystemInfo       *SystemInfoStore
 	WGServers        *WGServerStore
+	NAT              *NATStore
+	StaticNAT        *StaticNATStore
+	HTTPProxy        *HTTPProxyStore
+	KeenDNS          *KeenDNSStore
 }
 
 // Deps groups the non-Store dependencies NewQueries needs.
@@ -60,6 +67,7 @@ func NewQueries(d Deps) *Queries {
 		isOS5 = func() bool { return false }
 	}
 	ifaces := NewInterfaceStore(d.Getter, d.Logger)
+	runningConfig := NewRunningConfigStore(d.Getter, d.Logger)
 	return &Queries{
 		Interfaces:       ifaces,
 		Peers:            NewPeerStore(d.Getter, d.Logger),
@@ -68,10 +76,17 @@ func NewQueries(d Deps) *Queries {
 		Routes:           NewRouteStore(d.Getter, d.Logger),
 		ObjectGroups:     NewObjectGroupStore(d.Getter, d.Logger),
 		DNSProxy:         NewDNSProxyStore(d.Getter, d.Logger, isOS5),
+		DNSProxyConfig:   NewDNSProxyConfigStore(d.Getter, d.Logger),
+		DNSProxyStatus:   NewDNSProxyStatusStore(d.Getter, d.Logger),
+		IPHost:           NewIPHostStore(d.Getter, d.Logger),
 		PingCheckProfile: NewPingCheckProfileStore(d.Getter, d.Logger),
 		PingCheckStatus:  NewPingCheckStatusStore(d.Getter, d.Logger),
-		RunningConfig:    NewRunningConfigStore(d.Getter, d.Logger),
+		RunningConfig:    runningConfig,
 		SystemInfo:       NewSystemInfoStore(d.Getter, d.Logger),
 		WGServers:        NewWGServerStore(d.Getter, d.Logger, ifaces),
+		NAT:              NewNATStore(d.Getter, d.Logger),
+		StaticNAT:        NewStaticNATStore(d.Getter, d.Logger),
+		HTTPProxy:        NewHTTPProxyStore(d.Getter, d.Logger),
+		KeenDNS:          NewKeenDNSStore(d.Getter, d.Logger),
 	}
 }

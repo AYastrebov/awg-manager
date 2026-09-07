@@ -59,30 +59,30 @@
 	<div class="flex flex-col gap-1">
 		<span class="font-medium">Автообновление подписок DNS</span>
 		<span class="setting-description">
-			Периодически обновлять списки доменов из подписок DNS-маршрутизации
+			Периодически обновлять списки доменов из подписок DNS-маршрутизации.
 		</span>
 	</div>
 	<Toggle checked={settings.dnsRoute.autoRefreshEnabled} onchange={onToggle} disabled={saving} />
 </div>
 
 {#if settings.dnsRoute.autoRefreshEnabled}
-	<div style="padding: 0 0 0.875rem 0;">
-		<div class="settings-panel">
-			<!-- svelte-ignore a11y_label_has_associated_control -->
-			<label class="form-label">Режим обновления:</label>
-			<div class="mode-options">
-				<label class="mode-option">
-					<input type="radio" value="interval" bind:group={localMode} disabled={saving} />
-					<span>каждые N часов</span>
-				</label>
-				<label class="mode-option">
-					<input type="radio" value="daily" bind:group={localMode} disabled={saving} />
-					<span>ежедневно</span>
-				</label>
-			</div>
+	<div class="settings-panel">
+		<!-- svelte-ignore a11y_label_has_associated_control -->
+		<label class="form-label">Режим обновления:</label>
+		<div class="mode-options">
+			<label class="mode-option">
+				<input type="radio" value="interval" bind:group={localMode} disabled={saving} />
+				<span>каждые N часов</span>
+			</label>
+			<label class="mode-option">
+				<input type="radio" value="daily" bind:group={localMode} disabled={saving} />
+				<span>ежедневно</span>
+			</label>
+		</div>
 
-			{#if localMode === 'interval'}
-				<div class="inline-form">
+		{#if localMode === 'interval'}
+			<div class="inline-form">
+				<div class="input-with-suffix">
 					<input
 						type="number"
 						id="dnsRefreshInterval"
@@ -92,59 +92,80 @@
 						disabled={saving}
 					/>
 					<span class="input-suffix">ч.</span>
-					{#if settingsChanged}
-						<Button
-							variant="primary"
-							size="sm"
-							onclick={handleSave}
-							loading={saving}
-						>
-							{saving ? 'Сохранение...' : 'Сохранить'}
-						</Button>
-					{/if}
 				</div>
-				<p class="form-hint">Рекомендуется от 6 до 24 часов</p>
-			{/if}
+				{#if settingsChanged}
+					<Button
+						variant="primary"
+						size="sm"
+						onclick={handleSave}
+						loading={saving}
+					>
+						{saving ? 'Сохранение...' : 'Сохранить'}
+					</Button>
+				{/if}
+			</div>
+			<p class="form-hint">Рекомендуется от 6 до 24 часов</p>
+		{/if}
 
-			{#if localMode === 'daily'}
-				<div class="inline-form">
-					<input
-						type="time"
-						id="dnsRefreshTime"
-						bind:value={localDailyTime}
-						disabled={saving}
-					/>
-					{#if settingsChanged}
-						<Button
-							variant="primary"
-							size="sm"
-							onclick={handleSave}
-							loading={saving}
-						>
-							{saving ? 'Сохранение...' : 'Сохранить'}
-						</Button>
-					{/if}
-				</div>
-				<p class="form-hint">Локальное время роутера</p>
-			{/if}
-		</div>
+		{#if localMode === 'daily'}
+			<div class="inline-form">
+				<input
+					type="time"
+					id="dnsRefreshTime"
+					bind:value={localDailyTime}
+					disabled={saving}
+				/>
+				{#if settingsChanged}
+					<Button
+						variant="primary"
+						size="sm"
+						onclick={handleSave}
+						loading={saving}
+					>
+						{saving ? 'Сохранение...' : 'Сохранить'}
+					</Button>
+				{/if}
+			</div>
+			<p class="form-hint">Локальное время роутера</p>
+		{/if}
 	</div>
 {/if}
 
 <style>
+	.settings-panel {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto;
+		grid-template-areas:
+			'label label'
+			'modes form'
+			'hint hint';
+		align-items: center;
+		gap: 0.55rem 0.75rem;
+		min-width: 0;
+		margin-top: 0.35rem;
+		padding: 0.75rem 0.875rem;
+		border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+		border-radius: var(--radius-sm);
+		background: color-mix(in srgb, var(--color-settings-control-bg) 72%, transparent);
+	}
+
 	.form-label {
+		grid-area: label;
 		display: block;
 		font-size: 0.8125rem;
-		font-weight: 500;
+		font-weight: 600;
 		color: var(--text-secondary);
-		margin-bottom: 0.375rem;
+		margin: 0;
 	}
 
 	.mode-options {
+		grid-area: modes;
 		display: flex;
 		flex-wrap: wrap;
-		gap: 0.5rem 1rem;
-		margin-bottom: 0.75rem;
+		align-items: center;
+		gap: 0.45rem 0.9rem;
+		min-width: 0;
+		margin: 0;
 	}
 
 	.mode-option {
@@ -162,40 +183,41 @@
 	}
 
 	.inline-form {
+		grid-area: form;
 		display: flex;
 		align-items: center;
-		gap: 0.75rem;
-		flex-wrap: wrap;
+		justify-content: flex-end;
+		gap: 0.5rem;
+		flex-wrap: nowrap;
+		min-width: 0;
+	}
+
+	.form-hint {
+		grid-area: hint;
+		margin: 0;
+		font-size: 0.75rem;
+		line-height: 1.35;
+		color: var(--text-secondary);
+	}
+
+	.input-with-suffix {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.35rem;
+		min-width: 0;
 	}
 
 	.input-suffix {
 		font-size: 0.8125rem;
 		color: var(--text-secondary);
-		margin-left: -0.5rem;
 	}
 
 	.inline-form input[type="number"] {
-		width: 80px;
-		padding: 0.5rem 0.75rem;
-		background: var(--bg-primary);
-		border: 1px solid var(--border);
-		border-radius: var(--radius-sm);
-		color: var(--text-primary);
-		font-size: 0.875rem;
+		width: 4.75rem;
 	}
 
 	.inline-form input[type="time"] {
-		padding: 0.5rem 0.75rem;
-		background: var(--bg-primary);
-		border: 1px solid var(--border);
-		border-radius: var(--radius-sm);
-		color: var(--text-primary);
-		font-size: 0.875rem;
-	}
-
-	.inline-form input:focus {
-		outline: none;
-		border-color: var(--accent);
+		width: 8rem;
 	}
 
 	@media (max-width: 640px) {
@@ -206,25 +228,54 @@
 			gap: 0.75rem;
 		}
 
+		.settings-panel {
+			grid-template-columns: minmax(0, 1fr);
+			grid-template-areas:
+				'label'
+				'modes'
+				'form'
+				'hint';
+			align-items: stretch;
+			gap: 0.6rem;
+			padding: 0.75rem;
+		}
+
 		.mode-options {
-			flex-direction: column;
+			display: grid;
+			grid-template-columns: repeat(2, minmax(0, 1fr));
 			gap: 0.5rem;
-			align-items: flex-start;
+			align-items: stretch;
+		}
+
+		.mode-option {
+			white-space: normal;
 		}
 
 		.inline-form {
 			flex-direction: column;
 			align-items: stretch;
+			justify-content: stretch;
 			gap: 0.5rem;
+		}
+
+		.input-with-suffix {
+			display: grid;
+			grid-template-columns: minmax(0, 1fr) auto;
+			width: 100%;
 		}
 
 		.inline-form input[type="number"],
 		.inline-form input[type="time"] {
 			width: 100%;
+			box-sizing: border-box;
 		}
 
-		.input-suffix {
-			margin-left: 0;
+		.inline-form :global(.btn) {
+			width: 100%;
+		}
+
+		.input-with-suffix .input-suffix {
+			flex: 0 0 auto;
 		}
 	}
 </style>

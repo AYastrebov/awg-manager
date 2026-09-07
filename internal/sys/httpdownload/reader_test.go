@@ -2,11 +2,34 @@ package httpdownload
 
 import (
 	"bytes"
-	"errors"
 	"io"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+type fixedChunkReader struct {
+	data []byte
+	pos  int
+	step int
+}
+
+func (r *fixedChunkReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := r.step
+	if n > len(p) {
+		n = len(p)
+	}
+	remain := len(r.data) - r.pos
+	if n > remain {
+		n = remain
+	}
+	copy(p[:n], r.data[r.pos:r.pos+n])
+	r.pos += n
+	return n, nil
+}
 
 func TestReader_PassthroughBytes(t *testing.T) {
 	src := bytes.Repeat([]byte("x"), 1024)
@@ -44,35 +67,46 @@ func TestReader_EmitsAtLeastOnceOnEOF(t *testing.T) {
 	}
 }
 
-func TestReader_EmitsAfterByteThreshold(t *testing.T) {
-	// Use fixed-size reads so threshold-based emits are deterministic.
-	// With 8KB chunks and 256KB payload, Reader crosses 64KB threshold
-	// repeatedly and must emit multiple frames.
-	src := bytes.Repeat([]byte("x"), 256*1024)
+func TestReader_DoesNotEmitOnEverySmallRead(t *testing.T) {
+	// Many tiny reads should not cause progress callback spam.
+	src := bytes.Repeat([]byte("x"), 64*1024)
 	var calls atomic.Int32
-	var lastDownloaded atomic.Int64
-	pr := NewReader(bytes.NewReader(src), int64(len(src)), func(downloaded, total int64) {
+	r := &fixedChunkReader{data: src, step: 16}
+	current := time.Unix(0, 0)
+	now := func() time.Time { return current }
+	pr := newReaderWithClock(r, int64(len(src)), func(downloaded, total int64) {
 		calls.Add(1)
-		lastDownloaded.Store(downloaded)
-	})
+	}, now)
+	if _, err := io.ReadAll(pr); err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("expected exactly final emit with frozen clock, got %d", got)
+	}
+}
 
-	buf := make([]byte, 8*1024)
+func TestReader_PeriodicEmitByTime(t *testing.T) {
+	src := bytes.Repeat([]byte("x"), 1536)
+	var calls atomic.Int32
+	r := &fixedChunkReader{data: src, step: 512}
+	current := time.Unix(0, 0)
+	now := func() time.Time { return current }
+	pr := newReaderWithClock(r, int64(len(src)), func(downloaded, total int64) {
+		calls.Add(1)
+	}, now)
+	buf := make([]byte, 512)
 	for {
 		_, err := pr.Read(buf)
-		if err == nil {
-			continue
-		}
-		if errors.Is(err, io.EOF) {
+		if err == io.EOF {
 			break
 		}
-		t.Fatalf("Read: %v", err)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		current = current.Add(210 * time.Millisecond)
 	}
-
-	if got := calls.Load(); got < 4 {
-		t.Errorf("expected ≥4 emits across 256KB stream, got %d", got)
-	}
-	if got := lastDownloaded.Load(); got != int64(len(src)) {
-		t.Errorf("last downloaded = %d, want %d (final frame)", got, len(src))
+	if got := calls.Load(); got < 2 {
+		t.Errorf("expected periodic emits, got %d", got)
 	}
 }
 

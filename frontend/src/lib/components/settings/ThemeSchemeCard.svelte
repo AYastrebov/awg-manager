@@ -1,16 +1,30 @@
 <script lang="ts">
-	import { Button } from '$lib/components/ui';
+	import { Button, SegmentedControl, Toggle } from '$lib/components/ui';
+	import SettingsSectionLabel from './SettingsSectionLabel.svelte';
+	import { compactLayout } from '$lib/stores/compactLayout';
+	import {
+		settingsSectionIconMode,
+		SETTINGS_SECTION_ICON_MODE_LABELS,
+		type SettingsSectionIconMode,
+	} from '$lib/stores/settingsSectionIconMode';
+	import { serviceLetterIcons } from '$lib/stores/serviceLetterIcons';
+	import { showSummary } from '$lib/stores/showSummary';
+	import { tunnelDashboardMode } from '$lib/stores/tunnelDashboardMode';
+	import { usageLevel } from '$lib/stores/settings';
+	import { isTunnelDashboardAvailable } from '$lib/types/usageLevel';
 	import {
 		theme,
 		THEME_PRESETS,
 		getThemePreviewStyle,
 		type ThemeCustomPalette,
-		type ThemeMode,
+		type ThemeModePreference,
 		type ThemePreset,
 	} from '$lib/stores/theme';
+	import { Palette, ChevronDown, Check } from 'lucide-svelte';
 
 	const PRESET_ORDER: ThemePreset[] = ['legacy', 'neo', 'mint', 'custom'];
-	const LEGACY_MODE_OPTIONS: Array<{ value: ThemeMode; label: string }> = [
+	const LEGACY_MODE_OPTIONS: Array<{ value: ThemeModePreference; label: string }> = [
+		{ value: 'system', label: 'Системная' },
 		{ value: 'dark', label: 'Тёмная' },
 		{ value: 'light', label: 'Светлая' },
 	];
@@ -20,10 +34,22 @@
 		{ key: 'text', label: 'Текст', hint: 'Основной цвет текста и контраста' },
 	];
 
+	const ICON_MODE_OPTIONS: Array<{ value: SettingsSectionIconMode; label: string }> = [
+		{ value: 'strict', label: SETTINGS_SECTION_ICON_MODE_LABELS.strict },
+		{ value: 'harmonious', label: SETTINGS_SECTION_ICON_MODE_LABELS.harmonious },
+		{ value: 'vivid', label: SETTINGS_SECTION_ICON_MODE_LABELS.vivid },
+	];
+
 	let expanded = $state(false);
+	const compactForced = $derived($usageLevel === 'basic');
+	const dashboardRowVisible = $derived(isTunnelDashboardAvailable($usageLevel));
+	const compactChecked = $derived(compactForced || $compactLayout);
 
 	const currentThemeLabel = $derived.by(() => {
 		if ($theme.preset !== 'custom') {
+			if ($theme.modePreference === 'system') {
+				return `${$theme.label} · Системная (${$theme.legacyMode === 'light' ? 'Светлая' : 'Тёмная'})`;
+			}
 			return `${$theme.label} · ${$theme.legacyMode === 'light' ? 'Светлая' : 'Тёмная'}`;
 		}
 		return `${$theme.label} · ${$theme.mode === 'light' ? 'Авто-светлая' : 'Авто-тёмная'}`;
@@ -32,7 +58,7 @@
 	function previewStyleFor(preset: ThemePreset): string {
 		return getThemePreviewStyle({
 			preset,
-			legacyMode: $theme.legacyMode,
+			modePreference: $theme.modePreference,
 			custom: $theme.custom,
 		});
 	}
@@ -42,38 +68,32 @@
 	}
 </script>
 
-<div class="card">
-	<button
-		type="button"
-		class="collapsible-header"
-		aria-expanded={expanded}
-		aria-controls="theme-scheme-body"
-		onclick={() => (expanded = !expanded)}
-	>
-		<span class="section-label">Цветовая схема</span>
-		<span class="header-meta">
-			<span class="current-theme">{currentThemeLabel}</span>
-			<svg
-				class="chevron"
-				class:open={expanded}
-				viewBox="0 0 24 24"
-				fill="none"
-				stroke="currentColor"
-				stroke-width="2"
-				aria-hidden="true"
-			>
-				<polyline points="6 9 12 15 18 9" />
-			</svg>
-		</span>
-	</button>
+<div class="settings-block">
+	<div class="card">
+	<SettingsSectionLabel label="Внешний вид" icon={Palette} tone="pink" header />
+	<div class="setting-row">
+		<button
+			type="button"
+			class="collapsible-header scheme-toggle"
+			aria-expanded={expanded}
+			aria-controls="theme-scheme-body"
+			onclick={() => (expanded = !expanded)}
+		>
+			<div class="flex flex-col gap-1">
+				<span class="font-medium">Цветовая схема</span>
+				<span class="setting-description">
+					Применяется сразу и сохраняется локально в этом браузере.
+				</span>
+			</div>
+			<span class="header-meta">
+				<span class="current-theme">{currentThemeLabel}</span>
+				<span class="chevron" class:open={expanded} aria-hidden="true"><ChevronDown size={14} strokeWidth={2} /></span>
+			</span>
+		</button>
+	</div>
 
 	{#if expanded}
 		<div id="theme-scheme-body" class="collapsible-body">
-			<p class="card-hint">
-				Применяется сразу и сохраняется локально в этом браузере. <code>Custom</code>
-				управляет только тремя цветами, остальные оттенки выводятся автоматически.
-			</p>
-
 			<div class="theme-grid" role="radiogroup" aria-label="Цветовая схема">
 				{#each PRESET_ORDER as preset (preset)}
 					{@const selected = $theme.preset === preset}
@@ -93,7 +113,7 @@
 							</div>
 							{#if selected}
 								<span class="theme-check" aria-hidden="true">
-									<svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12" /></svg>
+									<Check size={14} strokeWidth={3} />
 								</span>
 							{/if}
 						</div>
@@ -119,13 +139,6 @@
 							</div>
 						</div>
 
-						<div class="theme-foot">
-							{#if preset !== 'custom'}
-								<span class="theme-tag">Темная / Светлая</span>
-							{:else}
-								<span class="theme-tag">3 базовых цвета</span>
-							{/if}
-						</div>
 					</button>
 				{/each}
 			</div>
@@ -133,20 +146,12 @@
 			{#if $theme.supportsModeToggle}
 				<div class="detail-block">
 					<div class="detail-title">Режим {THEME_PRESETS[$theme.preset].label}</div>
-					<div class="mode-switch" role="radiogroup" aria-label={`Режим темы ${THEME_PRESETS[$theme.preset].label}`}>
-						{#each LEGACY_MODE_OPTIONS as option (option.value)}
-							<button
-								type="button"
-								role="radio"
-								aria-checked={$theme.legacyMode === option.value}
-								class="mode-pill"
-								class:active={$theme.legacyMode === option.value}
-								onclick={() => theme.setMode(option.value)}
-							>
-								{option.label}
-							</button>
-						{/each}
-					</div>
+					<SegmentedControl
+						value={$theme.modePreference}
+						options={LEGACY_MODE_OPTIONS}
+						ariaLabel={`Режим темы ${THEME_PRESETS[$theme.preset].label}`}
+						onchange={(mode) => theme.setMode(mode)}
+					/>
 				</div>
 			{/if}
 
@@ -195,9 +200,107 @@
 			{/if}
 		</div>
 	{/if}
+
+	<div class="setting-row icon-mode-row">
+		<div class="flex flex-col gap-1">
+			<span class="font-medium">Окраска иконок</span>
+			<span class="setting-description">
+				Заголовки настроек, политики доступа, VPN для устройств и глобус-заглушка в списках маршрутизации.
+			</span>
+		</div>
+		<SegmentedControl
+			value={$settingsSectionIconMode}
+			options={ICON_MODE_OPTIONS}
+			ariaLabel="Окраска иконок"
+			onchange={(mode) => settingsSectionIconMode.setMode(mode)}
+		/>
+	</div>
+	<div class="setting-row compact-layout-row">
+		<div class="flex flex-col gap-1">
+			<span class="font-medium">Компактный режим</span>
+			<span class="setting-description">
+				{#if compactForced}
+					В базовом режиме всегда включена: колонка 960px и меньшие боковые отступы.
+				{:else}
+					Сужает интерфейс с краев, как в версии 2.8.2, фокусируя внимание на центре экрана (автоматически включается в базовом режиме).
+				{/if}
+			</span>
+		</div>
+		<Toggle
+			checked={compactChecked}
+			disabled={compactForced}
+			onchange={(enabled) => compactLayout.setEnabled(enabled)}
+		/>
+	</div>
+	{#if dashboardRowVisible}
+	<div class="setting-row dashboard-mode-row">
+		<div class="flex flex-col gap-1">
+			<span class="font-medium">Режим дашборда</span>
+			<span class="setting-description">
+				Объединяет AWG, Sing-box и подписки на одной странице с общей панелью поиска и создания.
+			</span>
+		</div>
+		<Toggle
+			checked={$tunnelDashboardMode}
+			onchange={(enabled) => tunnelDashboardMode.setEnabled(enabled)}
+		/>
+	</div>
+	{/if}
+	<div class="setting-row summary-row">
+		<div class="flex flex-col gap-1">
+			<span class="font-medium">Отображать summary</span>
+			<span class="setting-description">
+				Плашка статистики (KPI) наверху страниц туннелей и серверов.
+			</span>
+		</div>
+		<Toggle
+			checked={$showSummary}
+			onchange={(enabled) => showSummary.setEnabled(enabled)}
+		/>
+	</div>
+	<div class="setting-row letter-icons-row">
+		<div class="flex flex-col gap-1">
+			<span class="font-medium">Буквенные иконки</span>
+			<span class="setting-description">
+				Цветная плитка с первой буквой названия для списков маршрутизации (если не был найден логотип). 
+			</span>
+		</div>
+		<Toggle
+			checked={$serviceLetterIcons}
+			onchange={(enabled) => serviceLetterIcons.setEnabled(enabled)}
+		/>
+	</div>
+	</div>
 </div>
 
 <style>
+	.compact-layout-row,
+	.dashboard-mode-row,
+	.summary-row,
+	.letter-icons-row {
+		align-items: center;
+	}
+
+	@media (max-width: 640px) {
+		.compact-layout-row,
+		.dashboard-mode-row,
+		.summary-row,
+		.letter-icons-row {
+			flex-direction: row;
+			align-items: center;
+			flex-wrap: nowrap;
+			gap: 0.75rem;
+		}
+
+		.compact-layout-row > *:first-child,
+		.dashboard-mode-row > *:first-child,
+		.summary-row > *:first-child,
+		.letter-icons-row > *:first-child {
+			flex: 1 1 auto;
+			min-width: 0;
+		}
+	}
+
 	.collapsible-header {
 		display: flex;
 		align-items: center;
@@ -215,9 +318,18 @@
 		text-align: left;
 	}
 
-	.collapsible-header > .section-label {
+	.setting-row > .scheme-toggle {
+		width: 100%;
 		min-width: 0;
-		flex-shrink: 1;
+	}
+
+	.scheme-toggle {
+		align-items: center;
+	}
+
+	.scheme-toggle > :first-child {
+		min-width: 0;
+		flex: 1 1 auto;
 	}
 
 	.collapsible-header:focus-visible {
@@ -243,6 +355,7 @@
 	}
 
 	.chevron {
+		display: inline-flex;
 		width: 14px;
 		height: 14px;
 		transition: transform var(--t-fast) ease;
@@ -253,13 +366,10 @@
 	}
 
 	.collapsible-body {
-		margin-top: 0.75rem;
-	}
-
-	.card-hint {
-		color: var(--color-text-muted);
-		font-size: 0.8125rem;
-		margin: 0 0 0.75rem 0;
+		border-top: 1px solid var(--color-border);
+		padding-top: 0.875rem;
+		padding-bottom: 0.875rem;
+		border-bottom: 1px solid var(--color-border);
 	}
 
 	.theme-grid {
@@ -281,7 +391,7 @@
 		padding: 0.75rem;
 		border: 1px solid var(--color-border);
 		border-radius: var(--radius);
-		background: var(--color-bg-tertiary);
+		background: var(--color-settings-control-bg);
 		color: inherit;
 		font: inherit;
 		text-align: left;
@@ -342,13 +452,6 @@
 		flex-shrink: 0;
 	}
 
-	.theme-check svg {
-		width: 14px;
-		height: 14px;
-		fill: none;
-		stroke: currentColor;
-		stroke-width: 3;
-	}
 
 	.theme-preview {
 		background: var(--color-bg-primary);
@@ -441,30 +544,8 @@
 		height: 2rem;
 	}
 
-	.theme-foot {
-		display: flex;
-		align-items: center;
-		justify-content: flex-start;
-	}
-
-	.theme-tag {
-		display: inline-flex;
-		align-items: center;
-		padding: 0.2rem 0.5rem;
-		border-radius: var(--radius-pill);
-		background: var(--color-bg-primary);
-		border: 1px solid var(--color-border);
-		color: var(--color-text-muted);
-		font-size: 0.6875rem;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.03em;
-	}
-
 	.detail-block {
 		margin-top: 0.9rem;
-		padding-top: 0.9rem;
-		border-top: 1px solid var(--color-border);
 	}
 
 	.detail-title {
@@ -474,38 +555,13 @@
 		margin-bottom: 0.6rem;
 	}
 
-	.mode-switch {
-		display: inline-flex;
-		background: var(--color-bg-primary);
-		border: 1px solid var(--color-border);
-		border-radius: var(--radius-pill);
-		padding: 0.25rem;
-		gap: 0.25rem;
+	.detail-block :global(.segmented-control) {
+		width: 100%;
 	}
 
-	.mode-pill {
-		border: 0;
-		border-radius: var(--radius-pill);
-		background: transparent;
-		color: var(--color-text-muted);
-		font: inherit;
-		font-size: 0.75rem;
-		font-weight: 600;
-		padding: 0.35rem 0.8rem;
-		cursor: pointer;
-		transition:
-			background var(--t-fast) ease,
-			color var(--t-fast) ease;
-	}
-
-	.mode-pill.active {
-		background: var(--color-accent);
-		color: var(--color-accent-contrast, var(--color-bg-primary));
-	}
-
-	.mode-pill:focus-visible {
-		outline: 2px solid var(--color-accent);
-		outline-offset: 2px;
+	.detail-block :global(.segmented-control-btn) {
+		flex: 1;
+		min-width: 0;
 	}
 
 	.custom-block {
@@ -546,7 +602,7 @@
 		padding: 0.75rem;
 		border-radius: var(--radius);
 		border: 1px solid var(--color-border);
-		background: var(--color-bg-primary);
+		background: var(--color-settings-control-bg);
 	}
 
 	.color-label {
@@ -626,6 +682,64 @@
 		.custom-header {
 			flex-direction: column;
 			align-items: stretch;
+		}
+	}
+
+	@media (max-width: 640px) {
+		.scheme-toggle {
+			display: grid;
+			grid-template-columns: minmax(0, 1fr);
+			align-items: stretch;
+			gap: 0.625rem;
+		}
+
+		.scheme-toggle > :first-child {
+			width: 100%;
+		}
+
+		.header-meta {
+			width: 100%;
+			min-width: 0;
+			box-sizing: border-box;
+			justify-content: space-between;
+			padding: 0.45rem 0.625rem;
+			border: 1px solid var(--color-border);
+			border-radius: var(--radius-sm);
+			background: var(--color-settings-control-bg);
+		}
+
+		.current-theme {
+			max-width: none;
+			min-width: 0;
+		}
+	}
+
+	@media (min-width: 641px) {
+		.scheme-toggle {
+			display: grid;
+			grid-template-columns: minmax(0, 1fr);
+			align-items: stretch;
+			gap: 0.75rem;
+		}
+
+		.scheme-toggle > :first-child {
+			width: 100%;
+		}
+
+		.header-meta {
+			width: 100%;
+			min-width: 0;
+			box-sizing: border-box;
+			justify-content: space-between;
+			padding: 0.45rem 0.625rem;
+			border: 1px solid var(--color-border);
+			border-radius: var(--radius-sm);
+			background: var(--color-settings-control-bg);
+		}
+
+		.current-theme {
+			max-width: none;
+			min-width: 0;
 		}
 	}
 </style>

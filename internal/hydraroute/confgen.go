@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/hoaxisr/awg-manager/internal/storage"
 )
 
 // Paths are package-level vars so tests can override them via t.TempDir().
@@ -37,7 +39,11 @@ func GenerateDomainConf(lists []ManagedEntry) string {
 			continue
 		}
 		fmt.Fprintf(&sb, "## %s\n", e.ListName)
-		fmt.Fprintf(&sb, "%s/%s\n", strings.Join(e.Domains, ","), e.Iface)
+		line := fmt.Sprintf("%s/%s", strings.Join(e.Domains, ","), e.Iface)
+		if e.Disabled {
+			line = "#" + line
+		}
+		fmt.Fprintf(&sb, "%s\n", line)
 	}
 	return sb.String()
 }
@@ -56,10 +62,18 @@ func GenerateIPList(lists []ManagedEntry) string {
 			continue
 		}
 		fmt.Fprintf(&sb, "## %s\n", e.ListName)
-		fmt.Fprintf(&sb, "/%s\n", e.Iface)
+		target := fmt.Sprintf("/%s", e.Iface)
+		if e.Disabled {
+			target = "#" + target
+		}
+		fmt.Fprintf(&sb, "%s\n", target)
 		for _, s := range e.Subnets {
-			sb.WriteString(s)
-			sb.WriteByte('\n')
+			if e.Disabled {
+				fmt.Fprintf(&sb, "#%s\n", s)
+			} else {
+				sb.WriteString(s)
+				sb.WriteByte('\n')
+			}
 		}
 		sb.WriteByte('\n') // HR Neo block terminator
 	}
@@ -76,13 +90,5 @@ func WriteWholeFile(filePath, content string) error {
 }
 
 func atomicWrite(filePath, content string) error {
-	tmpPath := filePath + ".awgm.tmp"
-	if err := os.WriteFile(tmpPath, []byte(content), 0o644); err != nil {
-		return fmt.Errorf("hydraroute: write tmp: %w", err)
-	}
-	if err := os.Rename(tmpPath, filePath); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("hydraroute: rename tmp: %w", err)
-	}
-	return nil
+	return storage.AtomicWrite(filePath, []byte(content))
 }

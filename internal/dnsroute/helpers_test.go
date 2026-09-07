@@ -6,15 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hoaxisr/awg-manager/internal/logger"
 	"github.com/hoaxisr/awg-manager/internal/ndms/command"
 	"github.com/hoaxisr/awg-manager/internal/ndms/query"
 )
-
-// noopLogger returns a logger for tests.
-func noopLogger() *logger.Logger {
-	return logger.New().WithComponent("dnsroute-test")
-}
 
 // fakePoster records payloads passed to Post for assertion.
 type fakePoster struct {
@@ -58,7 +52,7 @@ func newTestNDMS() (*query.Queries, *command.Commands, *fakePoster, *query.FakeG
 		Logger: query.NopLogger(),
 		IsOS5:  func() bool { return true },
 	})
-	sc := command.NewSaveCoordinator(poster, nopPublisher{}, 500*time.Millisecond, 5*time.Second)
+	sc := command.NewSaveCoordinator(poster, nopPublisher{}, 500*time.Millisecond, 5*time.Second, 0, nil)
 	c := command.NewCommands(command.Deps{
 		Poster:  poster,
 		Save:    sc,

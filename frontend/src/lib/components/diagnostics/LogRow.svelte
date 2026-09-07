@@ -4,22 +4,26 @@
 
 <script lang="ts">
   import { openContextMenu } from './log-row-context-menu';
-  import { formatTime } from '$lib/utils/format';
+  import { formatDateTimeWithOffset, formatTime } from '$lib/utils/format';
   import { familyOf } from './subgroup-palette';
   import { stripAnsi } from '$lib/utils/ansi';
 
   interface Props {
     log: LogEntry;
+    routerOffset?: number | null;
+    showFullTimestamp?: boolean;
     expanded?: boolean;
     onToggleExpand?: () => void;
     onClickScope?: (group: string, subgroup: string) => void;
     onClickLevel?: (level: string) => void;
-    onCopyLine?: (text: string) => void;
+    onCopyLine?: (log: LogEntry) => void;
     onCopyMessage?: (text: string) => void;
   }
 
   let {
     log,
+    routerOffset,
+    showFullTimestamp = false,
     expanded = false,
     onToggleExpand,
     onClickScope,
@@ -29,8 +33,37 @@
   }: Props = $props();
 
   const isExpanded = $derived(expanded || log.level === 'error' || log.level === 'warn');
+  const fullTimestamp = $derived(
+    formatDateTimeWithOffset(log.timestamp, routerOffset ?? undefined),
+  );
+  function formatTimeWithOffset(timestamp: string, offsetMinutes?: number | null): string {
+    const date = new Date(timestamp);
+    if (isNaN(date.getTime())) return timestamp;
+
+    const pad = (n: number) => String(n).padStart(2, '0');
+
+    if (offsetMinutes === undefined || offsetMinutes === null || !Number.isFinite(offsetMinutes)) {
+      return formatTime(timestamp);
+    }
+
+    const shifted = new Date(date.getTime() + offsetMinutes * 60_000);
+    return `${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}:${pad(shifted.getUTCSeconds())}`;
+  }
+  const formattedTimestamp = $derived(
+    showFullTimestamp
+      ? fullTimestamp
+      : formatTimeWithOffset(log.timestamp, routerOffset),
+  );
 
   const subgroupFamily = $derived(familyOf(log.subgroup));
+
+  // Схлопнутые повторы: бейдж «×N» = всего появлений записи; тултип —
+  // время последнего повтора (timestamp строки — первое появление).
+  const repeatTitle = $derived(
+    log.lastSeen
+      ? `Повторялось, последний раз: ${formatDateTimeWithOffset(log.lastSeen, routerOffset ?? undefined)}`
+      : 'Повторяющаяся запись',
+  );
 
   // Sing-box stderr lines (and any other ANSI-emitting source) may carry
   // raw colour escapes. Strip at the render boundary — sing-box has no
@@ -47,10 +80,6 @@
     debug: 'DEBUG',
   };
 
-  const formattedLine = $derived(
-    `[${formatTime(log.timestamp)}] [${(levelLabel[log.level] ?? log.level).toUpperCase()}] [${log.group}${log.subgroup ? '/' + log.subgroup : ''}] ${log.action} ${log.target}: ${cleanMessage}`,
-  );
-
   function handleClickScope(e: MouseEvent) {
     e.stopPropagation();
     onClickScope?.(log.group, log.subgroup);
@@ -63,7 +92,7 @@
 
   function handleContextMenu(e: MouseEvent) {
     openContextMenu(e, log, {
-      onCopyLine: () => onCopyLine?.(formattedLine),
+      onCopyLine: () => onCopyLine?.(log),
       onCopyMessage: () => onCopyMessage?.(cleanMessage),
       onFilterScope: () => onClickScope?.(log.group, log.subgroup),
       onFilterLevel: () => onClickLevel?.(log.level),
@@ -97,7 +126,13 @@
   tabindex="0"
   aria-expanded={isExpanded}
 >
-  <span class="time">{formatTime(log.timestamp)}</span>
+  <span
+    class="time"
+    class:time-full={showFullTimestamp}
+    title={fullTimestamp}
+  >
+    {formattedTimestamp}
+  </span>
   <button
     type="button"
     class="level-chip level-chip-{log.level}"
@@ -121,6 +156,9 @@
   <span class="target">{log.target}</span>
   <span class="arrow">→</span>
   <span class="message" class:truncate={!isExpanded}>{cleanMessage}</span>
+  {#if (log.repeats ?? 0) > 0}
+    <span class="repeat-badge" title={repeatTitle}>×{(log.repeats ?? 0) + 1}</span>
+  {/if}
 </div>
 
 <style>
@@ -162,7 +200,27 @@
   .row.level-error { border-left-color: var(--color-error); }
   .row.level-warn { border-left-color: var(--color-warning); }
 
-  .time { color: var(--color-text-muted); white-space: nowrap; }
+  .repeat-badge {
+    flex: 0 0 auto;
+    font-size: 11px;
+    line-height: 1.4;
+    padding: 0 5px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--color-border);
+    background: var(--color-bg-secondary);
+    color: var(--color-text-muted);
+    white-space: nowrap;
+  }
+
+  .time {
+    color: var(--color-text-muted);
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .time-full {
+    min-width: 25ch;
+  }
 
   .level-chip {
     display: inline-block;
@@ -230,6 +288,9 @@
   @media (max-width: 640px) {
     .row {
       flex-wrap: wrap;
+    }
+    .time-full {
+      min-width: auto;
     }
     .arrow {
       display: none;

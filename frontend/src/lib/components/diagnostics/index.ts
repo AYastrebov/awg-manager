@@ -1,4 +1,3 @@
-export { default as DiagnosticsTestList } from './DiagnosticsTestList.svelte';
 export { default as DiagnosticsTestItem } from './DiagnosticsTestItem.svelte';
 export { default as LogsLiveIndicator } from './LogsLiveIndicator.svelte';
 export { default as LogRow } from './LogRow.svelte';
@@ -10,5 +9,10 @@ export { default as ChecksToolbar } from './ChecksToolbar.svelte';
 export { default as ChecksGroup } from './ChecksGroup.svelte';
 export { default as ChecksAdvancedPopover } from './ChecksAdvancedPopover.svelte';
 export { default as ClientDnsCheck } from './ClientDnsCheck.svelte';
+export { default as AboutInfoSection } from './AboutInfoSection.svelte';
 export { contextMenu, openContextMenu, closeContextMenu } from './log-row-context-menu';
 export type { ContextMenuState } from './log-row-context-menu';
+export { default as UpstreamsTable } from './UpstreamsTable.svelte';
+export { default as PolicyStatRow } from './PolicyStatRow.svelte';
+export { default as StaticRecordsCard } from './StaticRecordsCard.svelte';
+export { default as RebindCard } from './RebindCard.svelte';

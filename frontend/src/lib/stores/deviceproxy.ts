@@ -1,7 +1,7 @@
 // Frontend polling stores for the device proxy feature:
 //   - config (30s poll): reflects persisted Config; SSE-invalidated by
 //     resource:invalidated{resource:"deviceproxy.config"}.
-//   - outbounds (15s poll): available outbound tags for the dropdowns.
+//   - outbounds (120s poll): available outbound tags for the dropdowns.
 //   - runtime (5s poll): live selector.now + persisted default for
 //     the "Активный туннель" card; SSE-invalidated by
 //     resource:invalidated{resource:"deviceproxy.runtime"}.
@@ -24,10 +24,19 @@ export const deviceProxyInstances: PollingStore<DeviceProxyInstance[]> = createP
 );
 registerStore('deviceproxy.config', deviceProxyInstances);
 
+// Каталог выходов — дорогой запрос (backend enumerate() дёргает полный RCI
+// show/interface), а содержимое меняется только при CRUD туннелей/подписок.
+// Панель Inbounds (DeviceProxyCompact) держит подписку постоянно, поэтому
+// длинный интервал важен: 15s-поллинг возвращал бы фоновую RCI-нагрузку
+// класса slow-RCI. Изменения имён доезжают за ≤2 мин или при перезаходе.
 export const deviceProxyOutbounds: PollingStore<DeviceProxyOutbound[]> = createPollingStore<DeviceProxyOutbound[]>(
 	() => api.listDeviceProxyOutbounds(),
-	{ staleTime: 15_000, pollInterval: 15_000 },
+	{ staleTime: 60_000, pollInterval: 120_000 },
 );
+// Регистрация нужна НЕ ради SSE — точечной инвалидации у каталога нет и
+// бэкенд такого ключа не публикует (см. пометку у ключа в storeRegistry).
+// Она нужна ради invalidateAll(): при выходе из Tier-3 отказа каталог
+// обязан перечитаться сразу, а не через ≤2 мин поллинга.
 registerStore('deviceproxy.outbounds', deviceProxyOutbounds);
 
 export const deviceProxyRuntime: PollingStore<DeviceProxyRuntime> = createPollingStore<DeviceProxyRuntime>(

@@ -1,6 +1,7 @@
 package singbox
 
 import (
+	"strings"
 	"sync"
 	"testing"
 
@@ -37,7 +38,7 @@ func (c *captureLogger) snapshot() []captured {
 
 func TestLogForwarder_LevelMapping(t *testing.T) {
 	cap := &captureLogger{}
-	f := NewLogForwarder("unused", cap)
+	f := NewLogForwarder(func() string { return "unused" }, cap)
 
 	cases := []struct {
 		name string
@@ -164,7 +165,7 @@ func TestLogForwarder_SubgroupClassification(t *testing.T) {
 
 func TestLogForwarder_DropsEmptyAndMalformed(t *testing.T) {
 	cap := &captureLogger{}
-	f := NewLogForwarder("unused", cap)
+	f := NewLogForwarder(func() string { return "unused" }, cap)
 
 	f.forward(nil)
 	f.forward([]byte(""))
@@ -178,6 +179,99 @@ func TestLogForwarder_DropsEmptyAndMalformed(t *testing.T) {
 }
 
 func TestLogForwarder_NilAppLoggerIsSafe(t *testing.T) {
-	f := NewLogForwarder("unused", nil)
+	f := NewLogForwarder(func() string { return "unused" }, nil)
 	f.forward([]byte(`{"type":"info","payload":"hello"}`))
+}
+
+func TestSanitizeSingboxLogText_RedactsDomainsAndIPs(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{
+			in:   "lookup domain node.example.org",
+			want: "lookup domain no************rg",
+		},
+		{
+			in:   "lookup succeed for node.example.org: 203.0.113.77",
+			want: "lookup succeed for no************rg: 20********77",
+		},
+		{
+			in:   "outbound connection to example.com:443",
+			want: "outbound connection to ex*******om:443",
+		},
+		{
+			in:   "inbound connection from 192.168.1.50:54321",
+			want: "inbound connection from 19********50:54321",
+		},
+		{
+			in:   "outbound connection to [2606:2800:220:1:248:1893:25c8:1946]:443",
+			want: "outbound connection to [26******************************46]:443",
+		},
+		{
+			in:   "lookup succeed for node.example.org: 2606:2800:220:1:248:1893:25c8:1946",
+			want: "lookup succeed for no************rg: 26******************************46",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got := sanitizeSingboxLogText(tc.in)
+			if got != tc.want {
+				t.Fatalf("sanitize = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLogForwarder_PreservesSensitiveHostsBeforeOutputMasking(t *testing.T) {
+	cap := &captureLogger{}
+	f := NewLogForwarder(func() string { return "unused" }, cap)
+
+	f.forward([]byte(`{"type":"debug","payload":"dns: lookup succeed for node.example.org: 203.0.113.77"}`))
+
+	got := cap.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("expected one log, got %d", len(got))
+	}
+	if got[0].Sub != logging.SubSBDNS {
+		t.Fatalf("subgroup = %q, want %q", got[0].Sub, logging.SubSBDNS)
+	}
+	if got[0].Target != "dns" {
+		t.Fatalf("target = %q, want dns", got[0].Target)
+	}
+	msg := got[0].Message
+	if !strings.Contains(msg, "node.example.org") {
+		t.Fatalf("raw domain missing before output masking: %q", msg)
+	}
+	if !strings.Contains(msg, "203.0.113.77") {
+		t.Fatalf("raw ip missing before output masking: %q", msg)
+	}
+	if strings.Contains(msg, "no************rg") || strings.Contains(msg, "20********77") {
+		t.Fatalf("message was redacted before output masking: %q", msg)
+	}
+}
+
+func TestLogForwarder_PreservesSensitiveHosts_AllLevels(t *testing.T) {
+	cases := []string{"error", "fatal", "panic", "warn", "warning", "info", "debug", "trace"}
+	for _, lvl := range cases {
+		t.Run(lvl, func(t *testing.T) {
+			cap := &captureLogger{}
+			f := NewLogForwarder(func() string { return "unused" }, cap)
+			line := `{"type":"` + lvl + `","payload":"dns: lookup succeed for node.example.org: 203.0.113.77 and [2606:2800:220:1:248:1893:25c8:1946]:443"}`
+			f.forward([]byte(line))
+
+			got := cap.snapshot()
+			if len(got) != 1 {
+				t.Fatalf("expected one log, got %d", len(got))
+			}
+			msg := got[0].Message
+			if !strings.Contains(msg, "node.example.org") || !strings.Contains(msg, "203.0.113.77") || !strings.Contains(msg, "2606:2800:220:1:248:1893:25c8:1946") {
+				t.Fatalf("raw sensitive value missing before output masking on level=%s: %q", lvl, msg)
+			}
+			if strings.Contains(msg, "no************rg") || strings.Contains(msg, "20********77") || strings.Contains(msg, "[26******************************46]:443") {
+				t.Fatalf("message was redacted before output masking on level=%s: %q", lvl, msg)
+			}
+		})
+	}
 }

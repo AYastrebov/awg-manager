@@ -63,20 +63,15 @@ func TestOversizedTags_UnknownTagHasNegativeCount(t *testing.T) {
 
 // setupGeoDataWithTags stages an in-memory GeoDataStore with a single
 // geoip file whose tag cache is pre-populated from the provided map.
-// The temp directory is installed as hrDir so GeoDataStore.GetTags
-// accepts paths rooted under it.
 func setupGeoDataWithTags(t *testing.T, tagsByName map[string][]GeoTag) *GeoDataStore {
 	t.Helper()
 	dir := t.TempDir()
-	origHRDir := hrDir
-	hrDir = dir
-	t.Cleanup(func() { hrDir = origHRDir })
 
-	path := filepath.Join(dir, "geoip.dat")
+	gds := NewGeoDataStore(dir)
+	path := filepath.Join(gds.geoDir, "geoip.dat")
 	if err := os.WriteFile(path, []byte{}, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	gds := NewGeoDataStore(dir)
 	gds.entries = []GeoFileEntry{{Type: "geoip", Path: path}}
 	all := make([]GeoTag, 0, len(tagsByName))
 	for _, v := range tagsByName {

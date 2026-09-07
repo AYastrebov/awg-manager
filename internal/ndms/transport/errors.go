@@ -1,14 +1,34 @@
 package transport
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+)
+
+// Sentinel errors для Batcher (DataLoader pattern для RCI reads).
+// См. internal/ndms/transport/batcher.go.
+var (
+	// ErrBatcherClosed возвращается из Submit, если Batcher был закрыт
+	// до того как submit смог enqueue request.
+	ErrBatcherClosed = errors.New("rci batcher: closed")
+
+	// ErrBatchResponseShape возвращается когда NDMS вернул response не в
+	// форме JSON-массива (например объект или строка). Сигнал что
+	// формат batch'а несовместим — нужно investigate.
+	ErrBatchResponseShape = errors.New("rci batcher: unexpected response shape (expected JSON array)")
+
+	// ErrBatchLengthMismatch возвращается когда len(response array) !=
+	// len(batch). Может означать NDMS reorder'ил или потерял элементы —
+	// сигнал что нужно перейти на id-tagged batch'и.
+	ErrBatchLengthMismatch = errors.New("rci batcher: response array length mismatch")
 )
 
 // HTTPError is returned by Client.Get / GetRaw / Post when NDMS replies
 // with a non-2xx status. Typed so callers can match on Status — e.g.
-// a 404 on /show/interface/<name>/wireguard/peer means "no peers",
-// not a real error.
+// PeerStore treats a 404 on /show/interface/<name> as "interface gone,
+// no peers" rather than a real error.
 type HTTPError struct {
 	Method string
 	Path   string
@@ -60,6 +80,13 @@ func (e *BatchError) Error() string {
 // Returns the message if the body indicates an application error,
 // "" otherwise. NDMS shape: {"status":"error","message":"…"}.
 func ExtractError(body []byte) string {
+	// Fast path: тело без поля "status" конвертом ошибки быть не может —
+	// байтовый скан вместо полного Unmarshal больших success-ответов
+	// (interface/object-group списки в сотни KB давали ~8% idle-CPU
+	// в профиле, стенд 2026-07-16). Семантика не меняется.
+	if !bytes.Contains(body, []byte(`"status"`)) {
+		return ""
+	}
 	var envelope struct {
 		Status  string `json:"status"`
 		Message string `json:"message"`

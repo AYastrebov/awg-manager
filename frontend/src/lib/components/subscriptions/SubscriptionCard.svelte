@@ -3,66 +3,78 @@
 	import type { SingboxLayoutMode } from '$lib/constants/singboxLayout';
 	import { goto } from '$app/navigation';
 	import { untrack } from 'svelte';
-	import { singboxDelayHistory, singboxTraffic, triggerDelayCheck } from '$lib/stores/singbox';
+	import { singboxDelayHistory, triggerDelayCheck } from '$lib/stores/singbox';
 	import { getTrafficRates, subscribeTraffic, loadHistory } from '$lib/stores/traffic';
-	import { TrafficSparkline } from '$lib/components/ui';
-	import { formatBytes } from '$lib/utils/format';
+	import { Badge, TunnelListActions } from '$lib/components/ui';
+	import {
+		TunnelDelaySparkBars,
+		TunnelListEndpointLine,
+		TunnelListTrafficCell,
+		TunnelMetaText,
+		TunnelSingboxPingButton,
+		TunnelTitleRow,
+	} from '$lib/components/tunnels';
+	import { singboxDelayFromHistory } from '$lib/utils/singboxDelay';
+	import { singboxDelayStatusDot } from '$lib/utils/statusDot';
 	import { resolveSubscriptionMemberTag } from '$lib/utils/subscriptionMember';
+	import { isCardNestedInteraction } from '$lib/utils/cardClick';
+	import TunnelDiagnosticsModal from '$lib/components/testing/TunnelDiagnosticsModal.svelte';
 
 	interface Props {
 		subscription: Subscription;
 		liveActiveMember?: string | null;
 		layout?: SingboxLayoutMode;
+		renderMode?: import('$lib/constants/singboxLayout').TunnelRenderMode;
 		ondelete?: (id: string) => void;
 		ondetail?: (tag: string) => void;
 	}
-	let { subscription, liveActiveMember = null, layout = 'grid', ondelete, ondetail }: Props = $props();
+	let {
+		subscription,
+		liveActiveMember = null,
+		layout = 'compact',
+		renderMode = 'compact',
+		ondelete,
+		ondetail,
+	}: Props = $props();
 
 	const resolvedMemberTag = $derived(resolveSubscriptionMemberTag(subscription, liveActiveMember));
 
-	const history = $derived($singboxDelayHistory.get(resolvedMemberTag) ?? []);
-	const latest = $derived(history.length > 0 ? history[history.length - 1] : -1);
-	const hasConsecutiveTimeout = $derived(
-		history.length >= 2 &&
-			history[history.length - 1] <= 0 &&
-			history[history.length - 2] <= 0,
+	const history = $derived(
+		resolvedMemberTag ? ($singboxDelayHistory.get(resolvedMemberTag) ?? []) : [],
 	);
-
-	const DELAY_OK = 200;
-	const DELAY_SLOW = 500;
-
-	const delayState = $derived.by((): 'ok' | 'slow' | 'fail' | 'unknown' => {
-		if (!resolvedMemberTag) return 'unknown';
-		if (latest < 0) return 'unknown';
-		if (latest <= 0) return hasConsecutiveTimeout ? 'fail' : 'slow';
-		if (latest < DELAY_OK) return 'ok';
-		if (latest < DELAY_SLOW) return 'slow';
-		return 'slow';
-	});
-	const delayText = $derived.by(() => {
-		if (!resolvedMemberTag) return '—';
-		if (delayState === 'unknown') return '—';
-		if (delayState === 'fail') return 'timeout';
-		if (latest <= 0) return '…';
-		return `${latest}ms`;
-	});
-
-	const traffic = $derived(resolvedMemberTag ? $singboxTraffic.get(resolvedMemberTag) : undefined);
-
-	const trafficSparkData = $derived.by(() => {
-		const n = Math.min(rxRates.length, txRates.length);
-		if (n === 0) return [];
-		const take = Math.min(36, n);
-		const out: number[] = [];
-		for (let i = n - take; i < n; i++) {
-			out.push(Math.max(0, rxRates[i] ?? 0) + Math.max(0, txRates[i] ?? 0));
+	const delayPresentation = $derived(
+		resolvedMemberTag ? singboxDelayFromHistory(history) : { state: 'unknown' as const, label: '—', latest: undefined },
+	);
+	const delayState = $derived(delayPresentation.state);
+	const delayText = $derived(delayPresentation.label);
+	const statusDot = $derived.by(() => {
+		if (subscription.lastError) {
+			return { variant: 'error' as const, pulse: false, label: 'error' };
 		}
-		return out;
+		if (!subscription.enabled) {
+			return { variant: 'muted' as const, pulse: false, label: 'off' };
+		}
+		if (resolvedMemberTag) {
+			return singboxDelayStatusDot(delayState, true);
+		}
+		return { variant: 'muted' as const, pulse: false, label: 'unknown' };
+	});
+	const trafficSparkSeries = $derived.by(() => {
+		const n = Math.min(rxRates.length, txRates.length);
+		if (n === 0) return { rx: [] as number[], tx: [] as number[] };
+		const take = Math.min(36, n);
+		const start = n - take;
+		return {
+			rx: rxRates.slice(start, n),
+			tx: txRates.slice(start, n),
+		};
 	});
 
 	let rxRates = $state<number[]>([]);
 	let txRates = $state<number[]>([]);
 	let trafficTag = $derived(resolvedMemberTag);
+	const inlineRxRate = $derived(rxRates.length > 0 ? rxRates[rxRates.length - 1] : 0);
+	const inlineTxRate = $derived(txRates.length > 0 ? txRates[txRates.length - 1] : 0);
 
 	$effect(() => {
 		const tag = trafficTag;
@@ -99,26 +111,43 @@
 			testingDelay = false;
 		}
 	}
-	function onDelayKeydown(e: KeyboardEvent): void {
-		if (e.key === 'Enter' || e.key === ' ') {
-			e.preventDefault();
-			e.stopPropagation();
-			void runDelayCheck(e);
-		}
-	}
-
-	function open(): void {
+	function open(e?: MouseEvent | KeyboardEvent): void {
+		if (e && isCardNestedInteraction(e)) return;
 		goto(`/subscriptions/${subscription.id}`);
 	}
 
-	function requestDelete(e: MouseEvent): void {
-		e.stopPropagation();
-		ondelete?.(subscription.id);
+	function openSettings(): void {
+		goto(`/subscriptions/${subscription.id}?tab=settings`);
 	}
+
+	let diagnosticsOpen = $state(false);
+
+	let selectorTag = $derived(subscription.selectorTag ?? '');
+	const proxyIface = $derived(subscription.proxyIndex >= 0 ? `Proxy${subscription.proxyIndex}` : '');
+	let kernelIface = $derived(subscription.proxyIndex >= 0 ? `t2s${subscription.proxyIndex}` : '');
+	const isURLTest = $derived(subscription.mode === 'urltest');
+	const resolvedMember = $derived(
+		subscription.members?.find((m) => m.tag === resolvedMemberTag) ?? null,
+	);
+	const listActiveServerName = $derived(
+		resolvedMember?.label?.trim() || resolvedMember?.tag?.trim() || '',
+	);
+	let showEndpoint = $state(false);
+	let diagnosticsUnavailableReason = $derived(
+		!selectorTag || !kernelIface
+			? 'Для подписки не удалось определить интерфейс тестирования.'
+			: undefined,
+	);
 
 	const status = $derived(
 		subscription.lastError ? 'error' : subscription.lastFetched ? 'ok' : 'pending',
 	);
+	const feedStatusLabel = $derived(
+		!subscription.enabled ? 'Выключена' : subscription.lastError ? 'Ошибка' : 'OK',
+	);
+	const modeLabel = $derived(subscription.mode === 'urltest' ? 'URLTest' : 'Selector');
+	const isInlineGroup = $derived(subscription.isInline || !subscription.url?.trim());
+	const sourceKindLabel = $derived(isInlineGroup ? 'группа' : 'подписка');
 	const lastFetchedHuman = $derived(
 		subscription.lastFetched ? formatRelative(subscription.lastFetched) : '—',
 	);
@@ -133,263 +162,602 @@
 	}
 </script>
 
-{#if layout === 'list'}
-	<div class="sub-list-group" class:err={status === 'error'}>
-		<div
-			role="button"
-			tabindex="0"
-			class="sub-list-click"
-			onclick={open}
-			onkeydown={(e) => {
-				if (e.key === 'Enter' || e.key === ' ') {
-					e.preventDefault();
-					open();
-				}
-			}}
-		>
-			<div class="sbx-sub-inactive-row">
-				<div class="list-cell" data-label="Статус">
-					<div class="badge {status}">
-						{#if status === 'ok'}OK{:else if status === 'error'}Ошибка{:else}—{/if}
+{#if renderMode === 'table'}
+	<tr
+		role="button"
+		tabindex="0"
+		class="sbx-sub-active-row"
+		class:err={status === 'error'}
+		class:off={!subscription.enabled}
+		onclick={(e) => open(e)}
+		onkeydown={(e) => {
+			if (e.key === 'Enter' || e.key === ' ') {
+				e.preventDefault();
+				open(e);
+			}
+		}}
+	>
+			<td class="tunnel-list-cell tunnel-list-cell--delay lc lc-delay">
+				{#if subscription.lastError}
+					<span class="delay-inline-err mono" title={subscription.lastError}>
+						{subscription.lastError}
+					</span>
+				{:else if !subscription.enabled}
+					<span class="delay-dash">—</span>
+				{:else if resolvedMemberTag}
+					<TunnelSingboxPingButton
+						layout="list"
+						label={delayText}
+						state={delayState}
+						checking={testingDelay}
+						onclick={runDelayCheck}
+					/>
+				{:else}
+					<span class="delay-dash">—</span>
+				{/if}
+			</td>
+			<td class="tunnel-list-cell tunnel-list-cell--name lc lc-name">
+				<div class="tunnel-list-name-stack">
+					<TunnelTitleRow
+						title={subscription.label || subscription.url}
+						dotVariant={statusDot.variant}
+						dotPulse={statusDot.pulse}
+						staticTitle
+					/>
+					<TunnelMetaText>
+						<span>{subscription.memberTags.length} серверов</span>
+						<span class="meta-dot" aria-hidden="true">·</span>
+						<span>{lastFetchedHuman}</span>
+					</TunnelMetaText>
+					<TunnelMetaText mono>
+						{#if proxyIface}
+							<span>{proxyIface}</span>
+							{#if kernelIface}<span class="meta-dot" aria-hidden="true">·</span><span>{kernelIface}</span>{/if}
+							<span class="meta-dot" aria-hidden="true">·</span>
+						{:else if subscription.inboundTag}
+							<span>{subscription.inboundTag}</span>
+							<span class="meta-dot" aria-hidden="true">·</span>
+						{/if}
+						<span>{modeLabel}</span>
+					</TunnelMetaText>
+				</div>
+			</td>
+			<td class="tunnel-list-cell tunnel-list-cell--endpoint lc lc-endpoint">
+				{#if !subscription.enabled}
+					<span class="off-label">выкл</span>
+				{:else if resolvedMember}
+					<div class="lc-endpoint-stack">
+						{#if listActiveServerName}
+							<span class="lc-endpoint-name" title={listActiveServerName}>{listActiveServerName}</span>
+						{/if}
+						<TunnelListEndpointLine
+							host={resolvedMember.server}
+							port={resolvedMember.port}
+							bind:show={showEndpoint}
+						/>
 					</div>
-				</div>
-				<div class="list-cell list-cell-delay" data-label="Delay">
-					{#if subscription.lastError}
-						<span class="delay-inline-err mono" title={subscription.lastError}>
-							{subscription.lastError}
-						</span>
-					{:else if resolvedMemberTag}
-						<button
-							type="button"
-							class="lat-btn {delayState}"
-							class:is-checking={testingDelay}
-							disabled={testingDelay}
-							onclick={runDelayCheck}
-							onkeydown={onDelayKeydown}
-							title="Обновить delay"
-						>
-							{testingDelay ? '...' : delayText}
-						</button>
-					{:else}
-						<span class="delay-dash">—</span>
-					{/if}
-				</div>
-				<div class="list-cell list-name" data-label="Подписка">
-					<div class="label-strong">{subscription.label || subscription.url}</div>
-					<div class="meta mono">{subscription.inboundTag} · :{subscription.listenPort}</div>
-				</div>
-				<div class="list-cell" data-label="Серверов">
-					{subscription.memberTags.length}
-				</div>
-				<div class="list-cell mono" data-label="Активен">
-					{subscription.activeMember || '—'}
-				</div>
-				<div class="list-cell list-cell-traffic" data-label="Трафик">
-					{#if subscription.lastError}
-						<span class="delay-dash">—</span>
-					{:else if resolvedMemberTag}
-						<div class="traffic-row-list">
-							<div
-								role="button"
-								tabindex="0"
-								class="traffic-mini-click"
-								onclick={(e) => {
-									e.stopPropagation();
-									ondetail?.(resolvedMemberTag);
-								}}
-								onkeydown={(e) => {
-									if (e.key === 'Enter' || e.key === ' ') {
-										e.preventDefault();
-										e.stopPropagation();
-										ondetail?.(resolvedMemberTag);
-									}
-								}}
-								title="Открыть детальный график"
-							>
-								<TrafficSparkline
-									data={trafficSparkData}
-									width={84}
-									height={22}
-									color="var(--color-accent)"
-								/>
-							</div>
-							<div class="traffic-mini-col mono">
-								<span>↓ {formatBytes(traffic?.download ?? 0)}</span>
-								<span>↑ {formatBytes(traffic?.upload ?? 0)}</span>
-							</div>
-						</div>
-					{:else}
-						<span class="delay-dash">—</span>
-					{/if}
-				</div>
-				<div class="list-cell list-cell-ping" data-label="Ping">
-					{#if subscription.lastError}
-						<span class="delay-dash">—</span>
-					{:else if resolvedMemberTag}
-						<div
-							class="spark-mini {delayState}"
-							title="Delay за последние проверки"
-						>
-							{#if history.length === 0}
-								{#each Array(10) as _, i (i)}
-									<div class="bar empty"></div>
-								{/each}
-							{:else}
-								{@const max = Math.max(...history.map((v) => (v <= 0 ? 100 : v)), 100)}
-								{#each history.slice(-14) as d, i (i)}
-									<div class="bar" style="height: {Math.max((d <= 0 ? max : d) / max, 0.08) * 100}%;"></div>
-								{/each}
-							{/if}
-						</div>
-					{:else}
-						<span class="delay-dash">—</span>
-					{/if}
-				</div>
-				<div class="list-cell" data-label="Обновлено">
-					{lastFetchedHuman}
-				</div>
-				<div class="list-cell list-actions" data-label="">
-					{#if ondelete}
-						<button
-							type="button"
-							class="card-remove"
-							title="Удалить подписку"
-							aria-label="Удалить подписку {subscription.label || subscription.url}"
-							onclick={requestDelete}
-						>
-							<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-								<line x1="18" y1="6" x2="6" y2="18" />
-								<line x1="6" y1="6" x2="18" y2="18" />
-							</svg>
-						</button>
-					{/if}
-				</div>
+				{:else}
+					<span class="delay-dash">—</span>
+				{/if}
+			</td>
+			<td class="tunnel-list-cell tunnel-list-cell--traffic lc lc-traffic">
+				{#if subscription.lastError || !subscription.enabled}
+					<span class="delay-dash">—</span>
+				{:else if resolvedMemberTag}
+					<TunnelListTrafficCell
+						rxRate={inlineRxRate}
+						txRate={inlineTxRate}
+						rxData={trafficSparkSeries.rx}
+						txData={trafficSparkSeries.tx}
+						onclick={() => ondetail?.(resolvedMemberTag)}
+						title="Открыть детальный график"
+					/>
+				{:else}
+					<span class="delay-dash">—</span>
+				{/if}
+			</td>
+			<td class="tunnel-list-cell tunnel-list-cell--ping lc">
+				{#if subscription.lastError || !subscription.enabled}
+					<span class="delay-dash">—</span>
+				{:else if resolvedMemberTag}
+					<TunnelDelaySparkBars
+						{history}
+						state={delayState}
+						layout="list"
+						title="Delay за последние проверки"
+					/>
+				{:else}
+					<span class="delay-dash">—</span>
+				{/if}
+			</td>
+			<td class="tunnel-list-cell tunnel-list-cell--actions lc lc-actions col-actions">
+				<TunnelListActions
+					onEdit={openSettings}
+					editLabel="Изменить"
+					editTitle="Настройки подписки «{subscription.label || subscription.url}»"
+					onTest={() => (diagnosticsOpen = true)}
+					testTitle="Открыть диагностику подписки «{subscription.label || subscription.url}»"
+					onDelete={ondelete ? () => ondelete(subscription.id) : undefined}
+					deleteTitle="Удалить подписку «{subscription.label || subscription.url}»"
+				/>
+			</td>
+	</tr>
+{:else if layout === 'dense' || renderMode === 'list-card'}
+{@const cardClickProps = {
+		role: 'button' as const,
+		tabindex: 0,
+		onclick: (e: MouseEvent) => open(e),
+		onkeydown: (e: KeyboardEvent) => {
+			if (e.key === 'Enter' || e.key === ' ') {
+				e.preventDefault();
+				open(e);
+			}
+		},
+	}}
+<div
+	class="card inactive-panel"
+	class:view-dense={renderMode !== 'list-card'}
+	class:view-list={renderMode === 'list-card'}
+	class:err={status === 'error'}
+	class:off={!subscription.enabled}
+	{...cardClickProps}
+>
+	<div class="inactive-header-dense">
+		<div class="inactive-header-main">
+			<div class="inactive-title-row">
+				<h3 class="inactive-title">{subscription.label || subscription.url}</h3>
+				<Badge variant="accent" size="sm">{sourceKindLabel}</Badge>
+			</div>
+			<div class="inactive-meta-dense mono">
+				{#if proxyIface}
+					<span>{proxyIface}</span>
+					{#if kernelIface}<span class="meta-dot" aria-hidden="true">·</span><span>{kernelIface}</span>{/if}
+				{:else}
+					<span>{subscription.inboundTag}</span>
+				{/if}
+				<span class="meta-dot" aria-hidden="true">·</span><span>:{subscription.listenPort}</span>
+				<span class="meta-dot" aria-hidden="true">·</span><span>{subscription.memberTags.length} серв.</span>
 			</div>
 		</div>
+		{#if subscription.enabled && !subscription.lastError && resolvedMemberTag}
+			<TunnelSingboxPingButton
+				layout="dense"
+				label={delayText}
+				state={delayState}
+				checking={testingDelay}
+				onclick={runDelayCheck}
+			/>
+		{:else}
+			<span
+				class="status-badge status-badge-dense"
+				class:status-off={!subscription.enabled}
+				class:status-error={subscription.enabled && status === 'error'}
+				class:status-ok={subscription.enabled && status === 'ok'}
+				class:status-pending={subscription.enabled && status === 'pending'}
+			>
+				{feedStatusLabel}
+			</span>
+		{/if}
 	</div>
+	{#if renderMode !== 'list-card'}
+	<hr class="divider" />
+	<div class="inactive-meta-dense secondary mono">
+		<span>{modeLabel}</span>
+		<span class="meta-dot" aria-hidden="true">·</span>
+		<span>обновлено {lastFetchedHuman}</span>
+		{#if subscription.activeMember}
+			<span class="meta-dot" aria-hidden="true">·</span>
+			<span>{subscription.activeMember}</span>
+		{/if}
+	</div>
+	{#if subscription.lastError}
+		<div class="inactive-err mono" title={subscription.lastError}>{subscription.lastError}</div>
+	{/if}
+	{/if}
+	{#if renderMode === 'list-card'}
+	<div class="actions">
+		<TunnelListActions
+			variant="labeled"
+			onEdit={openSettings}
+			editLabel="Изменить"
+			editTitle="Настройки подписки «{subscription.label || subscription.url}»"
+			onTest={() => (diagnosticsOpen = true)}
+			testTitle="Открыть диагностику подписки «{subscription.label || subscription.url}»"
+			onDelete={ondelete ? () => ondelete(subscription.id) : undefined}
+			deleteTitle="Удалить подписку «{subscription.label || subscription.url}»"
+		/>
+	</div>
+	{/if}
+</div>
 {:else}
 <div
+	class="card panel inactive-panel view-compact"
+	class:err={status === 'error'}
+	class:off={!subscription.enabled}
 	role="button"
 	tabindex="0"
-	class="card"
-	class:panel={layout === 'grid'}
-	class:err={status === 'error'}
-	onclick={open}
+	onclick={(e) => open(e)}
 	onkeydown={(e) => {
 		if (e.key === 'Enter' || e.key === ' ') {
 			e.preventDefault();
-			open();
+			open(e);
 		}
 	}}
 >
-	<div class="head">
-		<div class="label">{subscription.label || subscription.url}</div>
-		<div class="head-right">
-			<div class="badge {status}">
-				{#if status === 'ok'}OK{:else if status === 'error'}Ошибка{:else}—{/if}
+	<div class="inactive-header">
+		<div class="inactive-header-main">
+			<h3 class="inactive-title">{subscription.label || subscription.url}</h3>
+			<div class="inactive-meta-line">
+				{#if proxyIface}
+					<span class="inactive-iface mono">{proxyIface}{#if kernelIface} · {kernelIface}{/if}</span>
+				{:else}
+					<span class="inactive-iface mono">{subscription.inboundTag}</span>
+				{/if}
+				<span class="inactive-kind">{modeLabel}</span>
 			</div>
-			{#if ondelete}
-				<button
-					type="button"
-					class="card-remove"
-					title="Удалить подписку"
-					aria-label="Удалить подписку {subscription.label || subscription.url}"
-					onclick={requestDelete}
-				>
-					<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-						<line x1="18" y1="6" x2="6" y2="18" />
-						<line x1="6" y1="6" x2="18" y2="18" />
-					</svg>
-				</button>
-			{/if}
+			<div class="inactive-note">
+				<Badge variant="accent" size="sm">{sourceKindLabel}</Badge>
+				<span class="meta-dot" aria-hidden="true">·</span>
+				:{subscription.listenPort}
+			</div>
+		</div>
+		<div class="inactive-status-wrap">
+			<span
+				class="status-badge"
+				class:status-off={!subscription.enabled}
+				class:status-error={subscription.enabled && status === 'error'}
+				class:status-ok={subscription.enabled && status === 'ok'}
+				class:status-pending={subscription.enabled && status === 'pending'}
+			>
+				<span class="led-dot" aria-hidden="true"></span>
+				{feedStatusLabel}
+			</span>
 		</div>
 	</div>
-	<div class="meta mono">{subscription.inboundTag} · :{subscription.listenPort}</div>
-	<div class="info">
-		{subscription.memberTags.length} серверов
-		{#if subscription.activeMember}· активен <span class="mono">{subscription.activeMember}</span>{/if}
-		· обновлено {lastFetchedHuman}
-		{#if subscription.refreshHours > 0}· auto {subscription.refreshHours}ч{/if}
+
+	<div class="inactive-details">
+		<div class="detail-row">
+			<span class="detail-label">Серверов</span>
+			<span class="detail-value">{subscription.memberTags.length}</span>
+		</div>
+		<div class="detail-row">
+			<span class="detail-label">Активный</span>
+			<span class="detail-value mono">{subscription.activeMember || '—'}</span>
+		</div>
+		<div class="detail-row">
+			<span class="detail-label">Обновлено</span>
+			<span class="detail-value">{lastFetchedHuman}</span>
+		</div>
+		{#if subscription.refreshHours > 0}
+			<div class="detail-row">
+				<span class="detail-label">Авто-обновление</span>
+				<span class="detail-value">каждые {subscription.refreshHours} ч</span>
+			</div>
+		{/if}
+		{#if subscription.lastError}
+			<div class="detail-row detail-row-err">
+				<span class="detail-label">Ошибка</span>
+				<span class="detail-value mono" title={subscription.lastError}>{subscription.lastError}</span>
+			</div>
+		{/if}
 	</div>
-	{#if subscription.lastError}
-		<div class="err-msg mono">{subscription.lastError}</div>
-	{/if}
+
+	<div class="actions actions--bar-top">
+		<TunnelListActions
+			variant="labeled"
+			onEdit={openSettings}
+			editLabel="Изменить"
+			editTitle="Настройки подписки «{subscription.label || subscription.url}»"
+			onTest={() => (diagnosticsOpen = true)}
+			testTitle="Открыть диагностику подписки «{subscription.label || subscription.url}»"
+			onDelete={ondelete ? () => ondelete(subscription.id) : undefined}
+			deleteTitle="Удалить подписку «{subscription.label || subscription.url}»"
+		/>
+	</div>
 </div>
 {/if}
+
+<TunnelDiagnosticsModal
+	open={diagnosticsOpen}
+	kind="subscription"
+	targetId={selectorTag}
+	displayName={subscription.label || selectorTag || subscription.id}
+	subjectLabel="подписку"
+	iface={kernelIface}
+	loading={false}
+	unavailableReason={diagnosticsUnavailableReason}
+	onclose={() => (diagnosticsOpen = false)}
+/>
 
 <style>
 	.card {
 		display: flex;
 		flex-direction: column;
-		gap: 0.3rem;
-		padding: 0.85rem 1rem;
+		gap: 12px;
+		padding: 12px 14px;
 		background: var(--color-bg-secondary);
 		border: 1px solid var(--color-border);
-		border-radius: 6px;
+		border-radius: var(--radius);
 		font: inherit;
 		text-align: left;
 		color: var(--color-text-primary);
 		cursor: pointer;
+		transition: border-color var(--t-fast) ease;
 	}
+	.card.off { border-color: var(--color-muted-border); opacity: 0.72; }
 	.card.panel {
-		padding: 16px;
-		border-radius: 10px;
+		gap: 0;
+		padding: 12px 14px;
 	}
-	.sub-list-group {
-		border-bottom: 1px solid var(--color-border);
-	}
-	.sub-list-group:last-child {
-		border-bottom: none;
-	}
-	.sub-list-click {
+	.card.panel.inactive-panel.view-compact {
 		cursor: pointer;
 	}
-	.sub-list-click:focus-visible {
-		outline: 2px solid var(--color-primary, #3b82f6);
-		outline-offset: 2px;
+	.card.panel.inactive-panel {
+		border: 1px dashed color-mix(in srgb, var(--color-text-muted) 38%, transparent);
 	}
-	.sbx-sub-inactive-row {
-		display: grid;
-		grid-template-columns:
-			minmax(64px, 0.9fr)
-			minmax(84px, 1fr)
-			minmax(140px, 1.25fr)
-			minmax(56px, 0.85fr)
-			minmax(88px, 1fr)
-			minmax(150px, 1.15fr)
-			minmax(56px, 0.85fr)
-			minmax(88px, 1fr)
-			minmax(44px, 0.75fr);
-		gap: 0.75rem 1rem;
+	@media (hover: hover) and (pointer: fine) {
+		.card.inactive-panel:hover {
+			border-color: var(--color-accent-border);
+		}
+	}
+	.card.panel.inactive-panel.off {
+		opacity: 1;
+	}
+	.card.panel.inactive-panel.err {
+		border-color: color-mix(in srgb, var(--color-error) 45%, transparent);
+	}
+	.card.view-dense.inactive-panel {
+		gap: 6px;
+		padding: 10px 12px;
+		cursor: pointer;
+		text-align: left;
+		font: inherit;
+		color: inherit;
+	}
+	.card.view-list.inactive-panel {
+		cursor: pointer;
+	}
+	.inactive-header-dense {
+		display: flex;
+		justify-content: space-between;
+		align-items: flex-start;
+		gap: 8px;
+	}
+	.card.view-dense .inactive-title {
+		font-size: 13px;
+	}
+	.inactive-meta-dense {
+		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
-		padding: 0.75rem 1rem;
-		min-width: 960px;
+		font-size: 9px;
+		color: var(--color-text-muted);
+		line-height: 1.3;
 	}
-	.sub-list-group.err .sbx-sub-inactive-row {
-		background: rgba(248, 81, 73, 0.04);
+
+	.meta-dot {
+		margin: 0 0.35em;
+		opacity: 0.75;
 	}
-	.sbx-sub-inactive-row .list-cell {
+
+	.inactive-title-row {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		min-width: 0;
+		overflow: hidden;
+	}
+
+	.inactive-title-row .inactive-title {
+		flex: 0 1 auto;
+		min-width: 0;
+	}
+
+	.inactive-title-row :global(.badge) {
+		flex-shrink: 0;
+		font-size: 9px;
+		padding: 1px 5px;
+	}
+
+	.card.view-dense .divider {
+		border: none;
+		border-top: 1px dashed var(--color-border);
+		margin: 4px 0;
+		height: 0;
+		background: none;
+	}
+	.inactive-meta-dense.secondary {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		margin-top: 2px;
+	}
+	.status-badge-dense {
+		font-size: 9px;
+		padding: 1px 6px;
+		flex-shrink: 0;
+	}
+	.inactive-err {
+		font-size: 9px;
+		color: var(--color-error);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.inactive-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: flex-start;
+		gap: 12px;
+	}
+	.inactive-header-main {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		min-width: 0;
+	}
+	.inactive-title {
+		margin: 0;
+		font-size: var(--sbx-card-title);
+		line-height: var(--sbx-card-title-line-height);
+		font-weight: 600;
+		color: var(--color-text-primary);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.inactive-meta-line {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 8px;
+	}
+	.inactive-iface {
+		font-size: var(--sbx-card-meta);
+		font-family: var(--font-mono, ui-monospace, monospace);
+		color: var(--color-text-muted);
+	}
+	.inactive-kind {
+		display: inline-flex;
+		align-items: center;
+		padding: 2px 8px;
+		font-size: var(--sbx-card-badge);
+		font-weight: 500;
+		border-radius: 10px;
+		background: rgba(88, 166, 255, 0.15);
+		color: var(--color-accent);
+	}
+	.inactive-note {
+		font-size: var(--sbx-card-note);
+		color: var(--color-text-muted);
+	}
+	.inactive-status-wrap {
+		flex-shrink: 0;
+	}
+	.status-badge {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		padding: 2px 10px;
+		font-size: var(--sbx-card-status);
+		font-weight: 500;
+		border-radius: 10px;
+	}
+	.status-badge.status-ok {
+		background: rgba(16, 185, 129, 0.15);
+		color: var(--color-success, #10b981);
+	}
+	.status-badge.status-error {
+		background: rgba(248, 81, 73, 0.15);
+		color: var(--color-error, #f85149);
+	}
+	.status-badge.status-off,
+	.status-badge.status-pending {
+		background: rgba(148, 163, 184, 0.15);
+		color: var(--color-text-muted);
+	}
+	.led-dot {
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		background: currentColor;
+		flex-shrink: 0;
+	}
+	.inactive-details {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+		margin-top: 12px;
+		padding-top: 12px;
+		padding-bottom: 12px;
+		border-top: 1px solid var(--color-border);
+	}
+	.detail-row {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		min-width: 0;
+	}
+	.detail-label {
+		font-size: var(--sbx-card-label);
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--color-text-muted);
+	}
+	.detail-value {
+		font-size: var(--sbx-card-value);
+		font-family: var(--font-mono, ui-monospace, monospace);
+		color: var(--color-text-secondary);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.detail-row-err .detail-value {
+		color: var(--color-error, #f85149);
+		white-space: normal;
+		overflow-wrap: anywhere;
+	}
+	.sbx-sub-active-row {
+		cursor: pointer;
+	}
+	.sbx-sub-active-row:focus-visible {
+		outline: 2px solid var(--color-accent);
+		outline-offset: -2px;
+	}
+	.lc {
 		display: flex;
 		align-items: center;
 		min-width: 0;
-		font-size: 0.8125rem;
+		font-size: var(--sbx-card-value);
 		color: var(--color-text-secondary);
+		vertical-align: middle;
 	}
-	.list-name {
-		flex-direction: column;
-		align-items: flex-start !important;
-		gap: 0.15rem;
-	}
-	.label-strong {
-		font-weight: 600;
-		font-size: 0.9375rem;
-		color: var(--color-text-primary);
-	}
-	.sbx-sub-inactive-row .list-cell-delay {
+	.lc-delay {
+		gap: 0.35rem;
 		min-width: 0;
 	}
+	.lc-name {
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 0.15rem;
+	}
+	.mono {
+		font-family: var(--font-mono, ui-monospace, monospace);
+	}
+	.lc-endpoint {
+		display: flex;
+		align-items: center;
+		gap: 0.35rem;
+	}
+	.lc-endpoint-stack {
+		display: flex;
+		flex-direction: column;
+		min-width: 0;
+		gap: 0.1rem;
+	}
+	.lc-endpoint-name {
+		font-size: var(--sbx-card-value);
+		color: var(--color-text-primary);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.off-label {
+		font-size: var(--sbx-card-badge);
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--color-text-muted);
+	}
+	.lc-actions {
+		flex-wrap: nowrap;
+		gap: 0.375rem;
+		justify-content: center;
+		align-items: center;
+		white-space: nowrap;
+	}
 	.delay-inline-err {
-		font-size: 0.68rem;
+		font-size: var(--sbx-card-badge);
 		line-height: 1.25;
 		color: #f85149;
 		overflow: hidden;
@@ -398,126 +766,7 @@
 		width: 100%;
 	}
 	.delay-dash {
-		font-size: 0.8125rem;
+		font-size: var(--sbx-card-value);
 		color: var(--color-text-muted);
 	}
-	.lat-btn {
-		padding: 0.15rem 0.45rem;
-		border-radius: 4px;
-		background: var(--color-bg-tertiary);
-		color: var(--color-text-muted);
-		border: 1px solid var(--color-border);
-		font: inherit;
-		font-size: 0.72rem;
-		font-family: var(--font-mono, ui-monospace, monospace);
-		cursor: pointer;
-	}
-	.lat-btn.is-checking {
-		opacity: 0.55;
-		cursor: wait;
-	}
-	.lat-btn.ok {
-		color: #3fb950;
-	}
-	.lat-btn.slow {
-		color: #d29922;
-	}
-	.lat-btn.fail {
-		color: #f85149;
-	}
-	.spark-mini {
-		display: flex;
-		align-items: flex-end;
-		gap: 1px;
-		height: 20px;
-		width: 100%;
-		max-width: 82px;
-	}
-	.spark-mini .bar {
-		flex: 1;
-		min-width: 0;
-		min-height: 2px;
-		border-radius: 1px;
-		background: var(--color-bg-tertiary);
-	}
-	.spark-mini.ok .bar {
-		background: #3fb950;
-	}
-	.spark-mini.slow .bar {
-		background: #d29922;
-	}
-	.spark-mini.fail .bar {
-		background: #f85149;
-	}
-	.spark-mini.unknown .bar,
-	.spark-mini .bar.empty {
-		opacity: 0.35;
-		height: 30% !important;
-	}
-	.traffic-row-list {
-		display: flex;
-		align-items: center;
-		gap: 0.45rem;
-		min-width: 0;
-	}
-	.traffic-mini-col {
-		display: flex;
-		flex-direction: column;
-		gap: 0.08rem;
-		font-size: 0.68rem;
-		line-height: 1.15;
-		color: var(--color-text-muted);
-		flex-shrink: 0;
-	}
-	.traffic-mini-click {
-		display: inline-flex;
-		border-radius: 4px;
-		cursor: pointer;
-		transition: background var(--t-fast) ease;
-	}
-	.traffic-mini-click:hover {
-		background: rgba(96, 165, 250, 0.06);
-	}
-	.traffic-mini-click:focus-visible {
-		outline: 1px solid var(--color-accent, #58a6ff);
-		outline-offset: 1px;
-	}
-	.card:focus-visible {
-		outline: 2px solid var(--color-primary, #3b82f6);
-		outline-offset: 2px;
-	}
-	.card.err { border-color: #f85149; }
-	.head { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }
-	.head-right { display: flex; align-items: center; gap: 0.5rem; }
-	.card-remove {
-		width: 22px;
-		height: 22px;
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		background: transparent;
-		border: 1px solid var(--color-border);
-		border-radius: 50%;
-		color: var(--color-text-muted);
-		cursor: pointer;
-		transition: color 120ms, border-color 120ms, background 120ms;
-	}
-	.card-remove:hover {
-		color: var(--color-error, #f85149);
-		border-color: var(--color-error, #f85149);
-		background: rgba(248, 81, 73, 0.08);
-	}
-	.card-remove:focus-visible {
-		outline: 2px solid var(--color-error, #f85149);
-		outline-offset: 1px;
-	}
-	.label { font-weight: 600; font-size: 0.95rem; }
-	.badge { font-size: 0.72rem; padding: 0.15rem 0.5rem; border-radius: 999px; }
-	.badge.ok { background: rgba(63, 185, 80, 0.15); color: #3fb950; }
-	.badge.error { background: rgba(248, 81, 73, 0.15); color: #f85149; }
-	.badge.pending { background: var(--color-bg-tertiary); color: var(--color-text-muted); }
-	.meta { font-size: 0.75rem; color: var(--color-text-muted); }
-	.info { font-size: 0.82rem; color: var(--color-text-muted); }
-	.err-msg { font-size: 0.78rem; color: #f85149; margin-top: 0.3rem; }
-	.mono { font-family: var(--font-mono, ui-monospace, monospace); }
 </style>

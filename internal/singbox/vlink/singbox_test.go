@@ -58,6 +58,11 @@ func TestIsSingboxJSON(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "xray config array with protocol not type",
+			body: `[{"remarks":"test","outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"1.2.3.4","port":443,"users":[{"id":"u"}]}]}}]}]`,
+			want: false,
+		},
+		{
 			name: "non-JSON share-link plain",
 			body: `vless://uuid@host:443?security=tls`,
 			want: false,
@@ -352,6 +357,20 @@ func TestParseSingboxBody_BrokenJSON(t *testing.T) {
 	}
 	if !strings.Contains(res.Errors[0].Message, "json parse") {
 		t.Errorf("expected json parse error, got %q", res.Errors[0].Message)
+	}
+}
+
+func TestParseSingboxBody_Mieru(t *testing.T) {
+	body := `{"outbounds":[{"type":"mieru","tag":"m","server":"h","server_port":443,"transport":"TCP","username":"u","password":"p"}]}`
+	res := ParseSingboxBody([]byte(body))
+	if len(res.Errors) != 0 {
+		t.Fatalf("errors: %+v", res.Errors)
+	}
+	if len(res.Outbounds) != 1 {
+		t.Fatalf("got %d outbounds, want 1", len(res.Outbounds))
+	}
+	if res.Outbounds[0].Protocol != "mieru" {
+		t.Fatalf("protocol=%q", res.Outbounds[0].Protocol)
 	}
 }
 

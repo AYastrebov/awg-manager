@@ -42,11 +42,49 @@ func TestRuleSetUpdate(t *testing.T) {
 		t.Errorf("expected ErrRuleSetNotFound, got %v", err)
 	}
 
-	// Tag rename rejected.
+	// Tag rename cascades to route and DNS references.
 	renamed := RuleSet{Tag: "geosite-renamed", Type: "remote", Format: "binary", URL: "https://example.com/x.srs", UpdateInterval: "24h"}
-	err = cfg.UpdateRuleSet("geosite-youtube", renamed)
-	if err == nil {
-		t.Error("expected tag-rename to be rejected, got nil")
+	cfg.Route.Rules = []Rule{{RuleSet: []string{"geosite-youtube"}, Action: "route", Outbound: "direct"}}
+	cfg.DNS.Rules = []DNSRule{{RuleSet: []string{"geosite-youtube"}, Server: "dns"}}
+	if err := cfg.UpdateRuleSet("geosite-youtube", renamed); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if cfg.Route.RuleSet[0].Tag != "geosite-renamed" {
+		t.Fatalf("rule_set tag not renamed: %+v", cfg.Route.RuleSet)
+	}
+	if cfg.Route.Rules[0].RuleSet[0] != "geosite-renamed" {
+		t.Fatalf("route rule_set refs not renamed: %+v", cfg.Route.Rules)
+	}
+	if cfg.DNS.Rules[0].RuleSet[0] != "geosite-renamed" {
+		t.Fatalf("dns rule_set refs not renamed: %+v", cfg.DNS.Rules)
+	}
+}
+
+func TestRuleSetRenameNestedRefsAndConflict(t *testing.T) {
+	cfg := NewEmptyConfig()
+	cfg.Route.RuleSet = []RuleSet{
+		{Tag: "old", Type: "remote", Format: "binary", URL: "https://example.com/old.srs", UpdateInterval: "24h"},
+		{Tag: "taken", Type: "remote", Format: "binary", URL: "https://example.com/taken.srs", UpdateInterval: "24h"},
+	}
+	cfg.Route.Rules = []Rule{{
+		Type: "logical", Mode: "or",
+		Rules:  []Rule{{RuleSet: []string{"old", "keep"}}},
+		Action: "route", Outbound: "direct",
+	}}
+	before, _ := json.Marshal(cfg)
+	if err := cfg.UpdateRuleSet("old", RuleSet{Tag: "taken", Type: "remote", Format: "binary", URL: "https://example.com/new.srs", UpdateInterval: "24h"}); !errors.Is(err, ErrRuleSetTagConflict) {
+		t.Fatalf("expected conflict, got %v", err)
+	}
+	after, _ := json.Marshal(cfg)
+	if string(before) != string(after) {
+		t.Fatalf("conflict mutated config: before=%s after=%s", before, after)
+	}
+	if err := cfg.UpdateRuleSet("old", RuleSet{Tag: "new", Type: "remote", Format: "binary", URL: "https://example.com/new.srs", UpdateInterval: "24h"}); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	got := cfg.Route.Rules[0].Rules[0].RuleSet
+	if len(got) != 2 || got[0] != "new" || got[1] != "keep" {
+		t.Fatalf("nested rule_set refs = %+v", got)
 	}
 }
 
@@ -79,6 +117,16 @@ func TestRuleSetRemoteURLValidation(t *testing.T) {
 	// Valid https URL accepted.
 	if err := cfg.AddRuleSet(RuleSet{Tag: "ok-https", Type: "remote", URL: "https://example.com/x.srs"}); err != nil {
 		t.Fatalf("valid https URL: %v", err)
+	}
+}
+
+func TestRuleSetTagReservedSRSSuffix(t *testing.T) {
+	cfg := NewEmptyConfig()
+	err := cfg.AddRuleSet(RuleSet{Tag: "geosite-samsung-srs", Type: "inline", Rules: []map[string]any{
+		{"domain_suffix": []any{".samsung.com"}},
+	}})
+	if err == nil || !contains(err.Error(), "-srs") {
+		t.Fatalf("expected reserved -srs suffix error, got %v", err)
 	}
 }
 
@@ -124,7 +172,14 @@ func contains(haystack, needle string) bool {
 func TestRuleSetDeleteWithReferences(t *testing.T) {
 	cfg := NewEmptyConfig()
 	cfg.Route.RuleSet = []RuleSet{{Tag: "geosite-youtube"}}
-	cfg.Route.Rules = []Rule{{RuleSet: []string{"geosite-youtube"}, Action: "route", Outbound: "awg10"}}
+	cfg.Route.Rules = []Rule{
+		{RuleSet: []string{"geosite-youtube"}, Action: "route", Outbound: "awg10"},
+		{RuleSet: []string{"geosite-youtube", "geosite-openai"}, Action: "route", Outbound: "awg11"},
+	}
+	cfg.DNS.Rules = []DNSRule{
+		{RuleSet: []string{"geosite-youtube"}, Server: "remote"},
+		{RuleSet: []string{"geosite-youtube", "geosite-openai"}, Server: "local"},
+	}
 
 	err := cfg.DeleteRuleSet("geosite-youtube", false)
 	if !errors.Is(err, ErrRuleSetReferenced) {
@@ -136,6 +191,60 @@ func TestRuleSetDeleteWithReferences(t *testing.T) {
 	}
 	if len(cfg.Route.RuleSet) != 0 {
 		t.Error("rule_set should be empty after force delete")
+	}
+	// Правило, для которого удалённый набор был ЕДИНСТВЕННЫМ условием,
+	// обязано исчезнуть вместе с ним. Оставить его нельзя: правило без
+	// матчеров sing-box матчит всем трафиком (abstractDefaultRule.Match
+	// возвращает true на пустом списке условий), то есть «пресет → VPN»
+	// после force-удаления тихо увёл бы в туннель вообще всё.
+	if len(cfg.Route.Rules) != 1 {
+		t.Fatalf("правило без оставшихся условий должно быть удалено, got %+v", cfg.Route.Rules)
+	}
+	if len(cfg.Route.Rules[0].RuleSet) != 1 || cfg.Route.Rules[0].RuleSet[0] != "geosite-openai" {
+		t.Fatalf("unrelated route rule_set refs should remain, got %+v", cfg.Route.Rules[0].RuleSet)
+	}
+	if cfg.Route.Rules[0].Outbound != "awg11" {
+		t.Fatalf("выжить должно именно второе правило, got %+v", cfg.Route.Rules[0])
+	}
+	if len(cfg.DNS.Rules) != 1 {
+		t.Fatalf("DNS-правило без оставшихся условий должно быть удалено, got %+v", cfg.DNS.Rules)
+	}
+	if len(cfg.DNS.Rules[0].RuleSet) != 1 || cfg.DNS.Rules[0].RuleSet[0] != "geosite-openai" {
+		t.Fatalf("unrelated dns rule_set refs should remain, got %+v", cfg.DNS.Rules[0].RuleSet)
+	}
+}
+
+func TestRuleSetDeleteWithDNSReferenceRefusesWithoutForce(t *testing.T) {
+	cfg := NewEmptyConfig()
+	cfg.Route.RuleSet = []RuleSet{{Tag: "geosite-youtube"}}
+	cfg.DNS.Rules = []DNSRule{{RuleSet: []string{"geosite-youtube"}, Server: "remote"}}
+
+	err := cfg.DeleteRuleSet("geosite-youtube", false)
+	if !errors.Is(err, ErrRuleSetReferenced) {
+		t.Errorf("expected ErrRuleSetReferenced, got %v", err)
+	}
+	if len(cfg.Route.RuleSet) != 1 || len(cfg.DNS.Rules) != 1 || len(cfg.DNS.Rules[0].RuleSet) != 1 {
+		t.Fatalf("non-force delete must not mutate config, got rule_sets=%+v dns=%+v", cfg.Route.RuleSet, cfg.DNS.Rules)
+	}
+}
+
+func TestRuleSetDeleteRemovesCompanionReferences(t *testing.T) {
+	cfg := NewEmptyConfig()
+	cfg.Route.RuleSet = []RuleSet{{Tag: "inline"}, {Tag: "inline-srs"}}
+	cfg.Route.Rules = []Rule{{RuleSet: []string{"inline-srs", "keep"}, Action: "route", Outbound: "proxy"}}
+	cfg.DNS.Rules = []DNSRule{{RuleSet: []string{"inline-srs", "keep"}, Server: "remote"}}
+
+	if err := cfg.DeleteRuleSet("inline", true); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Route.RuleSet) != 0 {
+		t.Fatalf("base and companion rule_set should be removed, got %+v", cfg.Route.RuleSet)
+	}
+	if len(cfg.Route.Rules) != 1 || len(cfg.Route.Rules[0].RuleSet) != 1 || cfg.Route.Rules[0].RuleSet[0] != "keep" {
+		t.Fatalf("companion route references should be removed only from rule_set list, got %+v", cfg.Route.Rules)
+	}
+	if len(cfg.DNS.Rules) != 1 || len(cfg.DNS.Rules[0].RuleSet) != 1 || cfg.DNS.Rules[0].RuleSet[0] != "keep" {
+		t.Fatalf("companion dns references should be removed only from rule_set list, got %+v", cfg.DNS.Rules)
 	}
 }
 
@@ -171,7 +280,7 @@ func TestRuleMove(t *testing.T) {
 
 func TestEnsureSystemRules(t *testing.T) {
 	cfg := NewEmptyConfig()
-	cfg.EnsureSystemRules()
+	cfg.EnsureSystemRules(true)
 	if len(cfg.Route.Rules) < 3 {
 		t.Fatalf("expected >=3 rules, got %d", len(cfg.Route.Rules))
 	}
@@ -207,7 +316,7 @@ func TestEnsureSystemRules(t *testing.T) {
 	}
 
 	// Idempotency: re-running should NOT add duplicates of any system rule.
-	cfg.EnsureSystemRules()
+	cfg.EnsureSystemRules(true)
 	var sniffCount, hijackCount, privateCount int
 	for _, r := range cfg.Route.Rules {
 		if r.Action == "sniff" && !r.hasAnyMatcher() {
@@ -223,6 +332,36 @@ func TestEnsureSystemRules(t *testing.T) {
 	if sniffCount != 1 || hijackCount != 1 || privateCount != 1 {
 		t.Errorf("system rules duplicated: sniff=%d hijack=%d private=%d",
 			sniffCount, hijackCount, privateCount)
+	}
+}
+
+func TestEnsureSystemRules_SnifferDisabled(t *testing.T) {
+	cfg := NewEmptyConfig()
+	cfg.Route.Rules = []Rule{
+		{Action: "sniff"},
+		{DomainSuffix: []string{"example.com"}, Action: "sniff"},
+	}
+	cfg.EnsureSystemRules(false)
+
+	for _, r := range cfg.Route.Rules {
+		if r.Action == "sniff" && !r.hasAnyMatcher() {
+			t.Fatalf("system sniff rule must be removed when sniffer is disabled: %+v", cfg.Route.Rules)
+		}
+	}
+	var userSniff, hijackCount int
+	for _, r := range cfg.Route.Rules {
+		if r.Action == "sniff" && len(r.DomainSuffix) == 1 && r.DomainSuffix[0] == "example.com" {
+			userSniff++
+		}
+		if r.Action == "hijack-dns" {
+			hijackCount++
+		}
+	}
+	if userSniff != 1 {
+		t.Fatalf("user-authored sniff rule should be preserved, got %d in %+v", userSniff, cfg.Route.Rules)
+	}
+	if hijackCount != 1 {
+		t.Fatalf("hijack-dns should remain enabled, got %d in %+v", hijackCount, cfg.Route.Rules)
 	}
 }
 
@@ -246,7 +385,7 @@ func TestEnsureSystemRules_PrivateBypassMustComeAfterHijack(t *testing.T) {
 			Action: "hijack-dns",
 		},
 	}
-	cfg.EnsureSystemRules()
+	cfg.EnsureSystemRules(true)
 
 	hijackPos, privatePos := -1, -1
 	for i, r := range cfg.Route.Rules {
@@ -283,7 +422,7 @@ func TestEnsureSystemRules_PreservesCustomPrivateBypass(t *testing.T) {
 	cfg.Route.Rules = []Rule{
 		{IPIsPrivate: &truePtr, Outbound: "lan-direct"},
 	}
-	cfg.EnsureSystemRules()
+	cfg.EnsureSystemRules(true)
 
 	var privateCount int
 	var firstPrivateOutbound string
@@ -332,7 +471,7 @@ func TestEnsureSystemRules_LegacyHijackRecognized(t *testing.T) {
 		{Action: "sniff"},
 		{Protocol: "dns", Action: "hijack-dns"},
 	}
-	cfg.EnsureSystemRules()
+	cfg.EnsureSystemRules(true)
 	var hijackCount int
 	for _, r := range cfg.Route.Rules {
 		if r.Action == "hijack-dns" {
@@ -401,10 +540,68 @@ func TestCompositeOutboundTagConflict(t *testing.T) {
 	}
 }
 
+func TestCompositeOutboundRenameCascadesReferences(t *testing.T) {
+	cfg := NewEmptyConfig()
+	cfg.Outbounds = []Outbound{
+		{Type: "urltest", Tag: "fast", Outbounds: []string{"awg10", "awg20"}},
+		{Type: "selector", Tag: "sel", Outbounds: []string{"fast", "awg30"}, Default: "fast"},
+	}
+	cfg.Route.Final = "fast"
+	cfg.Route.Rules = []Rule{{
+		Type: "logical", Mode: "or",
+		Rules:  []Rule{{Outbound: "fast"}},
+		Action: "route", Outbound: "fast",
+	}}
+	cfg.DNS.Servers = []DNSServer{{Tag: "dns", Type: "udp", Server: "1.1.1.1", Detour: "fast"}}
+	cfg.Route.RuleSet = []RuleSet{{Tag: "geo", Type: "remote", Format: "binary", URL: "https://example.com/geo.srs", DownloadDetour: "fast"}}
+
+	if err := cfg.UpdateCompositeOutbound("fast", Outbound{Type: "urltest", Tag: "quick", Outbounds: []string{"awg10", "awg20"}}); err != nil {
+		t.Fatalf("rename outbound: %v", err)
+	}
+	if cfg.Route.Rules[0].Outbound != "quick" || cfg.Route.Rules[0].Rules[0].Outbound != "quick" {
+		t.Fatalf("route outbound refs not renamed: %+v", cfg.Route.Rules)
+	}
+	if cfg.Route.Final != "quick" {
+		t.Fatalf("route.final = %q", cfg.Route.Final)
+	}
+	if cfg.Outbounds[1].Outbounds[0] != "quick" || cfg.Outbounds[1].Default != "quick" {
+		t.Fatalf("composite refs not renamed: %+v", cfg.Outbounds[1])
+	}
+	if cfg.DNS.Servers[0].Detour != "quick" {
+		t.Fatalf("dns detour = %q", cfg.DNS.Servers[0].Detour)
+	}
+	if cfg.Route.RuleSet[0].DownloadDetour != "quick" {
+		t.Fatalf("download_detour = %q", cfg.Route.RuleSet[0].DownloadDetour)
+	}
+}
+
+func TestCompositeOutboundRenameConflictDoesNotMutate(t *testing.T) {
+	cfg := NewEmptyConfig()
+	cfg.Outbounds = []Outbound{
+		{Type: "urltest", Tag: "fast", Outbounds: []string{"awg10", "awg20"}},
+		{Type: "urltest", Tag: "taken", Outbounds: []string{"awg30", "awg40"}},
+	}
+	before, _ := json.Marshal(cfg)
+	err := cfg.UpdateCompositeOutbound("fast", Outbound{Type: "urltest", Tag: "taken", Outbounds: []string{"awg10", "awg20"}})
+	if !errors.Is(err, ErrOutboundTagConflict) {
+		t.Fatalf("expected ErrOutboundTagConflict, got %v", err)
+	}
+	after, _ := json.Marshal(cfg)
+	if string(before) != string(after) {
+		t.Fatalf("conflict mutated config: before=%s after=%s", before, after)
+	}
+}
+
 func TestCompositeOutboundDeleteReferenced(t *testing.T) {
 	cfg := NewEmptyConfig()
-	cfg.Outbounds = []Outbound{{Type: "urltest", Tag: "fast"}}
+	cfg.Outbounds = []Outbound{
+		{Type: "urltest", Tag: "fast"},
+		{Type: "selector", Tag: "sel", Outbounds: []string{"fast", "keep"}, Default: "fast"},
+	}
+	cfg.Route.Final = "fast"
 	cfg.Route.Rules = []Rule{{DomainSuffix: []string{"x.com"}, Action: "route", Outbound: "fast"}}
+	cfg.DNS.Servers = []DNSServer{{Tag: "dns", Type: "udp", Server: "1.1.1.1", Detour: "fast"}}
+	cfg.Route.RuleSet = []RuleSet{{Tag: "geo", Type: "remote", Format: "binary", URL: "https://example.com/geo.srs", DownloadDetour: "fast"}}
 
 	err := cfg.DeleteCompositeOutbound("fast", false)
 	if !errors.Is(err, ErrOutboundReferenced) {
@@ -412,6 +609,24 @@ func TestCompositeOutboundDeleteReferenced(t *testing.T) {
 	}
 	if err := cfg.DeleteCompositeOutbound("fast", true); err != nil {
 		t.Fatal(err)
+	}
+	if len(cfg.Route.Rules) != 0 {
+		t.Fatalf("route rule referencing deleted outbound should be removed, got %+v", cfg.Route.Rules)
+	}
+	if cfg.Route.Final != "direct" {
+		t.Fatalf("route.final = %q, want direct", cfg.Route.Final)
+	}
+	if len(cfg.Outbounds) != 1 || cfg.Outbounds[0].Tag != "sel" {
+		t.Fatalf("deleted outbound not removed: %+v", cfg.Outbounds)
+	}
+	if len(cfg.Outbounds[0].Outbounds) != 1 || cfg.Outbounds[0].Outbounds[0] != "keep" || cfg.Outbounds[0].Default != "" {
+		t.Fatalf("composite refs not cleaned: %+v", cfg.Outbounds[0])
+	}
+	if cfg.DNS.Servers[0].Detour != "" {
+		t.Fatalf("dns detour not cleared: %+v", cfg.DNS.Servers[0])
+	}
+	if cfg.Route.RuleSet[0].DownloadDetour != "" {
+		t.Fatalf("download_detour not cleared: %+v", cfg.Route.RuleSet[0])
 	}
 }
 
@@ -493,6 +708,40 @@ func TestValidateSingboxRouterSettings(t *testing.T) {
 			}
 			if !c.wantError && err != nil {
 				t.Errorf("expected no error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestNormalizeSingboxRouterSettings_DeviceMode(t *testing.T) {
+	cases := []struct {
+		name      string
+		mode      string
+		want      string
+		wantError bool
+	}{
+		{"empty defaults to policy", "", "policy", false},
+		{"policy accepted", "policy", "policy", false},
+		{"all accepted", "all", "all", false},
+		{"invalid rejected", "everything", "", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := NormalizeSingboxRouterSettings(storage.SingboxRouterSettings{
+				DeviceMode:    c.mode,
+				WANAutoDetect: true,
+			})
+			if c.wantError {
+				if err == nil {
+					t.Fatalf("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NormalizeSingboxRouterSettings: %v", err)
+			}
+			if got.DeviceMode != c.want {
+				t.Fatalf("DeviceMode = %q, want %q", got.DeviceMode, c.want)
 			}
 		})
 	}

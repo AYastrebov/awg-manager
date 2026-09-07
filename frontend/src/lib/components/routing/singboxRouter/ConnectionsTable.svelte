@@ -59,6 +59,10 @@
 		if (sortBy !== col) return '';
 		return sortDir === 'asc' ? '▲' : '▼';
 	}
+
+	function outboundClass(c: Connection): string {
+		return (c.chains[0] ?? '').startsWith('awg-') ? 'awg' : '';
+	}
 </script>
 
 <div class="wrap">
@@ -80,7 +84,7 @@
 				<th class="sortable" onclick={() => onSortChange('source')}>Источник {arrow('source')}</th>
 				<th class="sortable" onclick={() => onSortChange('destination')}>Назначение {arrow('destination')}</th>
 				<th class="sortable" onclick={() => onSortChange('outbound')}>Outbound {arrow('outbound')}</th>
-				<th>Rule</th>
+				<th class="col-rule">Rule</th>
 				<th class="sortable num" onclick={() => onSortChange('upload')}>↑ {arrow('upload')}</th>
 				<th class="sortable num" onclick={() => onSortChange('download')}>↓ {arrow('download')}</th>
 				<th class="sortable" onclick={() => onSortChange('start')}>Время {arrow('start')}</th>
@@ -109,8 +113,8 @@
 							<div class="mono">{c.metadata.destinationIP}<span class="muted">:{c.metadata.destinationPort}</span></div>
 						{/if}
 					</td>
-					<td><span class="badge">{c.outboundLabel}</span></td>
-					<td title={`${c.rule} ${c.rulePayload}`.trim()}>
+					<td><span class="badge {outboundClass(c)}" title={c.chains[0] ?? c.outboundLabel}>{c.outboundLabel}</span></td>
+					<td class="col-rule" title={`${c.rule} ${c.rulePayload}`.trim()}>
 						<span class="badge muted">{c.rule || '—'}</span>
 					</td>
 					<td class="mono num">{formatBytes(c.upload)}</td>
@@ -162,8 +166,8 @@
 	.t th {
 		font-size: 11px; font-weight: 600;
 		text-transform: uppercase; letter-spacing: 0.04em;
-		color: var(--text-secondary, #b8b6b3);
-		background: var(--surface-1, #1f2425);
+		color: var(--text-primary, #c0caf5);
+		background: var(--bg-secondary, #16161e);
 		/* z-index lifts the header above tbody rows so they don't bleed
 		   through during scroll (sticky elements get a stacking context
 		   but tbody rows have z-index:auto by default). */
@@ -194,6 +198,10 @@
 		font-size: 11px;
 		font-family: ui-monospace, monospace;
 	}
+	.badge.awg {
+		background: rgba(156, 138, 255, 0.14);
+		color: #9c8aff;
+	}
 	.badge.muted { background: rgba(110, 110, 110, 0.15); color: var(--text-tertiary, #6e6e6e); }
 	.kill {
 		all: unset;
@@ -219,4 +227,9 @@
 	}
 	.pager button:hover:not(:disabled) { background: var(--surface-hover, #262a2c); }
 	.pager button:disabled { opacity: 0.3; cursor: not-allowed; }
+	/* RULE column: cap at its colgroup hint so long rule_set=[…] strings
+	   don't push the column wider than intended. The full value is always
+	   available via the title attribute on the cell. */
+	.col-rule { max-width: 110px; }
+	.col-rule .badge { max-width: 100%; overflow: hidden; text-overflow: ellipsis; display: block; }
 </style>

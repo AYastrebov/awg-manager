@@ -3,6 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { onMount, onDestroy } from 'svelte';
 	import { tunnels } from '$lib/stores/tunnels';
+	import { usageLevel } from '$lib/stores/settings';
 	import { notifications } from '$lib/stores/notifications';
 	import { api } from '$lib/api/client';
 	import type { AWGTunnel, SystemInfo, WANInterface, RouterInterface, TunnelListItem } from '$lib/types';
@@ -13,6 +14,11 @@
 	import { editTunnelSchema } from '$lib/schemas/tunnel';
 	import { AWGAdvancedParams, ReplaceTunnelConfigModal } from '$lib/components/tunnels';
 	import TunnelEditHeader from '$lib/components/tunnels/TunnelEditHeader.svelte';
+	import AwgConfigAnalyzer from '$lib/components/diagnostics/AwgConfigAnalyzer.svelte';
+	import { SettingsSectionLabel } from '$lib/components/settings';
+	import { AWG_PARAM_HINTS } from '$lib/utils/awgParamHints';
+	import { awgProxyOutdated, supportsAwg3, supportsAwg31OnNativeWG } from '$lib/utils/backendAvailability';
+	import { Network, Route, Router, Server, Tag } from 'lucide-svelte';
 
 	let { data } = $props();
 
@@ -23,38 +29,36 @@
 		SPA: true,
 	});
 
-	const hints: Record<string, string> = {
-		jc: 'Количество junk-пакетов, отправляемых перед handshake. Диапазон: 0-128.',
-		jmin: 'Минимальный размер junk-пакета в байтах. Диапазон: 0-1280.',
-		jmax: 'Максимальный размер junk-пакета в байтах. Диапазон: 0-1280.',
-		s1: 'Padding для Init Handshake.',
-		s2: 'Padding для Response Handshake.',
-		s3: 'Padding для Transport Handshake Init.',
-		s4: 'Padding для Transport Handshake Response.',
-		h1: 'Кастомный заголовок для Init Handshake. Формат: число или диапазон (мин-макс).',
-		h2: 'Кастомный заголовок для Response Handshake. Формат: число или диапазон (мин-макс).',
-		h3: 'Кастомный заголовок для Cookie Reply. Формат: число или диапазон (мин-макс).',
-		h4: 'Кастомный заголовок для Transport. Формат: число или диапазон (мин-макс).',
-		i1: 'Signature пакет I1 — имитация протокола. Поддерживает CPS теги.',
-		i2: 'Signature пакет I2.',
-		i3: 'Signature пакет I3.',
-		i4: 'Signature пакет I4.',
-		i5: 'Signature пакет I5.'
-	};
+	const hints = AWG_PARAM_HINTS;
 
 	type ActionStatus = 'loading' | 'success' | 'error';
 
-	type TunnelDetailTab = 'basic' | 'obfuscation' | 'routing';
+	type TunnelDetailTab = 'basic' | 'obfuscation' | 'routing' | 'awgConfig';
 	let activeTab = $state<TunnelDetailTab>('basic');
 	const detailTabs = [
 		{ id: 'basic', label: 'Основное' },
 		{ id: 'obfuscation', label: 'Обфускация' },
 		{ id: 'routing', label: 'Маршрутизация' },
+		{ id: 'awgConfig', label: 'Анализ конфига' },
 	];
 	let replaceModalOpen = $state(false);
 
 	let tunnel = $state<AWGTunnel | null>(null);
 	let systemInfo = $state<SystemInfo | null>(null);
+	// AWG 3.0 идёт от версии kernel-модуля, AWG 3.1 на NativeWG — от версии
+	// awg_proxy.ko: у бэкендов разные модули и разные версии.
+	// Модуль в ядре старее того, что принёс IPK: awg_proxy не перезагружается,
+	// пока у него есть живые слоты, поэтому при поднятом туннеле апгрейд ждёт
+	// перезагрузки роутера — и до неё AWG 3.1 недоступен без видимой причины.
+	let proxyOutdated = $derived(
+		tunnel?.backend === 'nativewg' &&
+			awgProxyOutdated(systemInfo?.awgProxyVersion, systemInfo?.awgProxyExpectedVersion),
+	);
+	let awg3Available = $derived(
+		tunnel?.backend === 'nativewg'
+			? supportsAwg31OnNativeWG(systemInfo?.awgProxyVersion, systemInfo?.awgProxyExpectedVersion)
+			: supportsAwg3(systemInfo?.kernelModuleLoadedVersion),
+	);
 	let loading = $state(true);
 	let saving = $state(false);
 
@@ -95,14 +99,22 @@
 
 	let tunnelId = $derived($page.params.id ?? '');
 
-	// Address editable: NativeWG always (NDMS SyncAddressMTU); kernel — only before first start
+	// Address editable: NativeWG always (NDMS SyncAddressMTU); kernel — only before OpkgTun/process exist
 	let addressDisabled = $derived.by(() => {
 		if (!tunnel) return true;
 		if (tunnel.backend === 'nativewg') return false;
-		return tunnel.state !== 'not_created';
+		if (tunnel.state === 'not_created') return false;
+		const info = tunnel.stateInfo;
+		if (info && !info.opkgTunExists && !info.processRunning) return false;
+		return true;
 	});
 
 	let ispValue = $derived(tunnel?.ispInterface || 'auto');
+
+	// Зеркальная запись прокси-выхода: имя, WAN-подключение и маршрут по
+	// умолчанию ведёт прокси-рантайм, правка отсюда не применится (бэкенд
+	// отвечает на неё отказом).
+	let isMirror = $derived(tunnel?.backend === 'wdtt-raw');
 
 	let otherTunnels = $derived(allTunnels.filter(t => t.id !== tunnelId));
 
@@ -175,10 +187,21 @@
 		$form.i3 = tunnel.interface.i3 || '';
 		$form.i4 = tunnel.interface.i4 || '';
 		$form.i5 = tunnel.interface.i5 || '';
+		$form.headerProtectionKey = tunnel.interface.headerProtectionKey || '';
+		$form.contentPaddingAddition = tunnel.interface.contentPaddingAddition || '';
+		$form.rekeyAfterTime = tunnel.interface.rekeyAfterTime || '';
+		$form.rekeyTimeout = tunnel.interface.rekeyTimeout || '';
+		$form.rejectAfterTime = tunnel.interface.rejectAfterTime || '';
+		$form.keepaliveTimeout = tunnel.interface.keepaliveTimeout || '';
+		$form.maxHandshakeAttempts = tunnel.interface.maxHandshakeAttempts || '';
+		// AWG 3.1 flags: read-only in the editor, shown only when the imported
+		// config carries them. buildUpdatePayload keeps them via the interface spread.
+		$form.randomTrailers = tunnel.interface.randomTrailers ?? false;
+		$form.disableCookies = tunnel.interface.disableCookies ?? false;
 		publicKey = tunnel.peer.publicKey;
 		$form.endpoint = tunnel.peer.endpoint;
 		$form.allowedIPs = tunnel.peer.allowedIPs.join(', ');
-		$form.persistentKeepalive = tunnel.peer.persistentKeepalive || 25;
+		$form.persistentKeepalive = String(tunnel.peer.persistentKeepalive ?? 25);
 	}
 
 	function buildUpdatePayload() {
@@ -196,7 +219,15 @@
 				i2: $form.i2 || undefined,
 				i3: $form.i3 || undefined,
 				i4: $form.i4 || undefined,
-				i5: $form.i5 || undefined
+				i5: $form.i5 || undefined,
+				// AWG 3.0 device params (kernel mode only).
+				headerProtectionKey: $form.headerProtectionKey || undefined,
+				contentPaddingAddition: $form.contentPaddingAddition || undefined,
+				rekeyAfterTime: $form.rekeyAfterTime || undefined,
+				rekeyTimeout: $form.rekeyTimeout || undefined,
+				rejectAfterTime: $form.rejectAfterTime || undefined,
+				keepaliveTimeout: $form.keepaliveTimeout || undefined,
+				maxHandshakeAttempts: $form.maxHandshakeAttempts || undefined
 			},
 			peer: {
 				...tunnel!.peer,
@@ -338,22 +369,34 @@
 			tabs={detailTabs}
 			active={activeTab}
 			onchange={(id) => (activeTab = id as TunnelDetailTab)}
+			urlParam="tab"
+			defaultTab="basic"
 		/>
 
 		<div class="tab-content">
 			{#if activeTab === 'basic'}
 				<form class="tab-form" onsubmit={(e) => { e.preventDefault(); handleSaveAndStart(); }}>
-					<section class="form-section">
-						<h2 class="section-title">Название</h2>
+					<section class="card tunnel-section">
+						<SettingsSectionLabel label="Название" icon={Tag} tone="slate" header />
 						<div class="flex flex-col gap-1.5">
 							<label class="field-label" for="name">Название туннеля</label>
-							<input type="text" id="name" class="field-input" bind:value={$form.name} />
+							<input
+								type="text"
+								id="name"
+								class="field-input"
+								bind:value={$form.name}
+								disabled={isMirror}
+								title={isMirror ? 'Имя задаётся инстансом WDTT' : undefined}
+							/>
+							{#if isMirror}
+								<p class="field-hint">Имя задаётся инстансом WDTT и меняется в его настройках.</p>
+							{/if}
 							{#if $errors.name}<p class="text-xs text-error-500 mt-1">{$errors.name}</p>{/if}
 						</div>
 					</section>
 
-					<section class="form-section">
-						<h2 class="section-title">Интерфейс [Interface]</h2>
+					<section class="card tunnel-section">
+						<SettingsSectionLabel label="Интерфейс [Interface]" icon={Network} tone="teal" header />
 						<div class="inline-fields">
 							<div class="flex flex-col gap-1.5" style="flex:1">
 								<label class="field-label" for="address-v4">IPv4 адрес</label>
@@ -369,26 +412,26 @@
 							<label class="field-label" for="address-v6">IPv6 адрес</label>
 							<input type="text" id="address-v6" class="field-input" bind:value={ipv6Address} disabled={addressDisabled} placeholder="fd00::2/128 (необязательно)" />
 						</div>
-						{#if addressDisabled}
-							<p class="field-hint">Адрес нельзя изменить для запущенного туннеля в режиме kernel</p>
+						{#if addressDisabled && tunnel?.backend !== 'nativewg'}
+							<p class="field-hint">Адрес нельзя изменить после первого запуска туннеля в режиме kernel</p>
 						{/if}
 						{#if $errors.address}<p class="text-xs text-error-500 mt-1">{$errors.address}</p>{/if}
 						<div class="flex flex-col gap-1.5" style="margin-top:12px">
 							<label class="field-label" for="dns">DNS</label>
 							<input type="text" id="dns" class="field-input" bind:value={$form.dns} placeholder="1.1.1.1, 8.8.8.8" />
-							<p class="field-hint">DNS-серверы через запятую. Применяются на роутере при старте туннеля.</p>
+							<p class="field-hint">DNS-серверы через запятую. Применяются на роутере при старте туннеля. Первый IPv4 из списка sing-box использует для доменов, направленных в этот туннель, и запрос идёт через сам туннель; если поле пустое — 1.1.1.1 (для split-туннеля адрес должен входить в AllowedIPs).</p>
 						</div>
 					</section>
 
-					<section class="form-section">
-						<h2 class="section-title">Сервер [Peer]</h2>
+					<section class="card tunnel-section">
+						<SettingsSectionLabel label="Сервер [Peer]" icon={Server} tone="indigo" header />
 						<div class="flex flex-col gap-1.5 pubkey-row">
 							<span class="field-label">Публичный ключ</span>
 							<code class="pubkey-value">{publicKey}</code>
 						</div>
 						<div class="flex flex-col gap-1.5" style="margin-bottom:12px">
 							<label class="field-label" for="endpoint">Endpoint</label>
-							<input type="text" id="endpoint" class="field-input" bind:value={$form.endpoint} />
+							<input type="text" id="endpoint" class="field-input" placeholder="vpn.example.com:51820 или [2001:db8::1]:51820" bind:value={$form.endpoint} />
 							{#if $errors.endpoint}<p class="text-xs text-error-500 mt-1">{$errors.endpoint}</p>{/if}
 						</div>
 						<div class="inline-fields">
@@ -399,7 +442,7 @@
 							</div>
 							<div class="flex flex-col gap-1.5" style="width:120px">
 								<label class="field-label" for="persistentKeepalive">Keepalive</label>
-								<input type="number" id="persistentKeepalive" class="field-input" bind:value={$form.persistentKeepalive} />
+								<input type="text" inputmode="text" id="persistentKeepalive" class="field-input" bind:value={$form.persistentKeepalive} />
 								{#if $errors.persistentKeepalive}<p class="text-xs text-error-500 mt-1">{$errors.persistentKeepalive}</p>{/if}
 							</div>
 						</div>
@@ -408,10 +451,19 @@
 
 			{:else if activeTab === 'obfuscation'}
 				<div class="tab-form">
+					{#if proxyOutdated}
+						<p class="module-warn">
+							В ядре загружен awg_proxy {systemInfo?.awgProxyVersion}, а в этой сборке —
+							{systemInfo?.awgProxyExpectedVersion}. Модуль нельзя заменить, пока через него
+							идут туннели: перезагрузите роутер, иначе параметры AWG 3.1 останутся недоступны.
+						</p>
+					{/if}
 					<AWGAdvancedParams
 						bind:form={$form}
 						errors={$errors}
 						{hints}
+						awg3={awg3Available}
+						awg3Limited={tunnel?.backend === 'nativewg'}
 					/>
 				</div>
 
@@ -427,41 +479,72 @@
 					...otherTunnels.map((t) => ({ value: `tunnel:${t.id}`, label: t.name, group: 'Через туннель' })),
 				]}
 				<div class="tab-form">
-					<section class="form-section">
-						<h2 class="section-title">Подключение (ISP)</h2>
+					<section class="card tunnel-section">
+						<SettingsSectionLabel label="Подключение (ISP)" icon={Router} tone="orange" header />
 						<p class="section-hint">Через какой WAN-интерфейс роутер будет подключаться к серверу VPN. По умолчанию используется основной интернет-канал.</p>
 						<Dropdown
 							value={ispValue}
 							options={ispOpts}
 							onchange={updateIspInterface}
-							disabled={savingIsp}
+							disabled={savingIsp || isMirror}
 							fullWidth
 						/>
-						<div class="advanced-toggle">
+						{#if isMirror}
+							<p class="field-hint">Подключение задаёт инстанс WDTT и меняется в его настройках.</p>
+						{/if}
+						<div class="setting-row toggle-inline-row advanced-toggle">
+							<div class="flex flex-col gap-1">
+								<span class="font-medium">Показать все интерфейсы</span>
+								<span class="setting-description">Включая внутренние интерфейсы роутера</span>
+							</div>
 							<Toggle
 								checked={showAllInterfaces}
 								onchange={toggleAllInterfaces}
 								loading={loadingAllInterfaces}
-								label="Показать все интерфейсы"
-								hint="Включая внутренние интерфейсы роутера"
-								size="sm"
 							/>
 						</div>
 					</section>
 
-					<section class="form-section">
-						<h2 class="section-title">Маршрут по умолчанию</h2>
-						<div class="setting-row">
-							<div class="flex flex-col gap-1">
-								<span class="font-medium">Default route</span>
-								<span class="setting-description">NDMS default route через интерфейс туннеля</span>
-							</div>
-							<Toggle
-								checked={tunnel.defaultRoute}
-								onchange={() => toggleDefaultRoute()}
-							/>
-						</div>
-					</section>
+					{#if $usageLevel === 'expert'}
+						<section class="card tunnel-section">
+							<SettingsSectionLabel label="Маршрут по умолчанию" icon={Route} tone="green" header />
+							{#if isMirror}
+								<!-- У зеркальной записи тумблера НЕТ, а не «есть, но выключен»:
+								     кандидатурой в NDMS распоряжается прокси-рантайм по конфигу
+								     инстанса, а флаг записи к этому отношения не имеет — его
+								     проставляет миграция чтения (storage/awg_store.go:150-154),
+								     и любое показанное состояние было бы выдумкой. -->
+								<p class="setting-description">
+									Маршрутом по умолчанию распоряжается инстанс WDTT: он объявляет
+									свой интерфейс кандидатом в NDMS по своим настройкам. Здесь
+									менять нечего.
+								</p>
+							{:else}
+								<div class="setting-row toggle-inline-row">
+									<div class="flex flex-col gap-1">
+										<span class="font-medium">NDMS Default Route</span>
+										<span class="setting-description">
+											В NDMS для OpkgTunX выполняется «ip route default», а не как full-tunnel на уровне Linux. <br>
+											Так туннель регистрируется среди интернет-выходов с метрикой (весом), по которому NDMS выбирает канал по умолчанию. 
+											Без этой записи туннель не участвует в политиках доступа. <br>
+											В большинстве случаев, данная опция должна быть включена, особенно, если интерфейс должен конкурировать за роль основного выхода.</span>
+									</div>
+									<Toggle checked={tunnel.defaultRoute} onchange={() => toggleDefaultRoute()} />
+								</div>
+							{/if}
+						</section>
+					{/if}
+				</div>
+			{:else if activeTab === 'awgConfig'}
+				<div class="tab-form">
+					<AwgConfigAnalyzer
+						initialTunnelId={tunnelId}
+						embedded
+						lockTunnelSelection
+						onTunnelSaved={() => {
+							loadTunnel();
+						}}
+					/>
 				</div>
 			{/if}
 		</div>
@@ -483,35 +566,29 @@
 {/if}
 
 <style>
+	.module-warn {
+		margin: 0 0 1rem;
+		padding: 0.7rem 0.9rem;
+		font-size: 0.85rem;
+		color: var(--warning);
+		background: color-mix(in srgb, var(--warning) 8%, transparent);
+		border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent);
+		border-radius: 8px;
+	}
+
 	.text-secondary {
 		color: var(--color-text-secondary);
-	}
-
-	.edit-wrapper {
-		max-width: 1200px;
-		margin: 0 auto;
-		width: 100%;
-	}
-
-	.tab-content {
-		padding: 20px 0;
-	}
-
-	.tab-form {
-		display: flex;
-		flex-direction: column;
-		gap: 20px;
 	}
 
 	.section-hint {
 		color: var(--color-text-muted);
 		font-size: 0.8125rem;
-		margin: 4px 0 12px 0;
+		margin: 0 0 12px 0;
 	}
 
 	.advanced-toggle {
-		margin-top: 12px;
-		padding-top: 12px;
+		margin-top: var(--settings-gap);
+		padding-top: var(--settings-gap);
 		border-top: 1px solid var(--color-border);
 	}
 
@@ -522,24 +599,12 @@
 		align-items: flex-start;
 	}
 
-	.form-section {
-		background: var(--color-bg-secondary);
-		border: 1px solid var(--color-border);
-		border-radius: var(--radius);
-		padding: 16px;
-	}
-
-	.section-title {
-		font-size: 14px;
-		font-weight: 600;
-		padding-bottom: 10px;
-		border-bottom: 1px solid var(--color-border);
+	.tunnel-section {
+		background: var(--color-settings-surface-bg);
 	}
 
 	.pubkey-row {
 		margin-bottom: 16px;
-		padding-bottom: 16px;
-		border-bottom: 1px solid var(--color-border);
 	}
 
 	.pubkey-value {

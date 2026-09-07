@@ -128,8 +128,11 @@
 		font-weight: 600;
 		color: var(--color-primary, #2563eb);
 	}
+	.share-links-back :global(.hl-json-key) {
+		color: var(--hl-json-key, #0284c7);
+	}
 	.share-links-back :global(.hl-json-str) {
-		color: var(--hl-json-str, #16a34a);
+		color: var(--hl-json-str, var(--text));
 	}
 	.share-links-back :global(.hl-json-num) {
 		color: var(--hl-json-num, #ea580c);

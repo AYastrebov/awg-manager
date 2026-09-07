@@ -50,6 +50,8 @@ const (
 	SubAccessPolicy   = "access-policy"
 	SubClientRoute    = "client-route"
 	SubSingboxRouter  = "singbox-router"
+	SubBypassSet      = "bypass-set"
+	SubSubscription   = "subscription"
 	SubDeviceProxy    = "deviceproxy"
 	SubHrNeo          = "hrneo"
 	SubRoutingCatalog = "catalog"
@@ -59,6 +61,7 @@ const (
 	SubBoot           = "boot"
 	SubWan            = "wan"
 	SubAuth           = "auth"
+	SubMcp            = "mcp"
 	SubSettings       = "settings"
 	SubUpdate         = "update"
 	SubCleanup        = "cleanup"
@@ -69,6 +72,11 @@ const (
 	SubProfiling      = "profiling" // slow HTTP telemetry (handlers → UI journal)
 	SubRCI            = "rci"
 	SubNDMS           = "ndms"
+	SubOrchestrator   = "orchestrator" // tunnel lifecycle decisions (decide/execute/external-restart)
+	SubKmod           = "kmod"         // awg_proxy kernel module load/add/remove
+	SubStorage        = "storage"      // tunnel store + settings persistence
+	SubHTTP           = "http"         // HTTP server lifecycle and listener events
+	SubMonitoring     = "monitoring"   // matrix probe transitions (ok→fail / restore)
 
 	// Singbox bucket subgroups
 	SubSBInbound  = "inbound"
@@ -77,6 +85,7 @@ const (
 	SubSBRouter   = "router"
 	SubSBRuntime  = "runtime"
 	SubSBProcess  = "process"
+	SubAwg3       = "awg3" // imported AWG3 endpoint projection into 16-awg3.json
 )
 
 // Bucket identifies which buffer a log entry belongs to. Sing-box logs are
@@ -103,21 +112,21 @@ func BucketForGroup(group string) Bucket {
 // (alphabetical within group except where a domain ordering matters).
 var KnownSubgroups = map[string][]string{
 	GroupTunnel: {
-		SubLifecycle, SubOps, SubState, SubFirewall,
+		SubLifecycle, SubOrchestrator, SubOps, SubKmod, SubState, SubFirewall,
 		SubPingcheck, SubConnectivity, SubTest, SubSignature,
 	},
 	GroupRouting: {
 		SubDnsRoute, SubStaticRoute, SubAccessPolicy, SubClientRoute,
-		SubSingboxRouter, SubDeviceProxy, SubHrNeo, SubRoutingCatalog,
+		SubSingboxRouter, SubBypassSet, SubSubscription, SubDeviceProxy, SubHrNeo, SubRoutingCatalog,
 		SubAWGOutbounds,
 	},
 	GroupServer: {
-		SubManaged,
+		SubHTTP, SubManaged,
 	},
 	GroupSystem: {
-		SubBoot, SubAuth, SubSettings, SubUpdate, SubWan, SubSystemTunnel,
+		SubBoot, SubAuth, SubMcp, SubSettings, SubUpdate, SubWan, SubSystemTunnel,
 		SubCleanup, SubDnsCheck, SubConnections, SubTraffic, SubDiagnostics,
-		SubProfiling, SubRCI, SubNDMS,
+		SubProfiling, SubRCI, SubNDMS, SubStorage, SubMonitoring,
 	},
 	GroupSingbox: {
 		SubSBProcess, SubSBInbound, SubSBOutbound, SubSBDNS, SubSBRouter, SubSBRuntime,
@@ -125,12 +134,18 @@ var KnownSubgroups = map[string][]string{
 }
 
 // LogEntry represents a single log entry.
+//
+// Идентичные повторы схлопываются в одну запись (см. LogBuffer.Coalesce):
+// Timestamp — первое появление, Repeats — сколько повторов свёрнуто
+// (0 = запись уникальна), LastSeen — время последнего повтора.
 type LogEntry struct {
-	Timestamp time.Time `json:"timestamp"`
-	Level     string    `json:"level"`
-	Group     string    `json:"group"`
-	Subgroup  string    `json:"subgroup,omitempty"`
-	Action    string    `json:"action"`
-	Target    string    `json:"target"`
-	Message   string    `json:"message"`
+	Timestamp time.Time  `json:"timestamp"`
+	Level     string     `json:"level"`
+	Group     string     `json:"group"`
+	Subgroup  string     `json:"subgroup,omitempty"`
+	Action    string     `json:"action"`
+	Target    string     `json:"target"`
+	Message   string     `json:"message"`
+	Repeats   int        `json:"repeats,omitempty"`
+	LastSeen  *time.Time `json:"lastSeen,omitempty"`
 }

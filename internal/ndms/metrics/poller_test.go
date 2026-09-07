@@ -100,7 +100,7 @@ func (f *fakeHistory) Entries() []fakeHistoryEntry {
 
 func TestMetricsPoller_PollsRunningAndPublishes(t *testing.T) {
 	fg := query.NewFakeGetter()
-	fg.SetJSON("/show/interface/Wireguard0/wireguard/peer", `[{"public-key":"k","rxbytes":100,"txbytes":200,"last-handshake":5,"online":true,"enabled":true}]`)
+	fg.SetJSON("/show/interface/Wireguard0", `{"wireguard":{"peer":[{"public-key":"k","rxbytes":100,"txbytes":200,"last-handshake":5,"online":true,"enabled":true}]}}`)
 	peers := query.NewPeerStoreWithTTL(fg, query.NopLogger(), 1*time.Second)
 
 	run := &fakeRunningProvider{}
@@ -163,7 +163,7 @@ func TestMetricsPoller_EmptyPeersCooldown_SkipsSubsequentTicks(t *testing.T) {
 	// the cooldown period so NDMS isn't hammered every 10s for
 	// nothing.
 	fg := query.NewFakeGetter()
-	fg.SetJSON("/show/interface/Wireguard1/wireguard/peer", `[]`)
+	fg.SetJSON("/show/interface/Wireguard1", `{"wireguard":{"peer":[]}}`)
 	peers := query.NewPeerStoreWithTTL(fg, query.NopLogger(), 1*time.Millisecond)
 
 	run := &fakeRunningProvider{}
@@ -181,7 +181,7 @@ func TestMetricsPoller_EmptyPeersCooldown_SkipsSubsequentTicks(t *testing.T) {
 	// following tick is skipped.
 	time.Sleep(80 * time.Millisecond)
 
-	calls := fg.Calls("/show/interface/Wireguard1/wireguard/peer")
+	calls := fg.Calls("/show/interface/Wireguard1")
 	if calls == 0 {
 		t.Fatal("expected at least one RCI call to prime the empty state")
 	}
@@ -192,7 +192,7 @@ func TestMetricsPoller_EmptyPeersCooldown_SkipsSubsequentTicks(t *testing.T) {
 
 func TestMetricsPoller_SkipsWhenNoSubscribers(t *testing.T) {
 	fg := query.NewFakeGetter()
-	fg.SetJSON("/show/interface/Wireguard0/wireguard/peer", `[]`)
+	fg.SetJSON("/show/interface/Wireguard0", `{"wireguard":{"peer":[]}}`)
 	peers := query.NewPeerStoreWithTTL(fg, query.NopLogger(), 1*time.Second)
 	run := &fakeRunningProvider{}
 	run.Set([]InterfaceRef{{ID: "Wireguard0"}})
@@ -212,7 +212,7 @@ func TestMetricsPoller_SkipsWhenNoSubscribers(t *testing.T) {
 
 func TestMetricsPoller_ServerChange_InvokesSnapshotCallback(t *testing.T) {
 	fg := query.NewFakeGetter()
-	fg.SetJSON("/show/interface/Wireguard10/wireguard/peer", `[{"public-key":"k","rxbytes":1,"txbytes":2,"last-handshake":0,"online":true,"enabled":true}]`)
+	fg.SetJSON("/show/interface/Wireguard10", `{"wireguard":{"peer":[{"public-key":"k","rxbytes":1,"txbytes":2,"last-handshake":0,"online":true,"enabled":true}]}}`)
 	peers := query.NewPeerStoreWithTTL(fg, query.NopLogger(), 1*time.Second)
 	run := &fakeRunningProvider{}
 	run.Set([]InterfaceRef{{ID: "Wireguard10", IsServer: true}})
@@ -239,7 +239,7 @@ func TestMetricsPoller_ServerChange_InvokesSnapshotCallback(t *testing.T) {
 
 func TestMetricsPoller_ServerNilCallback_NoPublish(t *testing.T) {
 	fg := query.NewFakeGetter()
-	fg.SetJSON("/show/interface/Wireguard10/wireguard/peer", `[{"public-key":"k","rxbytes":1,"txbytes":2,"last-handshake":0,"online":true,"enabled":true}]`)
+	fg.SetJSON("/show/interface/Wireguard10", `{"wireguard":{"peer":[{"public-key":"k","rxbytes":1,"txbytes":2,"last-handshake":0,"online":true,"enabled":true}]}}`)
 	peers := query.NewPeerStoreWithTTL(fg, query.NopLogger(), 1*time.Second)
 	run := &fakeRunningProvider{}
 	run.Set([]InterfaceRef{{ID: "Wireguard10", IsServer: true}})
@@ -260,7 +260,7 @@ func TestMetricsPoller_ServerNilCallback_NoPublish(t *testing.T) {
 
 func TestMetricsPoller_DedupsUnchangedData(t *testing.T) {
 	fg := query.NewFakeGetter()
-	fg.SetJSON("/show/interface/Wireguard0/wireguard/peer", `[{"public-key":"k","rxbytes":100,"txbytes":200,"last-handshake":5,"online":true,"enabled":true}]`)
+	fg.SetJSON("/show/interface/Wireguard0", `{"wireguard":{"peer":[{"public-key":"k","rxbytes":100,"txbytes":200,"last-handshake":5,"online":true,"enabled":true}]}}`)
 	peers := query.NewPeerStoreWithTTL(fg, query.NopLogger(), 1*time.Millisecond)
 	run := &fakeRunningProvider{}
 	run.Set([]InterfaceRef{{ID: "Wireguard0"}})
@@ -281,7 +281,7 @@ func TestMetricsPoller_DedupsUnchangedData(t *testing.T) {
 
 func TestMetricsPoller_Stop_Idempotent(t *testing.T) {
 	fg := query.NewFakeGetter()
-	fg.SetJSON("/show/interface/Wireguard0/wireguard/peer", `[]`)
+	fg.SetJSON("/show/interface/Wireguard0", `{"wireguard":{"peer":[]}}`)
 	peers := query.NewPeerStoreWithTTL(fg, query.NopLogger(), 1*time.Second)
 	run := &fakeRunningProvider{}
 	pub := &fakeMetricsPublisher{}

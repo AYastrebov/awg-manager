@@ -3,11 +3,12 @@ package hydraroute
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/hoaxisr/awg-manager/internal/logger"
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/ndms/command"
 	"github.com/hoaxisr/awg-manager/internal/ndms/query"
@@ -21,38 +22,84 @@ type KernelIfaceResolver interface {
 
 // Service manages HydraRoute Neo integration: detection, config writes, daemon control.
 type Service struct {
-	resolver        KernelIfaceResolver
-	log             *logger.Logger
-	appLog          *logging.ScopedLogger
-	mu              sync.Mutex
-	status          Status
-	restartTimer    *time.Timer
-	geodata         *GeoDataStore
-	dnsListProvider func() []DnsListInfo
-	queries         *query.Queries
-	policies        *command.PolicyCommands
+	resolver                 KernelIfaceResolver
+	appLog                   *logging.ScopedLogger
+	mu                       sync.Mutex
+	status                   Status
+	restartTimer             *time.Timer
+	geodata                  *GeoDataStore
+	dnsListProvider          func() []DnsListInfo
+	queries                  *query.Queries
+	policies                 *command.PolicyCommands
+	lastError                string
+	versionCached            string
+	versionFetchedAt         time.Time
+	versionBinaryFingerprint string
 }
 
+const versionCacheTTL = 5 * time.Minute
+
 // NewService creates a new HydraRoute service. Detects HRNeo on creation.
-func NewService(resolver KernelIfaceResolver, log *logger.Logger, appLogger logging.AppLogger) *Service {
+func NewService(resolver KernelIfaceResolver, appLogger logging.AppLogger) *Service {
 	s := &Service{
 		resolver: resolver,
-		log:      log,
 		appLog:   logging.NewScopedLogger(appLogger, logging.GroupRouting, logging.SubHrNeo),
 		status:   Detect(),
 	}
 	if s.status.Installed {
-		s.log.Infof("hydraroute: detected (running=%v)", s.status.Running)
 		s.appLog.Info("detect", "", fmt.Sprintf("HrNeo detected (running=%v)", s.status.Running))
+		s.HealInvalidRuntimeConfig()
 	}
 	return s
+}
+
+func (s *Service) HealInvalidRuntimeConfig() {
+	s.healBrokenDefaults()
+
+	changed, chosen, err := HealInvalidRuntimeConfig()
+	if err != nil {
+		s.appLog.Warn("config-heal", "", "failed to heal invalid config: "+err.Error())
+		return
+	}
+	if !changed {
+		return
+	}
+	s.appLog.Warn("config-heal", "IpsetMaxElem", fmt.Sprintf("invalid or duplicate IpsetMaxElem healed to %d", chosen))
+	if s.status.Installed && !s.status.Running {
+		s.scheduleRestart("config-heal")
+	}
+}
+
+// healBrokenDefaults чинит hrneo.conf, испорченный старыми дефолтами
+// AWGM (#767). Рестарт нужен всегда: демон уже прочитал испорченный
+// конфиг при своём старте, и без перезапуска правка не применится.
+func (s *Service) healBrokenDefaults() {
+	healed, err := HealBrokenDefaults()
+	if err != nil {
+		s.appLog.Warn("config-heal", "", "failed to heal AWGM defaults: "+err.Error())
+		return
+	}
+	if len(healed) == 0 {
+		return
+	}
+	s.appLog.Warn("config-heal", strings.Join(healed, ","),
+		"восстановлены встроенные дефолты HR Neo, затёртые старыми версиями AWGM")
+	if s.status.Installed {
+		s.scheduleRestart("config-heal-defaults")
+	}
 }
 
 // GetStatus returns cached detection status.
 func (s *Service) GetStatus() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.status
+	status := s.status
+	if status.Running {
+		status.LastError = ""
+	} else {
+		status.LastError = s.lastError
+	}
+	return status
 }
 
 // RefreshStatus re-detects HydraRoute and updates cached status.
@@ -60,6 +107,12 @@ func (s *Service) RefreshStatus() Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.status = Detect()
+	s.status.Version = s.getVersionCachedLocked()
+	if s.status.Running {
+		s.status.LastError = ""
+	} else {
+		s.status.LastError = s.lastError
+	}
 	return s.status
 }
 
@@ -77,27 +130,47 @@ func (s *Service) Control(action string) error {
 	defer s.mu.Unlock()
 
 	if !s.status.Installed {
-		return fmt.Errorf("HydraRoute Neo is not installed")
+		err := fmt.Errorf("HydraRoute Neo is not installed")
+		s.lastError = err.Error()
+		return err
 	}
 
 	switch action {
 	case "start", "stop", "restart":
 		result, err := exec.Run(context.Background(), neoCommand, action)
 		if err != nil {
-			return fmt.Errorf("neo %s: %w", action, exec.FormatError(result, err))
+			formatted := fmt.Errorf("neo %s: %w", action, exec.FormatError(result, err))
+			s.lastError = formatted.Error()
+			return formatted
 		}
 		s.status = Detect()
+		s.status.Version = s.getVersionCachedLocked()
+		s.lastError = ""
 		return nil
 	default:
-		return fmt.Errorf("unknown action: %s", action)
+		err := fmt.Errorf("unknown action: %s", action)
+		s.lastError = err.Error()
+		return err
 	}
 }
 
 // scheduleRestart debounces neo restart: resets timer on each call.
-func (s *Service) scheduleRestart() {
+//
+// Central guard: при !Installed silently skip — это покрывает все
+// callsite'ы (rules-write/config-heal/config-write/policy-order/geo-sync)
+// одной защитой. Без guard'а AfterFunc через 2s делал fork/exec
+// /opt/bin/neo restart, что на чистой системе без HR Neo приводило к
+// шуму "neo restart failed: no such file or directory". Решение:
+// systematic-debugging session 2026-05-23.
+func (s *Service) scheduleRestart(reason string) {
+	if !s.status.Installed {
+		s.appLog.Debug("restart-schedule", "", "skipped: HR Neo не установлен (reason: "+reason+")")
+		return
+	}
 	if s.restartTimer != nil {
 		s.restartTimer.Stop()
 	}
+	s.appLog.Info("restart-schedule", "", "neo restart scheduled: "+reason)
 	s.restartTimer = time.AfterFunc(2*time.Second, func() {
 		// Mark timer as completed before releasing the lock so a concurrent
 		// scheduleRestart sees nil and creates a fresh timer rather than
@@ -108,16 +181,83 @@ func (s *Service) scheduleRestart() {
 
 		result, err := exec.Run(context.Background(), neoCommand, "restart")
 		if err != nil {
-			s.log.Warnf("hydraroute: neo restart failed: %v", exec.FormatError(result, err))
+			s.appLog.Warn("restart", "neo", exec.FormatError(result, err).Error())
 			s.appLog.Warn("restart", "", fmt.Sprintf("neo restart failed: %v", exec.FormatError(result, err)))
+			s.mu.Lock()
+			s.lastError = fmt.Sprintf("neo restart: %v", exec.FormatError(result, err))
+			s.mu.Unlock()
 		} else {
-			s.log.Infof("hydraroute: neo restarted")
+			s.appLog.Info("restart", "neo", "restarted")
 			s.appLog.Info("restart", "", "neo restarted")
+			s.mu.Lock()
+			s.lastError = ""
+			s.mu.Unlock()
 		}
 		s.mu.Lock()
 		s.status = Detect()
+		s.status.Version = s.getVersionCachedLocked()
+		if s.status.Running {
+			s.status.LastError = ""
+		} else {
+			s.status.LastError = s.lastError
+		}
 		s.mu.Unlock()
 	})
+}
+
+func (s *Service) ScheduleRestart(reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scheduleRestart(reason)
+}
+
+func (s *Service) getVersionCachedLocked() string {
+	if !s.status.Installed {
+		s.versionCached = ""
+		s.versionFetchedAt = time.Time{}
+		s.versionBinaryFingerprint = ""
+		return ""
+	}
+
+	now := time.Now()
+	currentFingerprint := hydraBinaryFingerprint()
+	if currentFingerprint == "" {
+		s.versionCached = ""
+		s.versionFetchedAt = now
+		s.versionBinaryFingerprint = ""
+		return ""
+	}
+	fingerprintChanged := s.versionBinaryFingerprint != "" &&
+		currentFingerprint != s.versionBinaryFingerprint
+
+	if fingerprintChanged {
+		s.versionCached = ""
+		s.versionFetchedAt = time.Time{}
+	}
+
+	if !fingerprintChanged && !s.versionFetchedAt.IsZero() && now.Sub(s.versionFetchedAt) < versionCacheTTL {
+		return s.versionCached
+	}
+
+	version := detectVersion(context.Background())
+	s.versionCached = version
+	s.versionFetchedAt = now
+	s.versionBinaryFingerprint = currentFingerprint
+	return s.versionCached
+}
+
+func hydraBinaryFingerprint() string {
+	st, err := os.Stat(hrneoBinary)
+	if err != nil || st.IsDir() {
+		return ""
+	}
+	return fmt.Sprintf(
+		"%s|%s|%s|%d",
+		filepath.Clean(hrneoBinary),
+		st.ModTime().UTC().Format(time.RFC3339Nano),
+		st.Mode().String(),
+		st.Size(),
+	)
 }
 
 // SetGeoDataStore sets the GeoDataStore used for syncing geo file paths to config.
@@ -176,9 +316,6 @@ func (s *Service) EnsurePolicyInterfaces(ctx context.Context, policyName string,
 	}
 
 	for i, iface := range ndmsIfaces {
-		if s.log != nil {
-			s.log.Infof("hydraroute: ip policy %s permit global %s order %d", policyName, iface, i)
-		}
 		s.appLog.Info("permit-iface", iface, fmt.Sprintf("ip policy %s permit global order %d", policyName, i))
 		if err := policies.PermitInterface(ctx, policyName, iface, i); err != nil {
 			s.appLog.Warn("permit-iface", iface, fmt.Sprintf("policy %s: %v", policyName, err))
@@ -203,57 +340,96 @@ func (s *Service) WriteConfig(cfg *Config) error {
 		cfg.GeoIPFiles = geoIP
 		cfg.GeoSiteFiles = geoSite
 	}
-
+	effectiveMaxElem := cfg.IpsetMaxElem
+	if cfg.IpsetMaxElem <= 0 {
+		effectiveMaxElem = defaultMaxElem
+		s.appLog.Warn("config-normalize", "IpsetMaxElem", "invalid value <=0 normalized to 65536")
+	}
 	if err := WriteConfig(cfg); err != nil {
+		s.appLog.Warn("config-write", "", "full config write failed: "+err.Error())
 		return err
 	}
 
-	s.scheduleRestart()
+	s.appLog.Info(
+		"config-write",
+		"",
+		fmt.Sprintf(
+			"HydraRoute settings updated: geoip=%d geosite=%d ipsetMaxElem=%d policyOrder=%d",
+			len(cfg.GeoIPFiles),
+			len(cfg.GeoSiteFiles),
+			effectiveMaxElem,
+			len(cfg.PolicyOrder),
+		),
+	)
+
+	s.scheduleRestart("config-write")
 	return nil
 }
 
-// SetPolicyOrder updates only the PolicyOrder field in hrneo.conf and restarts.
+// SetPolicyOrder updates only PolicyOrder in hrneo.conf and restarts.
 func (s *Service) SetPolicyOrder(order []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.appLog.Info("policy-order", "", fmt.Sprintf("patch-only policy order write: entries=%d", len(order)))
 
-	cfg, err := ReadConfig()
-	if err != nil {
-		return fmt.Errorf("read config: %w", err)
-	}
-
-	cfg.PolicyOrder = order
-
-	if s.geodata != nil {
-		geoIP, geoSite := s.geodata.GeoFilePaths()
-		cfg.GeoIPFiles = geoIP
-		cfg.GeoSiteFiles = geoSite
-	}
-
-	if err := WriteConfig(cfg); err != nil {
+	if err := WritePolicyOrderOnly(order); err != nil {
+		s.appLog.Warn("policy-order", "", "patch-only policy order write failed: "+err.Error())
 		return err
 	}
 
-	s.scheduleRestart()
+	s.scheduleRestart("policy-order")
 	return nil
 }
 
-// SyncGeoFilesToConfig reads the current config and writes it back with updated geo file paths.
+// SyncGeoFilesToConfig updates only GeoIPFile/GeoSiteFile in hrneo.conf.
+// При !Installed — no-op: если HR Neo удалили, мы не обновляем его
+// конфиг "на будущее" (решено session 2026-05-23).
 func (s *Service) SyncGeoFilesToConfig() error {
-	cfg, err := ReadConfig()
-	if err != nil {
-		return err
+	s.mu.Lock()
+	installed := s.status.Installed
+	s.mu.Unlock()
+	if !installed {
+		s.appLog.Debug("sync-geo", "", "skipped: HR Neo не установлен")
+		return nil
 	}
 	geoIP, geoSite := 0, 0
-	if s.geodata != nil {
-		ips, sites := s.geodata.GeoFilePaths()
-		geoIP, geoSite = len(ips), len(sites)
+	var ips []string
+	var sites []string
+	s.mu.Lock()
+	gds := s.geodata
+	s.mu.Unlock()
+	if gds == nil {
+		s.appLog.Warn("sync-geo", "", "geo data store not initialized")
+		return fmt.Errorf("geo data store not initialized")
 	}
-	if s.log != nil {
-		s.log.Infof("hydraroute: sync geo files to config — %d geoip + %d geosite", geoIP, geoSite)
+	ips, sites = gds.GeoFilePaths()
+	geoIP, geoSite = len(ips), len(sites)
+	s.appLog.Info("sync-geo", "", fmt.Sprintf("patch-only geo file sync: geoip=%d geosite=%d", geoIP, geoSite))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := WriteGeoFilesOnly(ips, sites); err != nil {
+		s.appLog.Warn("sync-geo", "", "patch-only geo file sync failed: "+err.Error())
+		return err
 	}
-	s.appLog.Info("sync-geo", "", fmt.Sprintf("sync geo files: %d geoip + %d geosite", geoIP, geoSite))
-	return s.WriteConfig(cfg)
+	s.scheduleRestart("geo-sync")
+	return nil
+}
+
+// RescanGeoFiles adopts geo paths from hrneo.conf that are not yet tracked.
+func (s *Service) RescanGeoFiles() (int, error) {
+	cfg, err := ReadConfig()
+	if err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	gds := s.geodata
+	s.mu.Unlock()
+	if gds == nil {
+		return 0, fmt.Errorf("geo data store not initialized")
+	}
+	// Catalog-only: paths already live in hrneo.conf — no config rewrite or
+	// neo restart (keeps tab-open rescan cheap).
+	return gds.AdoptExternalFiles(cfg)
 }
 
 // CalculateIpsetUsage returns the current ipset usage per kernel interface.

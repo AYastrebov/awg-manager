@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
-  import { appLogEntries, singboxLogEntries, logStoreFor, type LogBucket, type LogStore } from '$lib/stores/logs';
+  import { onMount, onDestroy, tick } from 'svelte';
+  import { TriangleAlert } from 'lucide-svelte';
+  import { logStoreFor, type LogBucket, type LogStore } from '$lib/stores/logs';
   import { LoadingSpinner, EmptyState } from '$lib/components/layout';
   import { Button } from '$lib/components/ui';
   import { api } from '$lib/api/client';
@@ -8,20 +9,54 @@
   import { usageLevel, settings } from '$lib/stores/settings';
   import { systemInfo } from '$lib/stores/system';
   import { copyToClipboard } from '$lib/utils/clipboard';
+  import { stripAnsi } from '$lib/utils/ansi';
+  import { formatDateTimeWithOffset } from '$lib/utils/format';
+  import { diagnosticsSanitized, toggleDiagnosticsSanitized } from '$lib/stores/diagnosticsPrivacy';
+  import { sanitizeLogEntry } from '$lib/utils/log-privacy';
   import LogRow from './LogRow.svelte';
-  import LogsToolbar, { ALL_LEVELS } from './LogsToolbar.svelte';
+  import LogsToolbar, { ALL_LEVELS, SINGBOX_GROUPS } from './LogsToolbar.svelte';
   import LogsContextMenu from './LogsContextMenu.svelte';
   import type { LogsFilter } from './LogsToolbar.svelte';
   import type { LogEntry } from '$lib/types';
 
-  const STORAGE_KEY = 'awgm.diagnostics.logsFilter';
-  const BUCKET_KEY = 'awgm.diagnostics.logsBucket';
+  // lockBucket: bucket инстанса. Каждый терминал в приложении показывает ровно
+  // одну корзину (Журнал — 'app'; FakeIP и TProxy — 'singbox'), переключателя
+  // app/singbox больше нет.
+  // storagePrefix: пространство localStorage-ключей инстанса. Терминалы на
+  // разных страницах (Диагностика, FakeIP, TProxy) обязаны хранить фильтры
+  // раздельно, иначе они перетекают между страницами через общие ключи.
+  let { lockBucket, storagePrefix = 'awgm.diagnostics' }: {
+    lockBucket: LogBucket;
+    storagePrefix?: string;
+  } = $props();
+
+  // Пропы фиксированы на всё время жизни инстанса — захват начальных значений
+  // намеренный.
+  // svelte-ignore state_referenced_locally
+  const STORAGE_KEY = `${storagePrefix}.logsFilter`;
+  // svelte-ignore state_referenced_locally
+  const FULL_TIMESTAMP_KEY = `${storagePrefix}.logsFullTimestamp`;
   const PAGE_SIZE = 200;
-  const SCROLL_THRESHOLD = 80;
+  type LogsQueryParams = {
+    bucket: 'app' | 'singbox';
+    groups: string[];
+    subgroups: string[];
+    limit: number;
+    offset: number;
+  };
+  /** Min distance from top before auto-pause; also scales with viewport (see scrollPauseThreshold). */
+  const SCROLL_THRESHOLD_MIN = 80;
+
+  function normalizeStringArray(v: unknown): string[] {
+    if (!Array.isArray(v)) return [];
+    return v.filter((x): x is string => typeof x === 'string' && x.length > 0);
+  }
 
   function defaultFilter(): LogsFilter {
-    return { search: '', group: '', subgroup: '', levels: [...ALL_LEVELS] };
+    return { search: '', groups: [], subgroups: [], levels: [...ALL_LEVELS] };
   }
+
+  let filterLoadWarning = false;
 
   function loadFilter(): LogsFilter {
     if (typeof localStorage === 'undefined') return defaultFilter();
@@ -39,35 +74,73 @@
       }
       return {
         search: parsed.search ?? '',
-        group: parsed.group ?? '',
-        subgroup: parsed.subgroup ?? '',
+        groups:
+          Array.isArray(parsed.groups)
+            ? normalizeStringArray(parsed.groups)
+            : (typeof parsed.group === 'string' && parsed.group ? [parsed.group] : []),
+        subgroups:
+          Array.isArray(parsed.subgroups)
+            ? normalizeStringArray(parsed.subgroups)
+            : (typeof parsed.subgroup === 'string' && parsed.subgroup ? [parsed.subgroup] : []),
         levels,
       };
     } catch {
+      filterLoadWarning = true;
       return defaultFilter();
     }
   }
 
   function saveFilter(f: LogsFilter) {
     if (typeof localStorage === 'undefined') return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(f));
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(f));
+    } catch {
+      /* quota / private mode — фильтр живёт в памяти */
+    }
   }
 
-  function loadBucket(): LogBucket {
-    if (typeof localStorage === 'undefined') return 'app';
-    const raw = localStorage.getItem(BUCKET_KEY);
-    return raw === 'singbox' ? 'singbox' : 'app';
+  function loadFullTimestamp(): boolean {
+    if (typeof localStorage === 'undefined') return false;
+    return localStorage.getItem(FULL_TIMESTAMP_KEY) === '1';
   }
 
-  function saveBucket(b: LogBucket) {
+  function saveFullTimestamp(v: boolean) {
     if (typeof localStorage === 'undefined') return;
-    localStorage.setItem(BUCKET_KEY, b);
+    try {
+      localStorage.setItem(FULL_TIMESTAMP_KEY, v ? '1' : '0');
+    } catch {
+      /* quota / private mode — настройка живёт в памяти */
+    }
   }
 
-  let filter = $state<LogsFilter>(loadFilter());
-  let bucket = $state<LogBucket>(loadBucket());
+  // Санация сохранённого фильтра: раньше терминалы делили один localStorage-ключ
+  // (FakeIP-журнал писал в него singbox-подгруппы, не трогая маркер bucket'а),
+  // поэтому в groups могут лежать группы чужого bucket'а. Наборы имён не
+  // пересекаются — фильтруем по принадлежности к SINGBOX_GROUPS, а не доверяем
+  // маркеру. Санация чистая (без записи): исправленный фильтр сохранится при
+  // первом же applyFilter.
+  function initialFilter(): LogsFilter {
+    const f = loadFilter();
+    const singbox = new Set<string>(SINGBOX_GROUPS);
+    const groups = f.groups.filter((g) =>
+      lockBucket === 'singbox' ? singbox.has(g) : !singbox.has(g),
+    );
+    if (groups.length === f.groups.length) return f;
+    return { ...f, groups, subgroups: [] };
+  }
+
+  // lockBucket — фиксированный проп (не меняется в рантайме): захват начального
+  // значения — намеренный.
+  // svelte-ignore state_referenced_locally
+  let filter = $state<LogsFilter>(initialFilter());
+  const bucket = $derived(lockBucket);
+  let showFullTimestamp = $state(loadFullTimestamp());
   let paused = $state(false);
+  /** User clicked Pause — do not auto-resume when scrolled back to the top. */
+  let manualPause = $state(false);
   let bufferCount = $state(0);
+  let anchorScrollHeight = 0;
+  let anchorScrollTop = 0;
   let downloading = $state(false);
   let clearing = $state(false);
   let expanded = $state<Record<string, boolean>>({});
@@ -76,20 +149,28 @@
   let initialFetchDone = $state(false);
   let prevLen = $state(0);
   let pageOffset = $state(0);
+  let manualFrozenLogs = $state<LogEntry[] | null>(null);
 
   /** Subgroup `profiling` is expert-only and only when -slow-request-ms > 0 at daemon start. */
   $effect(() => {
     if (!$settings) return;
     const profilingEnabled = ($systemInfo.data?.slowRequestThresholdMs ?? 0) > 0;
     if ($usageLevel === 'expert' && profilingEnabled) return;
-    if (filter.subgroup !== 'profiling') return;
-    void applyFilter({ ...filter, subgroup: '' });
+    if (!filter.subgroups.includes('profiling')) return;
+    (async () => {
+      try {
+        await applyFilter({ ...filter, subgroups: filter.subgroups.filter((s) => s !== 'profiling') });
+      } catch {
+        notifications.error('Не удалось сбросить фильтр profiling');
+      }
+    })();
   });
   let loadingMore = $state(false);
   let availableSubgroups = $state<string[]>([]);
   const subgroupCache = new Map<string, string[]>();
 
   const activeStore = $derived<LogStore>(logStoreFor(bucket));
+  const privacyRevealAvailable = $derived(true);
 
   // Reactive subscriptions to the active store. $derived re-runs each time
   // the store identity changes (bucket toggle), so we re-subscribe naturally
@@ -115,21 +196,31 @@
   }
 
   // Initial fetch + every bucket switch: replace the entire active store.
-  async function loadBucketFresh(b: LogBucket) {
-    const store = logStoreFor(b);
+  function buildLogQuery(limit: number, offset = 0): LogsQueryParams {
+    if (bucket === 'singbox') {
+      return {
+        bucket,
+        groups: ['singbox'],
+        subgroups: filter.groups,
+        limit,
+        offset,
+      };
+    }
+
+    return {
+      bucket,
+      groups: filter.groups,
+      subgroups: filter.subgroups,
+      limit,
+      offset,
+    };
+  }
+
+  async function loadBucketFresh() {
+    const store = logStoreFor(bucket);
     pageOffset = 0;
-    const groupParam = b === 'singbox' ? 'singbox' : (filter.group || undefined);
-    const subgroupParam = b === 'singbox'
-      ? (filter.group ? filter.group : (filter.subgroup || undefined))
-      : (filter.subgroup || undefined);
     try {
-      const resp = await api.getLogs({
-        bucket: b,
-        group: groupParam,
-        subgroup: subgroupParam,
-        limit: PAGE_SIZE,
-        offset: 0,
-      });
+      const resp = await api.getLogs(buildLogQuery(PAGE_SIZE, 0));
       store.setEntries(resp.logs);
       store.setTotal(resp.total);
       store.setEnabled(resp.enabled);
@@ -148,13 +239,9 @@
   async function fetchSubgroups(group: string): Promise<string[]> {
     if (!group) return [];
     if (subgroupCache.has(group)) return subgroupCache.get(group)!;
-    try {
-      const resp = await api.getLogsSubgroups(group);
-      subgroupCache.set(group, resp.subgroups);
-      return resp.subgroups;
-    } catch {
-      return [];
-    }
+    const resp = await api.getLogsSubgroups(group);
+    subgroupCache.set(group, resp.subgroups);
+    return resp.subgroups;
   }
 
   async function refreshSubgroups() {
@@ -164,15 +251,41 @@
       availableSubgroups = [];
       return;
     }
-    if (!filter.group) {
+    if (filter.groups.length === 0) {
       availableSubgroups = [];
       return;
     }
-    availableSubgroups = await fetchSubgroups(filter.group);
+    try {
+      const lists = await Promise.all(filter.groups.map((g) => fetchSubgroups(g)));
+      const seen = new Set<string>();
+      const merged: string[] = [];
+
+      for (const list of lists) {
+        for (const s of list) {
+          if (seen.has(s)) continue;
+          seen.add(s);
+          merged.push(s);
+        }
+      }
+
+      availableSubgroups = merged;
+      const allowed = new Set(merged);
+      const nextSubgroups = filter.subgroups.filter((s) => allowed.has(s));
+      if (nextSubgroups.length !== filter.subgroups.length) {
+        filter = { ...filter, subgroups: nextSubgroups };
+        saveFilter(filter);
+      }
+    } catch {
+      availableSubgroups = [];
+      notifications.error('Не удалось загрузить список подгрупп журнала');
+    }
   }
 
   onMount(async () => {
-    await loadBucketFresh(bucket);
+    if (filterLoadWarning) {
+      notifications.warning('Не удалось прочитать сохранённые фильтры журнала, применены значения по умолчанию');
+    }
+    await loadBucketFresh();
     await refreshSubgroups();
     setTimeout(() => (initialFetchDone = true), 100);
     window.addEventListener('keydown', handleKeydown);
@@ -182,16 +295,43 @@
     window.removeEventListener('keydown', handleKeydown);
   });
 
+  function scrollPauseThreshold(): number {
+    if (!scrollEl) return SCROLL_THRESHOLD_MIN;
+    // ~¾ viewport: scrolling “a page or two” away from the live head pauses follow.
+    return Math.max(SCROLL_THRESHOLD_MIN, scrollEl.clientHeight * 0.75);
+  }
+
   function onScroll() {
     if (!scrollEl) return;
-    const top = scrollEl.scrollTop;
-    if (top > SCROLL_THRESHOLD) {
+    if (scrollEl.scrollTop > scrollPauseThreshold()) {
       paused = true;
-    } else {
+    } else if (!manualPause) {
       paused = false;
       bufferCount = 0;
     }
   }
+
+  // Keep the viewport anchored while paused — new SSE rows prepend at the top and
+  // would otherwise push content under the scroll position.
+  $effect.pre(() => {
+    void $activeStore.length;
+    if (scrollEl && paused && initialFetchDone) {
+      anchorScrollHeight = scrollEl.scrollHeight;
+      anchorScrollTop = scrollEl.scrollTop;
+    }
+  });
+
+  $effect(() => {
+    void $activeStore.length;
+    if (!initialFetchDone || !scrollEl || !paused) return;
+    void tick().then(() => {
+      if (!scrollEl || !paused) return;
+      const delta = scrollEl.scrollHeight - anchorScrollHeight;
+      if (delta > 0 && scrollEl.scrollTop > 0) {
+        scrollEl.scrollTop = anchorScrollTop + delta;
+      }
+    });
+  });
 
   $effect(() => {
     const len = $activeStore.length;
@@ -206,72 +346,99 @@
   });
 
   function togglePause() {
-    paused = !paused;
-    if (!paused) {
-      scrollEl?.scrollTo({ top: 0, behavior: 'smooth' });
-      bufferCount = 0;
+    if (paused) {
+      resumeAndScroll();
+    } else {
+      manualPause = true;
+      manualFrozenLogs = filteredLogs.slice();
+      paused = true;
     }
   }
 
   function resumeAndScroll() {
-    scrollEl?.scrollTo({ top: 0, behavior: 'smooth' });
+    manualPause = false;
     paused = false;
     bufferCount = 0;
+    manualFrozenLogs = null;
+    scrollEl?.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  function normalizeLogForOutput(log: LogEntry): LogEntry {
+    const clean = {
+      ...log,
+      target: stripAnsi(log.target),
+      message: stripAnsi(log.message),
+    };
+    const shouldSanitize = $diagnosticsSanitized;
+    return shouldSanitize ? sanitizeLogEntry(clean) : clean;
+  }
+
+  function logForPrivacy(log: LogEntry): LogEntry {
+    return normalizeLogForOutput(log);
   }
 
   async function applyFilter(f: LogsFilter) {
+    // Filter changes should be predictable: drop manual pause snapshot and return to live mode.
+    manualPause = false;
+    paused = false;
+    bufferCount = 0;
+    manualFrozenLogs = null;
     filter = f;
     saveFilter(f);
     // Group changed → refresh subgroup catalog; subgroup change keeps catalog.
     await refreshSubgroups();
-    await loadBucketFresh(bucket);
+    await loadBucketFresh();
   }
 
-  async function setBucket(b: LogBucket) {
-    if (b === bucket) return;
-    bucket = b;
-    saveBucket(b);
-    // Reset filters on bucket switch — group sets are disjoint per bucket.
-    filter = { ...filter, group: '', subgroup: '' };
-    saveFilter(filter);
-    await loadBucketFresh(b);
-    await refreshSubgroups();
-  }
-
-  const displayLogs = $derived.by(() => {
+  const filteredLogs = $derived.by(() => {
     let arr: LogEntry[] = $activeStore;
     if (filter.levels.length > 0 && filter.levels.length < ALL_LEVELS.length) {
       const set = new Set(filter.levels);
       arr = arr.filter((l) => set.has(l.level));
     }
     if (bucket === 'singbox') {
-      // sing-box bucket: filter.group is the SUBGROUP selector, filter.subgroup unused
-      if (filter.group) arr = arr.filter((l) => l.subgroup === filter.group);
+      if (filter.groups.length > 0) {
+        const set = new Set(filter.groups);
+        arr = arr.filter((l) => set.has(l.subgroup));
+      }
     } else {
-      if (filter.group) arr = arr.filter((l) => l.group === filter.group);
-      if (filter.subgroup) arr = arr.filter((l) => l.subgroup === filter.subgroup);
+      if (filter.groups.length > 0) {
+        const set = new Set(filter.groups);
+        arr = arr.filter((l) => set.has(l.group));
+      }
+      if (filter.subgroups.length > 0) {
+        const set = new Set(filter.subgroups);
+        arr = arr.filter((l) => set.has(l.subgroup));
+      }
     }
     if (filter.search) {
       const q = filter.search.toLowerCase();
-      arr = arr.filter(
-        (l) =>
-          l.message.toLowerCase().includes(q) ||
-          l.target.toLowerCase().includes(q) ||
-          l.action.toLowerCase().includes(q),
-      );
+      arr = arr.filter((l) => {
+        const visible = logForPrivacy(l);
+        return (
+          visible.message.toLowerCase().includes(q) ||
+          visible.target.toLowerCase().includes(q) ||
+          visible.action.toLowerCase().includes(q)
+        );
+      });
     }
     return arr;
   });
 
-  function handleClickScope(group: string, subgroup: string) {
+  const displayLogs = $derived.by(() => {
+    if (manualPause && manualFrozenLogs) return manualFrozenLogs;
+    return filteredLogs;
+  });
+
+  async function handleClickScope(group: string, subgroup: string) {
     if (bucket === 'singbox') {
-      // For sing-box the "scope" click maps the subgroup into the group selector.
-      filter = { ...filter, group: subgroup, subgroup: '' };
+      filter = { ...filter, groups: subgroup ? [subgroup] : [], subgroups: [] };
     } else {
-      filter = { ...filter, group, subgroup };
+      filter = { ...filter, groups: group ? [group] : [], subgroups: subgroup ? [subgroup] : [] };
     }
     saveFilter(filter);
-    refreshSubgroups();
+    await refreshSubgroups();
+    await loadBucketFresh();
   }
 
   function handleClickLevel(level: string) {
@@ -279,9 +446,54 @@
     saveFilter(filter);
   }
 
-  function formatLine(log: LogEntry): string {
-    const scope = log.subgroup ? `${log.group}/${log.subgroup}` : log.group;
-    return `[${log.timestamp}] [${log.level.toUpperCase()}] [${scope}] ${log.action} ${log.target}: ${log.message}`;
+  function toggleFullTimestamp() {
+    showFullTimestamp = !showFullTimestamp;
+    saveFullTimestamp(showFullTimestamp);
+  }
+
+  async function handleToggleSanitizeLogs() {
+    toggleDiagnosticsSanitized();
+    manualPause = false;
+    paused = false;
+    bufferCount = 0;
+    manualFrozenLogs = null;
+    await loadBucketFresh();
+  }
+
+  function formatLine(log: LogEntry, routerOffset: number): string {
+    const visible = logForPrivacy(log);
+    const scope = visible.subgroup ? `${visible.group}/${visible.subgroup}` : visible.group;
+    const t = formatDateTimeWithOffset(visible.timestamp, routerOffset);
+    return `[${t}] [${visible.level.toUpperCase()}] [${scope}] ${visible.action} ${visible.target}: ${visible.message}`;
+  }
+
+  function getRouterOffsetOrWarn(): number | null {
+    const routerOffset = $systemInfo.data?.routerTimezoneOffsetMinutes;
+    if (routerOffset === undefined || routerOffset === null || !Number.isFinite(routerOffset)) {
+      notifications.warning('Время роутера ещё не загружено, попробуйте через несколько секунд');
+      return null;
+    }
+    return routerOffset;
+  }
+
+  async function getFreshRouterClockOrWarn(): Promise<{ routerTime: string; routerOffset: number } | null> {
+    await systemInfo.refetch();
+
+    const routerTime = $systemInfo.data?.routerTime;
+    const routerOffset = $systemInfo.data?.routerTimezoneOffsetMinutes;
+
+    if (!routerTime || routerOffset === undefined || routerOffset === null || !Number.isFinite(routerOffset)) {
+      notifications.warning('Время роутера ещё не загружено, попробуйте через несколько секунд');
+      return null;
+    }
+
+    return { routerTime, routerOffset };
+  }
+
+  function formatRouterClockFilenameStamp(routerTime: string, routerOffset: number): string {
+    return formatDateTimeWithOffset(routerTime, routerOffset)
+      .replace(' ', '-')
+      .replace(/:/g, '-');
   }
 
   async function copyText(text: string, successMsg: string) {
@@ -293,39 +505,77 @@
   }
 
   async function handleCopy() {
-    const text = displayLogs.map(formatLine).join('\n');
+    const routerOffset = getRouterOffsetOrWarn();
+    if (routerOffset === null) return;
+    const text = displayLogs.map((log) => formatLine(log, routerOffset)).join('\n');
     await copyText(text, 'Скопировано в буфер обмена');
   }
 
-  function handleCopyLine(text: string) {
-    copyText(text, 'Строка скопирована');
+  function handleCopyLine(log: LogEntry) {
+    const routerOffset = getRouterOffsetOrWarn();
+    if (routerOffset === null) return;
+    copyText(formatLine(log, routerOffset), 'Строка скопирована');
   }
 
   function handleCopyMessage(text: string) {
     copyText(text, 'Сообщение скопировано');
   }
 
+  function matchesCurrentVisibleFilters(log: LogEntry, currentFilter: LogsFilter): boolean {
+    if (currentFilter.levels.length > 0 && currentFilter.levels.length < ALL_LEVELS.length) {
+      const set = new Set(currentFilter.levels);
+      if (!set.has(log.level)) return false;
+    }
+
+    if (bucket === 'singbox') {
+      if (currentFilter.groups.length > 0) {
+        const set = new Set(currentFilter.groups);
+        if (!set.has(log.subgroup)) return false;
+      }
+    } else {
+      if (currentFilter.groups.length > 0) {
+        const set = new Set(currentFilter.groups);
+        if (!set.has(log.group)) return false;
+      }
+      if (currentFilter.subgroups.length > 0) {
+        const set = new Set(currentFilter.subgroups);
+        if (!set.has(log.subgroup)) return false;
+      }
+    }
+
+    if (currentFilter.search) {
+      const q = currentFilter.search.toLowerCase();
+      const visible = logForPrivacy(log);
+      return (
+        visible.message.toLowerCase().includes(q) ||
+        visible.target.toLowerCase().includes(q) ||
+        visible.action.toLowerCase().includes(q)
+      );
+    }
+
+    return true;
+  }
+
   async function handleDownload() {
     downloading = true;
     try {
-      const resp = await api.getLogs({
-        bucket,
-        group: bucket === 'singbox' ? 'singbox' : (filter.group || undefined),
-        subgroup: bucket === 'singbox' ? (filter.group || undefined) : (filter.subgroup || undefined),
-        limit: $totalStore || 10000,
-      });
-      const text = resp.logs.map(formatLine).join('\n');
+      const clock = await getFreshRouterClockOrWarn();
+      if (clock === null) return;
+
+      const resp = await api.getLogs(buildLogQuery($totalStore || 10000, 0));
+      const logs = resp.logs.filter((log) => matchesCurrentVisibleFilters(log, filter));
+      const text = logs.map((log) => formatLine(log, clock.routerOffset)).join('\n');
       const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
       const url = URL.createObjectURL(blob);
-      const date = new Date().toISOString().slice(0, 10);
+      const stamp = formatRouterClockFilenameStamp(clock.routerTime, clock.routerOffset);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `awg-manager-${bucket}-logs-${date}.txt`;
+      a.download = `awg-manager-${bucket}-logs-${stamp}.txt`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      notifications.success(`Скачано ${resp.logs.length} записей`);
+      notifications.success(`Скачано ${logs.length} записей`);
     } catch {
       notifications.error('Не удалось скачать логи');
     } finally {
@@ -355,13 +605,7 @@
     loadingMore = true;
     pageOffset += PAGE_SIZE;
     try {
-      const resp = await api.getLogs({
-        bucket,
-        group: bucket === 'singbox' ? 'singbox' : (filter.group || undefined),
-        subgroup: bucket === 'singbox' ? (filter.group || undefined) : (filter.subgroup || undefined),
-        limit: PAGE_SIZE,
-        offset: pageOffset,
-      });
+      const resp = await api.getLogs(buildLogQuery(PAGE_SIZE, pageOffset));
       activeStore.appendPage(resp.logs);
       activeStore.setTotal(resp.total);
       activeStore.setStats({
@@ -400,11 +644,7 @@
       description="Включите логирование в настройках для записи событий."
     >
       {#snippet icon()}
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="48" height="48">
-          <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
-          <line x1="12" y1="9" x2="12" y2="13" />
-          <circle cx="12" cy="17" r="1" fill="currentColor" />
-        </svg>
+        <TriangleAlert size={48} aria-hidden="true" />
       {/snippet}
       {#snippet action()}
         <Button variant="primary" size="md" href="/settings">Открыть настройки</Button>
@@ -417,7 +657,6 @@
       bind:filter
       onFilterChange={applyFilter}
       {bucket}
-      onBucketChange={setBucket}
       {paused}
       {bufferCount}
       onTogglePause={togglePause}
@@ -425,6 +664,12 @@
       onCopy={handleCopy}
       onDownload={handleDownload}
       onClear={handleClear}
+      {showFullTimestamp}
+      onToggleFullTimestamp={toggleFullTimestamp}
+      sanitizeLogs={$diagnosticsSanitized}
+      onToggleSanitizeLogs={handleToggleSanitizeLogs}
+      sanitizeToggleAvailable={privacyRevealAvailable}
+      sanitizeToggleHint=""
       totalEntries={$totalStore}
       visibleEntries={displayLogs.length}
       bufferStats={$statsStore}
@@ -442,13 +687,16 @@
       {/if}
       {#each displayLogs as log (logKey(log))}
         {@const k = logKey(log) /* WeakMap returns the same id; reuse for expanded[] */}
+        {@const visibleLog = logForPrivacy(log)}
         <LogRow
-          {log}
+          log={visibleLog}
+          routerOffset={$systemInfo.data?.routerTimezoneOffsetMinutes}
+          showFullTimestamp={showFullTimestamp}
           expanded={expanded[k] ?? false}
           onToggleExpand={() => (expanded = { ...expanded, [k]: !expanded[k] })}
           onClickScope={handleClickScope}
           onClickLevel={handleClickLevel}
-          onCopyLine={handleCopyLine}
+          onCopyLine={() => handleCopyLine(log)}
           onCopyMessage={handleCopyMessage}
         />
       {/each}

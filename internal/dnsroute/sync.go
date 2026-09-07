@@ -68,14 +68,26 @@ type rciDiff struct {
 	routeDeletes  []rciRouteDelete
 	groupDeletes  []string
 	groupUpdates  []rciGroupUpdate
-	routeUpserts  []rciRouteOp
+	routeRebuilds []rciRouteRebuild
 	routeDisables []rciRouteDisable
+}
+
+// rciRouteRebuild — перезапись всего блока маршрутов одной группы: снос
+// текущих строк и запись целевых в порядке приоритета. Единица диффа именно
+// блок, а не отдельная строка, потому что порядок строк в NDMS и есть
+// приоритет, а переставить строку нечем: upsert существующей её не двигает,
+// новая уходит в хвост (проверено на 5.01). Поэтому любое расхождение состава
+// или порядка лечится только перезаписью блока целиком (#801).
+type rciRouteRebuild struct {
+	group   string
+	deletes []string     // интерфейсы текущих строк группы
+	upserts []rciRouteOp // целевые строки в порядке приоритета
 }
 
 // rciRouteDisable is a toggle of the `disable` flag on an existing route,
 // keyed by Keenetic's stable index hash. Pending disables for routes that
-// were just upserted (no index yet) are carried by routeUpserts.Disabled
-// and applied after a post-upsert refetch.
+// were just written (no index yet) are carried by rciRouteOp.Disabled
+// and applied after a post-write refetch.
 type rciRouteDisable struct {
 	Index    string
 	Disabled bool
@@ -95,9 +107,10 @@ type rciRouteOp struct {
 	Iface  string `json:"interface"`
 	Auto   bool   `json:"auto,omitempty"`
 	Reject bool   `json:"reject,omitempty"`
-	// Disabled — if true, the route is created/updated as enabled first
-	// (UpsertRoutes has no `disable` field), and the reconciler fetches
-	// its freshly-assigned index post-upsert to issue a SetDisabled call.
+	// Disabled — desired disable state. The route payload has no `disable`
+	// field, and a rewritten route comes back enabled with a fresh index, so
+	// applyDiff re-fetches indexes after the rewrite and settles the flag with
+	// SetDisabled in BOTH directions (set on new-disabled, clear on re-enabled).
 	Disabled bool `json:"-"`
 }
 
@@ -112,7 +125,7 @@ type rciGroupUpdate struct {
 
 func (d rciDiff) isEmpty() bool {
 	return len(d.routeDeletes) == 0 && len(d.groupDeletes) == 0 &&
-		len(d.groupUpdates) == 0 && len(d.routeUpserts) == 0 &&
+		len(d.groupUpdates) == 0 && len(d.routeRebuilds) == 0 &&
 		len(d.routeDisables) == 0
 }
 
@@ -166,8 +179,8 @@ func (s *ServiceImpl) reconcile(ctx context.Context) error {
 		return nil
 	}
 
-	s.logInfo("reconcile", "", fmt.Sprintf("Reconciling: %d group deletes, %d group updates, %d route deletes, %d route upserts, %d route disables",
-		len(diff.groupDeletes), len(diff.groupUpdates), len(diff.routeDeletes), len(diff.routeUpserts), len(diff.routeDisables)))
+	s.logInfo("reconcile", "", fmt.Sprintf("Reconciling: %d group deletes, %d group updates, %d route deletes, %d route block rewrites, %d route disables",
+		len(diff.groupDeletes), len(diff.groupUpdates), len(diff.routeDeletes), len(diff.routeRebuilds), len(diff.routeDisables)))
 
 	// Detailed names — the count-only log above loses diagnostic power when
 	// reconcile runs but the router still shows an old entry; these lines
@@ -226,9 +239,10 @@ func buildTargetState(data *StoreData, failedTunnels map[string]struct{}) target
 		items = append(items, list.Domains...)
 		items = append(items, list.Subnets...)
 
-		// Excludes live in the first group only and also count against
-		// the group's capacity; shrink the first chunk's budget accordingly.
-		chunks := chunkWithFirstBudget(items, MaxDomainsPerGroup, len(list.Excludes))
+		// NDMS applies an exclude only inside its own object-group, so the
+		// full exclude set goes into every chunk. Excludes also count
+		// against the group's capacity — shrink each chunk's budget.
+		chunks := chunkWithReserve(items, MaxDomainsPerGroup, len(list.Excludes))
 
 		for i, chunk := range chunks {
 			groupName := buildGroupName(list.ID, list.Name, i+1)
@@ -236,10 +250,7 @@ func buildTargetState(data *StoreData, failedTunnels map[string]struct{}) target
 			g := targetGroup{
 				name:     groupName,
 				includes: chunk,
-			}
-
-			if i == 0 {
-				g.excludes = list.Excludes
+				excludes: list.Excludes,
 			}
 
 			ts.groups = append(ts.groups, g)
@@ -263,7 +274,7 @@ func buildTargetState(data *StoreData, failedTunnels map[string]struct{}) target
 				ts.routes = append(ts.routes, targetRoute{
 					group:    groupName,
 					iface:    rt.Interface,
-					fallback: fallback,
+					fallback: materializedFallback(fallback),
 					disabled: routeDisabled,
 				})
 			}
@@ -273,29 +284,36 @@ func buildTargetState(data *StoreData, failedTunnels map[string]struct{}) target
 	return ts
 }
 
-// chunkWithFirstBudget splits items into chunks of at most maxPerChunk, where
-// the first chunk is shrunk by firstReserved slots so the caller can inject
-// extra elements (excludes) into that group without overflowing NDMS's limit.
+// materializedFallback collapses a stored fallback value to what NDMS can
+// actually distinguish. UpsertRoutes sends auto:true unconditionally, so
+// "auto" and "" are indistinguishable in router state — only "reject" is a
+// separate shape. Comparing the raw stored value made routes with fallback
+// "auto" mismatch current state forever: every reconcile re-upserted them and
+// the cheap SetDisabled toggle path was unreachable (#489).
+func materializedFallback(f string) string {
+	if f == "reject" {
+		return "reject"
+	}
+	return ""
+}
+
+// chunkWithReserve splits items into chunks of at most maxPerChunk, where
+// every chunk is shrunk by reserved slots so the caller can inject extra
+// elements (excludes) into each group without overflowing NDMS's limit.
 //
-// The returned slice always has len == ceil-ish of items size; if firstReserved
-// consumes all of the first chunk's capacity, chunks[0] is empty (caller still
-// needs a group for the excludes) and items start in chunks[1].
-func chunkWithFirstBudget(items []string, maxPerChunk, firstReserved int) [][]string {
+// If reserved swallows the whole budget the chunk size falls back to 1 — the
+// group will overflow and NDMS will say so, which beats looping forever.
+func chunkWithReserve(items []string, maxPerChunk, reserved int) [][]string {
 	if maxPerChunk <= 0 || len(items) == 0 {
 		return nil
 	}
-	firstBudget := maxPerChunk - firstReserved
-	if firstBudget < 0 {
-		firstBudget = 0
+	budget := maxPerChunk - reserved
+	if budget < 1 {
+		budget = 1
 	}
 	var chunks [][]string
-	end := firstBudget
-	if end > len(items) {
-		end = len(items)
-	}
-	chunks = append(chunks, items[:end])
-	for i := end; i < len(items); i += maxPerChunk {
-		j := i + maxPerChunk
+	for i := 0; i < len(items); i += budget {
+		j := i + budget
 		if j > len(items) {
 			j = len(items)
 		}
@@ -415,77 +433,56 @@ func computeDiff(current currentState, target targetState) rciDiff {
 		}
 	}
 
-	// For each target group: compare routes, delete removed, upsert if changed,
-	// toggle disable flag if only that differs.
-	for group, tgts := range targetByGroup {
+	// Для каждой целевой группы: совпало — ничего; различается только пауза —
+	// дешёвый toggle по index (#489); всё остальное (состав, порядок, форма
+	// fallback) — перезапись блока целиком, потому что порядок строк = приоритет
+	// и переставить строку в NDMS нечем (#801).
+	//
+	// Обход по отсортированным именам: map даёт случайный порядок, и без
+	// сортировки последовательность POST-ов гуляла бы от прогона к прогону.
+	groupNames := make([]string, 0, len(targetByGroup))
+	for group := range targetByGroup {
+		groupNames = append(groupNames, group)
+	}
+	sort.Strings(groupNames)
+
+	for _, group := range groupNames {
+		tgts := targetByGroup[group]
 		curs := currentByGroup[group]
 
 		if routesEqual(curs, tgts) {
 			continue
 		}
 
-		// Index current routes by iface for O(1) lookups while diffing.
-		curByIface := make(map[string]currentRoute, len(curs))
-		for _, cr := range curs {
-			curByIface[cr.iface] = cr
-		}
-
-		// Delete current routes for interfaces no longer in target
-		targetIfaceSet := make(map[string]bool)
-		for _, tr := range tgts {
-			targetIfaceSet[tr.iface] = true
-		}
-		for _, cr := range curs {
-			if !targetIfaceSet[cr.iface] {
-				diff.routeDeletes = append(diff.routeDeletes, rciRouteDelete{
-					Group: cr.group, Iface: cr.iface, No: true,
-				})
-			}
-		}
-
-		// For each target route:
-		//  - if no matching current route → upsert (new route).
-		//  - if current exists and only `disabled` differs → issue a
-		//    disable.index toggle (no recreate).
-		//  - otherwise (fallback/reject diff) → upsert.
-		//
-		// Upserts that should end up disabled carry the Disabled flag so
-		// applyDiff can re-fetch the freshly-assigned index and follow up
-		// with SetDisabled. UpsertRoutes itself has no `disable` field.
-		for _, tr := range tgts {
-			cr, exists := curByIface[tr.iface]
-			if !exists {
-				diff.routeUpserts = append(diff.routeUpserts, rciRouteOp{
-					Group:    tr.group,
-					Iface:    tr.iface,
-					Auto:     true,
-					Reject:   tr.fallback == "reject",
-					Disabled: tr.disabled,
-				})
-				continue
-			}
-
-			sameShape := cr.fallback == tr.fallback
-			if !sameShape {
-				diff.routeUpserts = append(diff.routeUpserts, rciRouteOp{
-					Group:    tr.group,
-					Iface:    tr.iface,
-					Auto:     true,
-					Reject:   tr.fallback == "reject",
-					Disabled: tr.disabled,
-				})
-				continue
-			}
-
-			if cr.disabled != tr.disabled {
+		if routesAligned(curs, tgts) {
+			for i := range tgts {
+				if curs[i].disabled == tgts[i].disabled {
+					continue
+				}
 				diff.routeDisables = append(diff.routeDisables, rciRouteDisable{
-					Index:    cr.index,
-					Disabled: tr.disabled,
-					Group:    tr.group,
-					Iface:    tr.iface,
+					Index:    curs[i].index,
+					Disabled: tgts[i].disabled,
+					Group:    tgts[i].group,
+					Iface:    tgts[i].iface,
 				})
 			}
+			continue
 		}
+
+		rb := rciRouteRebuild{group: group}
+		for _, cr := range curs {
+			rb.deletes = append(rb.deletes, cr.iface)
+		}
+		for _, tr := range tgts {
+			rb.upserts = append(rb.upserts, rciRouteOp{
+				Group:    tr.group,
+				Iface:    tr.iface,
+				Auto:     true,
+				Reject:   tr.fallback == "reject",
+				Disabled: tr.disabled,
+			})
+		}
+		diff.routeRebuilds = append(diff.routeRebuilds, rb)
 	}
 
 	// Delete routes for groups that exist on router but have no target routes
@@ -548,66 +545,82 @@ func (s *ServiceImpl) applyDiff(ctx context.Context, diff rciDiff) error {
 		}
 		if err := s.commands.ObjectGroups.UpsertGroup(ctx, mut); err != nil {
 			groupErrors = append(groupErrors, fmt.Sprintf("%s: %v", g.name, err))
-			s.log.Warnf("reconcile: group %s update failed: %v", g.name, err)
+			s.appLog.Warn("reconcile-group", g.name, err.Error())
 		}
 	}
 
-	// Phase 4: Create/update routes (all in one call, order = priority)
-	if len(diff.routeUpserts) > 0 {
-		specs := make([]command.DNSRouteSpec, 0, len(diff.routeUpserts))
-		for _, ro := range diff.routeUpserts {
-			specs = append(specs, command.DNSRouteSpec{
+	// Phase 4: перезапись блоков маршрутов. На каждую группу ровно один POST:
+	// снос её текущих строк и запись целевых в порядке приоритета едут вместе,
+	// иначе между POST-ами группа осталась бы без правил (на больших списках —
+	// сотни миллисекунд без DNS-маршрутизации).
+	for _, rb := range diff.routeRebuilds {
+		dels := make([]command.DNSRouteSpec, 0, len(rb.deletes))
+		for _, iface := range rb.deletes {
+			dels = append(dels, command.DNSRouteSpec{Group: rb.group, Interface: iface})
+		}
+		ups := make([]command.DNSRouteSpec, 0, len(rb.upserts))
+		for _, ro := range rb.upserts {
+			ups = append(ups, command.DNSRouteSpec{
 				Group:     ro.Group,
 				Interface: ro.Iface,
 				Reject:    ro.Reject,
 			})
 		}
-		if err := s.commands.DNSRoutes.UpsertRoutes(ctx, specs); err != nil {
-			s.logError("applyDiff", "", fmt.Sprintf("Phase4: UpsertRoutes(%d) failed", len(specs)), err.Error())
-			return fmt.Errorf("upsert routes: %w", err)
+		if err := s.commands.DNSRoutes.ReplaceRoutes(ctx, dels, ups); err != nil {
+			s.logError("applyDiff", rb.group,
+				fmt.Sprintf("Phase4: ReplaceRoutes(-%d/+%d) failed", len(dels), len(ups)), err.Error())
+			return fmt.Errorf("replace routes for %s: %w", rb.group, err)
 		}
-		s.logInfo("applyDiff", "", fmt.Sprintf("Phase4: upserted %d routes OK", len(specs)))
+		ifaces := make([]string, 0, len(ups))
+		for _, u := range ups {
+			ifaces = append(ifaces, u.Interface)
+		}
+		s.logInfo("applyDiff", rb.group,
+			fmt.Sprintf("Phase4: route block rewritten in priority order: %v", ifaces))
 	}
 
-	// Phase 5a: re-fetch router state so newly-created routes get their
-	// freshly-assigned indexes, needed for disable toggles below.
-	var needPostFetch bool
-	for _, ro := range diff.routeUpserts {
-		if ro.Disabled {
-			needPostFetch = true
-			break
-		}
-	}
-
+	// Phase 5a: re-fetch router state so rewritten routes get their freshly
+	// assigned indexes, needed for the disable toggles below. A rewritten route
+	// always comes back enabled, so a paused list must have its flag re-applied
+	// here — otherwise the UI shows it paused while the router routes traffic
+	// (#489).
 	postDisables := append([]rciRouteDisable{}, diff.routeDisables...)
 
-	if needPostFetch {
+	var written []rciRouteOp
+	for _, rb := range diff.routeRebuilds {
+		written = append(written, rb.upserts...)
+	}
+
+	if len(written) > 0 {
 		s.queries.DNSProxy.InvalidateAll()
 		fresh, err := s.queries.DNSProxy.List(ctx)
 		if err != nil {
-			s.logError("applyDiff", "", "Phase5a: refetch dns-proxy after upsert", err.Error())
+			s.logError("applyDiff", "", "Phase5a: refetch dns-proxy after rewrite", err.Error())
 			// Non-fatal: the next reconcile will catch up.
 		} else {
 			indexByKey := make(map[string]string, len(fresh))
+			disabledByKey := make(map[string]bool, len(fresh))
 			for _, r := range fresh {
 				if r.Index == "" {
 					continue
 				}
-				indexByKey[r.Group+"|"+r.Interface] = r.Index
+				key := r.Group + "|" + r.Interface
+				indexByKey[key] = r.Index
+				disabledByKey[key] = r.Disabled
 			}
-			for _, ro := range diff.routeUpserts {
-				if !ro.Disabled {
-					continue
-				}
+			for _, ro := range written {
 				key := ro.Group + "|" + ro.Iface
 				idx, ok := indexByKey[key]
 				if !ok || idx == "" {
-					s.logError("applyDiff", "", fmt.Sprintf("Phase5a: no index for %s", key), "route not in post-upsert show")
+					s.logError("applyDiff", "", fmt.Sprintf("Phase5a: no index for %s", key), "route not in post-rewrite show")
 					continue
+				}
+				if disabledByKey[key] == ro.Disabled {
+					continue // router already in the desired state
 				}
 				postDisables = append(postDisables, rciRouteDisable{
 					Index:    idx,
-					Disabled: true,
+					Disabled: ro.Disabled,
 					Group:    ro.Group,
 					Iface:    ro.Iface,
 				})
@@ -664,16 +677,31 @@ func diffStringSlices(current, target []string) (add, remove []string) {
 	return
 }
 
-// routesEqual checks if current routes match target routes (same interfaces, order, fallback).
-func routesEqual(current []currentRoute, target []targetRoute) bool {
+// routesAligned reports whether current and target hold the same routes in the
+// same order, ignoring the disable flag. Order is part of the comparison
+// because it is the priority the user set: NDMS picks the tunnel by the order
+// of `dns-proxy route` lines (#801).
+func routesAligned(current []currentRoute, target []targetRoute) bool {
 	if len(current) != len(target) {
 		return false
 	}
 	for i := range current {
 		if current[i].group != target[i].group ||
 			current[i].iface != target[i].iface ||
-			current[i].fallback != target[i].fallback ||
-			current[i].disabled != target[i].disabled {
+			current[i].fallback != target[i].fallback {
+			return false
+		}
+	}
+	return true
+}
+
+// routesEqual is routesAligned plus a matching disable flag — nothing to do.
+func routesEqual(current []currentRoute, target []targetRoute) bool {
+	if !routesAligned(current, target) {
+		return false
+	}
+	for i := range current {
+		if current[i].disabled != target[i].disabled {
 			return false
 		}
 	}

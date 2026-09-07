@@ -5,6 +5,21 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { theme } from '$lib/stores/theme';
+	import { compactLayout, isCompactLayoutActive } from '$lib/stores/compactLayout';
+	import {
+		tunnelDashboardLayout,
+		tunnelDashboardMode,
+		tunnelDashboardView,
+	} from '$lib/stores/tunnelDashboardMode';
+	import {
+		tunnelDashboardGroupMode,
+		tunnelDashboardManualOrder,
+		tunnelDashboardOrderMode,
+		tunnelDashboardTags,
+	} from '$lib/stores/tunnelDashboardPrefs';
+	import { settingsSectionIconMode } from '$lib/stores/settingsSectionIconMode';
+	import { serviceLetterIcons } from '$lib/stores/serviceLetterIcons';
+	import { showSummary } from '$lib/stores/showSummary';
 	import { auth, isAuthenticated, isLoading } from '$lib/stores/auth';
 	import { notifications } from '$lib/stores/notifications';
 	import { api } from '$lib/api/client';
@@ -18,12 +33,21 @@
 	import { monitoringStore } from '$lib/stores/monitoring';
 	import { appendPingLog } from '$lib/stores/pingcheck';
 	import { systemInfo } from '$lib/stores/system';
+	import { subscriptionsStore } from '$lib/stores/subscriptions';
 	import { feedTraffic } from '$lib/stores/traffic';
-	import { applyTraffic as singboxApplyTraffic, applyDelay as singboxApplyDelay } from '$lib/stores/singbox';
+	import { applyTraffic as singboxApplyTraffic, applyTrafficTotals as singboxApplyTrafficTotals, applyDelay as singboxApplyDelay } from '$lib/stores/singbox';
+	import { applySingboxMemory } from '$lib/stores/singboxMemory';
 	import { singboxRouter } from '$lib/stores/singboxRouter';
+	import { fakeipTransition } from '$lib/stores/fakeipTransition';
 	import { invalidateResource, invalidateAll } from '$lib/stores/storeRegistry';
 	import { setDeviceProxyMissingTarget, clearDeviceProxyMissingTarget } from '$lib/stores/deviceproxy';
 	import { settings as settingsStore, reloadSettings, usageLevel } from '$lib/stores/settings';
+	import { loadPresetCatalog } from '$lib/stores/presets';
+	import { donateModalOpen, openDonateModal, closeDonateModal } from '$lib/stores/donateModal';
+	import { outboundReferenced } from '$lib/stores/outboundReferenced';
+	import TunnelReferencedModal from '$lib/components/tunnels/TunnelReferencedModal.svelte';
+	import { TriangleAlert } from 'lucide-svelte';
+	import DevelopFeedbackFab from '$lib/components/layout/DevelopFeedbackFab.svelte';
 	import {
 		isSectionVisible,
 		pathToSection,
@@ -39,7 +63,6 @@
 	let { children }: { children: Snippet } = $props();
 
 	let mobileMenuOpen = $state(false);
-	let donateModalOpen = $state(false);
 	let booting = $state(false);
 
 	let backendOffline = $derived(!$serverOnline);
@@ -58,15 +81,28 @@
 
 	let disconnectSSE: (() => void) | null = null;
 	let unsubSysInfo: (() => void) | null = null;
+	let unsubSubscriptions: (() => void) | null = null;
+
+	const isDevelopChannel = $derived($settingsStore?.updates?.channel === 'develop');
 
 	let knownInstanceId = '';
+
+	function observeInstanceId(instanceId?: string) {
+		if (!instanceId) return;
+		if (knownInstanceId && knownInstanceId !== instanceId) {
+			location.reload();
+			return;
+		}
+		knownInstanceId = instanceId;
+	}
 
 	function startSSE() {
 		if (disconnectSSE) return;
 		// singboxStatus / singboxTunnels now poll automatically on subscribe;
 		// no eager fetch needed here — components subscribe as they mount.
 		disconnectSSE = connectSSE({
-			onConnected: () => {
+			onConnected: (data) => {
+				observeInstanceId(data?.instanceId);
 				// SSE may have been down for minutes. Clear connectivity side-channel
 				// (it's stream-only, not included in the polling snapshot) and force a
 				// fresh fetch of tunnel state to catch any drift during the outage.
@@ -108,12 +144,7 @@
 				// Phase C: serverOnline.set() is gone (derived from healthMonitor);
 				// keep the booting/instanceId handling — still used by the UI.
 				booting = false;
-				// Detect backend restart — force full page reload to pick up new JS
-				if (knownInstanceId && data.instanceId && knownInstanceId !== data.instanceId) {
-					location.reload();
-					return;
-				}
-				knownInstanceId = data.instanceId;
+				observeInstanceId(data.instanceId);
 			},
 			onSystemBooting: () => {
 				// Phase C: serverOnline.set() is gone; booting flag still drives UI.
@@ -157,7 +188,9 @@
 					feedTraffic(t.tag, t.download, t.upload);
 				}
 			},
+			onSingboxTrafficTotals: singboxApplyTrafficTotals,
 			onSingboxDelay: (data) => singboxApplyDelay(data.tag, data.delay),
+			onSingboxMemory: applySingboxMemory,
 
 			// HydraRoute geo download progress
 			onHydraRouteGeoProgress: (data) => geoDownloadProgress.ingest(data),
@@ -197,6 +230,12 @@
 				if (data.resource === 'singbox.router.rules') {
 					void singboxRouter.loadRulesSnapshot();
 				}
+				// Engine died/restarted: operator publishes singbox.status on exit
+				// (operator.go). singboxRouter is not a PollingStore, so refetch the
+				// router status directly — this is what surfaces lastError / clears СБОЙ.
+				if (data.resource === 'singbox.status') {
+					void singboxRouter.reloadStatus();
+				}
 			},
 
 			// Device-proxy: selected outbound was deleted — show a banner in the tab.
@@ -207,6 +246,7 @@
 			// Sing-box Router state streams (rules, rule-sets, outbounds, status).
 			// Staging updates arrive via resource:invalidated → onResourceInvalidated above.
 			onSingboxRouterStatus: singboxRouter.applyStatus,
+			onSingboxRouterTransition: fakeipTransition.applyTransition,
 			onSingboxRouterRules: singboxRouter.applyRules,
 			onSingboxRouterRuleSets: singboxRouter.applyRuleSets,
 			onSingboxRouterOutbounds: singboxRouter.applyOutbounds,
@@ -231,11 +271,16 @@
 			if (!unsubSysInfo) {
 				unsubSysInfo = systemInfo.subscribe(() => {});
 			}
+			if (!unsubSubscriptions) {
+				unsubSubscriptions = subscriptionsStore.subscribe(() => {});
+			}
 		} else {
 			healthMonitor.stop();
 			stopSSE();
 			unsubSysInfo?.();
 			unsubSysInfo = null;
+			unsubSubscriptions?.();
+			unsubSubscriptions = null;
 		}
 	});
 
@@ -248,6 +293,7 @@
 			// every active polling store. Inactive stores auto-refetch on
 			// their next subscribe via invalidate()'s mark-stale branch.
 			invalidateAll();
+			void loadPresetCatalog(true);
 			wasOffline = false;
 		}
 	});
@@ -283,6 +329,21 @@
 		}
 	});
 
+	// Preset catalog needs an authenticated session; onMount alone races login
+	// and a cold backend — DnsRoutePresetModal would show "Каталог пуст" until F5.
+	$effect(() => {
+		if ($isAuthenticated) {
+			void loadPresetCatalog();
+		}
+	});
+
+	// Sync usage level and compact layout to <html> for gutter tokens.
+	$effect(() => {
+		document.documentElement.setAttribute('data-usage-level', $usageLevel);
+		const compact = isCompactLayoutActive($usageLevel, $compactLayout);
+		document.documentElement.setAttribute('data-layout-compact', compact ? 'true' : 'false');
+	});
+
 	// Route guard: redirect away from sections hidden at the current usage level.
 	let lastWarnedPath = $state<string | null>(null);
 
@@ -310,6 +371,17 @@
 
 	onMount(async () => {
 		theme.init();
+		compactLayout.init();
+		settingsSectionIconMode.init();
+		serviceLetterIcons.init();
+		showSummary.init();
+		tunnelDashboardMode.init();
+		tunnelDashboardLayout.init();
+		tunnelDashboardView.init();
+		tunnelDashboardOrderMode.init();
+		tunnelDashboardManualOrder.init();
+		tunnelDashboardGroupMode.init();
+		tunnelDashboardTags.init();
 		await auth.checkStatus();
 	});
 
@@ -323,11 +395,7 @@
 
 {#if backendOffline}
 	<div class="offline-screen">
-		<svg class="offline-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-			<path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
-			<line x1="12" y1="9" x2="12" y2="13"/>
-			<line x1="12" y1="17" x2="12.01" y2="17"/>
-		</svg>
+		<TriangleAlert class="offline-icon" size={48} aria-hidden="true" />
 		<h2 class="offline-title">Сервер недоступен</h2>
 		<p class="offline-status">Не удалось подключиться к AWG Manager</p>
 		<div class="offline-spinner"></div>
@@ -355,7 +423,7 @@
 		bind:mobileMenuOpen
 		onToggleThemeMode={() => theme.toggleMode()}
 		onLogout={() => auth.logout()}
-		onOpenDonate={() => (donateModalOpen = true)}
+		onOpenDonate={openDonateModal}
 	/>
 
 	{#if !$isAuthenticated && $page.url.pathname !== '/terms'}
@@ -392,19 +460,28 @@
 
 	{/if}
 
-	<Modal bind:open={donateModalOpen} title="Поддержать проект" size="sm" onclose={() => donateModalOpen = false}>
+	<Modal
+		open={$donateModalOpen}
+		title="Поддержать проект"
+		size="sm"
+		onclose={closeDonateModal}
+	>
+		<p class="donate-intro">
+			Если у вас есть лишние шекели, вам понравилось как вам не отвечают на вопросы и вы готовы
+			самостоятельно решать проблемы, а еще вы оценили подход — «ни дня без нового бага», то:
+		</p>
+		<p class="donate-intro">
+			Вы можете поделиться богатством и дать возможность родить новые проблемы там, где еще вчера
+			все было хорошо:
+		</p>
 		<div class="donate-wallets">
 			<div class="donate-wallet">
 				<span class="donate-wallet-label">USDT / ETH</span>
 				<code class="donate-wallet-addr">0x7eae43b82157f2e4ea233eddf5d9ce19a1064f04</code>
 			</div>
 			<div class="donate-wallet">
-				<span class="donate-wallet-label">USDT ERC20</span>
-				<code class="donate-wallet-addr">0x35eC46d51f06DAf2DDbfA2a1b9B28a360643fEa8</code>
-			</div>
-			<div class="donate-wallet">
-				<span class="donate-wallet-label">USDT / TRC20</span>
-				<code class="donate-wallet-addr">TEpJh2p9j3fp6MigyqGvq1gC5D3CsxBeJw</code>
+				<span class="donate-wallet-label">USDT / Tron</span>
+				<code class="donate-wallet-addr">TDisGwxj2AopFzT2VQ9JwY6QDyjChUP5EA</code>
 			</div>
 			<div class="donate-wallet">
 				<span class="donate-wallet-label">Boosty</span>
@@ -414,8 +491,24 @@
 				<span class="donate-wallet-label">ЮMoney</span>
 				<a class="donate-wallet-link" href="https://yoomoney.ru/fundraise/1GF36UHR07L.260312" target="_blank" rel="noopener">yoomoney.ru/fundraise</a>
 			</div>
+			<div class="donate-wallet">
+				<span class="donate-wallet-label">Или любая сумма</span>
+				<a class="donate-wallet-link" href="https://yoomoney.ru/to/4100119477098112/0" target="_blank" rel="noopener">yoomoney.ru/to/4100119477098112</a>
+			</div>
 		</div>
 	</Modal>
+
+	<TunnelReferencedModal
+		open={$outboundReferenced !== null}
+		details={$outboundReferenced?.details ?? null}
+		tunnelName={$outboundReferenced?.name}
+		entityLabel={$outboundReferenced?.entityLabel}
+		onclose={() => outboundReferenced.close()}
+	/>
+
+	{#if $isAuthenticated && isDevelopChannel}
+		<DevelopFeedbackFab />
+	{/if}
 {/if}
 
 <style>
@@ -448,6 +541,14 @@
 		flex-direction: column;
 	}
 
+	/* v2.8.2: колонка контента 960px, боковые поля 1rem (компактная ширина). */
+	:global(html[data-layout-compact='true']) .main {
+		max-width: 960px;
+		margin-left: auto;
+		margin-right: auto;
+		padding: 0 1rem;
+	}
+
 	.offline-screen {
 		min-height: 100vh;
 		display: flex;
@@ -458,9 +559,7 @@
 		gap: 0.75rem;
 	}
 
-	.offline-icon {
-		width: 48px;
-		height: 48px;
+	:global(.offline-icon) {
 		color: var(--warning, #f59e0b);
 	}
 
@@ -490,6 +589,12 @@
 		color: var(--text-tertiary);
 		font-size: 0.8125rem;
 		margin: 0;
+	}
+
+	.donate-intro {
+		font-size: 0.8125rem;
+		color: var(--text-secondary);
+		margin: 0 0 0.75rem;
 	}
 
 	.donate-wallets {

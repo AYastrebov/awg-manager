@@ -2,15 +2,18 @@
 	import { page } from '$app/stores';
 	import { onMount, onDestroy } from 'svelte';
 	import { api } from '$lib/api/client';
-	import type { Subscription } from '$lib/types';
+	import type { Subscription, SubscriptionMember } from '$lib/types';
 	import { PageContainer, PageHeader, LoadingSpinner } from '$lib/components/layout';
-	import { Tabs, GridListToggle } from '$lib/components/ui';
+	import { Tabs, LayoutViewToggle } from '$lib/components/ui';
 	import SubscriptionMembersTab from '$lib/components/subscriptions/SubscriptionMembersTab.svelte';
+	import SubscriptionExcludedSection from '$lib/components/subscriptions/SubscriptionExcludedSection.svelte';
 	import SubscriptionSettingsTab from '$lib/components/subscriptions/SubscriptionSettingsTab.svelte';
 	import { usageLevel } from '$lib/stores/settings';
 	import {
 		SINGBOX_LAYOUT_STORAGE_KEY,
-		TUNNEL_MOBILE_LAYOUT_MAX_WIDTH_PX,
+		parseSingboxLayoutMode,
+		readTunnelMobileLayout,
+		subscribeTunnelMobileLayout,
 		type SingboxLayoutMode,
 	} from '$lib/constants/singboxLayout';
 	import { isMockDevMode } from '$lib/env';
@@ -31,29 +34,50 @@
 	let progressTotal = $state(0);
 	let progressLoaded = $state(0);
 
-	let active = $state<'members' | 'settings'>('members');
+	let active = $state<'members' | 'excluded' | 'settings'>('members');
+	let excludedRestoring = $state(false);
 	let membersAutoDelayCheckNonce = $state(0);
 	let liveActiveMember = $state<string | null>(null);
 	let currentSubscriptionSurface = '';
 	let subscriptionSurfaceEntryNonce = $state(0);
 	let lastAutoDelayCheckKey = '';
 
-	let singboxLayoutMode = $state<SingboxLayoutMode>('grid');
+	let singboxLayoutMode = $state<SingboxLayoutMode>('compact');
 	let singboxLayoutReady = false;
-	let isSingboxMembersMobile = $state(false);
+	let isSingboxMembersMobile = $state(readTunnelMobileLayout());
 	const showSingboxListOption = $derived($usageLevel !== 'basic');
-	const singboxEffectiveLayout = $derived<SingboxLayoutMode>(
-		isSingboxMembersMobile || (!showSingboxListOption && singboxLayoutMode === 'list')
-			? 'grid'
-			: singboxLayoutMode,
-	);
-	const showSingboxGridListToggle = $derived(showSingboxListOption && !isSingboxMembersMobile);
-
-	function isSingboxLayoutMode(value: string | null): value is SingboxLayoutMode {
-		return value === 'grid' || value === 'list';
-	}
+	const singboxEffectiveLayout = $derived.by((): SingboxLayoutMode => {
+		if (isSingboxMembersMobile || (!showSingboxListOption && singboxLayoutMode === 'list')) {
+			return 'compact';
+		}
+		// Members tab has no dense cards — same grid as compact.
+		if (singboxLayoutMode === 'dense') return 'compact';
+		return singboxLayoutMode;
+	});
+	const showSingboxLayoutPicker = $derived(!isSingboxMembersMobile);
+	const showSingboxGridListToggle = $derived(showSingboxListOption && showSingboxLayoutPicker);
 
 	let evtSrc: EventSource | null = null;
+
+	function patchSubscriptionEnabled(nextEnabled: boolean): void {
+		if (subscription) {
+			subscription = { ...subscription, enabled: nextEnabled };
+		}
+	}
+
+	async function restoreExcluded(tags: string[]): Promise<void> {
+		if (excludedRestoring || tags.length === 0) return;
+		error = '';
+		excludedRestoring = true;
+		try {
+			await api.restoreSubscriptionMembers(id, tags);
+			loadStream();
+		} catch (e) {
+			error = e instanceof Error ? e.message : 'Не удалось вернуть';
+		} finally {
+			excludedRestoring = false;
+		}
+	}
 
 	function loadStream(): void {
 		if (!id) return;
@@ -87,31 +111,58 @@
 		let streamDone = false;
 		let fallbackTried = false;
 
+		// SSE-события парсятся без проверки формы, а хендлеры ниже читают их
+		// структурно (spread в Subscription, member.tag): битое событие не
+		// должно убивать прогрессивную загрузку — оно молча пропускается.
+		const parseEventObject = (e: Event): Record<string, unknown> | null => {
+			try {
+				const parsed: unknown = JSON.parse((e as MessageEvent).data);
+				return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+					? (parsed as Record<string, unknown>)
+					: null;
+			} catch {
+				return null;
+			}
+		};
+
 		evtSrc.addEventListener('meta', (e) => {
-			const meta = JSON.parse((e as MessageEvent).data);
+			const meta = parseEventObject(e) as (Partial<Subscription> & { total?: number }) | null;
+			if (!meta) return;
 			subscription = {
 				...meta,
 				members: [],
 				memberTags: [],
 				orphanTags: [],
+				rejectedMembers: meta.rejectedMembers ?? [],
+				infoItems: meta.infoItems ?? [],
 				activeMember: '',
+				excludedTags: [],
+				excludedMembers: [],
+				filteredMembers: [],
 			} as Subscription;
-			progressTotal = meta.total ?? 0;
+			progressTotal = typeof meta.total === 'number' ? meta.total : 0;
 		});
 
 		evtSrc.addEventListener('member', (e) => {
 			if (!subscription) return;
-			const { member } = JSON.parse((e as MessageEvent).data);
+			const payload = parseEventObject(e);
+			const member = payload?.member as SubscriptionMember | undefined;
+			if (!member || typeof member !== 'object' || typeof member.tag !== 'string') return;
 			subscription.members = [...(subscription.members ?? []), member];
 			subscription.memberTags = [...subscription.memberTags, member.tag];
 			progressLoaded += 1;
 		});
 
 		evtSrc.addEventListener('done', (e) => {
-			if (subscription) {
-				const data = JSON.parse((e as MessageEvent).data);
+			const data = parseEventObject(e) as Partial<Subscription> | null;
+			if (subscription && data) {
 				subscription.orphanTags = data.orphanTags ?? [];
 				subscription.activeMember = data.activeMember ?? '';
+				subscription.rejectedMembers = data.rejectedMembers ?? subscription.rejectedMembers ?? [];
+				subscription.infoItems = data.infoItems ?? subscription.infoItems ?? [];
+				subscription.excludedTags = data.excludedTags ?? [];
+				subscription.excludedMembers = data.excludedMembers ?? [];
+				subscription.filteredMembers = data.filteredMembers ?? [];
 			}
 			streamDone = true;
 			loading = false;
@@ -154,20 +205,16 @@
 
 	onMount(() => {
 		const sb = localStorage.getItem(SINGBOX_LAYOUT_STORAGE_KEY);
-		if (isSingboxLayoutMode(sb)) singboxLayoutMode = sb;
+		const parsed = parseSingboxLayoutMode(sb);
+		if (parsed) singboxLayoutMode = parsed;
 		singboxLayoutReady = true;
 		loadStream();
 	});
 
-	onMount(() => {
-		const media = window.matchMedia(`(max-width: ${TUNNEL_MOBILE_LAYOUT_MAX_WIDTH_PX}px)`);
-		const sync = (event?: MediaQueryList | MediaQueryListEvent) => {
-			isSingboxMembersMobile = event ? event.matches : media.matches;
-		};
-		sync(media);
-		media.addEventListener('change', sync);
-		return () => media.removeEventListener('change', sync);
-	});
+	onMount(() => subscribeTunnelMobileLayout((mobile) => {
+		isSingboxMembersMobile = mobile;
+	}));
+
 	onDestroy(() => {
 		evtSrc?.close();
 		evtSrc = null;
@@ -229,13 +276,19 @@
 		if (!singboxLayoutReady) return;
 		localStorage.setItem(SINGBOX_LAYOUT_STORAGE_KEY, singboxLayoutMode);
 	});
+
+	$effect(() => {
+		if (!loading && active === 'excluded' && subscription && (subscription.excludedMembers?.length ?? 0) === 0) {
+			active = 'members';
+		}
+	});
 </script>
 
 <svelte:head>
 	<title>{subscription?.label ?? 'Подписка'} - AWG Manager</title>
 </svelte:head>
 
-<PageContainer width="full">
+<PageContainer width="wide">
 	{#if !subscription && loading}
 		<!-- Initial spinner before meta arrives (any subscription size) -->
 		<div class="loading-centered">
@@ -245,13 +298,19 @@
 		<div class="err">{error}</div>
 	{:else if subscription}
 		<PageHeader title={subscription.label || subscription.url} backTo="/?tab=subscriptions" />
+		{@const excludedCount = subscription.excludedMembers?.length ?? 0}
 		<Tabs
 			tabs={[
 				{ id: 'members', label: `Серверы (${subscription.memberTags.length})` },
+				...(excludedCount > 0
+					? [{ id: 'excluded', label: 'Исключённые', badge: excludedCount }]
+					: []),
 				{ id: 'settings', label: 'Настройки' },
 			]}
 			active={active}
-			onchange={(tabId) => (active = tabId as 'members' | 'settings')}
+			onchange={(tabId) => (active = tabId as 'members' | 'excluded' | 'settings')}
+			urlParam="tab"
+			defaultTab="members"
 		/>
 		{#if loading && progressTotal > PROGRESS_BAR_THRESHOLD}
 			<div class="loading-progress">
@@ -268,11 +327,12 @@
 		{/if}
 		<section class="content">
 			{#if active === 'members'}
-				{#if subscription.memberTags.length > 0}
+				{#if subscription.memberTags.length > 0 && showSingboxLayoutPicker}
 					<div class="members-toolbar">
-						<GridListToggle
-							value={singboxEffectiveLayout}
+						<LayoutViewToggle
+							value={singboxLayoutMode}
 							showListOption={showSingboxGridListToggle}
+							showDenseOption={false}
 							onchange={(v) => (singboxLayoutMode = v)}
 						/>
 					</div>
@@ -284,8 +344,20 @@
 					autoDelayCheckNonce={membersAutoDelayCheckNonce}
 					layout={singboxEffectiveLayout}
 				/>
+			{:else if active === 'excluded'}
+				<SubscriptionExcludedSection
+					members={subscription.excludedMembers ?? []}
+					restoring={excludedRestoring}
+					onrestore={restoreExcluded}
+				/>
 			{:else}
-				<SubscriptionSettingsTab {subscription} onUpdated={loadStream} />
+				<div class="edit-wrapper">
+					<SubscriptionSettingsTab
+						{subscription}
+						onUpdated={loadStream}
+						onEnabledChanged={patchSubscriptionEnabled}
+					/>
+				</div>
 			{/if}
 		</section>
 	{/if}
@@ -298,6 +370,12 @@
 		display: flex;
 		justify-content: flex-end;
 		margin-bottom: 0.75rem;
+	}
+
+	@media (max-width: 760px) {
+		.members-toolbar {
+			display: none;
+		}
 	}
 	.loading-progress {
 		margin: 1rem 0;

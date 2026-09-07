@@ -2,7 +2,7 @@
 //
 //	go generate ./cmd/awg-manager
 //
-// In dev, Swagger UI: open the Svelte app at /dev/api-docs (Vite proxies /api to the daemon).
+// In dev, Swagger UI: open the Svelte app at /api-docs (Vite proxies /api to the daemon).
 //
 // Requires Go ≥ module version (see go.mod). Output: internal/openapi/swagger.yaml
 //
@@ -17,4 +17,4 @@
 //	@description				Session cookie set by POST /auth/login. Omit for public routes.
 package main
 
-//go:generate go run github.com/swaggo/swag/cmd/swag@v1.16.4 init -g docs.go -d .,../../internal/api -o ../../internal/openapi --parseInternal --ot yaml
+//go:generate go run github.com/swaggo/swag/cmd/swag@v1.16.4 init -g docs.go -d .,../../internal/api,../../internal/sys/routerinfo,../../internal/diagnostics,../../internal/presets,../../internal/proxyapp,../../internal/sys/files,../../internal/sys/opkg,../../internal/sys/ports,../../internal/sys/procmon,../../internal/sys/services -o ../../internal/openapi --parseInternal --ot yaml

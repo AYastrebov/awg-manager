@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,7 +22,6 @@ import (
 
 // mockRouterSvc satisfies router.Service with controllable return values.
 type mockRouterSvc struct {
-	enableErr     error
 	bindMAC       string
 	bindPolicy    string
 	bindErr       error
@@ -27,38 +29,111 @@ type mockRouterSvc struct {
 	applyErr      error
 	applyRes      orchestrator.ValidationResult
 	discardErr    error
+	datFileErr    error
+	// switchTarget is written from the handler's async goroutine (SwitchMode
+	// responds 202-style before the service call) and polled by the test —
+	// guard it or `go test -race` trips.
+	switchMu     sync.Mutex
+	switchTarget string
+	switchErr    error
+	settings     storage.SingboxRouterSettings
+	// updateSettingsErr, when set, is returned by UpdateSettings so handler
+	// error-mapping (e.g. QOS_CLASSES_INVALID → 400) can be asserted.
+	updateSettingsErr error
+	// bulkOutboundErr / bulkDetourErr, when set, are returned by
+	// BulkSetRuleOutbound / BulkSetRuleSetDetour so handler error-mapping can
+	// be asserted without a real ServiceImpl.
+	bulkOutboundErr error
+	bulkDetourErr   error
+	// dnsRuleErr, when set, is returned by AddDNSRule/UpdateDNSRule so the
+	// DNS-preset error mapping (reserved tag vs managed rule) can be asserted.
+	dnsRuleErr error
+	// natPreview / natPreviewErr feed the policy-tun source-preserve preview.
+	natPreview    []router.NATSegmentInfo
+	natPreviewErr error
+	// applyCalls / discardCalls count invocations of ApplyStaging /
+	// DiscardStaging so handlers can be asserted to actually call the service.
+	applyCalls   int
+	discardCalls int
+	// policies backs ListPolicies for composition assertions.
+	policies []router.PolicyInfo
 }
 
-func (m *mockRouterSvc) Enable(ctx context.Context) error  { return m.enableErr }
-func (m *mockRouterSvc) Disable(ctx context.Context) error { return nil }
 func (m *mockRouterSvc) Reconcile(ctx context.Context) error { return nil }
+func (m *mockRouterSvc) SwitchRoutingMode(ctx context.Context, target string) error {
+	m.switchMu.Lock()
+	m.switchTarget = target
+	m.switchMu.Unlock()
+	return m.switchErr
+}
+
+func (m *mockRouterSvc) switchedTarget() string {
+	m.switchMu.Lock()
+	defer m.switchMu.Unlock()
+	return m.switchTarget
+}
 func (m *mockRouterSvc) GetStatus(ctx context.Context) (router.Status, error) {
 	return router.Status{}, nil
 }
 func (m *mockRouterSvc) GetSettings(ctx context.Context) (storage.SingboxRouterSettings, error) {
-	return storage.SingboxRouterSettings{}, nil
+	return m.settings, nil
 }
 func (m *mockRouterSvc) UpdateSettings(ctx context.Context, s storage.SingboxRouterSettings) error {
+	if m.updateSettingsErr != nil {
+		return m.updateSettingsErr
+	}
+	m.settings = s
 	return nil
 }
 func (m *mockRouterSvc) ListWANInterfaces(ctx context.Context) ([]router.WANInterfaceInfo, error) {
 	return nil, nil
+}
+func (m *mockRouterSvc) ListBindableInterfaces(ctx context.Context) ([]router.WANInterfaceInfo, error) {
+	return []router.WANInterfaceInfo{{Name: "ipsec0", Label: "IPSec", Up: true}}, nil
+}
+func (m *mockRouterSvc) ListAllBindableInterfaces(ctx context.Context) ([]router.WANInterfaceInfo, error) {
+	return []router.WANInterfaceInfo{{Name: "ipsec0", Label: "IPSec", Up: true}}, nil
+}
+func (m *mockRouterSvc) ListIngressEligibleInterfaces(ctx context.Context) ([]router.WANInterfaceInfo, error) {
+	return nil, nil
+}
+func (m *mockRouterSvc) PolicyTunNATPreview(ctx context.Context) (router.NATPreview, error) {
+	return router.NATPreview{Segments: m.natPreview}, m.natPreviewErr
 }
 func (m *mockRouterSvc) ListRules(ctx context.Context) ([]router.Rule, error) { return nil, nil }
 func (m *mockRouterSvc) AddRule(ctx context.Context, rule router.Rule) error  { return nil }
 func (m *mockRouterSvc) UpdateRule(ctx context.Context, index int, rule router.Rule) error {
 	return nil
 }
-func (m *mockRouterSvc) DeleteRule(ctx context.Context, index int) error           { return nil }
-func (m *mockRouterSvc) MoveRule(ctx context.Context, from, to int) error          { return nil }
-func (m *mockRouterSvc) SetRouteFinal(ctx context.Context, tag string) error       { return nil }
+func (m *mockRouterSvc) DeleteRule(ctx context.Context, index int) error { return nil }
+func (m *mockRouterSvc) BulkSetRuleOutbound(ctx context.Context, indices []int, outbound string) error {
+	return m.bulkOutboundErr
+}
+func (m *mockRouterSvc) MoveRule(ctx context.Context, from, to int) error           { return nil }
+func (m *mockRouterSvc) SetRouteFinal(ctx context.Context, tag string) error        { return nil }
 func (m *mockRouterSvc) ListRuleSets(ctx context.Context) ([]router.RuleSet, error) { return nil, nil }
-func (m *mockRouterSvc) AddRuleSet(ctx context.Context, rs router.RuleSet) error { return nil }
+func (m *mockRouterSvc) AddRuleSet(ctx context.Context, rs router.RuleSet) error    { return nil }
 func (m *mockRouterSvc) UpdateRuleSet(ctx context.Context, tag string, rs router.RuleSet) error {
 	return nil
 }
+func (m *mockRouterSvc) BulkSetRuleSetDetour(ctx context.Context, tags []string, detour string) error {
+	return m.bulkDetourErr
+}
 func (m *mockRouterSvc) DeleteRuleSet(ctx context.Context, tag string, force bool) error {
 	return nil
+}
+func (m *mockRouterSvc) DatRuleSetURL(ctx context.Context, kind string, tags []string) (string, error) {
+	q := "kind=" + kind
+	for _, tag := range tags {
+		q += "&tag=" + tag
+	}
+	return "http://127.0.0.1:2222/api/singbox/router/rulesets/dat-srs?" + q + "&token=test", nil
+}
+func (m *mockRouterSvc) DatRuleSetFile(ctx context.Context, kind string, tags []string, token string) (string, error) {
+	if m.datFileErr != nil {
+		return "", m.datFileErr
+	}
+	return "", router.ErrDatRuleSetForbidden
 }
 func (m *mockRouterSvc) ListCompositeOutbounds(ctx context.Context) ([]router.CompositeOutboundView, error) {
 	return nil, nil
@@ -75,8 +150,9 @@ func (m *mockRouterSvc) DeleteCompositeOutbound(ctx context.Context, tag string,
 func (m *mockRouterSvc) ApplyPreset(ctx context.Context, presetID, outboundTag string) error {
 	return nil
 }
+func (m *mockRouterSvc) ListPresets() ([]router.Preset, error) { return nil, nil }
 func (m *mockRouterSvc) ListPolicies(ctx context.Context) ([]router.PolicyInfo, error) {
-	return []router.PolicyInfo{}, nil
+	return m.policies, nil
 }
 func (m *mockRouterSvc) CreatePolicy(ctx context.Context, description string) (router.PolicyInfo, error) {
 	return router.PolicyInfo{Name: "Policy0", Description: description}, nil
@@ -100,19 +176,48 @@ func (m *mockRouterSvc) UpdateDNSServer(ctx context.Context, tag string, s route
 func (m *mockRouterSvc) DeleteDNSServer(ctx context.Context, tag string, force bool) error {
 	return nil
 }
+func (m *mockRouterSvc) MoveDNSServer(ctx context.Context, from, to int) error      { return nil }
 func (m *mockRouterSvc) ListDNSRules(ctx context.Context) ([]router.DNSRule, error) { return nil, nil }
-func (m *mockRouterSvc) AddDNSRule(ctx context.Context, r router.DNSRule) error      { return nil }
+func (m *mockRouterSvc) AddDNSRule(ctx context.Context, r router.DNSRule) error {
+	return m.dnsRuleErr
+}
 func (m *mockRouterSvc) UpdateDNSRule(ctx context.Context, index int, r router.DNSRule) error {
+	return m.dnsRuleErr
+}
+func (m *mockRouterSvc) DeleteDNSRule(ctx context.Context, index int) error  { return nil }
+func (m *mockRouterSvc) MoveDNSRule(ctx context.Context, from, to int) error { return nil }
+func (m *mockRouterSvc) GetDNSGlobals(ctx context.Context) (string, string, string, error) {
+	return "", "", "", nil
+}
+func (m *mockRouterSvc) SetDNSGlobals(ctx context.Context, final, strategy, timeout string) error {
 	return nil
 }
-func (m *mockRouterSvc) DeleteDNSRule(ctx context.Context, index int) error          { return nil }
-func (m *mockRouterSvc) MoveDNSRule(ctx context.Context, from, to int) error          { return nil }
-func (m *mockRouterSvc) GetDNSGlobals(ctx context.Context) (string, string, error)   { return "", "", nil }
-func (m *mockRouterSvc) SetDNSGlobals(ctx context.Context, final, strategy string) error {
+func (m *mockRouterSvc) GetDNSChainPreset(ctx context.Context) (storage.DNSChainPresetState, error) {
+	return storage.DNSChainPresetState{}, nil
+}
+func (m *mockRouterSvc) SetDNSChainPreset(ctx context.Context, st storage.DNSChainPresetState) error {
 	return nil
 }
 func (m *mockRouterSvc) Inspect(ctx context.Context, input router.InspectInput) (router.InspectResult, error) {
 	return router.InspectResult{Input: input.Domain, InputType: "domain", Destination: "direct", MatchedRule: -1, Matches: []router.RuleMatchResult{}, Final: "direct"}, nil
+}
+func (m *mockRouterSvc) InspectDNS(ctx context.Context, input router.InspectDNSInput) (router.InspectDNSResult, error) {
+	return router.InspectDNSResult{
+		Input: input.Domain, InputType: "domain", MatchedRule: -1,
+		Server: "fakeip", Classification: "fakeip", Pool: "198.18.0.0/15",
+		Matches: []router.DNSRuleMatchResult{}, Final: "fakeip",
+	}, nil
+}
+func (m *mockRouterSvc) InspectStream(ctx context.Context, input router.InspectInput) (<-chan router.InspectStreamEvent, error) {
+	ch := make(chan router.InspectStreamEvent, 1)
+	ch <- router.InspectStreamEvent{
+		Type: "result",
+		Result: &router.InspectResult{
+			Input: input.Domain, InputType: "domain", Destination: "direct", MatchedRule: -1, Matches: []router.RuleMatchResult{}, Final: "direct",
+		},
+	}
+	close(ch)
+	return ch, nil
 }
 
 func (m *mockRouterSvc) StagingStatus(_ context.Context) router.StagingStatus {
@@ -120,10 +225,12 @@ func (m *mockRouterSvc) StagingStatus(_ context.Context) router.StagingStatus {
 }
 
 func (m *mockRouterSvc) ApplyStaging(_ context.Context) (orchestrator.ValidationResult, error) {
+	m.applyCalls++
 	return m.applyRes, m.applyErr
 }
 
 func (m *mockRouterSvc) DiscardStaging(_ context.Context) error {
+	m.discardCalls++
 	return m.discardErr
 }
 
@@ -131,33 +238,160 @@ func newMockRouterHandler(svc *mockRouterSvc) *SingboxRouterHandler {
 	return &SingboxRouterHandler{svc: svc}
 }
 
-func TestRouterEnable_PolicyNotConfigured_Returns400(t *testing.T) {
-	svc := &mockRouterSvc{enableErr: router.ErrPolicyNotConfigured}
+type fakeDPRefs struct{ ref bool }
+
+func (f fakeDPRefs) HasSelectorReference(_ string) bool { return f.ref }
+
+func TestRouterDeleteOutbound_ReferencedByProxy_Returns409(t *testing.T) {
+	svc := &mockRouterSvc{}
 	h := newMockRouterHandler(svc)
-	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/enable", nil)
+	h.SetOutboundRefCheckers(fakeDPRefs{ref: true}, nil)
+
+	body := strings.NewReader(`{"tag":"grp-eu","force":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/outbounds/delete", body)
 	rr := httptest.NewRecorder()
-	h.Enable(rr, req)
+	h.DeleteOutbound(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("want 409, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRouterPutSettings_QoSClassesInvalid_Returns400(t *testing.T) {
+	svc := &mockRouterSvc{updateSettingsErr: fmt.Errorf("%w: qosClasses[0]: DSCP должен быть 0-63 (получено 99)", router.ErrQoSClassesInvalid)}
+	h := newMockRouterHandler(svc)
+	req := httptest.NewRequest(http.MethodPut, "/api/singbox/router/settings",
+		strings.NewReader(`{"qosClasses":[{"dscp":99,"outbound":"vpn","enabled":true}]}`))
+	rr := httptest.NewRecorder()
+	h.PutSettings(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "QOS_CLASSES_INVALID") {
+		t.Errorf("want code QOS_CLASSES_INVALID in body: %s", rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "DSCP") {
+		t.Errorf("want detailed DSCP message in body: %s", rr.Body.String())
+	}
+}
+
+func TestRouterPutSettings_RoundTripsQoSClasses(t *testing.T) {
+	svc := &mockRouterSvc{}
+	h := newMockRouterHandler(svc)
+	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/settings",
+		strings.NewReader(`{"enabled":true,"wanAutoDetect":true,"qosClasses":[{"dscp":46,"name":"VoIP","outbound":"vpn-a","enabled":true}]}`))
+	rr := httptest.NewRecorder()
+	h.PutSettings(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	if len(svc.settings.QoSClasses) != 1 {
+		t.Fatalf("qosClasses not decoded: %+v", svc.settings)
+	}
+	got := svc.settings.QoSClasses[0]
+	if got.DSCP != 46 || got.Name != "VoIP" || got.Outbound != "vpn-a" || !got.Enabled {
+		t.Errorf("qos class round-trip mismatch: %+v", got)
+	}
+}
+
+// PUT settings декодируется прямо в storage.SingboxRouterSettings (маппинга
+// DTO нет — DTO существует только как swagger-зеркало), поэтому регресс имён
+// json-тегов ловится только сквозным PUT→GET.
+func TestRouterPutSettings_RoundTripsPolicyTunSourcePreserve(t *testing.T) {
+	svc := &mockRouterSvc{}
+	h := newMockRouterHandler(svc)
+	req := httptest.NewRequest(http.MethodPut, "/api/singbox/router/settings",
+		strings.NewReader(`{"enabled":true,"wanAutoDetect":true,"routingMode":"policy-tun",`+
+			`"policyTunSourcePreserve":true,"policyTunNatSegments":["Home","Guest"]}`))
+	rr := httptest.NewRecorder()
+	h.PutSettings(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT: want 200, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	if !svc.settings.PolicyTunSourcePreserve {
+		t.Errorf("policyTunSourcePreserve not decoded: %+v", svc.settings)
+	}
+	if got := svc.settings.PolicyTunNATSegments; len(got) != 2 || got[0] != "Home" || got[1] != "Guest" {
+		t.Errorf("policyTunNatSegments round-trip mismatch: %+v", got)
+	}
+
+	getRR := httptest.NewRecorder()
+	h.GetSettings(getRR, httptest.NewRequest(http.MethodGet, "/api/singbox/router/settings", nil))
+	if getRR.Code != http.StatusOK {
+		t.Fatalf("GET: want 200, got %d (body: %s)", getRR.Code, getRR.Body.String())
+	}
+	body := getRR.Body.String()
+	for _, want := range []string{`"policyTunSourcePreserve":true`, `"policyTunNatSegments":["Home","Guest"]`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("GET body missing %s: %s", want, body)
+		}
+	}
+}
+
+func TestRouterSwitchMode_CallsService(t *testing.T) {
+	svc := &mockRouterSvc{}
+	h := newMockRouterHandler(svc)
+	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/mode",
+		strings.NewReader(`{"mode":"fakeip-tun"}`))
+	rr := httptest.NewRecorder()
+	h.SwitchMode(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if svc.switchedTarget() == "fakeip-tun" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := svc.switchedTarget(); got != "fakeip-tun" {
+		t.Errorf("svc.SwitchRoutingMode target = %q want fakeip-tun", got)
+	}
+}
+
+func TestRouterSwitchMode_PolicyTun(t *testing.T) {
+	svc := &mockRouterSvc{}
+	h := newMockRouterHandler(svc)
+	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/mode",
+		strings.NewReader(`{"mode":"policy-tun"}`))
+	rr := httptest.NewRecorder()
+	h.SwitchMode(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if svc.switchedTarget() == "policy-tun" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := svc.switchedTarget(); got != "policy-tun" {
+		t.Errorf("svc.SwitchRoutingMode target = %q want policy-tun", got)
+	}
+}
+
+func TestRouterSwitchMode_BadMode_Returns400(t *testing.T) {
+	svc := &mockRouterSvc{}
+	h := newMockRouterHandler(svc)
+	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/mode",
+		strings.NewReader(`{"mode":"bogus"}`))
+	rr := httptest.NewRecorder()
+	h.SwitchMode(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Errorf("want 400, got %d (body: %s)", rr.Code, rr.Body.String())
 	}
-}
-
-func TestRouterEnable_PolicyMissing_Returns400(t *testing.T) {
-	svc := &mockRouterSvc{enableErr: router.ErrPolicyMissing}
-	h := newMockRouterHandler(svc)
-	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/enable", nil)
-	rr := httptest.NewRecorder()
-	h.Enable(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Errorf("want 400, got %d", rr.Code)
+	if got := svc.switchedTarget(); got != "" {
+		t.Errorf("service should not be called for bad mode, got target=%q", got)
 	}
 }
 
-func TestRouterEnable_MethodNotAllowed(t *testing.T) {
+func TestRouterSwitchMode_MethodNotAllowed(t *testing.T) {
 	h := newMockRouterHandler(&mockRouterSvc{})
-	req := httptest.NewRequest(http.MethodGet, "/api/singbox/router/enable", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/singbox/router/mode", nil)
 	rr := httptest.NewRecorder()
-	h.Enable(rr, req)
+	h.SwitchMode(rr, req)
 	if rr.Code != http.StatusMethodNotAllowed {
 		t.Errorf("want 405, got %d", rr.Code)
 	}
@@ -182,12 +416,24 @@ func TestRouterBindDevice_DelegatesToService(t *testing.T) {
 }
 
 func TestRouterListPolicies_Returns200(t *testing.T) {
-	h := newMockRouterHandler(&mockRouterSvc{})
+	svc := &mockRouterSvc{policies: []router.PolicyInfo{{Name: "Policy0"}, {Name: "Policy7"}}}
+	h := newMockRouterHandler(svc)
 	req := httptest.NewRequest(http.MethodGet, "/api/singbox/router/policies", nil)
 	rr := httptest.NewRecorder()
 	h.PoliciesCollection(rr, req)
 	if rr.Code != http.StatusOK {
-		t.Errorf("want 200, got %d (body: %s)", rr.Code, rr.Body.String())
+		t.Fatalf("want 200, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	var got struct {
+		Data []struct {
+			Name string `json:"name"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Data) != 2 || got.Data[0].Name != "Policy0" || got.Data[1].Name != "Policy7" {
+		t.Fatalf("wrong data: %#v", got.Data)
 	}
 }
 
@@ -254,11 +500,12 @@ func TestGetStaging_WithDraft(t *testing.T) {
 func TestPostStagingApply_200(t *testing.T) {
 	svc := &mockRouterSvc{}
 	h := newMockRouterHandler(svc)
-	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/staging/apply", nil)
-	rr := httptest.NewRecorder()
-	h.PostStagingApply(rr, req)
-	if rr.Code != http.StatusOK {
-		t.Errorf("status: %d body=%s", rr.Code, rr.Body)
+	rr := perform(h.PostStagingApply, http.MethodPost, "/api/singbox/router/staging/apply", "")
+	if rr.Code != 200 || svc.applyCalls != 1 {
+		t.Fatalf("code=%d applyCalls=%d body=%s", rr.Code, svc.applyCalls, rr.Body)
+	}
+	if decodeJSONBody(t, rr)["data"].(map[string]any)["ok"] != true {
+		t.Fatalf("тело: %s", rr.Body)
 	}
 }
 
@@ -322,11 +569,17 @@ func TestPostStagingApply_422OnSbCheck(t *testing.T) {
 func TestPostStagingDiscard_200(t *testing.T) {
 	svc := &mockRouterSvc{}
 	h := newMockRouterHandler(svc)
-	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/staging/discard", nil)
-	rr := httptest.NewRecorder()
-	h.PostStagingDiscard(rr, req)
-	if rr.Code != http.StatusOK {
-		t.Errorf("status: %d body=%s", rr.Code, rr.Body)
+	rr := perform(h.PostStagingDiscard, http.MethodPost, "/api/singbox/router/staging/discard", "")
+	if rr.Code != 200 || svc.discardCalls != 1 {
+		t.Fatalf("code=%d discardCalls=%d body=%s", rr.Code, svc.discardCalls, rr.Body)
+	}
+}
+
+func TestPostStagingDiscard_500OnServiceError(t *testing.T) {
+	svc := &mockRouterSvc{discardErr: errors.New("io")}
+	rr := perform(newMockRouterHandler(svc).PostStagingDiscard, http.MethodPost, "/api/singbox/router/staging/discard", "")
+	if rr.Code != 500 {
+		t.Fatalf("отказ службы → 500, got %d", rr.Code)
 	}
 }
 
@@ -366,7 +619,7 @@ func TestPostStagingDiscard_405OnWrongMethod(t *testing.T) {
 func newTestRouterHandlerReal(t *testing.T) (*SingboxRouterHandler, string) {
 	t.Helper()
 	dir := t.TempDir()
-	orch := orchestrator.New(dir, nil)
+	orch := orchestrator.NewWithAppliedPath(dir, nil, filepath.Join(t.TempDir(), "singbox-applied.json"))
 	if err := orch.Register(orchestrator.SlotMeta{Slot: orchestrator.SlotRouter, Filename: "20-router.json"}); err != nil {
 		t.Fatal(err)
 	}
@@ -412,5 +665,429 @@ func TestAddRule_RegressionStagesNotApplies(t *testing.T) {
 	activePath := filepath.Join(dir, "20-router.json")
 	if _, err := os.Stat(activePath); !os.IsNotExist(err) {
 		t.Errorf("active file should not exist, got err=%v", err)
+	}
+}
+
+// TestRouterBulkSetRuleOutbound_200 exercises the endpoint against a real
+// ServiceImpl: seeds one route rule, bulk-sets its outbound, and verifies
+// both the {"updated":1} response and that the rule was actually mutated.
+func TestRouterBulkSetRuleOutbound_200(t *testing.T) {
+	h, _ := newTestRouterHandlerReal(t)
+
+	addBody := `{"action":"route","outbound":"old","domain_suffix":["example.com"]}`
+	addReq := httptest.NewRequest(http.MethodPost, "/api/singbox/router/rules/add", strings.NewReader(addBody))
+	addReq.Header.Set("Content-Type", "application/json")
+	addRR := httptest.NewRecorder()
+	h.AddRule(addRR, addReq)
+	if addRR.Code != http.StatusOK {
+		t.Fatalf("seed AddRule: want 200, got %d (body: %s)", addRR.Code, addRR.Body.String())
+	}
+
+	body := `{"indices":[0],"outbound":"direct"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/rules/bulk-outbound", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.BulkSetRuleOutbound(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	var env struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Updated int `json:"updated"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v (body: %s)", err, rr.Body.String())
+	}
+	if !env.Success || env.Data.Updated != 1 {
+		t.Fatalf("want success=true updated=1, got %+v", env)
+	}
+
+	rules, err := h.svc.ListRules(context.Background())
+	if err != nil {
+		t.Fatalf("ListRules: %v", err)
+	}
+	if len(rules) != 1 || rules[0].Outbound != "direct" {
+		t.Fatalf("rule outbound not updated: %+v", rules)
+	}
+}
+
+// TestRouterBulkSetRuleOutbound_EmptyIndices_Returns400 verifies the service's
+// empty-selection guard (ErrBulkEmptyIndices) maps to 400, not 500.
+func TestRouterBulkSetRuleOutbound_EmptyIndices_Returns400(t *testing.T) {
+	h, _ := newTestRouterHandlerReal(t)
+
+	body := `{"indices":[],"outbound":"direct"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/rules/bulk-outbound", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.BulkSetRuleOutbound(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+}
+
+// TestRouterBulkSetRuleOutbound_DuplicateIndex_Returns400 verifies the
+// service's non-empty-but-invalid selection guard (ErrBulkInvalidSelection)
+// maps to 400, not 500.
+func TestRouterBulkSetRuleOutbound_DuplicateIndex_Returns400(t *testing.T) {
+	h, _ := newTestRouterHandlerReal(t)
+
+	addBody := `{"action":"route","outbound":"old","domain_suffix":["example.com"]}`
+	addReq := httptest.NewRequest(http.MethodPost, "/api/singbox/router/rules/add", strings.NewReader(addBody))
+	addReq.Header.Set("Content-Type", "application/json")
+	addRR := httptest.NewRecorder()
+	h.AddRule(addRR, addReq)
+	if addRR.Code != http.StatusOK {
+		t.Fatalf("seed AddRule: want 200, got %d (body: %s)", addRR.Code, addRR.Body.String())
+	}
+
+	body := `{"indices":[0,0],"outbound":"direct"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/rules/bulk-outbound", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.BulkSetRuleOutbound(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	var env struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v (body: %s)", err, rr.Body.String())
+	}
+	if env.Code != "BULK_INVALID_SELECTION" {
+		t.Fatalf("want code BULK_INVALID_SELECTION, got %q", env.Code)
+	}
+}
+
+func TestRouterBulkSetRuleOutbound_MethodNotAllowed(t *testing.T) {
+	h := newMockRouterHandler(&mockRouterSvc{})
+	req := httptest.NewRequest(http.MethodGet, "/api/singbox/router/rules/bulk-outbound", nil)
+	rr := httptest.NewRecorder()
+	h.BulkSetRuleOutbound(rr, req)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status: got %d, want 405", rr.Code)
+	}
+}
+
+// TestRouterBulkSetRuleSetDetour_200 exercises the endpoint against a real
+// ServiceImpl: seeds one remote ruleset, bulk-sets its detour, and verifies
+// both the {"updated":1} response and that the ruleset was actually mutated.
+func TestRouterBulkSetRuleSetDetour_200(t *testing.T) {
+	h, _ := newTestRouterHandlerReal(t)
+
+	addBody := `{"tag":"geosite-test","type":"remote","url":"https://cdn.example.com/geosite-test.srs","download_detour":"old"}`
+	addReq := httptest.NewRequest(http.MethodPost, "/api/singbox/router/rulesets/add", strings.NewReader(addBody))
+	addReq.Header.Set("Content-Type", "application/json")
+	addRR := httptest.NewRecorder()
+	h.AddRuleSet(addRR, addReq)
+	if addRR.Code != http.StatusOK {
+		t.Fatalf("seed AddRuleSet: want 200, got %d (body: %s)", addRR.Code, addRR.Body.String())
+	}
+
+	body := `{"tags":["geosite-test"],"downloadDetour":"direct"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/rulesets/bulk-detour", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.BulkSetRuleSetDetour(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	var env struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Updated int `json:"updated"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v (body: %s)", err, rr.Body.String())
+	}
+	if !env.Success || env.Data.Updated != 1 {
+		t.Fatalf("want success=true updated=1, got %+v", env)
+	}
+
+	ruleSets, err := h.svc.ListRuleSets(context.Background())
+	if err != nil {
+		t.Fatalf("ListRuleSets: %v", err)
+	}
+	if len(ruleSets) != 1 || ruleSets[0].DownloadDetour != "direct" {
+		t.Fatalf("ruleset detour not updated: %+v", ruleSets)
+	}
+}
+
+// TestRouterBulkSetRuleSetDetour_EmptyTags_Returns400 verifies the service's
+// empty-selection guard (ErrBulkEmptyTags) maps to 400, not 500.
+func TestRouterBulkSetRuleSetDetour_EmptyTags_Returns400(t *testing.T) {
+	h, _ := newTestRouterHandlerReal(t)
+
+	body := `{"tags":[],"downloadDetour":"direct"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/rulesets/bulk-detour", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.BulkSetRuleSetDetour(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRouterBulkSetRuleSetDetour_MethodNotAllowed(t *testing.T) {
+	h := newMockRouterHandler(&mockRouterSvc{})
+	req := httptest.NewRequest(http.MethodGet, "/api/singbox/router/rulesets/bulk-detour", nil)
+	rr := httptest.NewRecorder()
+	h.BulkSetRuleSetDetour(rr, req)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status: got %d, want 405", rr.Code)
+	}
+}
+
+func TestInspectStream_InvalidPortNotNumber_Returns400(t *testing.T) {
+	h := newMockRouterHandler(&mockRouterSvc{})
+	req := httptest.NewRequest(http.MethodGet, "/api/singbox/router/inspect/stream?domain=google.com&port=abc", nil)
+	rr := httptest.NewRecorder()
+	h.InspectStream(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestInspectStream_InvalidPortRange_Returns400(t *testing.T) {
+	h := newMockRouterHandler(&mockRouterSvc{})
+	req := httptest.NewRequest(http.MethodGet, "/api/singbox/router/inspect/stream?domain=google.com&port=70000", nil)
+	rr := httptest.NewRecorder()
+	h.InspectStream(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestInspectStream_InvalidProtocol_Returns400(t *testing.T) {
+	h := newMockRouterHandler(&mockRouterSvc{})
+	req := httptest.NewRequest(http.MethodGet, "/api/singbox/router/inspect/stream?domain=google.com&protocol=icmp", nil)
+	rr := httptest.NewRecorder()
+	h.InspectStream(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestInspectStream_ValidParams_Returns200SSE(t *testing.T) {
+	h := newMockRouterHandler(&mockRouterSvc{})
+	req := httptest.NewRequest(http.MethodGet, "/api/singbox/router/inspect/stream?domain=google.com&port=443&protocol=tcp", nil)
+	rr := httptest.NewRecorder()
+	h.InspectStream(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if got := rr.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("unexpected content-type: %q", got)
+	}
+}
+
+func TestInspectPost_InvalidPortAndProtocol_Returns400(t *testing.T) {
+	h := newMockRouterHandler(&mockRouterSvc{})
+	body := strings.NewReader(`{"domain":"google.com","port":70000,"protocol":"icmp"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/inspect", body)
+	rr := httptest.NewRecorder()
+	h.Inspect(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		b, _ := io.ReadAll(rr.Body)
+		t.Fatalf("want 400, got %d body=%s", rr.Code, string(b))
+	}
+}
+
+func TestListBindableInterfaces_Returns200WithData(t *testing.T) {
+	h := newMockRouterHandler(&mockRouterSvc{})
+	req := httptest.NewRequest(http.MethodGet, "/api/singbox/router/bindable-interfaces", nil)
+	rr := httptest.NewRecorder()
+	h.ListBindableInterfaces(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	var env struct {
+		Data []struct {
+			Name string `json:"name"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v (body: %s)", err, rr.Body.String())
+	}
+	if len(env.Data) != 1 || env.Data[0].Name != "ipsec0" {
+		t.Errorf("unexpected data: %+v", env.Data)
+	}
+}
+
+func TestPolicyTunNATPreview_Returns200WithSegments(t *testing.T) {
+	h := newMockRouterHandler(&mockRouterSvc{natPreview: []router.NATSegmentInfo{
+		{Name: "Home", Mode: "dynamic"},
+		{Name: "Guest", Mode: "static", StaticWAN: "PPPoE0"},
+	}})
+	req := httptest.NewRequest(http.MethodGet, "/api/singbox/router/policy-tun/nat-preview", nil)
+	rr := httptest.NewRecorder()
+	h.PolicyTunNATPreview(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	var env struct {
+		Data struct {
+			Segments []struct {
+				Name      string `json:"name"`
+				Mode      string `json:"mode"`
+				StaticWAN string `json:"staticWan"`
+			} `json:"segments"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v (body: %s)", err, rr.Body.String())
+	}
+	segs := env.Data.Segments
+	if len(segs) != 2 || segs[0].Name != "Home" || segs[0].Mode != "dynamic" ||
+		segs[1].StaticWAN != "PPPoE0" {
+		t.Errorf("unexpected segments: %+v", segs)
+	}
+}
+
+// Пустой список обязан приезжать как [], а не null: фронт рисует по нему
+// редактируемый предпоказ.
+func TestPolicyTunNATPreview_EmptyIsArray(t *testing.T) {
+	h := newMockRouterHandler(&mockRouterSvc{})
+	req := httptest.NewRequest(http.MethodGet, "/api/singbox/router/policy-tun/nat-preview", nil)
+	rr := httptest.NewRecorder()
+	h.PolicyTunNATPreview(rr, req)
+	if !strings.Contains(rr.Body.String(), `"segments":[]`) {
+		t.Errorf("empty preview must serialise as []: %s", rr.Body.String())
+	}
+}
+
+func TestListBindableInterfaces_405OnWrongMethod(t *testing.T) {
+	h := newMockRouterHandler(&mockRouterSvc{})
+	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/bindable-interfaces", nil)
+	rr := httptest.NewRecorder()
+	h.ListBindableInterfaces(rr, req)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("want 405, got %d", rr.Code)
+	}
+}
+
+func TestDatRuleSetURL_InvalidQuery_Returns400(t *testing.T) {
+	h := newMockRouterHandler(&mockRouterSvc{})
+	req := httptest.NewRequest(http.MethodGet, "/api/singbox/router/rulesets/dat-url?kind=bad&tag=GOOGLE", nil)
+	rr := httptest.NewRecorder()
+	h.DatRuleSetURL(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestDatRuleSetURL_MultipleTags_ReturnsURLWithRepeatedTagParams(t *testing.T) {
+	h := newMockRouterHandler(&mockRouterSvc{})
+	req := httptest.NewRequest(http.MethodGet, "/api/singbox/router/rulesets/dat-url?kind=geosite&tag=GOOGLE&tag=YOUTUBE", nil)
+	rr := httptest.NewRecorder()
+	h.DatRuleSetURL(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "tag=GOOGLE") || !strings.Contains(rr.Body.String(), "tag=YOUTUBE") {
+		t.Fatalf("response missing repeated tag params: %s", rr.Body.String())
+	}
+}
+
+func TestDatRuleSetSRS_BadToken_Returns403(t *testing.T) {
+	h := newMockRouterHandler(&mockRouterSvc{datFileErr: router.ErrDatRuleSetForbidden})
+	req := httptest.NewRequest(http.MethodGet, "/api/singbox/router/rulesets/dat-srs?kind=geosite&tag=GOOGLE&token=bad", nil)
+	rr := httptest.NewRecorder()
+	h.DatRuleSetSRS(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("want 403, got %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// DNS-preset errors map to two distinct codes: claiming the reserved awgm-dns-*
+// tag namespace is a different fix for the caller than touching a managed rule.
+func TestRouterAddDNSRule_ChainTagReserved_ReturnsOwnCode(t *testing.T) {
+	svc := &mockRouterSvc{dnsRuleErr: router.ErrDNSChainTagReserved}
+	h := newMockRouterHandler(svc)
+	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/dns/rules",
+		strings.NewReader(`{"tag":"awgm-dns-mine","server":"dns-direct"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.AddDNSRule(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	var env struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v (body: %s)", err, rr.Body.String())
+	}
+	if env.Code != "DNS_TAG_RESERVED" {
+		t.Fatalf("want code DNS_TAG_RESERVED, got %q", env.Code)
+	}
+}
+
+func TestRouterUpdateDNSRule_Managed_ReturnsManagedCode(t *testing.T) {
+	svc := &mockRouterSvc{dnsRuleErr: router.ErrDNSRuleManaged}
+	h := newMockRouterHandler(svc)
+	req := httptest.NewRequest(http.MethodPost, "/api/singbox/router/dns/rules/update",
+		strings.NewReader(`{"index":0,"rule":{"server":"dns-direct"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.UpdateDNSRule(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	var env struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v (body: %s)", err, rr.Body.String())
+	}
+	if env.Code != "DNS_RULE_MANAGED" {
+		t.Fatalf("want code DNS_RULE_MANAGED, got %q", env.Code)
+	}
+}
+
+// Footgun Д2: после того как "" стало значимым («v6 выключен»), PUT без поля
+// fakeipPool6 декодировался бы в Go zero "" и МОЛЧА выключал v6 (узор
+// PR #757 с routingMode). Absent обязан сохранять текущее значение.
+func TestRouterPutSettings_OmittedPool6KeepsStored(t *testing.T) {
+	svc := &mockRouterSvc{settings: storage.SingboxRouterSettings{FakeIPPool6: "fc00::/18"}}
+	h := newMockRouterHandler(svc)
+	req := httptest.NewRequest(http.MethodPut, "/api/singbox/router/settings",
+		strings.NewReader(`{"enabled":true,"wanAutoDetect":true,"policyName":"awgm-router"}`))
+	rr := httptest.NewRecorder()
+	h.PutSettings(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	if svc.settings.FakeIPPool6 != "fc00::/18" {
+		t.Errorf("fakeipPool6 = %q, want сохранённое \"fc00::/18\" (absent ≠ empty)", svc.settings.FakeIPPool6)
+	}
+}
+
+// Обратное направление: явное "" доходит до сервиса как "" (осознанное
+// выключение). На уровне handler'а это СТРАХОВКА (decode и сегодня отдаёт ""),
+// краснота выключения целиком — сквозной тест роутера.
+func TestRouterPutSettings_ExplicitEmptyPool6Passes(t *testing.T) {
+	svc := &mockRouterSvc{settings: storage.SingboxRouterSettings{FakeIPPool6: "fc00::/18"}}
+	h := newMockRouterHandler(svc)
+	req := httptest.NewRequest(http.MethodPut, "/api/singbox/router/settings",
+		strings.NewReader(`{"enabled":true,"wanAutoDetect":true,"fakeipPool6":""}`))
+	rr := httptest.NewRecorder()
+	h.PutSettings(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d (body: %s)", rr.Code, rr.Body.String())
+	}
+	if svc.settings.FakeIPPool6 != "" {
+		t.Errorf("fakeipPool6 = %q, want \"\" (подстановки быть не должно)", svc.settings.FakeIPPool6)
 	}
 }

@@ -179,7 +179,6 @@ func TestServiceImpl_CRUD(t *testing.T) {
 		store:    store,
 		queries:  q,
 		commands: c,
-		log:      noopLogger(),
 	}
 
 	ctx := context.Background()
@@ -286,7 +285,7 @@ func TestServiceImpl_CreateValidation(t *testing.T) {
 	}
 
 	q, c, _, _ := newTestNDMS()
-	svc := &ServiceImpl{store: store, queries: q, commands: c, log: noopLogger()}
+	svc := &ServiceImpl{store: store, queries: q, commands: c}
 	ctx := context.Background()
 
 	t.Run("empty name", func(t *testing.T) {
@@ -304,6 +303,111 @@ func TestServiceImpl_CreateValidation(t *testing.T) {
 	})
 }
 
+func TestServiceImpl_UpdatePartialPreservesExcludesTextSubnets(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	if _, err := store.Load(); err != nil {
+		t.Fatal(err)
+	}
+
+	q, c, _, _ := newTestNDMS()
+	svc := &ServiceImpl{store: store, queries: q, commands: c}
+	ctx := context.Background()
+
+	manualText := "example.com\n.local\n10.0.0.0/8"
+	excludesText := `
+# local bypass
+.local
+10.0.0.0/8
+`
+
+	created, err := svc.Create(ctx, DomainList{
+		Name:         "with excludes text",
+		ManualText:   &manualText,
+		ExcludesText: &excludesText,
+		Routes:       []RouteTarget{{Interface: "OpkgTun0", TunnelID: "t1"}},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	if len(created.Excludes) != 1 || created.Excludes[0] != "local" {
+		t.Fatalf("created Excludes = %#v, want [local]", created.Excludes)
+	}
+	if len(created.ExcludeSubnets) != 1 || created.ExcludeSubnets[0] != "10.0.0.0/8" {
+		t.Fatalf("created ExcludeSubnets = %#v, want [10.0.0.0/8]", created.ExcludeSubnets)
+	}
+
+	updated, err := svc.Update(ctx, DomainList{
+		ID:     created.ID,
+		Routes: []RouteTarget{{Interface: "OpkgTun1", TunnelID: "t2"}},
+	})
+	if err != nil {
+		t.Fatalf("Update partial: %v", err)
+	}
+
+	if updated.ExcludesText == nil || *updated.ExcludesText != excludesText {
+		t.Fatalf("ExcludesText was not preserved: %#v", updated.ExcludesText)
+	}
+	if len(updated.Excludes) != 1 || updated.Excludes[0] != "local" {
+		t.Fatalf("updated Excludes = %#v, want [local]", updated.Excludes)
+	}
+	if len(updated.ExcludeSubnets) != 1 || updated.ExcludeSubnets[0] != "10.0.0.0/8" {
+		t.Fatalf("updated ExcludeSubnets = %#v, want [10.0.0.0/8]", updated.ExcludeSubnets)
+	}
+}
+
+// Excludes no longer have to match an include: NDMS matches domains by
+// suffix without a dot boundary (x.com also matches yandex.com), so an
+// exclude for an unrelated domain is a legitimate workaround. Whether the
+// entry makes sense is the router's call — we just pass it through.
+func TestServiceImpl_CreateAcceptsUnrelatedExclude(t *testing.T) {
+	svc := newTestService(t)
+	ctx := context.Background()
+
+	created, err := svc.Create(ctx, DomainList{
+		Name:          "unrelated exclude",
+		ManualDomains: []string{"x.com"},
+		Excludes:      []string{"yandex.com", "192.168.0.0/24"},
+		Routes:        []RouteTarget{{Interface: "OpkgTun0", TunnelID: "t1"}},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if len(created.Excludes) != 1 || created.Excludes[0] != "yandex.com" {
+		t.Errorf("Excludes = %#v, want [yandex.com]", created.Excludes)
+	}
+	if len(created.ExcludeSubnets) != 1 || created.ExcludeSubnets[0] != "192.168.0.0/24" {
+		t.Errorf("ExcludeSubnets = %#v, want [192.168.0.0/24]", created.ExcludeSubnets)
+	}
+}
+
+func TestServiceImpl_UpdateAcceptsUnrelatedExclude(t *testing.T) {
+	svc := newTestService(t)
+	ctx := context.Background()
+
+	created, err := svc.Create(ctx, DomainList{
+		Name:          "unrelated exclude",
+		ManualDomains: []string{"x.com"},
+		Routes:        []RouteTarget{{Interface: "OpkgTun0", TunnelID: "t1"}},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	excludesText := "yandex.com"
+	updated, err := svc.Update(ctx, DomainList{
+		ID:           created.ID,
+		ExcludesText: &excludesText,
+	})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if len(updated.Excludes) != 1 || updated.Excludes[0] != "yandex.com" {
+		t.Errorf("Excludes = %#v, want [yandex.com]", updated.Excludes)
+	}
+}
+
 func TestServiceImpl_NotFound(t *testing.T) {
 	dir := t.TempDir()
 	store := NewStore(dir)
@@ -312,7 +416,7 @@ func TestServiceImpl_NotFound(t *testing.T) {
 	}
 
 	q, c, _, _ := newTestNDMS()
-	svc := &ServiceImpl{store: store, queries: q, commands: c, log: noopLogger()}
+	svc := &ServiceImpl{store: store, queries: q, commands: c}
 	ctx := context.Background()
 
 	if _, err := svc.Get(ctx, "nope"); err == nil {
@@ -340,7 +444,6 @@ func TestServiceImpl_OnTunnelDelete_CleansFailoverState(t *testing.T) {
 		store:    store,
 		queries:  q,
 		commands: c,
-		log:      noopLogger(),
 	}
 	fm := NewFailoverManager(func() error { return nil })
 	svc.SetFailoverManager(fm)
@@ -375,7 +478,7 @@ func TestServiceImpl_OnTunnelDelete_PreservesListDomains(t *testing.T) {
 		t.Fatal(err)
 	}
 	q, c, _, _ := newTestNDMS()
-	svc := &ServiceImpl{store: store, queries: q, commands: c, log: noopLogger()}
+	svc := &ServiceImpl{store: store, queries: q, commands: c}
 	svc.SetFailoverManager(NewFailoverManager(func() error { return nil }))
 
 	// soloList → only bound to "doomed", becomes orphan after delete.
@@ -443,7 +546,6 @@ func TestServiceImpl_LookupAffectedLists_RestoredAction(t *testing.T) {
 		store:    store,
 		queries:  q,
 		commands: c,
-		log:      noopLogger(),
 	}
 	fm := NewFailoverManager(func() error { return nil })
 	svc.SetFailoverManager(fm)
@@ -486,77 +588,21 @@ func TestServiceImpl_LookupAffectedLists_RestoredAction(t *testing.T) {
 	}
 }
 
-func TestValidateExcludes_DomainNeedsInclude(t *testing.T) {
-	err := validateExcludes(
-		[]string{"google.com"},
-		nil,
-		[]string{"yandex.ru"},
-		nil,
-	)
-	if err == nil {
-		t.Fatal("expected error: yandex.ru has no matching include")
-	}
-}
-
-func TestValidateExcludes_SubdomainOK(t *testing.T) {
-	err := validateExcludes(
-		[]string{"google.com"},
-		nil,
-		[]string{"gemini.google.com"},
-		nil,
-	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestValidateExcludes_SubnetNeedsInclude(t *testing.T) {
-	err := validateExcludes(
-		nil,
-		[]string{"10.0.0.0/8"},
-		nil,
-		[]string{"192.168.0.0/24"},
-	)
-	if err == nil {
-		t.Fatal("expected error: 192.168/24 not inside any include subnet")
-	}
-}
-
-func TestValidateExcludes_SubnetInsideOK(t *testing.T) {
-	err := validateExcludes(
-		nil,
-		[]string{"10.0.0.0/8"},
-		nil,
-		[]string{"10.0.0.0/24"},
-	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestValidateExcludes_InvalidCIDR(t *testing.T) {
-	err := validateExcludes(nil, nil, nil, []string{"not-a-cidr"})
-	if err == nil {
-		t.Fatal("expected error for invalid CIDR")
-	}
-}
-
 // TestServiceCreate_SplitsAndDedupsMixedExcludes is an integration test
 // of the full Create pipeline: user typed mixed domains + CIDRs into
-// the Excludes field, server splits them, validates, persists, dedup
-// runs, and another list's parent doesn't claim the holed subdomain.
+// the Excludes field, server splits them, persists, dedup runs, and
+// another list's parent doesn't claim the holed subdomain.
 func TestServiceCreate_SplitsAndDedupsMixedExcludes(t *testing.T) {
 	// Skip if integration scaffold isn't available — these tests need a
 	// fully-wired ServiceImpl with a Store and resolveRouteInterfaces.
-	// We intentionally exercise validateExcludes + splitDomainsAndSubnets
-	// without going through real RCI: callers in unit tests build
-	// DomainList directly and check the dedup output, not the Service.
+	// We intentionally exercise splitDomainsAndSubnets without going
+	// through real RCI: callers in unit tests build DomainList directly
+	// and check the dedup output, not the Service.
 	//
 	// This test verifies the standalone helpers compose correctly:
 	// 1. splitDomainsAndSubnets routes CIDRs out of mixed input.
-	// 2. validateExcludes accepts the resulting halves.
-	// 3. BuildIndex registers domain-form excludes as holes.
-	// 4. dedupSubnets respects the CIDR-form excludes.
+	// 2. BuildIndex registers domain-form excludes as holes.
+	// 3. dedupSubnets respects the CIDR-form excludes.
 
 	rawExcludes := []string{"gemini.google.com", "10.0.0.0/24"}
 	rawDomains := []string{"google.com", "10.0.0.0/16"}
@@ -575,10 +621,6 @@ func TestServiceCreate_SplitsAndDedupsMixedExcludes(t *testing.T) {
 	}
 	if len(exclSubnets) != 1 || exclSubnets[0] != "10.0.0.0/24" {
 		t.Fatalf("exclSubnets: %v", exclSubnets)
-	}
-
-	if err := validateExcludes(domains, subnets, exclDomains, exclSubnets); err != nil {
-		t.Fatalf("validateExcludes: %v", err)
 	}
 
 	// Now build a list with the classified data and verify dedup carves

@@ -31,7 +31,7 @@ func TestIntegration_ParseAddValidate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", link, err)
 		}
-		if err := cfg.AddTunnel(p.Tag, p.Protocol, p.Server, int(p.Port), p.Outbound); err != nil {
+		if err := cfg.AddTunnelWithListenPort(p.Tag, p.Protocol, p.Server, int(p.Port), 0, p.Outbound); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -57,7 +57,7 @@ func TestIntegration_ParseAddValidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, _ := vlink.ParseLink("vless://u@nl.tld:443#Netherlands")
-	cfg.AddTunnel(p.Tag, p.Protocol, p.Server, int(p.Port), p.Outbound)
+	cfg.AddTunnelWithListenPort(p.Tag, p.Protocol, p.Server, int(p.Port), 0, p.Outbound)
 	var nl TunnelInfo
 	for _, ti := range cfg.Tunnels() {
 		if ti.Tag == "Netherlands" {
@@ -84,7 +84,7 @@ func TestIntegration_ParseAddValidate(t *testing.T) {
 	// Validate with mock exec (real sing-box not available in CI)
 	v := &Validator{
 		binary: "sing-box",
-		exec: func(bin string, args ...string) ([]byte, error) {
+		exec: func(_ context.Context, bin string, args ...string) ([]byte, error) {
 			// Check that the last arg is the absolute path to our config
 			if len(args) != 3 {
 				t.Errorf("args len: %v", args)
@@ -155,12 +155,18 @@ type integrationSingbox struct {
 	dir string
 }
 
-func (s *integrationSingbox) Reload() error                              { return nil }
+func (s *integrationSingbox) Reload() error                             { return nil }
 func (s *integrationSingbox) IsRunning() (bool, int)                    { return false, 0 }
 func (s *integrationSingbox) Start() error                              { return nil }
+func (s *integrationSingbox) ClearManualStop() error                    { return nil }
 func (s *integrationSingbox) ValidateConfigDir(_ context.Context) error { return nil }
 func (s *integrationSingbox) ConfigDir() string                         { return s.dir }
 func (s *integrationSingbox) Binary() string                            { return "" }
+func (s *integrationSingbox) LastError() string                         { return "" }
+func (s *integrationSingbox) AutoRestartIfCrashed(_ context.Context) (bool, bool, error) {
+	return false, false, nil // integration env: никаких сайд-эффектов от reconcile
+}
+func (s *integrationSingbox) CrashStats() (int, string, time.Time) { return 0, "", time.Time{} }
 
 // noopWANIPCollector is a test double that returns no WAN IPs. Wired
 // into router.Deps so NewService doesn't fall back to the production
@@ -199,7 +205,7 @@ func newIntegrationEnv(t *testing.T) *integrationEnv {
 	dir := t.TempDir()
 
 	proc := &integrationProc{running: true} // already running so ApplyStaging triggers Reload not Start
-	orch := orchestrator.New(dir, proc)
+	orch := orchestrator.NewWithAppliedPath(dir, proc, filepath.Join(t.TempDir(), "singbox-applied.json"))
 
 	if err := orch.Register(orchestrator.SlotMeta{
 		Slot:     orchestrator.SlotBase,

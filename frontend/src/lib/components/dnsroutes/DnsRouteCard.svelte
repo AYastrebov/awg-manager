@@ -1,7 +1,9 @@
 <script lang="ts">
 	import type { DnsRoute, RoutingTunnel } from '$lib/types';
-	import { Toggle } from '$lib/components/ui';
+	import { Toggle, Badge } from '$lib/components/ui';
+	import RoutingTargetBadges from '$lib/components/routing/RoutingTargetBadges.svelte';
 	import { ServiceIcon } from '$lib/components/dnsroutes';
+	import { SquarePen, Trash2, RefreshCw } from 'lucide-svelte';
 
 	interface Props {
 		route: DnsRoute;
@@ -14,8 +16,8 @@
 		selectable?: boolean;
 		selected?: boolean;
 		onselect?: () => void;
-		hydrarouteInstalled?: boolean;
 		onicon?: () => void;
+		downloadRouteLabel?: string;
 	}
 
 	let {
@@ -29,22 +31,9 @@
 		selectable = false,
 		selected = false,
 		onselect,
-		hydrarouteInstalled = false,
-		onicon
+		onicon,
+		downloadRouteLabel = ''
 	}: Props = $props();
-
-	let backendLabel = $derived.by(() => {
-		if (route.backend === 'hydraroute') {
-			return hydrarouteInstalled ? 'HR' : 'HR \u26a0';
-		}
-		return 'NDMS';
-	});
-
-	let backendClass = $derived(
-		route.backend === 'hydraroute'
-			? (hydrarouteInstalled ? 'badge-hr' : 'badge-hr-warn')
-			: 'badge-ndms'
-	);
 
 	// Post-split data stores CIDRs in route.subnets; legacy lists created
 	// before commit a65b76f4 (2026-04-15) may still have CIDRs mixed into
@@ -67,16 +56,13 @@
 		return '';
 	});
 
-	let routeTarget = $derived.by(() => {
-		const routes = route.routes ?? [];
-		if (routes.length === 0) return '';
-		const first = routes[0];
-		const tuns = tunnels ?? [];
-		if (tuns.length > 0) {
-			const found = tuns.find(t => t.id === first.tunnelId);
+	let routeTargets = $derived.by(() => {
+		const tuns = tunnels;
+		return (route.routes ?? []).map((target) => {
+			const found = tuns.find((t) => t.id === target.tunnelId);
 			if (found) return found.name;
-		}
-		return first.interface || first.tunnelId;
+			return target.interface || target.tunnelId;
+		});
 	});
 
 	// Orphan = list whose bindings all pointed to a tunnel that got
@@ -131,6 +117,11 @@
 			{#if sourceSummary}
 				<span class="card-source">{sourceSummary}</span>
 			{/if}
+			{#if subCount > 0 && downloadRouteLabel}
+				<span class="card-download-route" title={downloadRouteLabel}>
+					Обновление через {downloadRouteLabel}
+				</span>
+			{/if}
 			{#if hasDedups}
 				<span class="card-dedup" title={dedupReport?.items?.map(
 					i => `${i.domain} — ${i.reason === 'exact' ? 'дубль' : 'покрыт'} ${i.coveredBy} (${i.listName || i.listId})`
@@ -138,14 +129,20 @@
 					{dedupReport?.totalRemoved} убрано
 				</span>
 			{/if}
-			{#if routeTarget}
+			{#if routeTargets.length > 0}
 				<div class="card-route">
-					<span>&rarr;</span> <code>{routeTarget}</code>
-					<span class="backend-badge {backendClass}">{backendLabel}</span>
+					<RoutingTargetBadges labels={routeTargets} overflowNoun="туннелей" />
 				</div>
 			{:else if isOrphan}
 				<div class="card-route">
-					<span class="badge-orphan" title="Туннель, к которому был привязан этот список, удалён. Нажмите «Изменить» и выберите новый туннель.">Без туннеля</span>
+					<Badge
+						variant="warning"
+						uppercase
+						size="xs"
+						title="Туннель, к которому был привязан этот список, удалён. Нажмите «Изменить» и выберите новый туннель."
+					>
+						Без туннеля
+					</Badge>
 				</div>
 			{/if}
 		</div>
@@ -158,24 +155,34 @@
 			disabled={isOrphan}
 			size="sm"
 		/>
-		<button class="action-btn" title="Изменить" onclick={() => onedit()}>
-			<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-				<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-				<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-			</svg>
-		</button>
-		<button class="action-btn" title="Обновить подписки" onclick={() => onrefresh()}>
-			<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-				<polyline points="23 4 23 10 17 10"/>
-				<path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
-			</svg>
-		</button>
-		<button class="action-btn danger" title="Удалить" onclick={() => ondelete()}>
-			<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-				<polyline points="3 6 5 6 21 6"/>
-				<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-			</svg>
-		</button>
+		<div class="action-row">
+			<button
+				type="button"
+				class="route-action-btn"
+				title={`Изменить DNS-маршрут «${route.name}»`}
+				onclick={() => onedit()}
+			>
+				<SquarePen size={15} />
+			</button>
+			<button
+				type="button"
+				class="route-action-btn success"
+				title={downloadRouteLabel
+					? `Обновить подписки DNS-маршрута «${route.name}» через ${downloadRouteLabel}`
+					: `Обновить подписки DNS-маршрута «${route.name}»`}
+				onclick={() => onrefresh()}
+			>
+				<RefreshCw size={15} />
+			</button>
+			<button
+				type="button"
+				class="route-action-btn danger"
+				title={`Удалить DNS-маршрут «${route.name}»`}
+				onclick={() => ondelete()}
+			>
+				<Trash2 size={15} />
+			</button>
+		</div>
 	</div>
 </div>
 
@@ -190,12 +197,12 @@
 		transition: border-color 0.2s;
 	}
 
-	.dns-card.enabled {
-		border: 2px solid var(--success);
+	.dns-card:hover {
+		border-color: var(--border-hover);
 	}
 
 	.dns-card:not(.enabled) {
-		opacity: 0.5;
+		opacity: 0.4;
 	}
 
 	.dns-card.selected {
@@ -207,21 +214,8 @@
 		border: 1px dashed var(--warn, #d08770);
 	}
 
-	.badge-orphan {
-		display: inline-block;
-		font-size: 0.625rem;
-		font-weight: 600;
-		color: var(--warn, #d08770);
-		background: color-mix(in srgb, var(--warn, #d08770) 15%, transparent);
-		padding: 2px 6px;
-		border-radius: 3px;
-		text-transform: uppercase;
-		letter-spacing: 0.03em;
-	}
-
 	.card-main {
 		display: flex;
-		align-items: flex-start;
 		gap: 10px;
 		min-width: 0;
 	}
@@ -261,47 +255,30 @@
 		color: var(--text-secondary);
 	}
 
-	.card-route {
-		font-size: 0.6875rem;
-		color: var(--text-secondary);
-		margin-top: 3px;
-	}
-
-	.card-route code {
-		background: var(--bg-hover);
-		color: var(--text-primary);
-		padding: 1px 6px;
-		border-radius: 3px;
+	.card-download-route {
 		font-size: 0.625rem;
-		font-family: monospace;
+		color: var(--text-muted);
+		max-width: 100%;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
 	}
 
 	.card-actions {
 		display: flex;
 		flex-direction: column;
-		align-items: center;
-		gap: 6px;
+		align-items: flex-end;
+		gap: 8px;
 		flex-shrink: 0;
 		margin-left: 8px;
+		align-self: stretch;
 	}
 
-	.action-btn {
+	.action-row {
 		display: flex;
-		padding: 2px;
-		background: none;
-		border: none;
-		color: var(--border-hover);
-		cursor: pointer;
-		border-radius: 4px;
-		transition: color 0.15s;
-	}
-
-	.action-btn:hover {
-		color: var(--accent);
-	}
-
-	.action-btn.danger:hover {
-		color: var(--error);
+		gap: 4px;
+		align-items: center;
+		margin-top: auto;
 	}
 
 	.led {
@@ -339,7 +316,7 @@
 		padding: 0;
 		background: none;
 		border: 1px solid transparent;
-		border-radius: 8px;
+		border-radius: 7px;
 		cursor: pointer;
 		transition: border-color 0.15s;
 		display: flex;
@@ -357,37 +334,8 @@
 		outline-offset: 2px;
 	}
 
-	.backend-badge {
-		font-size: 0.5625rem;
-		font-weight: 600;
-		padding: 1px 5px;
-		border-radius: 3px;
-		vertical-align: middle;
-		margin-left: 4px;
-	}
-
-	.badge-ndms {
-		background: rgba(122, 162, 247, 0.15);
-		color: var(--accent);
-	}
-
-	.badge-hr {
-		background: rgba(16, 185, 129, 0.15);
-		color: var(--success);
-	}
-
-	.badge-hr-warn {
-		background: rgba(245, 158, 11, 0.15);
-		color: var(--warning);
-	}
-
 	:global(html[data-theme-preset='neo']) .card-source,
 	:global(html[data-theme-preset='neo']) .card-route {
 		color: var(--text-primary);
-	}
-
-	:global(html[data-theme-preset='neo']) .card-route code {
-		background: color-mix(in srgb, var(--bg-hover) 80%, var(--accent) 20%);
-		color: var(--color-accent-contrast, #0b0b0b);
 	}
 </style>

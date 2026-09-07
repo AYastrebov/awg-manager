@@ -1,3 +1,5 @@
+import { DAY_WORDS, HOUR_WORDS, MINUTE_WORDS, pluralForm } from './pluralize';
+
 /**
  * Format bytes to human readable string
  */
@@ -8,9 +10,24 @@ export function formatBytes(bytes: number, decimals = 2): string {
     const dm = decimals < 0 ? 0 : decimals;
     const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
 
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    // Дробные значения < 1 (например, скорость 0.5 Б/с) дают log < 0 и
+    // sizes[-1] === undefined; сверху ограничиваем последним юнитом.
+    const i = Math.min(Math.max(Math.floor(Math.log(bytes) / Math.log(k)), 0), sizes.length - 1);
 
     return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+}
+
+/**
+ * Скорость в байтах/с с ФИКСИРОВАННЫМ одним знаком после запятой — ширина
+ * строки не прыгает между тиками живых обновлений (та же причина, что у
+ * formatTrafficStable в liveConnectionsStore).
+ */
+export function formatByteRate(bytesPerSec: number): string {
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    if (bytesPerSec <= 0) return `0.0 ${sizes[0]}/с`;
+    const i = Math.min(Math.max(Math.floor(Math.log(bytesPerSec) / Math.log(k)), 0), sizes.length - 1);
+    return `${(bytesPerSec / Math.pow(k, i)).toFixed(1)} ${sizes[i]}/с`;
 }
 
 /**
@@ -74,6 +91,7 @@ export function formatTime(timestamp: string): string {
  */
 export function formatDate(timestamp: string): string {
     const date = new Date(timestamp);
+    if (isNaN(date.getTime())) return '—';
     return date.toLocaleDateString('ru-RU', {
         day: '2-digit',
         month: '2-digit',
@@ -81,6 +99,36 @@ export function formatDate(timestamp: string): string {
         minute: '2-digit',
         second: '2-digit'
     });
+}
+
+/**
+ * Format timestamp using explicit UTC offset minutes (router timezone),
+ * independent from browser locale timezone.
+ * Output: YYYY-MM-DD HH:mm:ss
+ */
+export function formatDateTimeWithOffset(timestamp: string, offsetMinutes?: number): string {
+    const d = new Date(timestamp);
+    if (isNaN(d.getTime())) return timestamp;
+
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const formatOffset = (mins: number): string => {
+        const sign = mins >= 0 ? '+' : '-';
+        const abs = Math.abs(mins);
+        const hours = Math.floor(abs / 60);
+        const minutes = abs % 60;
+        return `${sign}${pad(hours)}:${pad(minutes)}`;
+    };
+
+    // Fallback for missing offset: use UTC-formatted value (not browser local timezone).
+    if (offsetMinutes === undefined || offsetMinutes === null || !Number.isFinite(offsetMinutes)) {
+        return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}+00:00`;
+    }
+
+    const shiftedMs = d.getTime() + offsetMinutes * 60_000;
+    const shifted = new Date(shiftedMs);
+
+    // Use UTC getters after applying offset shift to avoid browser timezone effects.
+    return `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} ${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}:${pad(shifted.getUTCSeconds())}${formatOffset(offsetMinutes)}`;
 }
 
 /**
@@ -102,32 +150,14 @@ export function formatRelativeTime(timestamp: string | Date): string {
 
     const diffMin = Math.floor(diffSec / 60);
     if (diffMin < 60) {
-        const lastDigit = diffMin % 10;
-        const lastTwo = diffMin % 100;
-        let word = 'минут';
-        if (lastTwo >= 11 && lastTwo <= 19) word = 'минут';
-        else if (lastDigit === 1) word = 'минуту';
-        else if (lastDigit >= 2 && lastDigit <= 4) word = 'минуты';
-        return `${diffMin} ${word} назад`;
+        return `${diffMin} ${pluralForm(diffMin, MINUTE_WORDS)} назад`;
     }
 
     const diffHours = Math.floor(diffSec / 3600);
     if (diffHours < 24) {
-        const lastDigit = diffHours % 10;
-        const lastTwo = diffHours % 100;
-        let word = 'часов';
-        if (lastTwo >= 11 && lastTwo <= 19) word = 'часов';
-        else if (lastDigit === 1) word = 'час';
-        else if (lastDigit >= 2 && lastDigit <= 4) word = 'часа';
-        return `${diffHours} ${word} назад`;
+        return `${diffHours} ${pluralForm(diffHours, HOUR_WORDS)} назад`;
     }
 
     const diffDays = Math.floor(diffSec / 86400);
-    const lastDigit = diffDays % 10;
-    const lastTwo = diffDays % 100;
-    let word = 'дней';
-    if (lastTwo >= 11 && lastTwo <= 19) word = 'дней';
-    else if (lastDigit === 1) word = 'день';
-    else if (lastDigit >= 2 && lastDigit <= 4) word = 'дня';
-    return `${diffDays} ${word} назад`;
+    return `${diffDays} ${pluralForm(diffDays, DAY_WORDS)} назад`;
 }

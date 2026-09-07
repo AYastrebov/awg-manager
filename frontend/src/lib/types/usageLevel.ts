@@ -22,7 +22,8 @@ export type Section =
 	| 'monitoring'
 	| 'diagnostics'
 	| 'settings'
-	| 'terminal';
+	| 'terminal'
+	| 'proxy';
 
 export type RoutingSubTab =
 	| 'accessPolicies'
@@ -30,6 +31,7 @@ export type RoutingSubTab =
 	| 'dnsRoutes'
 	| 'ipRoutes'
 	| 'hrNeo'
+	| 'geoData'
 	| 'singboxRouter';
 
 const SECTION_MIN_LEVEL: Record<Section, UsageLevel> = {
@@ -43,18 +45,66 @@ const SECTION_MIN_LEVEL: Record<Section, UsageLevel> = {
 	subscriptions: 'advanced',
 	monitoring: 'advanced',
 	terminal: 'advanced',
+	proxy: 'advanced',
 };
 
 const ROUTING_SUBTAB_MIN_LEVEL: Record<RoutingSubTab, UsageLevel> = {
 	accessPolicies: 'basic',
 	clientRoutes: 'basic',
-	dnsRoutes: 'advanced',
+	dnsRoutes: 'basic',
 	ipRoutes: 'advanced',
 	hrNeo: 'expert',
+	geoData: 'expert',
 	singboxRouter: 'expert',
 };
 
 const LEVEL_RANK: Record<UsageLevel, number> = { basic: 0, advanced: 1, expert: 2 };
+
+/** Блок «Внешний вид» / цветовая схема — не ниже «Расширенного». */
+export const APPEARANCE_SETTINGS_MIN_LEVEL: UsageLevel = 'advanced';
+
+/** Режим дашборда на странице туннелей (#142) — не ниже «Расширенного». */
+export const TUNNEL_DASHBOARD_MIN_LEVEL: UsageLevel = 'advanced';
+
+/** Переключатель stable/develop — только на «Продвинутом». */
+export const UPDATE_CHANNEL_MIN_LEVEL: UsageLevel = 'expert';
+
+/** Блок «Автоматическая установка» обновлений — только на «Продвинутом». */
+export const AUTO_INSTALL_MIN_LEVEL: UsageLevel = 'expert';
+
+/** Подробности маршрута служебных загрузок: "через Direct (WAN)", route labels и transport hints. */
+export const DOWNLOAD_ROUTE_DETAILS_MIN_LEVEL: UsageLevel = 'expert';
+
+/** Порт и интерфейсы HTTP-сервера панели — только на «Продвинутом». */
+export const HTTP_SERVER_SETTINGS_MIN_LEVEL: UsageLevel = 'expert';
+
+export function isUsageLevelAtLeast(level: UsageLevel, minimum: UsageLevel): boolean {
+	return LEVEL_RANK[level] >= LEVEL_RANK[minimum];
+}
+
+export function isAppearanceSettingsVisible(level: UsageLevel): boolean {
+	return isUsageLevelAtLeast(level, APPEARANCE_SETTINGS_MIN_LEVEL);
+}
+
+export function isTunnelDashboardAvailable(level: UsageLevel): boolean {
+	return isUsageLevelAtLeast(level, TUNNEL_DASHBOARD_MIN_LEVEL);
+}
+
+export function isUpdateChannelSwitchVisible(level: UsageLevel): boolean {
+	return isUsageLevelAtLeast(level, UPDATE_CHANNEL_MIN_LEVEL);
+}
+
+export function isAutoInstallSettingsVisible(level: UsageLevel): boolean {
+	return isUsageLevelAtLeast(level, AUTO_INSTALL_MIN_LEVEL);
+}
+
+export function areDownloadRouteDetailsVisible(level: UsageLevel): boolean {
+	return isUsageLevelAtLeast(level, DOWNLOAD_ROUTE_DETAILS_MIN_LEVEL);
+}
+
+export function isHttpServerSettingsVisible(level: UsageLevel): boolean {
+	return isUsageLevelAtLeast(level, HTTP_SERVER_SETTINGS_MIN_LEVEL);
+}
 
 export function isSectionVisible(level: UsageLevel, section: Section): boolean {
 	return LEVEL_RANK[level] >= LEVEL_RANK[SECTION_MIN_LEVEL[section]];
@@ -73,15 +123,16 @@ export function pathToSection(pathname: string): Section | null {
 	if (pathname.startsWith('/servers')) return 'servers';
 	if (pathname.startsWith('/subscriptions')) return 'subscriptions';
 	if (pathname.startsWith('/routing')) return 'routing';
-	if (
-		pathname.startsWith('/monitoring') ||
-		pathname.startsWith('/pingcheck') ||
-		pathname.startsWith('/connections')
-	)
-		return 'monitoring';
 	if (pathname.startsWith('/diagnostics') || pathname.startsWith('/logs')) return 'diagnostics';
 	if (pathname.startsWith('/settings')) return 'settings';
 	if (pathname.startsWith('/terminal')) return 'terminal';
+	// Старые адреса — редиректы на /proxy, гейт у них общий.
+	if (
+		pathname.startsWith('/proxy') ||
+		pathname.startsWith('/freeturn') ||
+		pathname.startsWith('/wdtt')
+	)
+		return 'proxy';
 	return null;
 }
 
@@ -93,7 +144,8 @@ export const SECTION_LABELS: Record<Section, string> = {
 	subscriptions: 'Подписки',
 	routing: 'Маршрутизация',
 	monitoring: 'Мониторинг',
-	diagnostics: 'Диагностика',
+	diagnostics: 'Инструменты',
 	settings: 'Настройки',
 	terminal: 'Терминал',
+	proxy: 'Прокси',
 };

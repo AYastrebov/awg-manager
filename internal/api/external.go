@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/response"
@@ -38,11 +39,11 @@ type ExternalTunnelService interface {
 
 // ExternalTunnelsHandler handles external tunnel operations.
 type ExternalTunnelsHandler struct {
-	svc                ExternalTunnelService
-	tunnelSvc          TunnelService
-	store              *storage.AWGTunnelStore
-	log                *logging.ScopedLogger
-	publishTunnelList  func(ctx context.Context)
+	svc               ExternalTunnelService
+	tunnelSvc         TunnelService
+	store             *storage.AWGTunnelStore
+	log               *logging.ScopedLogger
+	publishTunnelList func(ctx context.Context)
 }
 
 // NewExternalTunnelsHandler creates a new external tunnels handler.
@@ -154,7 +155,10 @@ func (h *ExternalTunnelsHandler) Adopt(w http.ResponseWriter, r *http.Request) {
 		h.publishTunnelList(r.Context())
 	}
 
-	resp, err := BuildTunnelResponse(r, h.tunnelSvc, h.store, result.ID)
+	// No orchestrator wired here; a freshly adopted tunnel has no bring-up
+	// window, so a zero quiescentUntil yields the same overlay the list shows
+	// for an orchestrator-unknown tunnel.
+	resp, err := BuildTunnelResponse(r, h.tunnelSvc, h.store, result.ID, time.Time{})
 	if err != nil {
 		response.Error(w, err.Error(), "ADOPT_FAILED")
 		return

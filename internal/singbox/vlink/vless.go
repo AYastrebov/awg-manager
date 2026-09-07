@@ -33,28 +33,63 @@ func parseVless(input string) (*ParsedOutbound, error) {
 		return nil, err
 	}
 
-	flow := normalizeFlow(q.Get("flow"))
-
 	stream, err := BuildStreamFromQuery(q, host)
 	if err != nil {
 		return nil, fmt.Errorf("vless: %w", err)
 	}
 
+	return buildVlessOutbound(host, uint16(port), uuid, q.Get("flow"), q.Get("encryption"), stream, u.Fragment, u.Fragment)
+}
+
+// meaninglessEncryption lists encryption values that carry no meaning for
+// VLESS: "none" from the spec itself, plus VMess ciphers that keep travelling
+// through public subscriptions by copy-paste. They are dropped silently.
+var meaninglessEncryption = map[string]bool{
+	"":                  true,
+	"none":              true,
+	"auto":              true,
+	"zero":              true,
+	"aes-128-gcm":       true,
+	"aes-256-gcm":       true,
+	"aes-128-cfb":       true,
+	"chacha20-poly1305": true,
+}
+
+// checkVlessEncryption rejects links that need real VLESS Encryption (issue
+// #603). sing-box has no encryption field on a VLESS outbound at all
+// (option.VLESSOutboundOptions) and decodes strictly, so passing the value
+// through poisons the whole config with `json: unknown field "encryption"`.
+// Dropping it silently would instead hand the user a server that cannot
+// connect, so anything outside the meaningless set fails here — the list is a
+// whitelist of junk on purpose: an unknown value is more likely a new
+// encryption spec than new junk, and a visible refusal beats a silent break.
+func checkVlessEncryption(encryption string) error {
+	if meaninglessEncryption[strings.ToLower(strings.TrimSpace(encryption))] {
+		return nil
+	}
+	return fmt.Errorf("vless: encryption=%q не поддерживается sing-box (VLESS Encryption) — сервер пропущен", encryption)
+}
+
+// buildVlessOutbound assembles the vless outbound shared by the share-link
+// parser (parseVless) and the Clash mapper (mapClashVless), so flow
+// normalization and encryption handling stay identical across both entry
+// formats — previously the Clash path took flow raw and ignored encryption.
+// tag falls back to vless-<host>-<port> when empty.
+func buildVlessOutbound(host string, port uint16, uuid, flow, encryption string, stream *StreamBuilder, tag, label string) (*ParsedOutbound, error) {
+	if err := checkVlessEncryption(encryption); err != nil {
+		return nil, err
+	}
 	out := map[string]any{
 		"type":        "vless",
 		"server":      host,
 		"server_port": port,
 		"uuid":        uuid,
 	}
-	if flow != "" {
-		out["flow"] = flow
-	}
-	if enc := q.Get("encryption"); enc != "" && enc != "none" {
-		out["encryption"] = enc
+	if f := normalizeFlow(flow); f != "" {
+		out["flow"] = f
 	}
 	stream.MergeIntoOutbound(out)
 
-	tag := u.Fragment
 	if tag == "" {
 		tag = fmt.Sprintf("vless-%s-%d", host, port)
 	}
@@ -64,14 +99,13 @@ func parseVless(input string) (*ParsedOutbound, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	return &ParsedOutbound{
 		Tag:      tag,
 		Protocol: "vless",
 		Server:   host,
-		Port:     uint16(port),
+		Port:     port,
 		Outbound: raw,
-		Label:    u.Fragment,
+		Label:    label,
 	}, nil
 }
 

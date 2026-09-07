@@ -2,14 +2,27 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/hoaxisr/awg-manager/internal/downloader"
 	"github.com/hoaxisr/awg-manager/internal/storage"
+	sysports "github.com/hoaxisr/awg-manager/internal/sys/ports"
 )
+
+type testDownloadOutboundsProvider struct {
+	items []downloader.Outbound
+}
+
+func (p testDownloadOutboundsProvider) ListDownloadOutbounds(_ context.Context) []downloader.Outbound {
+	return p.items
+}
 
 // newSettingsHandlerForTest returns a SettingsHandler backed by an
 // isolated SettingsStore in a temp directory. The store is preloaded so
@@ -26,6 +39,123 @@ func newSettingsHandlerForTest(t *testing.T) (*SettingsHandler, *storage.Setting
 	}
 	h := NewSettingsHandler(store, nil)
 	return h, store
+}
+
+func TestUpdate_SingboxLogLevelInvalidRejected(t *testing.T) {
+	h, _ := newSettingsHandlerForTest(t)
+	body := []byte(`{"logging":{"singboxLogLevel":"verbose"}}`)
+
+	req := httptest.NewRequest(http.MethodPost, "/settings/update", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.Update(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "INVALID_SINGBOX_LOG_LEVEL") {
+		t.Fatalf("missing INVALID_SINGBOX_LOG_LEVEL, body=%s", rec.Body.String())
+	}
+}
+
+func TestUpdate_SingboxLogLevelChanged_ApplyCallbackCalledOnce(t *testing.T) {
+	h, store := newSettingsHandlerForTest(t)
+	calls := 0
+	h.SetApplySingboxLogSettings(func() error {
+		calls++
+		return nil
+	})
+
+	body := []byte(`{"logging":{"singboxLogLevel":"warn"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/settings/update", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.Update(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if calls != 1 {
+		t.Fatalf("apply callback calls = %d, want 1", calls)
+	}
+	got, _ := store.Get()
+	if got.Logging.SingboxLogLevel != "warn" {
+		t.Fatalf("stored singboxLogLevel = %q, want warn", got.Logging.SingboxLogLevel)
+	}
+}
+
+func TestUpdate_SingboxLogLevelPartialPreservesOtherLoggingFields(t *testing.T) {
+	h, store := newSettingsHandlerForTest(t)
+	current, _ := store.Get()
+	seed := *current
+	seed.Logging.Enabled = true
+	seed.Logging.MaxAge = 4
+	seed.Logging.LogLevel = "debug"
+	seed.Logging.AppMaxEntries = 6000
+	seed.Logging.SingboxMaxEntries = 7000
+	seed.Logging.SingboxLogLevel = "trace"
+	if err := store.Update(func(cur *storage.Settings) error { *cur = seed; return nil }); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	body := []byte(`{"logging":{"singboxLogLevel":"warn"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/settings/update", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.Update(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	got, _ := store.Get()
+	if !got.Logging.Enabled || got.Logging.MaxAge != 4 || got.Logging.LogLevel != "debug" {
+		t.Fatalf("logging core fields changed unexpectedly: %+v", got.Logging)
+	}
+	if got.Logging.AppMaxEntries != 6000 || got.Logging.SingboxMaxEntries != 7000 {
+		t.Fatalf("logging entry caps changed unexpectedly: %+v", got.Logging)
+	}
+	if got.Logging.SingboxLogLevel != "warn" {
+		t.Fatalf("singboxLogLevel = %q, want warn", got.Logging.SingboxLogLevel)
+	}
+}
+
+func TestUpdate_SingboxLogLevelNormalizedBeforeSave(t *testing.T) {
+	h, store := newSettingsHandlerForTest(t)
+	body := []byte(`{"logging":{"singboxLogLevel":" WARN "}}`)
+	req := httptest.NewRequest(http.MethodPost, "/settings/update", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.Update(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	got, _ := store.Get()
+	if got.Logging.SingboxLogLevel != "warn" {
+		t.Fatalf("stored singboxLogLevel = %q, want warn", got.Logging.SingboxLogLevel)
+	}
+}
+
+func TestUpdate_SingboxLogLevelUnchanged_ApplyCallbackNotCalled(t *testing.T) {
+	h, store := newSettingsHandlerForTest(t)
+	current, _ := store.Get()
+	current.Logging.SingboxLogLevel = "trace"
+	if err := store.Update(func(cur *storage.Settings) error { *cur = *current; return nil }); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	calls := 0
+	h.SetApplySingboxLogSettings(func() error {
+		calls++
+		return nil
+	})
+
+	body := []byte(`{"logging":{"logLevel":"info","appMaxEntries":7000}}`)
+	req := httptest.NewRequest(http.MethodPost, "/settings/update", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.Update(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if calls != 0 {
+		t.Fatalf("apply callback calls = %d, want 0", calls)
+	}
 }
 
 // TestUpdateUsageLevelAccepted verifies that a valid usageLevel value
@@ -68,7 +198,7 @@ func TestUpdateUsageLevelInvalidRejected(t *testing.T) {
 		"updates": {"checkEnabled": true},
 		"dnsRoute": {"autoRefreshEnabled": false},
 		"usageLevel": "garbage",
-		"singboxRouter": {"enabled": false, "policyName": "", "refreshMode": "interval", "refreshIntervalHours": 24}
+		"singboxRouter": {"enabled": false, "policyName": ""}
 	}`)
 
 	req := httptest.NewRequest(http.MethodPost, "/settings/update", bytes.NewReader(body))
@@ -96,7 +226,7 @@ func TestUpdateUsageLevelEmptyPreserves(t *testing.T) {
 	current, _ := store.Get()
 	seed := *current
 	seed.UsageLevel = storage.UsageLevelExpert
-	if err := store.Save(&seed); err != nil {
+	if err := store.Update(func(cur *storage.Settings) error { *cur = seed; return nil }); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -110,9 +240,9 @@ func TestUpdateUsageLevelEmptyPreserves(t *testing.T) {
 		"pingCheck": {"enabled": false, "defaults": {"method":"http","target":"8.8.8.8","interval":45,"deadInterval":120,"failThreshold":3}},
 		"logging": {"enabled": true, "maxAge": 2},
 		"disableMemorySaving": false,
-		"updates": {"checkEnabled": true},
+		"updates": {"checkEnabled": true, "autoInstallIntervalDays": 7, "autoInstallTime": "05:00"},
 		"dnsRoute": {"autoRefreshEnabled": false},
-		"singboxRouter": {"enabled": false, "policyName": "", "refreshMode": "interval", "refreshIntervalHours": 24}
+		"singboxRouter": {"enabled": false, "policyName": ""}
 	}`)
 
 	req := httptest.NewRequest(http.MethodPost, "/settings/update", bytes.NewReader(body))
@@ -142,7 +272,7 @@ func TestUpdate_PartialPayload_PreservesOmittedFields(t *testing.T) {
 	seed.ApiKey = "seeded-key"
 	seed.Server.Port = 3333
 	seed.UsageLevel = storage.UsageLevelExpert
-	if err := store.Save(&seed); err != nil {
+	if err := store.Update(func(cur *storage.Settings) error { *cur = seed; return nil }); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -186,7 +316,7 @@ func TestUpdate_AuthEnabledFalse_NotReverted(t *testing.T) {
 	current, _ := store.Get()
 	seed := *current
 	seed.AuthEnabled = true
-	if err := store.Save(&seed); err != nil {
+	if err := store.Update(func(cur *storage.Settings) error { *cur = seed; return nil }); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -247,7 +377,7 @@ func TestUpdate_ApiKeyExplicitEmpty_Preserved(t *testing.T) {
 	current, _ := store.Get()
 	seed := *current
 	seed.ApiKey = "preexisting-key"
-	if err := store.Save(&seed); err != nil {
+	if err := store.Update(func(cur *storage.Settings) error { *cur = seed; return nil }); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -262,5 +392,266 @@ func TestUpdate_ApiKeyExplicitEmpty_Preserved(t *testing.T) {
 	got, _ := store.Get()
 	if got.ApiKey != "preexisting-key" {
 		t.Errorf("ApiKey = %q after explicit empty patch, want preexisting-key", got.ApiKey)
+	}
+}
+
+func TestUpdate_DownloadRoute_RejectsUnknownTag(t *testing.T) {
+	h, _ := newSettingsHandlerForTest(t)
+	dl := downloader.NewService(downloader.Deps{
+		Outbounds: testDownloadOutboundsProvider{
+			items: []downloader.Outbound{
+				{Tag: "direct", Kind: "direct", Label: "Direct (WAN)", Available: true},
+				{Tag: "awg-1", Kind: "awg", Label: "AWG 1", Available: false},
+			},
+		},
+	})
+	h.SetDownloadService(dl)
+
+	body := []byte(`{"download":{"routeTag":"unknown-route"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/settings/update", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.Update(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "INVALID_DOWNLOAD_ROUTE") {
+		t.Fatalf("missing INVALID_DOWNLOAD_ROUTE, body=%s", rec.Body.String())
+	}
+}
+
+func TestUpdate_DownloadRoute_NormalizesEmptyToDirect(t *testing.T) {
+	h, store := newSettingsHandlerForTest(t)
+	body := []byte(`{"download":{"routeTag":"   ","routeKind":"awg"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/settings/update", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.Update(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	got, _ := store.Get()
+	if got.Download.RouteTag != "direct" {
+		t.Fatalf("routeTag = %q, want direct", got.Download.RouteTag)
+	}
+	if got.Download.RouteKind != "direct" {
+		t.Fatalf("routeKind = %q, want direct", got.Download.RouteKind)
+	}
+}
+
+func TestUpdate_PingCheckTargetValidAndEmpty(t *testing.T) {
+	h, store := newSettingsHandlerForTest(t)
+
+	body := []byte(`{"pingCheck":{"enabled":false,"defaults":{"method":"http","target":"  1.1.1.1  ","interval":45,"deadInterval":120,"failThreshold":3}}}`)
+	req := httptest.NewRequest(http.MethodPost, "/settings/update", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.Update(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	got, _ := store.Get()
+	if got.PingCheck.Defaults.Target != "1.1.1.1" {
+		t.Fatalf("target = %q, want 1.1.1.1", got.PingCheck.Defaults.Target)
+	}
+
+	body = []byte(`{"pingCheck":{"enabled":false,"defaults":{"method":"http","target":"  ","interval":45,"deadInterval":120,"failThreshold":3}}}`)
+	req = httptest.NewRequest(http.MethodPost, "/settings/update", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	h.Update(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	got, _ = store.Get()
+	if got.PingCheck.Defaults.Target != storage.DefaultPingCheckTarget {
+		t.Fatalf("target = %q, want %q", got.PingCheck.Defaults.Target, storage.DefaultPingCheckTarget)
+	}
+}
+
+func TestUpdate_PingCheckTargetInvalidRejected(t *testing.T) {
+	h, _ := newSettingsHandlerForTest(t)
+	body := []byte(`{"pingCheck":{"enabled":false,"defaults":{"method":"http","target":"https://example.com","interval":45,"deadInterval":120,"failThreshold":3}}}`)
+	req := httptest.NewRequest(http.MethodPost, "/settings/update", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.Update(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "INVALID_PING_CHECK_TARGET") {
+		t.Fatalf("missing INVALID_PING_CHECK_TARGET, body=%s", rec.Body.String())
+	}
+}
+
+func TestUpdate_ConnectivityCheckURLValidEmptyInvalid(t *testing.T) {
+	h, store := newSettingsHandlerForTest(t)
+
+	body := []byte(`{"connectivityCheckUrl":" https://probe.example.net/generate_204 "}`)
+	req := httptest.NewRequest(http.MethodPost, "/settings/update", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.Update(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	got, _ := store.Get()
+	if got.ConnectivityCheckURL != "https://probe.example.net/generate_204" {
+		t.Fatalf("connectivityCheckUrl = %q", got.ConnectivityCheckURL)
+	}
+
+	body = []byte(`{"connectivityCheckUrl":"  "}`)
+	req = httptest.NewRequest(http.MethodPost, "/settings/update", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	h.Update(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	got, _ = store.Get()
+	if got.ConnectivityCheckURL != storage.DefaultConnectivityCheckURL {
+		t.Fatalf("connectivityCheckUrl = %q, want %q", got.ConnectivityCheckURL, storage.DefaultConnectivityCheckURL)
+	}
+
+	body = []byte(`{"connectivityCheckUrl":"ftp://example.net/check"}`)
+	req = httptest.NewRequest(http.MethodPost, "/settings/update", bytes.NewReader(body))
+	rec = httptest.NewRecorder()
+	h.Update(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "INVALID_CONNECTIVITY_CHECK_URL") {
+		t.Fatalf("missing INVALID_CONNECTIVITY_CHECK_URL, body=%s", rec.Body.String())
+	}
+}
+
+// «Включить проверку на всех туннелях» не должно заводить измерение на
+// зеркальных записях прокси-выходов: пользователь их туннелями не заводил, и
+// своя настройка у них есть на карточке. Симметрично для выключения.
+func TestPingCheckOnAllTunnels_SkipsWdttRawMirrors(t *testing.T) {
+	h, store := newSettingsHandlerForTest(t)
+	dir := t.TempDir()
+	tunnels := storage.NewAWGTunnelStoreWithLockDir(dir, filepath.Join(dir, "locks"))
+	h.SetTunnelStore(tunnels)
+
+	own := &storage.AWGTunnel{ID: "awg10", Name: "Свой", Backend: "kernel",
+		DefaultRouteSet: true,
+		Interface:       storage.AWGInterface{Address: "10.0.0.1/32", MTU: 1420}}
+	mirror := &storage.AWGTunnel{ID: "wdttraw-de", Name: "Зеркало", Backend: "wdtt-raw",
+		DefaultRouteSet: true,
+		Interface:       storage.AWGInterface{Address: "10.70.0.2/32", MTU: 1420}}
+	for _, tun := range []*storage.AWGTunnel{own, mirror} {
+		if err := tunnels.Create(tun); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	settings, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.enablePingCheckOnAllTunnels(settings); err != nil {
+		t.Fatal(err)
+	}
+
+	gotOwn, err := tunnels.Get("awg10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotOwn.PingCheck == nil || !gotOwn.PingCheck.Enabled {
+		t.Fatal("на своём туннеле проверка обязана включиться")
+	}
+	gotMirror, err := tunnels.Get("wdttraw-de")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotMirror.PingCheck != nil && gotMirror.PingCheck.Enabled {
+		t.Fatal("на зеркальной записи проверка включена глобальным тумблером: пользователь её не выбирал")
+	}
+}
+
+// F10: отказ деривации ВНУТРИ мутатора store.Update должен отдаваться кодом
+// поля, а не глухим SETTINGS_SAVE_ERROR. Узкие мутаторы валидируемых полей не
+// пишут, поэтому отказ провоцируется конкурентной записью из фейка
+// порт-инспектора — он исполняется между черновой валидацией и записью.
+type corruptingInspector struct {
+	store *storage.SettingsStore
+}
+
+func (c corruptingInspector) InspectPort(int, string) ([]sysports.Binding, error) {
+	_ = c.store.Update(func(s *storage.Settings) error {
+		s.UsageLevel = "garbage" // мимо API такой не пройдёт — имитация будущего писателя
+		return nil
+	})
+	return nil, nil
+}
+
+func TestUpdate_MutatorDerivationFailureReportsFieldCode(t *testing.T) {
+	h, store := newSettingsHandlerForTest(t)
+	h.SetClashPortInspector(corruptingInspector{store: store})
+
+	body := []byte(`{"singboxClashPort":9500}`)
+	req := httptest.NewRequest(http.MethodPost, "/settings/update", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	h.Update(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "INVALID_USAGE_LEVEL") {
+		t.Fatalf("ожидался код поля INVALID_USAGE_LEVEL, body=%s", rec.Body.String())
+	}
+}
+
+func TestSettingsHandler_UpdatePublishesInvalidation(t *testing.T) {
+	h, _ := newSettingsHandlerForTest(t)
+	p := newBusProbe(t)
+	h.SetEventBus(p.bus())
+	rr := perform(h.Update, http.MethodPost, "/settings", `{"usageLevel":"expert"}`)
+	if rr.Code != 200 {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if got, want := p.invalidated(), []string{"settings/updated"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("публикации = %v, want %v", got, want)
+	}
+	// Отказ разбора — публикаций нет.
+	p2 := newBusProbe(t)
+	h2, _ := newSettingsHandlerForTest(t)
+	h2.SetEventBus(p2.bus())
+	if rr := perform(h2.Update, http.MethodPost, "/settings", `{`); rr.Code == 200 {
+		t.Fatal("битый JSON обязан отвергаться")
+	}
+	if got := p2.invalidated(); len(got) != 0 {
+		t.Fatalf("на отказе публикаций быть не должно: %v", got)
+	}
+}
+
+// Ротация: ключ в теле ответа = ключ в сторе ≠ прежнему; UUID v4; публикация api-key-rotated.
+func TestSettingsHandler_RegenerateApiKey_RotatesAndPersists(t *testing.T) {
+	h, store := newSettingsHandlerForTest(t)
+	if err := store.SetApiKey("old-key-0000"); err != nil {
+		t.Fatal(err)
+	}
+	p := newBusProbe(t)
+	h.SetEventBus(p.bus())
+
+	rr := perform(h.RegenerateApiKey, http.MethodPost, "/settings/regenerate-api-key", "")
+	if rr.Code != 200 {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	data, _ := decodeJSONBody(t, rr)["data"].(map[string]any)
+	got, _ := data["apiKey"].(string)
+	snap, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == "" || got == "old-key-0000" || got != snap.ApiKey {
+		t.Fatalf("ключ: тело=%q стор=%q (старый old-key-0000)", got, snap.ApiKey)
+	}
+	if len(got) != 36 || got[14] != '4' {
+		t.Fatalf("ожидался UUID v4, got %q", got)
+	}
+	if got, want := p.invalidated(), []string{"settings/api-key-rotated"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("публикации = %v, want %v", got, want)
+	}
+	rr = perform(h.RegenerateApiKey, http.MethodGet, "/settings/regenerate-api-key", "")
+	if rr.Code != 405 {
+		t.Fatalf("GET → 405, got %d", rr.Code)
+	}
+	if got := p.invalidated(); len(got) != 0 {
+		t.Fatalf("на 405 публикаций быть не должно: %v", got)
 	}
 }

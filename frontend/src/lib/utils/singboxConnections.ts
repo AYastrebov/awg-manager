@@ -24,15 +24,22 @@ export function parseSnapshot(
 	clientsByIP: Map<string, string>,
 ): ConnectionsSnapshot {
 	const rawConns = raw.connections ?? [];
-	const connections: Connection[] = rawConns.map((c) => {
-		const ip = c.metadata.sourceIP.toLowerCase();
-		const clientName = clientsByIP.get(ip);
-		return {
-			...c,
-			clientName,
-			outboundLabel: chainOutboundLabel(c.chains),
-		};
-	});
+	const connections: Connection[] = rawConns
+		// Снапшот приходит по WS без проверки формы: одна битая запись
+		// (metadata/sourceIP/chains не той формы) не должна ронять весь
+		// live-поток шапки и FlowGraph — пропускаем её, остальные живут.
+		.filter(
+			(c) => typeof c?.metadata?.sourceIP === 'string' && Array.isArray(c.chains),
+		)
+		.map((c) => {
+			const ip = c.metadata.sourceIP.toLowerCase();
+			const clientName = clientsByIP.get(ip);
+			return {
+				...c,
+				clientName,
+				outboundLabel: chainOutboundLabel(c.chains),
+			};
+		});
 	return {
 		connections,
 		downloadTotal: raw.downloadTotal ?? 0,
@@ -63,13 +70,14 @@ export function matchFilters(c: Connection, f: ConnectionFilters): boolean {
 export function aggregateBy(
 	conns: Connection[],
 	keyFn: (c: Connection) => string,
+	labelFn: (c: Connection) => string = keyFn,
 ): ConnectionBucket[] {
 	const acc = new Map<string, ConnectionBucket>();
 	let totalDown = 0;
 	for (const c of conns) {
 		const k = keyFn(c);
 		totalDown += c.download;
-		const cur = acc.get(k) ?? { key: k, upload: 0, download: 0, count: 0, pct: 0 };
+		const cur = acc.get(k) ?? { key: k, label: labelFn(c), upload: 0, download: 0, count: 0, pct: 0 };
 		cur.upload += c.upload;
 		cur.download += c.download;
 		cur.count += 1;

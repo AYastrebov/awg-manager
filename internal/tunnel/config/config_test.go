@@ -44,8 +44,8 @@ PersistentKeepalive = 30
 	if tunnel.Peer.Endpoint != "vpn.example.com:51820" {
 		t.Errorf("Endpoint = %q, want %q", tunnel.Peer.Endpoint, "vpn.example.com:51820")
 	}
-	if tunnel.Peer.PersistentKeepalive != 30 {
-		t.Errorf("PersistentKeepalive = %d, want %d", tunnel.Peer.PersistentKeepalive, 30)
+	if tunnel.Peer.PersistentKeepalive != "30" {
+		t.Errorf("PersistentKeepalive = %s, want %d", tunnel.Peer.PersistentKeepalive, 30)
 	}
 	if len(tunnel.Peer.AllowedIPs) != 2 {
 		t.Fatalf("AllowedIPs len = %d, want 2", len(tunnel.Peer.AllowedIPs))
@@ -178,7 +178,7 @@ Endpoint = server:51820
 		t.Errorf("MTU = %d, want default %d", tunnel.Interface.MTU, DefaultMTU)
 	}
 	if tunnel.Peer.PersistentKeepalive != DefaultPersistentKeepalive {
-		t.Errorf("PersistentKeepalive = %d, want default %d",
+		t.Errorf("PersistentKeepalive = %s, want default %s",
 			tunnel.Peer.PersistentKeepalive, DefaultPersistentKeepalive)
 	}
 	if len(tunnel.Peer.AllowedIPs) != 2 {
@@ -261,8 +261,8 @@ PERSISTENTKEEPALIVE = 15
 	if tunnel.Interface.MTU != 1420 {
 		t.Errorf("MTU = %d, want 1420", tunnel.Interface.MTU)
 	}
-	if tunnel.Peer.PersistentKeepalive != 15 {
-		t.Errorf("PersistentKeepalive = %d, want 15", tunnel.Peer.PersistentKeepalive)
+	if tunnel.Peer.PersistentKeepalive != "15" {
+		t.Errorf("PersistentKeepalive = %s, want 15", tunnel.Peer.PersistentKeepalive)
 	}
 }
 
@@ -469,7 +469,7 @@ func TestGenerate_BasicConfig(t *testing.T) {
 			PublicKey:           "pubkey=",
 			Endpoint:            "server:51820",
 			AllowedIPs:          []string{"0.0.0.0/0", "::/0"},
-			PersistentKeepalive: 25,
+			PersistentKeepalive: "25",
 		},
 	}
 
@@ -504,7 +504,7 @@ func TestGenerate_WithObfuscation(t *testing.T) {
 			PublicKey:           "pubkey=",
 			Endpoint:            "server:51820",
 			AllowedIPs:          []string{"0.0.0.0/0"},
-			PersistentKeepalive: 25,
+			PersistentKeepalive: "25",
 		},
 	}
 
@@ -540,7 +540,7 @@ func TestGenerate_WithSignaturePackets(t *testing.T) {
 			PublicKey:           "pubkey=",
 			Endpoint:            "server:51820",
 			AllowedIPs:          []string{"0.0.0.0/0"},
-			PersistentKeepalive: 25,
+			PersistentKeepalive: "25",
 		},
 	}
 
@@ -550,6 +550,39 @@ func TestGenerate_WithSignaturePackets(t *testing.T) {
 	assertContains(t, result, "I2 = CCDD")
 	assertContains(t, result, "I3 = EEFF")
 	assertContains(t, result, "I4 = 0011")
+	assertContains(t, result, "I5 = 2233")
+}
+
+func TestGenerate_WithSignaturePacketsWithoutI1(t *testing.T) {
+	tunnel := &storage.AWGTunnel{
+		Interface: storage.AWGInterface{
+			PrivateKey: "privkey=",
+			AWGObfuscation: storage.AWGObfuscation{
+				Jc:   4,
+				Jmin: 50,
+				Jmax: 1000,
+				S1:   56,
+				S2:   78,
+				H1:   "111",
+				H2:   "222",
+				H3:   "333",
+				H4:   "444",
+				I2:   "CCDD",
+				I5:   "2233",
+			},
+		},
+		Peer: storage.AWGPeer{
+			PublicKey:           "pubkey=",
+			Endpoint:            "server:51820",
+			AllowedIPs:          []string{"0.0.0.0/0"},
+			PersistentKeepalive: "25",
+		},
+	}
+
+	result := Generate(tunnel)
+
+	assertNotContains(t, result, "I1 =")
+	assertContains(t, result, "I2 = CCDD")
 	assertContains(t, result, "I5 = 2233")
 }
 
@@ -563,7 +596,7 @@ func TestGenerate_PresharedKey(t *testing.T) {
 			PresharedKey:        "psk=",
 			Endpoint:            "server:51820",
 			AllowedIPs:          []string{"0.0.0.0/0"},
-			PersistentKeepalive: 25,
+			PersistentKeepalive: "25",
 		},
 	}
 
@@ -580,7 +613,7 @@ func TestGenerate_NoPresharedKey(t *testing.T) {
 			PublicKey:           "pubkey=",
 			Endpoint:            "server:51820",
 			AllowedIPs:          []string{"0.0.0.0/0"},
-			PersistentKeepalive: 25,
+			PersistentKeepalive: "25",
 		},
 	}
 
@@ -597,7 +630,7 @@ func TestGenerate_DefaultAllowedIPs(t *testing.T) {
 			PublicKey:           "pubkey=",
 			Endpoint:            "server:51820",
 			AllowedIPs:          nil, // empty
-			PersistentKeepalive: 25,
+			PersistentKeepalive: "25",
 		},
 	}
 
@@ -789,7 +822,7 @@ func TestRoundtrip_ParseThenGenerate(t *testing.T) {
 			PresharedKey:        "psk=",
 			Endpoint:            "server:51820",
 			AllowedIPs:          []string{"0.0.0.0/0", "::/0"},
-			PersistentKeepalive: 25,
+			PersistentKeepalive: "25",
 		},
 	}
 
@@ -859,6 +892,15 @@ func TestClassifyAWGVersion_AWG15(t *testing.T) {
 	}
 }
 
+func TestClassifyAWGVersion_AWG15_AnySignaturePacket(t *testing.T) {
+	iface := &storage.AWGInterface{
+		AWGObfuscation: storage.AWGObfuscation{I3: "AABB"},
+	}
+	if v := ClassifyAWGVersion(iface); v != "awg1.5" {
+		t.Errorf("ClassifyAWGVersion = %q, want %q", v, "awg1.5")
+	}
+}
+
 func TestClassifyAWGVersion_AWG20(t *testing.T) {
 	iface := &storage.AWGInterface{
 		AWGObfuscation: storage.AWGObfuscation{H1: "100-200", H2: "222", H3: "333", H4: "444", I1: "AABB"},
@@ -888,6 +930,52 @@ func TestClassifyAWGVersion_AWG15_TakesPriorityOverAWG10(t *testing.T) {
 	}
 }
 
+func TestClassifyAWGVersion_AWG3_HeaderProtection(t *testing.T) {
+	iface := &storage.AWGInterface{
+		AWGObfuscation: storage.AWGObfuscation{
+			H1: "1", H2: "2", H3: "3", H4: "4",
+			HeaderProtectionKey: "cGxhY2Vob2xkZXJrZXlwbGFjZWhvbGRlcmtleTEyMzQ=",
+		},
+	}
+	if v := ClassifyAWGVersion(iface); v != "awg3" {
+		t.Errorf("ClassifyAWGVersion = %q, want %q", v, "awg3")
+	}
+}
+
+func TestClassifyAWGVersion_AWG3_AnyTimerParam(t *testing.T) {
+	// A single awg3 timing param (no header-protection) is still AWG 3.0.
+	iface := &storage.AWGInterface{
+		AWGObfuscation: storage.AWGObfuscation{RekeyAfterTime: "120-150"},
+	}
+	if v := ClassifyAWGVersion(iface); v != "awg3" {
+		t.Errorf("ClassifyAWGVersion = %q, want %q", v, "awg3")
+	}
+}
+
+func TestClassifyAWGVersion_AWG3_TakesPriorityOverAWG20(t *testing.T) {
+	// awg3 params + AWG 2.0 H-ranges + signature packet → awg3 wins.
+	iface := &storage.AWGInterface{
+		AWGObfuscation: storage.AWGObfuscation{
+			H1: "100-200", H2: "2", H3: "3", H4: "4", I1: "sig",
+			MaxHandshakeAttempts: "5",
+		},
+	}
+	if v := ClassifyAWGVersion(iface); v != "awg3" {
+		t.Errorf("ClassifyAWGVersion = %q, want %q", v, "awg3")
+	}
+}
+
+func TestIsAWGObfuscated_AWG3Only(t *testing.T) {
+	// Header-protection alone (no Jc/S/H/I) must count as obfuscated so
+	// writeAWGParams emits the awg3 block.
+	iface := &storage.AWGInterface{
+		AWGObfuscation: storage.AWGObfuscation{ContentPaddingAddition: "16"},
+	}
+	if !IsAWGObfuscated(iface) {
+		t.Errorf("IsAWGObfuscated = false, want true for awg3-only config")
+	}
+}
+
 // --- isRange tests ---
 
 func TestIsRange(t *testing.T) {
@@ -913,6 +1001,112 @@ func TestIsRange(t *testing.T) {
 	}
 }
 
+// --- AWG 3.0 (kernel feat/awg3) device params ---
+
+func TestGenerate_WithAWG3Params(t *testing.T) {
+	tunnel := &storage.AWGTunnel{
+		Interface: storage.AWGInterface{
+			PrivateKey: "privkey=",
+			AWGObfuscation: storage.AWGObfuscation{
+				H1: "1", H2: "2", H3: "3", H4: "4",
+				HeaderProtectionKey:    "cGxhY2Vob2xkZXJrZXlwbGFjZWhvbGRlcmtleTEyMzQ=",
+				ContentPaddingAddition: "16",
+				RekeyAfterTime:         "120-150",
+				RekeyTimeout:           "5",
+				RejectAfterTime:        "180",
+				KeepaliveTimeout:       "25",
+				MaxHandshakeAttempts:   "5",
+			},
+		},
+		Peer: storage.AWGPeer{
+			PublicKey:  "pubkey=",
+			Endpoint:   "server:51820",
+			AllowedIPs: []string{"0.0.0.0/0"},
+		},
+	}
+
+	result := Generate(tunnel)
+
+	assertContains(t, result, "HeaderProtectionKey = cGxhY2Vob2xkZXJrZXlwbGFjZWhvbGRlcmtleTEyMzQ=")
+	assertContains(t, result, "ContentPaddingAddition = 16")
+	assertContains(t, result, "RekeyAfterTime = 120-150")
+	assertContains(t, result, "RekeyTimeout = 5")
+	assertContains(t, result, "RejectAfterTime = 180")
+	assertContains(t, result, "KeepaliveTimeout = 25")
+	assertContains(t, result, "MaxHandshakeAttempts = 5")
+}
+
+func TestGenerate_OmitsUnsetAWG3Params(t *testing.T) {
+	tunnel := &storage.AWGTunnel{
+		Interface: storage.AWGInterface{
+			PrivateKey: "privkey=",
+			AWGObfuscation: storage.AWGObfuscation{
+				H1: "1", H2: "2", H3: "3", H4: "4",
+				RekeyAfterTime: "120", // only one awg3 param set
+			},
+		},
+		Peer: storage.AWGPeer{PublicKey: "pubkey=", Endpoint: "server:51820", AllowedIPs: []string{"0.0.0.0/0"}},
+	}
+
+	result := Generate(tunnel)
+
+	assertContains(t, result, "RekeyAfterTime = 120")
+	assertNotContains(t, result, "HeaderProtectionKey =")
+	assertNotContains(t, result, "ContentPaddingAddition =")
+	assertNotContains(t, result, "MaxHandshakeAttempts =")
+}
+
+func TestParse_AWG3Params(t *testing.T) {
+	content := `[Interface]
+PrivateKey = privkey=
+Address = 10.0.0.2/32
+H1 = 1
+H2 = 2
+H3 = 3
+H4 = 4
+HeaderProtectionKey = cGxhY2Vob2xkZXJrZXlwbGFjZWhvbGRlcmtleTEyMzQ=
+ContentPaddingAddition = 16
+RekeyAfterTime = 120-150
+RekeyTimeout = 5
+RejectAfterTime = 180
+KeepaliveTimeout = 25
+MaxHandshakeAttempts = 5
+
+[Peer]
+PublicKey = pubkey=
+Endpoint = server:51820
+AllowedIPs = 0.0.0.0/0
+`
+
+	tunnel, err := Parse(content)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	iface := tunnel.Interface
+	if iface.HeaderProtectionKey != "cGxhY2Vob2xkZXJrZXlwbGFjZWhvbGRlcmtleTEyMzQ=" {
+		t.Errorf("HeaderProtectionKey = %q", iface.HeaderProtectionKey)
+	}
+	if iface.ContentPaddingAddition != "16" {
+		t.Errorf("ContentPaddingAddition = %q, want 16", iface.ContentPaddingAddition)
+	}
+	if iface.RekeyAfterTime != "120-150" {
+		t.Errorf("RekeyAfterTime = %q, want 120-150", iface.RekeyAfterTime)
+	}
+	if iface.RekeyTimeout != "5" {
+		t.Errorf("RekeyTimeout = %q, want 5", iface.RekeyTimeout)
+	}
+	if iface.RejectAfterTime != "180" {
+		t.Errorf("RejectAfterTime = %q, want 180", iface.RejectAfterTime)
+	}
+	if iface.KeepaliveTimeout != "25" {
+		t.Errorf("KeepaliveTimeout = %q, want 25", iface.KeepaliveTimeout)
+	}
+	if iface.MaxHandshakeAttempts != "5" {
+		t.Errorf("MaxHandshakeAttempts = %q, want 5", iface.MaxHandshakeAttempts)
+	}
+}
+
 // --- Helpers ---
 
 func assertContains(t *testing.T, s, substr string) {
@@ -926,5 +1120,131 @@ func assertNotContains(t *testing.T, s, substr string) {
 	t.Helper()
 	if strings.Contains(s, substr) {
 		t.Errorf("output should not contain %q:\n%s", substr, s)
+	}
+}
+
+// --- AWG 3.1 boolean device flags ---
+
+func TestGenerate_AWG31Flags(t *testing.T) {
+	cases := map[string]struct {
+		obf     storage.AWGObfuscation
+		want    []string
+		notWant []string
+	}{
+		"both off": {
+			obf:     storage.AWGObfuscation{},
+			notWant: []string{"RandomTrailers", "DisableCookies"},
+		},
+		"trailers on": {
+			obf:     storage.AWGObfuscation{RandomTrailers: true},
+			want:    []string{"RandomTrailers = on"},
+			notWant: []string{"DisableCookies"},
+		},
+		"cookies disabled": {
+			obf:     storage.AWGObfuscation{DisableCookies: true},
+			want:    []string{"DisableCookies = on"},
+			notWant: []string{"RandomTrailers"},
+		},
+		"both on": {
+			obf:  storage.AWGObfuscation{RandomTrailers: true, DisableCookies: true},
+			want: []string{"RandomTrailers = on", "DisableCookies = on"},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			tunnel := &storage.AWGTunnel{
+				Interface: storage.AWGInterface{
+					PrivateKey:     "aPrivateKey123=",
+					Address:        "10.0.0.2/32",
+					AWGObfuscation: tc.obf,
+				},
+				Peer: storage.AWGPeer{PublicKey: "aPublicKey456="},
+			}
+			got := Generate(tunnel)
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Fatalf("expected %q in:\n%s", want, got)
+				}
+			}
+			for _, notWant := range tc.notWant {
+				if strings.Contains(got, notWant) {
+					t.Fatalf("expected no %q in:\n%s", notWant, got)
+				}
+			}
+		})
+	}
+}
+
+// TestParse_AWG31FlagsOffIsAbsent pins that "off" reads as not set. The kernel
+// puts both flags into every device dump unconditionally, so `awg showconf`
+// always prints them, and importing that output must not turn a plain tunnel
+// into an awg3 one — the same trap awg3Range already guards for "0".
+func TestParse_AWG31Flags(t *testing.T) {
+	cases := map[string]struct {
+		line string
+		want bool
+	}{
+		"on":      {"RandomTrailers = on", true},
+		"On":      {"RandomTrailers = On", true},
+		"numeric": {"RandomTrailers = 1", true},
+		"off":     {"RandomTrailers = off", false},
+		"zero":    {"RandomTrailers = 0", false},
+		"absent":  {"", false},
+		"garbage": {"RandomTrailers = maybe", false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			conf := "[Interface]\nPrivateKey = aPrivateKey123=\nAddress = 10.0.0.2/32\n" +
+				tc.line + "\n\n[Peer]\nPublicKey = aPublicKey456=\nEndpoint = 1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0\n"
+			tunnel, err := Parse(conf)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tunnel.Interface.RandomTrailers != tc.want {
+				t.Fatalf("RandomTrailers = %v, want %v", tunnel.Interface.RandomTrailers, tc.want)
+			}
+		})
+	}
+}
+
+func TestParse_AWG31DisableCookies(t *testing.T) {
+	conf := "[Interface]\nPrivateKey = aPrivateKey123=\nAddress = 10.0.0.2/32\n" +
+		"DisableCookies = on\n\n[Peer]\nPublicKey = aPublicKey456=\nEndpoint = 1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0\n"
+	tunnel, err := Parse(conf)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !tunnel.Interface.DisableCookies {
+		t.Fatal("DisableCookies = on did not parse")
+	}
+}
+
+// TestClassifyAWGVersion_AWG31Flags keeps a showconf round-trip of a plain
+// tunnel classified as plain: both flags printed as off must leave it alone.
+func TestClassifyAWGVersion_AWG31Flags(t *testing.T) {
+	plain := &storage.AWGInterface{}
+	if got := ClassifyAWGVersion(plain); got != "wg" {
+		t.Fatalf("an interface with both flags off classified as %q", got)
+	}
+	withFlag := &storage.AWGInterface{
+		AWGObfuscation: storage.AWGObfuscation{RandomTrailers: true},
+	}
+	if got := ClassifyAWGVersion(withFlag); got != "awg3.1" {
+		t.Fatalf("RandomTrailers on classified as %q, want awg3.1", got)
+	}
+	withCookies := &storage.AWGInterface{
+		AWGObfuscation: storage.AWGObfuscation{DisableCookies: true},
+	}
+	if got := ClassifyAWGVersion(withCookies); got != "awg3.1" {
+		t.Fatalf("DisableCookies on classified as %q, want awg3.1", got)
+	}
+	// A 3.0 param alongside a flag is still a 3.1 config: 3.1 is a superset.
+	mixed := &storage.AWGInterface{
+		AWGObfuscation: storage.AWGObfuscation{
+			HeaderProtectionKey: "aKey=", RandomTrailers: true,
+		},
+	}
+	if got := ClassifyAWGVersion(mixed); got != "awg3.1" {
+		t.Fatalf("HeaderProtectionKey + RandomTrailers classified as %q, want awg3.1", got)
 	}
 }

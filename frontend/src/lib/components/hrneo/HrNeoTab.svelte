@@ -1,3 +1,8 @@
+<script lang="ts" module>
+	/** Survives tab unmount on /routing so sidebar target/service selection is restored. */
+	let persistedSelection: import('./HrNeoTargetSidebar.svelte').SidebarSelection = null;
+</script>
+
 <script lang="ts">
 	import { api } from '$lib/api/client';
 	import type {
@@ -10,17 +15,19 @@
 	} from '$lib/types';
 	import { notifications } from '$lib/stores/notifications';
 	import { Modal, StoreStatusBadge, Button } from '$lib/components/ui';
-	import { dnsRoutesStore } from '$lib/stores/routing';
+	import { dnsRoutesStore, invalidateAllRouting, routingTunnelsStore } from '$lib/stores/routing';
 	import { InterfaceList } from '$lib/components/accesspolicy';
 	import HrNeoTargetSidebar, {
 		type TargetEntry,
 		type SidebarSelection,
 	} from './HrNeoTargetSidebar.svelte';
 	import HrNeoRulesList from './HrNeoRulesList.svelte';
-	import HrNeoGeoDataView from './HrNeoGeoDataView.svelte';
 	import HrNeoSettingsView from './HrNeoSettingsView.svelte';
 	import HrNeoDisabledTagsView from './HrNeoDisabledTagsView.svelte';
 	import HrNeoEditModal from './HrNeoEditModal.svelte';
+	import { IconPickerModal, ServiceCatalogModal } from '$lib/components/dnsroutes';
+	import type { CatalogPreset } from '$lib/types';
+	import { hrNeoCatalogPresetFilter } from '$lib/utils/catalog-preset';
 
 	interface Props {
 		dnsRoutes: DnsRoute[];
@@ -58,13 +65,25 @@
 	});
 
 	let geoFiles = $state<GeoFileEntry[]>([]);
-	let selection = $state<SidebarSelection>(null);
+	// svelte-ignore state_referenced_locally
+	let selection = $state<SidebarSelection>(persistedSelection);
+
+	$effect(() => {
+		persistedSelection = selection;
+	});
+
+	let hrNeoDataReady = $derived(
+		($dnsRoutesStore.lastFetchedAt > 0 || $dnsRoutesStore.status === 'error') &&
+			($routingTunnelsStore.lastFetchedAt > 0 || $routingTunnelsStore.status === 'error'),
+	);
 
 	let editOpen = $state(false);
 	let editingRule = $state<DnsRoute | null>(null);
 	let editInitialTarget = $state<{ kind: 'interface' | 'policy'; name: string } | undefined>(
 		undefined,
 	);
+	let editInitialPreset = $state<CatalogPreset | null>(null);
+	let catalogOpen = $state(false);
 	let saving = $state(false);
 
 	let isMobile = $state(false);
@@ -92,6 +111,62 @@
 	let maxelem = $state<number>(0);
 	let oversizedInstalled = $state<boolean>(false);
 	let pendingOversizedRefresh: ReturnType<typeof setTimeout> | null = null;
+
+	/** Debounce HR Neo restarts when toggling several rules quickly. */
+	const HR_TOGGLE_DEBOUNCE_MS = 600;
+	let optimisticEnabled = $state<Record<string, boolean>>({});
+	let pendingToggleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	/** Per-rule generation — stale API responses are ignored after a newer toggle. */
+	let toggleGeneration = new Map<string, number>();
+	let hrToggleLoadingId = $state<string | null>(null);
+
+	function ruleForCard(rule: DnsRoute): DnsRoute {
+		if (rule.id in optimisticEnabled) {
+			return { ...rule, enabled: optimisticEnabled[rule.id] };
+		}
+		return rule;
+	}
+
+	function scheduleHrRuleToggle(rule: DnsRoute, enabled: boolean) {
+		optimisticEnabled = { ...optimisticEnabled, [rule.id]: enabled };
+		const gen = (toggleGeneration.get(rule.id) ?? 0) + 1;
+		toggleGeneration.set(rule.id, gen);
+		const prev = pendingToggleTimers.get(rule.id);
+		if (prev) clearTimeout(prev);
+		pendingToggleTimers.set(
+			rule.id,
+			setTimeout(() => {
+				pendingToggleTimers.delete(rule.id);
+				void flushHrRuleToggle(rule.id, gen);
+			}, HR_TOGGLE_DEBOUNCE_MS),
+		);
+	}
+
+	async function flushHrRuleToggle(id: string, gen: number) {
+		if (toggleGeneration.get(id) !== gen) return;
+		const enabled = optimisticEnabled[id];
+		if (enabled === undefined) return;
+
+		hrToggleLoadingId = id;
+		try {
+			const fresh = await api.setDnsRouteEnabled(id, enabled);
+			if (toggleGeneration.get(id) !== gen) return;
+			dnsRoutesStore.applyMutationResponse(fresh);
+			const next = { ...optimisticEnabled };
+			delete next[id];
+			optimisticEnabled = next;
+		} catch (e: unknown) {
+			if (toggleGeneration.get(id) !== gen) return;
+			const next = { ...optimisticEnabled };
+			delete next[id];
+			optimisticEnabled = next;
+			notifications.error(e instanceof Error ? e.message : String(e));
+		} finally {
+			if (toggleGeneration.get(id) === gen) {
+				hrToggleLoadingId = null;
+			}
+		}
+	}
 
 	async function loadOversized() {
 		try {
@@ -121,6 +196,8 @@
 
 	$effect(() => () => {
 		if (pendingOversizedRefresh) clearTimeout(pendingOversizedRefresh);
+		for (const t of pendingToggleTimers.values()) clearTimeout(t);
+		pendingToggleTimers.clear();
 	});
 
 	function targetOf(r: DnsRoute): { name: string; kind: 'policy' | 'interface' } | null {
@@ -190,29 +267,62 @@
 
 	let geositeFiles = $derived(geoFiles.filter((g) => g.type === 'geosite').map((g) => g.path));
 	let geoipFiles = $derived(geoFiles.filter((g) => g.type === 'geoip').map((g) => g.path));
-
-	// Auto-select first target (or geodata) when none is selected
+	// Auto-select first target (policy or interface) or settings once routing
+	// data is known. Without the ready gate, a cold ?tab=hrneo load sees
+	// targets=[] briefly and sticks on settings even after rules arrive.
 	$effect(() => {
-		if (!selection) {
-			if (targets.length > 0) selection = { type: 'target', name: targets[0].name };
-			else selection = { type: 'service', item: 'geodata' };
-		}
+		if (selection) return;
+		if (!hrNeoDataReady) return;
+		if (targets.length > 0) selection = { type: 'target', name: targets[0].name };
+		else selection = { type: 'service', item: 'settings' };
+	});
+
+	// Drop a stale persisted target (policy or interface) if it vanished.
+	$effect(() => {
+		const sel = selection;
+		if (!sel || sel.type !== 'target') return;
+		if (!hrNeoDataReady) return;
+		if (targets.some((t) => t.name === sel.name)) return;
+		selection = null;
 	});
 
 	function openNewRule() {
 		editingRule = null;
 		editInitialTarget = undefined;
+		editInitialPreset = null;
 		editOpen = true;
 	}
 
-	function openNewRuleForSelectedTarget() {
+	function openNewRuleForSelectedTarget(preset: CatalogPreset | null = null) {
 		editingRule = null;
 		if (selection?.type === 'target' && selectedTargetEntry) {
 			editInitialTarget = { kind: selectedTargetEntry.kind, name: selection.name };
 		} else {
 			editInitialTarget = undefined;
 		}
+		editInitialPreset = preset;
 		editOpen = true;
+	}
+
+	function openCatalogForTarget() {
+		catalogOpen = true;
+	}
+
+	function handleCatalogConfirm(presets: CatalogPreset[]) {
+		catalogOpen = false;
+		const preset = presets[0];
+		if (!preset) return;
+		openNewRuleForSelectedTarget(preset);
+	}
+
+	function openCatalogFromEdit() {
+		catalogOpen = true;
+	}
+
+	function handleCatalogPickFromEdit(presets: CatalogPreset[]) {
+		catalogOpen = false;
+		if (presets.length === 0) return;
+		editInitialPreset = presets[0];
 	}
 
 	function openEditRule(r: DnsRoute) {
@@ -246,14 +356,11 @@
 			} else {
 				await api.createDnsRoute(payload);
 			}
-			editOpen = false;
 			scheduleOversizedRefresh();
-			// HR Neo save may have created a fresh NDMS policy and/or permitted
-			// interfaces through the orchestrator. Those mutations don't flow
-			// through AccessPolicyHandler, so no automatic SSE snapshot is
-			// broadcast — the sidebar target flashes "broken" until the user
-			// refreshes. Force a routing refresh to pull the new state in.
 			api.refreshRouting().catch(() => {});
+
+			editOpen = false;
+			editInitialPreset = null;
 		} catch (e: unknown) {
 			const msg = e instanceof Error ? e.message : String(e);
 			notifications.error(msg);
@@ -263,10 +370,17 @@
 	}
 
 	let pendingDelete = $state<DnsRoute | null>(null);
+	let iconPickerOpen = $state(false);
+	let pickingForRule = $state<DnsRoute | null>(null);
 	let deleting = $state(false);
 
 	function handleDelete(r: DnsRoute) {
 		pendingDelete = r;
+	}
+
+	function openIconPicker(rule: DnsRoute) {
+		pickingForRule = rule;
+		iconPickerOpen = true;
 	}
 
 	async function confirmDelete() {
@@ -334,6 +448,10 @@
 	function policyByName(name: string) {
 		return policies.find((p) => p.name === name) ?? null;
 	}
+
+	function handleInterfaceListUpdate() {
+		invalidateAllRouting();
+	}
 </script>
 
 <div class="hrneo-status-row">
@@ -364,10 +482,11 @@
 						<InterfaceList
 							interfaces={selectedPolicy.interfaces ?? []}
 							availableInterfaces={policyInterfaces}
+							addPickerVariant="panel"
 							onpermit={policyPermit}
 							ondeny={policyDeny}
 							onreorder={policyPermit}
-							onupdate={() => {}}
+							onupdate={handleInterfaceListUpdate}
 						/>
 					</section>
 				{/if}
@@ -375,12 +494,15 @@
 					target={selection.name}
 					targetKind={selectedTargetEntry.kind}
 					rules={rulesOfSelected}
-					onaddrule={openNewRuleForSelectedTarget}
+					displayRule={ruleForCard}
+					toggleLoadingId={hrToggleLoadingId}
+					ontogglerule={scheduleHrRuleToggle}
+					oncatalog={openCatalogForTarget}
+					onmanual={() => openNewRuleForSelectedTarget(null)}
 					oneditrule={openEditRule}
 					ondeleterule={handleDelete}
+					oniconrule={openIconPicker}
 				/>
-			{:else if selection?.type === 'service' && selection.item === 'geodata'}
-				<HrNeoGeoDataView files={geoFiles} onrefresh={loadGeoFiles} />
 			{:else if selection?.type === 'service' && selection.item === 'disabled-tags'}
 				<HrNeoDisabledTagsView tags={oversizedTags} {maxelem} />
 			{:else if selection?.type === 'service' && selection.item === 'settings'}
@@ -409,10 +531,11 @@
 								<InterfaceList
 									interfaces={pol.interfaces ?? []}
 									availableInterfaces={policyInterfaces}
+									addPickerVariant="panel"
 									onpermit={(iface, order) => permitInterfaceFor(t.name, iface, order)}
 									ondeny={(iface) => denyInterfaceFor(t.name, iface)}
 									onreorder={(iface, order) => permitInterfaceFor(t.name, iface, order)}
-									onupdate={() => {}}
+									onupdate={handleInterfaceListUpdate}
 								/>
 							</section>
 						{/if}
@@ -420,22 +543,24 @@
 							target={t.name}
 							targetKind={t.kind}
 							rules={hrRules.filter((r) => targetOf(r)?.name === t.name)}
-							onaddrule={() => {
-								editInitialTarget = { kind: t.kind, name: t.name };
-								editingRule = null;
-								editOpen = true;
+							displayRule={ruleForCard}
+							toggleLoadingId={hrToggleLoadingId}
+							ontogglerule={scheduleHrRuleToggle}
+							oncatalog={() => {
+								selection = { type: 'target', name: t.name };
+								openCatalogForTarget();
+							}}
+							onmanual={() => {
+								selection = { type: 'target', name: t.name };
+								openNewRuleForSelectedTarget(null);
 							}}
 							oneditrule={openEditRule}
 							ondeleterule={handleDelete}
+							oniconrule={openIconPicker}
 						/>
 					</div>
 				</details>
 			{/each}
-
-			<details>
-				<summary>Гео-данные ({geoFiles.length})</summary>
-				<div class="acc-body"><HrNeoGeoDataView files={geoFiles} onrefresh={loadGeoFiles} /></div>
-			</details>
 
 			<details>
 				<summary>Настройки демона</summary>
@@ -456,8 +581,33 @@
 	{maxelem}
 	{saving}
 	initialTarget={editInitialTarget}
+	initialPreset={editInitialPreset}
+	onpickcatalog={() => {
+		if (editOpen) openCatalogFromEdit();
+		else openCatalogForTarget();
+	}}
 	onsave={handleSave}
-	onclose={() => (editOpen = false)}
+	onclose={() => {
+		editOpen = false;
+		editInitialPreset = null;
+	}}
+/>
+
+<ServiceCatalogModal
+	bind:open={catalogOpen}
+	title="Каталог сервисов"
+	presetFilter={hrNeoCatalogPresetFilter}
+	footer="none"
+	multiple={false}
+	confirmLabel="Выбрать"
+	onclose={() => (catalogOpen = false)}
+	onconfirm={(presets) => {
+		if (editOpen) {
+			handleCatalogPickFromEdit(presets);
+		} else {
+			handleCatalogConfirm(presets);
+		}
+	}}
 />
 
 {#if pendingDelete}
@@ -483,6 +633,31 @@
 			</Button>
 		{/snippet}
 	</Modal>
+{/if}
+
+{#if pickingForRule}
+	<IconPickerModal
+		open={iconPickerOpen}
+		iconUrl={pickingForRule.iconUrl}
+		ruleName={pickingForRule.name}
+		onclose={() => {
+			iconPickerOpen = false;
+			pickingForRule = null;
+		}}
+		onapply={async (newUrl) => {
+			if (!pickingForRule) return;
+			const rule = pickingForRule;
+			iconPickerOpen = false;
+			pickingForRule = null;
+			try {
+				await api.updateDnsRoute(rule.id, { ...rule, iconUrl: newUrl ?? undefined });
+				invalidateAllRouting();
+				notifications.success(newUrl ? 'Иконка изменена' : 'Иконка сброшена');
+			} catch (e: unknown) {
+				notifications.error(e instanceof Error ? e.message : 'Не удалось обновить иконку');
+			}
+		}}
+	/>
 {/if}
 
 <style>
@@ -517,7 +692,7 @@
 		align-items: start;
 	}
 	.hrneo-tab.mobile {
-		grid-template-columns: 1fr;
+		grid-template-columns: minmax(0, 1fr);
 		gap: 8px;
 	}
 	.pane-container {
@@ -573,7 +748,11 @@
 	}
 	.tname {
 		flex: 1;
+		min-width: 0;
 		font-weight: 600;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
 	}
 	.tmeta {
 		color: var(--text-muted);
@@ -597,6 +776,11 @@
 		justify-content: space-between;
 		gap: 10px;
 		margin-bottom: 10px;
+		/* Issue #214 Sc1: на 357px viewport h3 + hint не помещались, и
+		 * hint "Изменения сохраняются сразу через RCI" обрезался эллипсисом.
+		 * flex-wrap позволяет hint'у перенестись на следующую строку,
+		 * а min-width: 0 на детях разрешает переносы внутри hint'а. */
+		flex-wrap: wrap;
 	}
 	.panel-header h3 {
 		margin: 0;
@@ -608,5 +792,6 @@
 		color: var(--text-muted);
 		font-size: 0.75rem;
 		font-style: italic;
+		min-width: 0;
 	}
 </style>

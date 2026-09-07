@@ -1,20 +1,26 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
 	import { api } from '$lib/api/client';
+	import { Button, Modal } from '$lib/components/ui';
 	import { diagnosticsStore } from '$lib/stores/diagnostics';
+	import { developFeedbackIncidentPending } from '$lib/stores/developFeedbackIncident';
 	import type { DiagnosticsTargetSeed } from '$lib/stores/diagnostics';
+	import { notifications } from '$lib/stores/notifications';
+	import { copyToClipboard } from '$lib/utils/clipboard';
 	import type { DiagEvent } from '$lib/types';
 	import {
 		ChecksToolbar,
 		ChecksGroup,
 		ClientDnsCheck,
 	} from '$lib/components/diagnostics';
+	import { collectDiagnosticsEnvironmentSnapshot } from '$lib/utils/diagnostics-environment';
 	import {
 		GLOBAL_TARGET_ID,
 		type DiagTestEvent,
 		type TargetSummary,
 	} from '$lib/types';
 	import type { GroupLed } from '$lib/components/diagnostics/ChecksGroup.svelte';
+	import { GITHUB_BUG_REPORT_URL } from '$lib/utils/githubFeedback';
 
 	interface Props {
 		tunnels: DiagnosticsTargetSeed[];
@@ -22,8 +28,13 @@
 
 	let { tunnels }: Props = $props();
 
+	const DIAGNOSTICS_REPORT_FILENAME = 'diagnostics.json';
+
 	let includeRestart = $state(false);
 	let downloadingReport = $state(false);
+	let creatingIncident = $state(false);
+	let incidentModalOpen = $state(false);
+	let awaitingIncidentModal = $state(false);
 	let eventSource: EventSource | null = null;
 
 	// Hide stopped tunnels — diagnostics only run on running ones.
@@ -154,13 +165,118 @@
 		);
 	}
 
+	async function downloadCurrentReport() {
+		let environment: unknown;
+		try {
+			environment = await collectDiagnosticsEnvironmentSnapshot();
+		} catch (e) {
+			environment = {
+				source: 'frontend',
+				partial: true,
+				errors: [{ scope: 'environment', message: e instanceof Error ? e.message : String(e) }],
+			};
+		}
+		await api.downloadDiagnosticsReport(environment);
+	}
+
 	async function downloadReport() {
 		downloadingReport = true;
 		try {
-			await api.downloadDiagnosticsReport();
+			await downloadCurrentReport();
 		} catch (e) {
 			diagnosticsStore.fail((e as Error).message);
 		} finally {
+			downloadingReport = false;
+		}
+	}
+
+	function openIncidentModal() {
+		incidentModalOpen = true;
+	}
+
+	$effect(() => {
+		if (!$developFeedbackIncidentPending) return;
+		developFeedbackIncidentPending.set(false);
+		awaitingIncidentModal = true;
+		if (!running) {
+			start();
+		}
+	});
+
+	$effect(() => {
+		if (!awaitingIncidentModal || running) return;
+		awaitingIncidentModal = false;
+		openIncidentModal();
+	});
+
+	function buildIncidentIssueBody(): string {
+		const pagePath = typeof window !== 'undefined'
+			? `${window.location.pathname}${window.location.search}${window.location.hash}`
+			: '/diagnostics';
+		return [
+			'## Что произошло',
+			'',
+			'<!-- Опишите проблему своими словами -->',
+			'',
+			'## Что ожидалось',
+			'',
+			'<!-- Что должно было произойти -->',
+			'',
+			'## Контекст',
+			'',
+			`- Страница: \`${pagePath}\``,
+			`- Создано: \`${new Date().toISOString()}\``,
+			`- Отчёт диагностики: прикрепите скачанный файл \`${DIAGNOSTICS_REPORT_FILENAME}\``,
+			'',
+			'## Важно',
+			'',
+			'Это публичный issue. Не прикладывайте приватные ключи, пароли, токены, реальные адреса и домены, если не хотите их раскрывать.',
+		].join('\n');
+	}
+
+	function copyText(text: string): Promise<boolean> {
+		return copyToClipboard(text);
+	}
+
+	function openPendingIssueWindow(): Window | null {
+		if (typeof window === 'undefined') return null;
+		const issueWindow = window.open('', '_blank');
+		if (issueWindow) {
+			issueWindow.opener = null;
+		}
+		return issueWindow;
+	}
+
+	async function confirmCreateIncident() {
+		if (!hasReport) {
+			incidentModalOpen = false;
+			return;
+		}
+
+		creatingIncident = true;
+		downloadingReport = true;
+		const issueWindow = openPendingIssueWindow();
+		try {
+			await downloadCurrentReport();
+			const body = buildIncidentIssueBody();
+			const copied = await copyText(body);
+			if (copied) {
+				notifications.success('Текст issue скопирован. Прикрепите скачанный отчёт на GitHub.');
+			} else {
+				notifications.warning('Отчёт скачан. Текст issue не удалось скопировать автоматически.');
+			}
+			const url = GITHUB_BUG_REPORT_URL;
+			if (issueWindow) {
+				issueWindow.location.href = url;
+			} else if (typeof window !== 'undefined') {
+				window.open(url, '_blank', 'noopener,noreferrer');
+			}
+			incidentModalOpen = false;
+		} catch (e) {
+			issueWindow?.close();
+			diagnosticsStore.fail((e as Error).message);
+		} finally {
+			creatingIncident = false;
 			downloadingReport = false;
 		}
 	}
@@ -188,6 +304,8 @@
 		onChangeIncludeRestart={(v) => (includeRestart = v)}
 		onStart={start}
 		onDownloadReport={downloadReport}
+		onCreateIncident={openIncidentModal}
+		{creatingIncident}
 	/>
 
 	<!-- DNS-маршрутизация — первая группа, отдельный flow -->
@@ -219,6 +337,53 @@
 	{/if}
 </div>
 
+<Modal
+	open={incidentModalOpen}
+	title={hasReport ? 'Создать инцидент на GitHub' : 'Сначала выполните диагностику'}
+	size="md"
+	onclose={() => (incidentModalOpen = false)}
+>
+	<div class="incident-modal-body">
+		{#if hasReport}
+			<p>
+				AWG Manager — open-source проект без службы поддержки и SLA. Инцидент попадёт
+				в публичный GitHub issue; ответ и исправление не гарантируются.
+			</p>
+			<p>
+				Будет скачан диагностический отчёт. Проверьте файл перед публикацией и
+				<strong>прикрепите его к issue вручную</strong>.
+			</p>
+			<p class="incident-warning">
+				Не публикуйте приватные ключи, пароли, токены, реальные адреса и домены,
+				если не хотите их раскрывать.
+			</p>
+		{:else}
+			<p>
+				Инцидент лучше создавать после полного прогона диагностики, чтобы к нему
+				можно было приложить отчёт.
+			</p>
+			<p class="incident-warning">
+				Запустите проверки, дождитесь завершения и вернитесь к кнопке «Инцидент».
+			</p>
+		{/if}
+	</div>
+
+	{#snippet actions()}
+		{#if hasReport}
+			<Button variant="secondary" size="md" onclick={() => (incidentModalOpen = false)} disabled={creatingIncident}>
+				Отмена
+			</Button>
+			<Button variant="primary" size="md" onclick={confirmCreateIncident} loading={creatingIncident}>
+				Скачать и открыть GitHub
+			</Button>
+		{:else}
+			<Button variant="primary" size="md" onclick={() => (incidentModalOpen = false)}>
+				Понятно
+			</Button>
+		{/if}
+	{/snippet}
+</Modal>
+
 <style>
 	.container {
 		background: var(--color-bg-secondary);
@@ -239,5 +404,26 @@
 		font-size: 12px;
 		color: var(--color-text-muted);
 		font-style: italic;
+	}
+
+	.incident-modal-body {
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+		font-size: 0.875rem;
+		line-height: 1.5;
+		color: var(--color-text-secondary);
+	}
+
+	.incident-modal-body p {
+		margin: 0;
+	}
+
+	.incident-warning {
+		padding: 0.75rem;
+		border: 1px solid var(--color-warning-border);
+		border-radius: var(--radius-sm);
+		background: var(--color-warning-tint);
+		color: var(--color-warning);
 	}
 </style>

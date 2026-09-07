@@ -3,8 +3,8 @@
 
   export interface LogsFilter {
     search: string;
-    group: string;
-    subgroup: string;
+    groups: string[];
+    subgroups: string[];
     levels: string[];
   }
 
@@ -47,6 +47,8 @@
     'access-policy': 'Access policies',
     'client-route': 'Per-client routes',
     'singbox-router': 'Sing-box router',
+    'bypass-set': 'Набор обхода',
+    subscription: 'Подписки',
     deviceproxy: 'Device proxy',
     hrneo: 'HrNeo',
     catalog: 'Каталог',
@@ -68,6 +70,11 @@
     profiling: 'Profiling HTTP',
     rci: 'RCI',
     ndms: 'NDMS',
+    storage: 'Хранилище',
+    monitoring: 'Мониторинг',
+    orchestrator: 'Оркестратор',
+    kmod: 'Модуль ядра',
+    http: 'HTTP-сервер',
   };
 
   export interface BufferBadge {
@@ -78,6 +85,7 @@
 </script>
 
 <script lang="ts">
+  import { Calendar, EyeOff, Eye, Play, Pause, Copy, Download, Trash2 } from 'lucide-svelte';
   import { Badge, StatusDot, Modal, Button } from '$lib/components/ui';
   import { formatRelativeTime } from '$lib/utils/format';
   import { usageLevel } from '$lib/stores/settings';
@@ -87,7 +95,6 @@
     filter: LogsFilter;
     onFilterChange: (filter: LogsFilter) => void;
     bucket: LogBucket;
-    onBucketChange: (bucket: LogBucket) => void;
     paused: boolean;
     bufferCount: number;
     onTogglePause: () => void;
@@ -95,6 +102,12 @@
     onCopy: () => void;
     onDownload: () => void;
     onClear: () => void;
+    showFullTimestamp: boolean;
+    onToggleFullTimestamp: () => void;
+    sanitizeLogs?: boolean;
+    onToggleSanitizeLogs?: () => void;
+    sanitizeToggleAvailable?: boolean;
+    sanitizeToggleHint?: string;
     totalEntries: number;
     visibleEntries: number;
     bufferStats: BufferBadge;
@@ -108,7 +121,6 @@
     filter = $bindable(),
     onFilterChange,
     bucket,
-    onBucketChange,
     paused,
     bufferCount,
     onTogglePause,
@@ -116,6 +128,12 @@
     onCopy,
     onDownload,
     onClear,
+    showFullTimestamp,
+    onToggleFullTimestamp,
+    sanitizeLogs = true,
+    onToggleSanitizeLogs = () => {},
+    sanitizeToggleAvailable = true,
+    sanitizeToggleHint = '',
     totalEntries,
     visibleEntries,
     bufferStats,
@@ -150,25 +168,46 @@
     onFilterChange({ ...filter });
   }
 
-  function selectGroup(g: string) {
-    if (filter.group === g) return;
-    filter.group = g;
-    filter.subgroup = '';
+  function clearGroups() {
+    filter.groups = [];
+    filter.subgroups = [];
     onFilterChange({ ...filter });
   }
 
-  function selectSubgroup(s: string) {
-    if (filter.subgroup === s) return;
-    filter.subgroup = s;
+  function toggleGroup(g: string) {
+    const set = new Set(filter.groups);
+    if (set.has(g)) {
+      set.delete(g);
+    } else {
+      set.add(g);
+    }
+    filter.groups = Array.from(set);
+    filter.subgroups = [];
+    onFilterChange({ ...filter });
+  }
+
+  function clearSubgroups() {
+    filter.subgroups = [];
+    onFilterChange({ ...filter });
+  }
+
+  function toggleSubgroup(s: string) {
+    const set = new Set(filter.subgroups);
+    if (set.has(s)) {
+      set.delete(s);
+    } else {
+      set.add(s);
+    }
+    filter.subgroups = Array.from(set);
     onFilterChange({ ...filter });
   }
 
   function toggleProfilingFilter() {
-    if (filter.subgroup === 'profiling') {
-      filter.subgroup = '';
+    if (filter.subgroups.includes('profiling')) {
+      filter.subgroups = [];
     } else {
-      filter.group = '';
-      filter.subgroup = 'profiling';
+      filter.groups = [];
+      filter.subgroups = ['profiling'];
     }
     onFilterChange({ ...filter });
   }
@@ -207,30 +246,6 @@
 
 <div class="toolbar">
   <div class="row row-bucket">
-    <span class="bucket-label">Источник</span>
-    <span class="chip-row" role="group" aria-label="Источник логов">
-      <button
-        type="button"
-        class="chip"
-        class:chip-active={bucket === 'app'}
-        aria-pressed={bucket === 'app'}
-        onclick={() => onBucketChange('app')}
-      >
-        Приложение
-      </button>
-      <button
-        type="button"
-        class="chip"
-        class:chip-active={bucket === 'singbox'}
-        aria-pressed={bucket === 'singbox'}
-        onclick={() => onBucketChange('singbox')}
-      >
-        Sing-box
-      </button>
-    </span>
-
-    <span class="divider" aria-hidden="true"></span>
-
     <span class="live-cell">
       {#if paused}
         <Badge variant="warning" size="sm">PAUSED</Badge>
@@ -273,9 +288,9 @@
         <button
           type="button"
           class="chip chip-profiling-stack"
-          class:chip-active={filter.subgroup === 'profiling'}
+          class:chip-active={filter.subgroups.includes('profiling')}
           aria-label="Журнал медленных HTTP-запросов"
-          aria-pressed={filter.subgroup === 'profiling'}
+          aria-pressed={filter.subgroups.includes('profiling')}
           onclick={toggleProfilingFilter}
         >
           Profiling
@@ -286,23 +301,23 @@
     <span class="divider" aria-hidden="true"></span>
 
     <span class="chip-row" role="group" aria-label="Фильтр по группе">
-      <button
-        type="button"
-        class="chip chip-group-pill"
-        class:chip-active={!filter.group}
-        aria-pressed={!filter.group}
-        onclick={() => selectGroup('')}
-      >
-        ALL
-      </button>
+        <button
+          type="button"
+          class="chip chip-group-pill"
+          class:chip-active={filter.groups.length === 0}
+          aria-pressed={filter.groups.length === 0}
+          onclick={clearGroups}
+        >
+          ALL
+        </button>
       {#each groupOptions as g (g)}
-        {@const active = filter.group === g}
+        {@const active = filter.groups.includes(g)}
         <button
           type="button"
           class="chip chip-group-pill chip-group-{g}"
           class:chip-active={active}
           aria-pressed={active}
-          onclick={() => selectGroup(g)}
+          onclick={() => toggleGroup(g)}
         >
           {GROUP_LABELS[g] ?? g}
         </button>
@@ -310,27 +325,27 @@
     </span>
   </div>
 
-  {#if availableSubgroups.length > 0 && (filter.group || bucket === 'singbox')}
+  {#if availableSubgroups.length > 0 && (filter.groups.length > 0 || bucket === 'singbox')}
     <div class="row row-subgroups">
       <span class="sub-label">Подгруппа</span>
       <span class="chip-row" role="group" aria-label="Фильтр по подгруппе">
         <button
           type="button"
           class="chip chip-sub"
-          class:chip-active={!filter.subgroup}
-          aria-pressed={!filter.subgroup}
-          onclick={() => selectSubgroup('')}
+          class:chip-active={filter.subgroups.length === 0}
+          aria-pressed={filter.subgroups.length === 0}
+          onclick={clearSubgroups}
         >
           ALL
         </button>
         {#each visibleSubgroups as s (s)}
-          {@const active = filter.subgroup === s}
+          {@const active = filter.subgroups.includes(s)}
           <button
             type="button"
             class="chip chip-sub"
             class:chip-active={active}
             aria-pressed={active}
-            onclick={() => selectSubgroup(s)}
+            onclick={() => toggleSubgroup(s)}
           >
             {SUBGROUP_LABELS[s] ?? s}
           </button>
@@ -352,17 +367,58 @@
     <span class="counter">{visibleEntries}/{totalEntries}</span>
 
     <span class="actions">
+      <button
+        type="button"
+        class="chip chip-timestamp"
+        class:chip-active={showFullTimestamp}
+        aria-pressed={showFullTimestamp}
+        title={showFullTimestamp ? 'Скрыть дату и часовой пояс' : 'Показать дату и часовой пояс'}
+        onclick={onToggleFullTimestamp}
+      >
+        <Calendar size={14} aria-hidden="true" />
+        Дата
+      </button>
+      <button
+        type="button"
+        class="chip chip-privacy"
+        class:chip-privacy-open={sanitizeToggleAvailable && !sanitizeLogs}
+        aria-pressed={sanitizeToggleAvailable && !sanitizeLogs}
+        aria-label={sanitizeToggleAvailable
+          ? (sanitizeLogs ? 'Показать реальные адреса в журнале' : 'Скрыть адреса в журнале')
+          : (sanitizeToggleHint || 'Журнал уже маскируется')}
+        disabled={!sanitizeToggleAvailable}
+        title={!sanitizeToggleAvailable ? sanitizeToggleHint : undefined}
+        onclick={() => {
+          if (!sanitizeToggleAvailable) return;
+          onToggleSanitizeLogs();
+        }}
+      >
+        {#if sanitizeLogs || !sanitizeToggleAvailable}
+          <EyeOff size={14} aria-hidden="true" />
+        {:else}
+          <Eye size={14} aria-hidden="true" />
+        {/if}
+        {sanitizeToggleAvailable ? (sanitizeLogs ? 'Скрыты' : 'Видны') : 'Уже скрыто'}
+      </button>
       <button type="button" class="chip" onclick={onTogglePause}>
-        {paused ? 'Resume' : 'Pause'}
+        {#if paused}
+          <Play size={14} aria-hidden="true" />
+        {:else}
+          <Pause size={14} aria-hidden="true" />
+        {/if}
+        {paused ? 'Продолжить' : 'Пауза'}
       </button>
       <button type="button" class="chip" onclick={onCopy} disabled={visibleEntries === 0}>
-        Copy
+        <Copy size={14} aria-hidden="true" />
+        Копировать
       </button>
       <button type="button" class="chip" onclick={onDownload} disabled={totalEntries === 0 || downloading}>
-        {downloading ? 'Downloading…' : 'Download'}
+        <Download size={14} aria-hidden="true" />
+        {downloading ? 'Скачивание…' : 'Скачать'}
       </button>
       <button type="button" class="chip chip-danger" onclick={handleClear} disabled={totalEntries === 0 || clearing}>
-        {clearing ? 'Clearing…' : 'Clear'}
+        <Trash2 size={14} aria-hidden="true" />
+        {clearing ? 'Очистка…' : 'Очистить'}
       </button>
     </span>
   </div>
@@ -420,7 +476,6 @@
     padding: 0.125rem 0.5rem;
   }
 
-  .bucket-label,
   .sub-label {
     color: var(--color-text-muted);
     font-weight: 600;
@@ -528,6 +583,59 @@
     gap: 0.25rem;
     margin-left: auto;
     flex-wrap: wrap;
+  }
+
+  .actions .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+
+  /* Keep readable contrast for the "Дата" chip in both states. */
+  .chip-timestamp:hover:not(.chip-active) {
+    color: var(--color-text-primary);
+  }
+  .chip-timestamp.chip-active,
+  .chip-timestamp.chip-active:hover {
+    color: var(--color-accent-contrast, #111);
+  }
+
+  .chip-privacy {
+    color: var(--color-text-secondary);
+    border-color: var(--color-border);
+    background: transparent;
+    transition:
+      background var(--t-fast) ease,
+      border-color var(--t-fast) ease,
+      color var(--t-fast) ease;
+  }
+  .chip-privacy:hover {
+    color: var(--color-text-primary);
+    border-color: var(--color-border-hover);
+    background: var(--color-bg-hover);
+  }
+  .chip-privacy-open {
+    color: var(--color-warning);
+    border-color: var(--color-warning-border);
+    background: var(--color-warning-tint);
+  }
+  .chip-privacy-open:hover {
+    color: var(--color-warning);
+    border-color: var(--color-warning);
+    background: color-mix(in srgb, var(--color-warning) 24%, transparent);
+  }
+  .chip-privacy:disabled,
+  .chip-privacy:disabled:hover {
+    opacity: 0.65;
+    cursor: not-allowed;
+    color: var(--color-text-muted);
+    border-color: var(--color-border);
+    background: transparent;
+    filter: none;
+  }
+  .chip-privacy:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
   }
 
   @media (max-width: 640px) {

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/hoaxisr/awg-manager/internal/storage"
 )
 
 const (
@@ -73,22 +75,13 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 
 // Save atomically writes config.json to disk (tmp file + rename).
 func (c *Config) Save(path string) error {
+	c.ensureNaiveUDPOverTCPOutbounds()
+	c.ensureHysteria2ChromeParrotOutbounds()
 	b, err := json.MarshalIndent(c.raw, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp) // best-effort cleanup
-		return err
-	}
-	return nil
+	return storage.AtomicWrite(path, b)
 }
 
 func (c *Config) inbounds() []any {
@@ -191,17 +184,10 @@ func (c *Config) Tunnels() []TunnelInfo {
 	return out
 }
 
-// AddTunnel inserts inbound + outbound + route rule for a new tunnel.
-// Returns error if tag already exists. Picks listen_port internally via
-// allocPort — use AddTunnelWithListenPort when the caller needs the
-// listen_port to align with an externally-chosen ProxyN slot.
-func (c *Config) AddTunnel(tag, protocol, server string, port int, outbound json.RawMessage) error {
-	return c.AddTunnelWithListenPort(tag, protocol, server, port, 0, outbound)
-}
-
-// AddTunnelWithListenPort is like AddTunnel but lets the caller pin the
-// listen_port. Pass 0 to fall back to allocPort (equivalent to AddTunnel).
-// A non-zero listenPort is rejected if already taken in this config.
+// AddTunnelWithListenPort inserts inbound + outbound + route rule for a new
+// tunnel and lets the caller pin the listen_port. Returns error if the tag
+// already exists. Pass 0 to pick the listen_port internally via allocPort;
+// a non-zero listenPort is rejected if already taken in this config.
 func (c *Config) AddTunnelWithListenPort(tag, protocol, server string, port, listenPort int, outbound json.RawMessage) error {
 	for _, ob := range c.userOutbounds() {
 		if t, _ := ob["tag"].(string); t == tag {
@@ -232,6 +218,8 @@ func (c *Config) AddTunnelWithListenPort(tag, protocol, server string, port, lis
 		return fmt.Errorf("bad outbound json: %w", err)
 	}
 	obMap["tag"] = tag
+	ensureNaiveUDPOverTCP(obMap)
+	ensureHysteria2ChromeParrot(obMap)
 
 	// Insert inbound before existing (any order works)
 	inbound := map[string]any{
@@ -314,6 +302,8 @@ func (c *Config) UpdateTunnel(tag string, outbound json.RawMessage) error {
 		return fmt.Errorf("bad outbound json: %w", err)
 	}
 	obMap["tag"] = tag
+	ensureNaiveUDPOverTCP(obMap)
+	ensureHysteria2ChromeParrot(obMap)
 
 	found := false
 	obs := c.outbounds()
@@ -333,6 +323,203 @@ func (c *Config) UpdateTunnel(tag string, outbound json.RawMessage) error {
 	}
 	c.setOutbounds(obs)
 	return nil
+}
+
+// RenameTunnel changes a user tunnel tag and all local references owned by
+// 10-tunnels.json. It preserves the listen_port, therefore the ProxyN/t2sN
+// slot remains stable.
+func (c *Config) RenameTunnel(oldTag, newTag string) error {
+	oldTag = strings.TrimSpace(oldTag)
+	newTag = strings.TrimSpace(newTag)
+	if oldTag == "" || newTag == "" {
+		return ErrInvalidTunnelTag
+	}
+	if oldTag == newTag {
+		found := false
+		for _, ob := range c.userOutbounds() {
+			if t, _ := ob["tag"].(string); t == oldTag {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("%w: %q", ErrTunnelNotFound, oldTag)
+		}
+		return nil
+	}
+
+	found := false
+	for _, ob := range c.userOutbounds() {
+		t, _ := ob["tag"].(string)
+		if t == oldTag {
+			found = true
+		}
+	}
+	for _, v := range c.outbounds() {
+		ob, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, _ := ob["tag"].(string); t == newTag {
+			return fmt.Errorf("%w: %q", ErrTunnelTagConflict, newTag)
+		}
+	}
+	if !found {
+		return fmt.Errorf("%w: %q", ErrTunnelNotFound, oldTag)
+	}
+
+	for _, v := range c.outbounds() {
+		ob, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, _ := ob["tag"].(string); t == oldTag {
+			ob["tag"] = newTag
+		}
+	}
+
+	oldInTag := oldTag + "-in"
+	newInTag := newTag + "-in"
+	for _, v := range c.inbounds() {
+		ib, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, _ := ib["tag"].(string); t == oldInTag {
+			ib["tag"] = newInTag
+		}
+	}
+
+	renameTunnelRouteRefs(c.routeRules(), oldTag, newTag, oldInTag, newInTag)
+	return nil
+}
+
+func ensureNaiveUDPOverTCP(ob map[string]any) bool {
+	if strOr(ob["type"], "") != "naive" {
+		return false
+	}
+	if _, ok := ob["udp_over_tcp"]; ok {
+		return false
+	}
+	ob["udp_over_tcp"] = map[string]any{
+		"enabled": true,
+		"version": 2,
+	}
+	return true
+}
+
+func (c *Config) ensureNaiveUDPOverTCPOutbounds() bool {
+	changed := false
+	for _, raw := range c.outbounds() {
+		ob, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if ensureNaiveUDPOverTCP(ob) {
+			changed = true
+		}
+	}
+	return changed
+}
+
+// tlsFieldSet сообщает, задано ли непустое значение TLS-поля. Listable-поля
+// sing-box приезжают из JSON то строкой, то массивом.
+func tlsFieldSet(tls map[string]any, key string) bool {
+	switch v := tls[key].(type) {
+	case string:
+		return v != ""
+	case []any:
+		return len(v) > 0
+	}
+	return false
+}
+
+// ensureHysteria2ChromeParrot выключает chrome-парротинг тем hysteria2, чьи
+// TLS-опции он не переживёт. sing-box 1.14.0-beta.7 включил его по умолчанию,
+// а его uTLS-хендшейк не игнорирует два клиентских поля, а падает на них:
+// колбэк VerifyConnection (его ставит disable_sni, пока имя сервера всё ещё
+// сверяется) и клиентский сертификат. Outbound'ы приезжают из подписки, где
+// пользователь их не правит, поэтому чиним на своей стороне.
+func ensureHysteria2ChromeParrot(ob map[string]any) bool {
+	if strOr(ob["type"], "") != "hysteria2" {
+		return false
+	}
+	if _, ok := ob["disable_chrome_parrot"]; ok {
+		return false
+	}
+	tls, ok := ob["tls"].(map[string]any)
+	if !ok {
+		return false
+	}
+	disableSNI, _ := tls["disable_sni"].(bool)
+	insecure, _ := tls["insecure"].(bool)
+	incompatible := disableSNI && !insecure
+	if !incompatible {
+		for _, key := range []string{"client_certificate", "client_certificate_path", "client_key", "client_key_path"} {
+			if tlsFieldSet(tls, key) {
+				incompatible = true
+				break
+			}
+		}
+	}
+	if !incompatible {
+		return false
+	}
+	ob["disable_chrome_parrot"] = true
+	return true
+}
+
+// EnsureOutboundCompat применяет к одному outbound'у компат-фиксы, обязательные
+// для КАЖДОГО продюсера слотов: naive → udp_over_tcp (без него UDP через naive
+// мёртв), hysteria2 → disable_chrome_parrot при несовместимых TLS-опциях
+// (sing-box 1.14.0-beta.7 включил парротинг по умолчанию). Экспортирован для
+// подписочного адаптера; Config.Save применяет те же фиксы через свои
+// методы-обёртки.
+func EnsureOutboundCompat(ob map[string]any) bool {
+	naive := ensureNaiveUDPOverTCP(ob)
+	hy2 := ensureHysteria2ChromeParrot(ob)
+	return naive || hy2
+}
+
+func (c *Config) ensureHysteria2ChromeParrotOutbounds() bool {
+	changed := false
+	for _, raw := range c.outbounds() {
+		ob, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if ensureHysteria2ChromeParrot(ob) {
+			changed = true
+		}
+	}
+	return changed
+}
+
+func renameTunnelRouteRefs(values []any, oldOut, newOut, oldIn, newIn string) {
+	for _, v := range values {
+		r, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if ob, _ := r["outbound"].(string); ob == oldOut {
+			r["outbound"] = newOut
+		}
+		switch in := r["inbound"].(type) {
+		case string:
+			if in == oldIn {
+				r["inbound"] = newIn
+			}
+		case []any:
+			for i, raw := range in {
+				if s, _ := raw.(string); s == oldIn {
+					in[i] = newIn
+				}
+			}
+		}
+		if nested, ok := r["rules"].([]any); ok {
+			renameTunnelRouteRefs(nested, oldOut, newOut, oldIn, newIn)
+		}
+	}
 }
 
 // GetOutbound returns the raw outbound JSON for a tag.
@@ -421,6 +608,8 @@ func detectTransport(ob map[string]any) string {
 		return "quic"
 	case "naive":
 		return "https"
+	case "mieru":
+		return strings.ToLower(strOr(ob["transport"], "tcp"))
 	}
 	if tr, ok := ob["transport"].(map[string]any); ok {
 		return strOr(tr["type"], "tcp")
@@ -448,6 +637,53 @@ func detectFingerprint(ob map[string]any) string {
 	return strOr(utls["fingerprint"], "")
 }
 
+// outboundRequiresFeature maps a sing-box outbound "type" value to the
+// build-tag name that a sing-box binary must declare in its `Tags:` line
+// (from `sing-box version`) for that outbound type to be available at
+// runtime. Empty string means no feature-tag is required (the type is
+// compiled into the core binary unconditionally).
+//
+// Список закрыт намеренно: имя тега нельзя выводить из соглашения
+// `with_<type>_outbound`. В нашем форке (include/registry.go, файл без
+// build-тегов) mieru регистрируется безусловно, тега with_mieru_outbound
+// не существует — и вывод такого тега из соглашения отбраковывал бы
+// рабочие mieru-подключения. Здесь только теги, подтверждённые файлом
+// include/<type>_outbound.go в исходниках sing-box.
+func outboundRequiresFeature(obType string) string {
+	if obType == "naive" {
+		return "with_naive_outbound"
+	}
+	return ""
+}
+
+// OutboundTypeRequiresFeature exposes outboundRequiresFeature for
+// cross-package callers (Operator, orchestrator, subscription layer).
+func OutboundTypeRequiresFeature(obType string) string {
+	return outboundRequiresFeature(obType)
+}
+
+// OutboundSupportedByFeatures returns true when the given sing-box build
+// tags (Features slice from InstallStatus) include the optional build tag
+// required for outboundType. Returns true for built-in types (no required
+// tag) and for unknown types — callers still get an error from
+// `sing-box check` in that case.
+//
+// Prefer this to direct Features-contains checks: callers don't need to
+// remember the exact tag name for every protocol, and unknown protocols
+// are treated as "probably supported" so sing-box itself gets to decide.
+func OutboundSupportedByFeatures(features []string, outboundType string) bool {
+	required := outboundRequiresFeature(outboundType)
+	if required == "" {
+		return true
+	}
+	for _, f := range features {
+		if f == required {
+			return true
+		}
+	}
+	return false
+}
+
 // DeviceProxySpec is the externally-supplied description of the
 // user-facing proxy. Each EnsureDeviceProxy call recomputes the
 // inbound + selector outbound from this spec. AWG-direct outbounds
@@ -455,7 +691,7 @@ func detectFingerprint(ob map[string]any) string {
 // awgoutbounds package. Spec only references their tags.
 type DeviceProxySpec struct {
 	Enabled     bool
-	ListenAddr  string   // already resolved to an IP literal
+	ListenAddr  string // already resolved to an IP literal
 	Port        int
 	Auth        DeviceProxyAuth
 	SelectedTag string   // member tag that becomes selector.default
@@ -817,10 +1053,6 @@ func (c *Config) pruneAWGOutbounds(keep map[string]string) {
 	c.setOutbounds(out)
 }
 
-func (c *Config) ensureDeviceProxyRouteRule() {
-	c.ensureDeviceProxyInstanceRouteRule(deviceProxyInboundTag, deviceProxySelectorTag)
-}
-
 func (c *Config) ensureDeviceProxyInstanceRouteRule(inboundTag, selectorTag string) {
 	rule := map[string]any{
 		"inbound":  inboundTag,
@@ -840,10 +1072,6 @@ func (c *Config) ensureDeviceProxyInstanceRouteRule(inboundTag, selectorTag stri
 		filtered = append(filtered, v)
 	}
 	c.setRouteRules(append([]any{rule}, filtered...))
-}
-
-func (c *Config) removeDeviceProxyRouteRule() {
-	c.removeDeviceProxyInstanceRouteRule(deviceProxyInboundTag)
 }
 
 func (c *Config) removeDeviceProxyInstanceRouteRule(inboundTag string) {
@@ -867,6 +1095,16 @@ func (c *Config) removeDeviceProxyInstanceRouteRule(inboundTag string) {
 // new config.d/ layout (00-base.json + 10-tunnels.json) on first run.
 // No-op when config.d already exists. Used by Operator.New to handle
 // upgrades from pre-router-engine builds.
+//
+// It splits AND deletes config.json in one pass: doing the tunnels split
+// here (not delegating to ensureLegacyConfigMigrated) keeps the two
+// migration paths mutually exclusive. Delegating the tunnels half while
+// leaving config.json behind makes ensureLegacyConfigMigrated ALSO run and
+// copy the legacy dns block into 10-tunnels.json, colliding with the dns
+// block this function writes into 00-base.json (configmerge rejects
+// duplicate dns.servers tags → sing-box dead after upgrade). It also
+// narrows route to {rules} only, dropping route.final/rule_set. Keep the
+// blind full-split here.
 func MigrateLegacyConfigDir(dir string) error {
 	configDir := filepath.Join(dir, "config.d")
 	if _, err := os.Stat(configDir); err == nil {
@@ -914,13 +1152,14 @@ func MigrateLegacyConfigDir(dir string) error {
 	return os.Remove(legacyPath)
 }
 
-// writeJSONFile is the shared atomic-ish JSON writer used by
+// writeJSONFile is the shared atomic JSON writer used by
 // MigrateLegacyConfigDir + ensureBaseConfig. Marshals with indent for
-// human-editable fragments.
+// human-editable fragments. Uses the fsync'ed temp+rename writer so a power
+// loss mid-write cannot leave a truncated config fragment behind.
 func writeJSONFile(path string, data any) error {
 	raw, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, raw, 0644)
+	return storage.AtomicWrite(path, raw)
 }

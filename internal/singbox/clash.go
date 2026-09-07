@@ -2,16 +2,23 @@ package singbox
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 )
 
 // ClashClient is a thin HTTP client for sing-box's Clash API.
+//
+// address меняется в рантайме (пользователь может сменить порт — issue #788),
+// а читают его конкурентно DelayChecker, LogForwarder, прокси Clash и
+// подписочные селекторы, поэтому доступ к полю только через Address/SetAddress.
 type ClashClient struct {
-	address string // e.g. "127.0.0.1:9099" — see singbox.clashAPIAddr
+	mu      sync.RWMutex
+	address string // e.g. "127.0.0.1:9099" — построен через ClashAddr
 	http    *http.Client
 }
 
@@ -39,7 +46,7 @@ type DelayHistory struct {
 
 // GetProxies returns the map of proxies keyed by name.
 func (c *ClashClient) GetProxies() (map[string]ClashProxy, error) {
-	u := fmt.Sprintf("http://%s/proxies", c.address)
+	u := fmt.Sprintf("http://%s/proxies", c.Address())
 	resp, err := c.http.Get(u)
 	if err != nil {
 		return nil, err
@@ -57,13 +64,40 @@ func (c *ClashClient) GetProxies() (map[string]ClashProxy, error) {
 	return wrap.Proxies, nil
 }
 
+// HasOutbound reports whether an outbound with the given tag is
+// currently present in the running sing-box (queried via Clash
+// /proxies). Used by the operator to decide tunnel.Running in
+// NDMS-proxy-disabled mode, where the kernel-iface probe is not
+// applicable.
+//
+// Returns false on any transport error or non-2xx — semantically
+// equivalent to "not operational right now", which matches the UI's
+// expectation when Clash is down or sing-box is restarting.
+func (c *ClashClient) HasOutbound(tag string) bool {
+	if tag == "" {
+		return false
+	}
+	proxies, err := c.GetProxies()
+	if err != nil {
+		return false
+	}
+	_, ok := proxies[tag]
+	return ok
+}
+
 // TestDelay triggers a latency test for a proxy via Clash API.
-func (c *ClashClient) TestDelay(name, testURL string, timeout time.Duration) (int, error) {
+// ctx обрывает САМ запрос: без него отмена клиента гасила только ожидание
+// между попытками, а проба висела до таймаута (F39).
+func (c *ClashClient) TestDelay(ctx context.Context, name, testURL string, timeout time.Duration) (int, error) {
 	q := url.Values{}
 	q.Set("url", testURL)
 	q.Set("timeout", fmt.Sprintf("%d", timeout.Milliseconds()))
-	u := fmt.Sprintf("http://%s/proxies/%s/delay?%s", c.address, url.PathEscape(name), q.Encode())
-	resp, err := c.http.Get(u)
+	u := fmt.Sprintf("http://%s/proxies/%s/delay?%s", c.Address(), url.PathEscape(name), q.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -82,8 +116,19 @@ func (c *ClashClient) TestDelay(name, testURL string, timeout time.Duration) (in
 
 // IsHealthy checks Clash API availability (fast health probe).
 func (c *ClashClient) IsHealthy() bool {
-	cli := &http.Client{Timeout: 1 * time.Second}
-	resp, err := cli.Get(fmt.Sprintf("http://%s/version", c.address))
+	// Ходим общим c.http, как остальной клиент: своя копия http.Client на
+	// каждый вызов транспорт НЕ заводила (Transport == nil ⇒ общий
+	// DefaultTransport), так что правка чисто про единообразие — выгоды в
+	// соединениях у неё нет (F40).
+	// Секундная граница пробы сохранена контекстом — у c.http таймаут 5 с,
+	// а это быстрая проба живости.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://%s/version", c.Address()), nil)
+	if err != nil {
+		return false
+	}
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return false
 	}
@@ -92,7 +137,19 @@ func (c *ClashClient) IsHealthy() bool {
 }
 
 // Address returns the Clash API address for WebSocket proxying.
-func (c *ClashClient) Address() string { return c.address }
+func (c *ClashClient) Address() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.address
+}
+
+// SetAddress repoints the client at a new Clash API endpoint. Called when the
+// user changes the port (issue #788); in-flight requests keep the old address.
+func (c *ClashClient) SetAddress(addr string) {
+	c.mu.Lock()
+	c.address = addr
+	c.mu.Unlock()
+}
 
 // SetSelector tells a running sing-box via the Clash API to switch the
 // active member of a selector outbound. Live switch: existing
@@ -103,7 +160,7 @@ func (c *ClashClient) SetSelector(selectorTag, memberTag string) error {
 	if err != nil {
 		return err
 	}
-	u := fmt.Sprintf("http://%s/proxies/%s", c.address, url.PathEscape(selectorTag))
+	u := fmt.Sprintf("http://%s/proxies/%s", c.Address(), url.PathEscape(selectorTag))
 	req, err := http.NewRequest(http.MethodPut, u, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -126,7 +183,7 @@ func (c *ClashClient) SetSelector(selectorTag, memberTag string) error {
 // callers can treat "no selector yet" as distinct from a transport
 // error.
 func (c *ClashClient) SelectorActive(selectorTag string) (string, error) {
-	u := fmt.Sprintf("http://%s/proxies/%s", c.address, url.PathEscape(selectorTag))
+	u := fmt.Sprintf("http://%s/proxies/%s", c.Address(), url.PathEscape(selectorTag))
 	resp, err := c.http.Get(u)
 	if err != nil {
 		return "", err

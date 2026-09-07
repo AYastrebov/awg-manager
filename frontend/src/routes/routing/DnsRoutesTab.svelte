@@ -1,14 +1,34 @@
 <script lang="ts">
-    import { onMount, onDestroy } from 'svelte';
     import { api } from '$lib/api/client';
-    import type { DnsRoute, RoutingTunnel } from '$lib/types';
-    import type { ServicePreset } from '$lib/data/presets';
+    import { errorMessage } from '$lib/utils/errorMessage';
+    import { Globe, LayoutGrid, Upload } from 'lucide-svelte';
+    import type { DnsRoute, RoutingTunnel, CatalogPreset } from '$lib/types';
     import { ConfirmModal, StoreStatusBadge, Button, Dropdown, type DropdownOption } from '$lib/components/ui';
-    import { DnsRouteCard, DnsRouteEditModal, DnsRouteImportModal, DnsRoutePresetModal, IconPickerModal } from '$lib/components/dnsroutes';
+    import {
+        DnsRouteCard,
+        DnsRouteEditModal,
+        DnsRouteImportModal,
+        DnsRoutePresetModal,
+        IconPickerModal,
+        NdmsDisclaimerBanner,
+    } from '$lib/components/dnsroutes';
     import { exportRoutes, downloadJson } from '$lib/utils/dns-export';
+    import { buildRoutingTunnelDropdownOptions } from '$lib/utils/routingTunnelOptions';
     import { notifications } from '$lib/stores/notifications';
+    import { downloadErrorToText } from '$lib/utils/downloadError';
     import { dnsRoutesStore } from '$lib/stores/routing';
+    import { settings, usageLevel } from '$lib/stores/settings';
+    import {
+        downloadOutbounds,
+        ensureDownloadOutboundsLoaded,
+        resolveDownloadRouteLabel,
+    } from '$lib/stores/downloadRoute';
+    import { areDownloadRouteDetailsVisible } from '$lib/types/usageLevel';
     import RoutingTabBodySkeleton from './RoutingTabBodySkeleton.svelte';
+    import RoutingRuleAddMenu from '$lib/components/routing/RoutingRuleAddMenu.svelte';
+    import { ERROR_WORDS, pluralForm, pluralize, RULE_WORDS } from '$lib/utils/pluralize';
+    import { presetCatalog } from '$lib/stores/presets';
+    import { resolvePresetManualDomains } from '$lib/utils/catalog-preset';
 
     interface Props {
         dnsRoutes: DnsRoute[];
@@ -61,13 +81,8 @@
     let dnsToggling = $state<string | null>(null);
     let dnsSaving = $state(false);
     let dnsModalOpen = $state(false);
-    let addMenuOpen = $state(false);
     let iconPickerOpen = $state(false);
     let pickingForRoute = $state<DnsRoute | null>(null);
-
-    function handleClickOutside() { addMenuOpen = false; }
-    onMount(() => document.addEventListener('click', handleClickOutside));
-    onDestroy(() => document.removeEventListener('click', handleClickOutside));
 
     // Orphan = list whose tunnel binding was wiped on tunnel delete.
     // Domain list / subscriptions survive in storage; the user reassigns
@@ -75,6 +90,9 @@
     let orphanDnsRoutes = $derived(dnsRoutes.filter(r => (r.routes?.length ?? 0) === 0));
     let boundDnsRoutes = $derived(dnsRoutes.filter(r => (r.routes?.length ?? 0) > 0));
     let dnsActiveCount = $derived(boundDnsRoutes.filter(r => r.enabled).length);
+    const showDownloadRouteDetails = $derived(areDownloadRouteDetailsVisible($usageLevel));
+    const downloadRouteLabel = $derived(resolveDownloadRouteLabel($settings, $downloadOutbounds));
+    const visibleDownloadRouteLabel = $derived(showDownloadRouteDetails ? downloadRouteLabel : '');
 
     async function createDnsRoute(data: Partial<DnsRoute>) {
         dnsSaving = true;
@@ -91,12 +109,18 @@
             } else {
                 notifications.success('DNS-маршрут создан');
             }
-        } catch (e: any) {
-            notifications.error(e.message || 'Ошибка создания');
+        } catch (e) {
+            notifications.error(errorMessage(e, 'Ошибка создания'));
         } finally {
             dnsSaving = false;
         }
     }
+
+    $effect(() => {
+        if (showDownloadRouteDetails) {
+            void ensureDownloadOutboundsLoaded();
+        }
+    });
 
     async function updateDnsRoute(data: Partial<DnsRoute>) {
         if (!editingDnsRoute) return;
@@ -114,8 +138,8 @@
             } else {
                 notifications.success('DNS-маршрут обновлён');
             }
-        } catch (e: any) {
-            notifications.error(e.message || 'Ошибка сохранения');
+        } catch (e) {
+            notifications.error(errorMessage(e, 'Ошибка сохранения'));
         } finally {
             dnsSaving = false;
         }
@@ -126,8 +150,8 @@
         try {
             const fresh = await api.setDnsRouteEnabled(id, enabled);
             dnsRoutesStore.applyMutationResponse(fresh);
-        } catch (e: any) {
-            notifications.error(e.message || 'Ошибка');
+        } catch (e) {
+            notifications.error(errorMessage(e, 'Ошибка'));
         } finally {
             dnsToggling = null;
         }
@@ -141,8 +165,8 @@
             const fresh = await api.deleteDnsRoute(id);
             dnsRoutesStore.applyMutationResponse(fresh);
             notifications.success('DNS-маршрут удалён');
-        } catch (e: any) {
-            notifications.error(e.message || 'Ошибка удаления');
+        } catch (e) {
+            notifications.error(errorMessage(e, 'Ошибка удаления'));
         }
     }
 
@@ -151,8 +175,8 @@
             const fresh = await api.refreshDnsRouteSubscriptions(id);
             dnsRoutesStore.applyMutationResponse(fresh);
             notifications.success('Подписки обновлены');
-        } catch (e: any) {
-            notifications.error(e.message || 'Ошибка обновления');
+        } catch (e: unknown) {
+            notifications.error(`Обновление подписок: ${downloadErrorToText(e)}`);
         }
     }
 
@@ -178,7 +202,7 @@
         const selected = dnsRoutes.filter(r => dnsSelected.has(r.id));
         const portable = exportRoutes(selected);
         downloadJson(portable, 'awg-dns-routes.json');
-        notifications.success(`Экспортировано ${portable.length} правил`);
+        notifications.success(`Экспортировано ${pluralize(portable.length, RULE_WORDS)}`);
     }
 
     async function bulkDnsToggle(enabled: boolean) {
@@ -195,8 +219,8 @@
             if (latest) dnsRoutesStore.applyMutationResponse(latest);
 
             const label = enabled ? 'Включено' : 'Выключено';
-            if (fail > 0) notifications.warning(`${label} ${ok} из ${ok + fail} правил (${fail} ошибок)`);
-            else notifications.success(`${label} ${ok} правил`);
+            if (fail > 0) notifications.warning(`${label} ${ok} из ${ok + fail} ${pluralForm(ok + fail, RULE_WORDS)} (${pluralize(fail, ERROR_WORDS)})`);
+            else notifications.success(`${label} ${pluralize(ok, RULE_WORDS)}`);
         } finally {
             dnsBulkLoading = false;
         }
@@ -212,7 +236,7 @@
             const deleted = Math.max(0, beforeCount - fresh.filter(r => r.backend !== 'hydraroute').length);
 
             exitDnsSelection();
-            notifications.success(`Удалено ${deleted} правил`);
+            notifications.success(`Удалено ${pluralize(deleted, RULE_WORDS)}`);
         } catch (e) {
             notifications.error(`Ошибка: ${e instanceof Error ? e.message : 'неизвестная ошибка'}`);
         } finally {
@@ -229,9 +253,11 @@
             for (const id of dnsSelected) {
                 const route = dnsRoutes.find(r => r.id === id);
                 if (!route) continue;
-                const newRoutes = route.routes.length > 0
-                    ? [{ ...route.routes[0], tunnelId: dnsBulkTunnelId, interface: dnsBulkTunnelId }, ...route.routes.slice(1)]
-                    : [{ tunnelId: dnsBulkTunnelId, interface: dnsBulkTunnelId, fallback: 'auto' as const }];
+                // Заменяем всю цепочку одним маршрутом; fallback берём
+                // с последнего звена прежней цепочки, иначе — 'auto'.
+                const prevFallback = route.routes[route.routes.length - 1]?.fallback;
+                const fallback = prevFallback === 'reject' ? 'reject' as const : 'auto' as const;
+                const newRoutes = [{ tunnelId: dnsBulkTunnelId, interface: dnsBulkTunnelId, fallback }];
                 // Send the full list with updated routes. The backend Update() uses
                 // PUT semantics — missing fields are interpreted as "zero value" and
                 // would wipe name/manualDomains/domains. Defense against that is also
@@ -240,8 +266,8 @@
             }
 
             dnsTunnelMode = false;
-            if (fail > 0) notifications.warning(`Туннель изменён для ${ok} из ${ok + fail} правил (${fail} ошибок)`);
-            else notifications.success(`Туннель изменён для ${ok} правил`);
+            if (fail > 0) notifications.warning(`Туннель изменён для ${ok} из ${ok + fail} ${pluralForm(ok + fail, RULE_WORDS)} (${pluralize(fail, ERROR_WORDS)})`);
+            else notifications.success(`Туннель изменён для ${pluralize(ok, RULE_WORDS)}`);
         } finally {
             dnsBulkLoading = false;
         }
@@ -258,6 +284,7 @@
                     excludes: route.excludes,
                     subnets: route.subnets,
                     enabled: route.enabled,
+                    iconUrl: route.iconUrl,
                     routes: route.tunnelId
                         ? [{ tunnelId: route.tunnelId, interface: route.tunnelId, fallback: 'auto' as const }]
                         : [],
@@ -269,26 +296,35 @@
         }
         dnsImportOpen = false;
         if (count > 0) {
-            notifications.success(`Импортировано ${count} правил`);
+            notifications.success(`Импортировано ${pluralize(count, RULE_WORDS)}`);
         }
     }
 
-    async function handlePresetCreate(presets: ServicePreset[], tunnelId: string, presetBackend: 'ndms' | 'hydraroute' = 'ndms') {
+    async function handlePresetCreate(presets: CatalogPreset[], tunnelId: string, presetBackend: 'ndms' | 'hydraroute' = 'ndms') {
         try {
-            const lists = presets.map(preset => ({
-                name: preset.name,
-                manualDomains: preset.domains ?? [],
-                subscriptions: preset.subscriptionUrl
-                    ? [{ url: preset.subscriptionUrl, name: preset.name }]
-                    : undefined,
-                enabled: true,
-                routes: [{ tunnelId, interface: tunnelId, fallback: 'auto' as const }],
-                backend: presetBackend,
-            }));
+            const catalog = $presetCatalog;
+            const lists = presets.flatMap((preset) => {
+                const dns = preset.engines.dns;
+                const manualDomains = resolvePresetManualDomains(preset, catalog);
+                if (manualDomains.length === 0 && !dns?.subscriptionUrl) return [];
+                return [{
+                    name: preset.name,
+                    manualDomains,
+                    subscriptions: dns?.subscriptionUrl
+                        ? [{ url: dns.subscriptionUrl, name: preset.name }]
+                        : undefined,
+                    enabled: true,
+                    routes: [{ tunnelId, interface: tunnelId, fallback: 'auto' as const }],
+                    backend: presetBackend,
+                }];
+            });
+            if (lists.length === 0) {
+                notifications.error('У выбранных пресетов нет DNS-записей');
+                return;
+            }
             const result = await api.createDnsRouteBatch(lists);
-
             if (result.created > 0) {
-                notifications.success(`Создано ${result.created} правил из каталога`);
+                notifications.success(`Создано ${pluralize(result.created, RULE_WORDS)} из каталога`);
             } else {
                 notifications.error('Не удалось создать ни одного правила');
             }
@@ -305,13 +341,14 @@
         <p>Для DNS-маршрутизации требуется прошивка OS5 или <a href="https://github.com/Ground-Zerro/HydraRoute" target="_blank" rel="noopener">HydraRoute Neo</a></p>
     </div>
 {:else}
+<NdmsDisclaimerBanner {isOS5} />
 <div class="section-header">
     {#if !dnsSelectionMode}
         <span class="section-summary">
             {#if bodyLoading}
                 …
             {:else}
-                {dnsRoutes.length} правил, {dnsActiveCount} активных
+                {pluralize(dnsRoutes.length, RULE_WORDS)}, {dnsActiveCount} активных
             {/if}
         </span>
         <div class="section-buttons">
@@ -319,31 +356,16 @@
             {#if dnsRoutes.length > 0}
                 <Button variant="ghost" size="sm" onclick={() => { dnsSelectionMode = true; dnsSelected = new Set(); }} disabled={bodyLoading}>Выбрать</Button>
             {/if}
-            <div class="dropdown-wrapper">
-                <Button variant="primary" size="sm" disabled={bodyLoading} onclick={(e) => { e.stopPropagation(); addMenuOpen = !addMenuOpen; }}>
-                    + Добавить
-                    {#snippet iconAfter()}
-                        <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor"><path d="M2 4l3 3 3-3"/></svg>
-                    {/snippet}
-                </Button>
-                {#if addMenuOpen}
-                    <div class="dropdown-menu">
-                        <button class="dropdown-item" onclick={() => { addMenuOpen = false; dnsPresetOpen = true; }}>
-                            <svg class="dropdown-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
-                            Из каталога
-                        </button>
-                        <button class="dropdown-item" onclick={() => { addMenuOpen = false; editingDnsRoute = null; dnsModalOpen = true; }}>
-                            <svg class="dropdown-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-                            Создать вручную
-                        </button>
-                        <div class="dropdown-sep"></div>
-                        <button class="dropdown-item" onclick={() => { addMenuOpen = false; dnsImportOpen = true; }}>
-                            <svg class="dropdown-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                            Загрузить конфигурацию
-                        </button>
-                    </div>
-                {/if}
-            </div>
+            <RoutingRuleAddMenu
+                disabled={bodyLoading}
+                oncatalog={() => (dnsPresetOpen = true)}
+                onmanual={() => {
+                    editingDnsRoute = null;
+                    dnsModalOpen = true;
+                }}
+                importEnabled
+                onimport={() => (dnsImportOpen = true)}
+            />
         </div>
     {:else}
         <div class="bulk-bar">
@@ -361,10 +383,10 @@
                     <button class="bulk-btn bulk-btn-export" disabled={dnsSelected.size === 0 || dnsBulkLoading} onclick={downloadDnsExport}>Экспорт</button>
                 </div>
             {:else}
-                {@const dnsBulkTunnelOpts: DropdownOption[] = [
-                    ...routingTunnels.filter(t => t.type === 'managed' && t.available).map((t) => ({ value: t.id, label: t.name })),
-                    ...routingTunnels.filter(t => t.type === 'system' && t.available).map((t) => ({ value: t.id, label: t.name })),
-                ]}
+                {@const dnsBulkTunnelOpts = buildRoutingTunnelDropdownOptions(routingTunnels, {
+                    requireSelectable: true,
+                    includeWan: false,
+                })}
                 <div class="bulk-tunnel-bar">
                     <span class="bulk-tunnel-label">Туннель:</span>
                     <div class="bulk-tunnel-select">
@@ -388,25 +410,21 @@
 {:else if dnsRoutes.length === 0}
     <div class="empty-state-rich">
         <div class="empty-icon">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                <circle cx="12" cy="12" r="10"/>
-                <line x1="2" y1="12" x2="22" y2="12"/>
-                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
-            </svg>
+            <Globe size={24} strokeWidth={1.5} />
         </div>
         <div class="empty-title">DNS-маршрутов пока нет</div>
         <div class="empty-desc">Выберите сервисы из каталога или создайте правило вручную</div>
         <div class="empty-actions">
             <Button variant="primary" disabled={bodyLoading} onclick={() => dnsPresetOpen = true}>
                 {#snippet iconBefore()}
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+                    <LayoutGrid size={14} />
                 {/snippet}
                 Из каталога
             </Button>
             <Button variant="secondary" disabled={bodyLoading} onclick={() => { editingDnsRoute = null; dnsModalOpen = true; }}>+ Создать вручную</Button>
             <Button variant="ghost" disabled={bodyLoading} onclick={() => dnsImportOpen = true}>
                 {#snippet iconBefore()}
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                    <Upload size={14} />
                 {/snippet}
                 Загрузить конфигурацию
             </Button>
@@ -431,6 +449,7 @@
                         selected={dnsSelected.has(route.id)}
                         onselect={() => toggleDnsSelect(route.id)}
                         onicon={() => { pickingForRoute = route; iconPickerOpen = true; }}
+                        downloadRouteLabel={visibleDownloadRouteLabel}
                     />
                 {/each}
             </div>
@@ -452,6 +471,7 @@
                     selected={dnsSelected.has(route.id)}
                     onselect={() => toggleDnsSelect(route.id)}
                     onicon={() => { pickingForRoute = route; iconPickerOpen = true; }}
+                    downloadRouteLabel={visibleDownloadRouteLabel}
                 />
             {/each}
         </div>
@@ -522,8 +542,8 @@
             try {
                 await api.updateDnsRoute(route.id, { ...route, iconUrl: newUrl ?? undefined });
                 notifications.success(newUrl ? 'Иконка изменена' : 'Иконка сброшена');
-            } catch (e: any) {
-                notifications.error(e?.message || 'Не удалось обновить иконку');
+            } catch (e) {
+                notifications.error(errorMessage(e, 'Не удалось обновить иконку'));
             }
         }}
     />
@@ -600,78 +620,10 @@
         flex-wrap: wrap;
     }
 
-    /* Dropdown menu */
-    .dropdown-wrapper {
-        position: relative;
-        display: inline-block;
-    }
-
-    .dropdown-menu {
-        position: absolute;
-        top: calc(100% + 4px);
-        right: 0;
-        z-index: 10;
-        background: var(--bg-secondary, var(--bg-card, #1a1b2e));
-        border: 1px solid var(--border);
-        border-radius: 8px;
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-        min-width: 210px;
-        padding: 4px;
-    }
-
-    @media (max-width: 480px) {
-        .dropdown-menu {
-            right: auto;
-            left: 0;
-            min-width: min(210px, calc(100vw - 32px));
-            max-width: calc(100vw - 32px);
-        }
-    }
-
-    .dropdown-item {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 0.5rem 0.75rem;
-        border-radius: 4px;
-        cursor: pointer;
-        font-size: 0.8125rem;
-        color: var(--text-secondary);
-        border: none;
-        background: none;
-        width: 100%;
-        text-align: left;
-        font-family: inherit;
-        transition: background 0.1s;
-    }
-
-    .dropdown-item:hover {
-        background: var(--bg-hover);
-        color: var(--text-primary);
-    }
-
-    :global(.dropdown-icon) {
-        width: 16px;
-        height: 16px;
-        flex-shrink: 0;
-        color: var(--text-muted);
-    }
-
-    .dropdown-item:hover :global(.dropdown-icon) {
-        color: var(--accent);
-    }
-
-    .dropdown-sep {
-        height: 1px;
-        background: var(--border);
-        margin: 4px 8px;
-    }
-
     @media (max-width: 640px) {
         .empty-actions {
             flex-direction: column;
             align-items: center;
         }
-        /* TODO Phase 1: full-width Button on narrow viewport (was .empty-actions .btn { width: 100% }) */
     }
 </style>

@@ -61,10 +61,15 @@ type ProxyConfigResponse struct {
 }
 
 // DeviceProxyRuntimeData mirrors frontend DeviceProxyRuntime.
+// degradedOutbound/fallbackTag: выбранный outbound (== defaultTag) сейчас
+// отсутствует в merged-конфиге (слот-источник выключен), трафик фактически
+// идёт через fallbackTag. Оба поля пустые, когда деградации нет (issue #465).
 type DeviceProxyRuntimeData struct {
-	Alive      bool   `json:"alive" example:"true"`
-	ActiveTag  string `json:"activeTag" example:"proxy-01"`
-	DefaultTag string `json:"defaultTag" example:"proxy-01"`
+	Alive            bool   `json:"alive" example:"true"`
+	ActiveTag        string `json:"activeTag" example:"proxy-01"`
+	DefaultTag       string `json:"defaultTag" example:"proxy-01"`
+	DegradedOutbound string `json:"degradedOutbound,omitempty" example:"vpn"`
+	FallbackTag      string `json:"fallbackTag,omitempty" example:"awg-awg10"`
 }
 
 // ProxyRuntimeResponse is the envelope for GET /proxy/runtime.
@@ -216,7 +221,10 @@ func (h *DeviceProxyHandler) SaveConfig(w http.ResponseWriter, r *http.Request) 
 	}
 	if err := h.svc.SaveConfig(r.Context(), cfg); err != nil {
 		// The TOCTOU race between SaveConfig's IsRunning() guard and
-		// the underlying ApplyConfigNoReload can surface this sentinel
+		// Мёртвая ветка: no-reload путь больше не производит этот сентинел
+		// (оркестраторная запись его не возвращает, а SaveConfig берёт
+		// no-reload только после IsRunning). Оставлен как страховка формы
+		// ответа, если сентинел вернётся из другого места.
 		// when sing-box dies mid-save. Map to 409 so API clients can
 		// retry without getting generic SAVE_FAILED — matches the
 		// contract SelectRuntime exposes for the same condition.
@@ -375,9 +383,8 @@ func (h *DeviceProxyHandler) GetInstanceRuntime(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		response.Error(w, "missing id", "MISSING_ID")
+	id, ok := requireQueryID(w, r)
+	if !ok {
 		return
 	}
 
@@ -409,9 +416,8 @@ func (h *DeviceProxyHandler) SelectInstanceRuntime(w http.ResponseWriter, r *htt
 		return
 	}
 
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		response.Error(w, "missing id", "MISSING_ID")
+	id, ok := requireQueryID(w, r)
+	if !ok {
 		return
 	}
 
@@ -481,9 +487,8 @@ func (h *DeviceProxyHandler) GetInstance(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		response.Error(w, "missing id", "MISSING_ID")
+	id, ok := requireQueryID(w, r)
+	if !ok {
 		return
 	}
 
@@ -558,26 +563,17 @@ func (h *DeviceProxyHandler) DeleteInstance(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		response.Error(w, "missing id", "MISSING_ID")
+	id, ok := requireQueryID(w, r)
+	if !ok {
 		return
 	}
-	if id == "default" {
-		response.Error(w, "default instance cannot be deleted", "DEFAULT_INSTANCE_PROTECTED")
-		return
-	}
-
-	if err := h.svc.DeleteInstance(r.Context(), id); err != nil {
-		if errors.Is(err, singbox.ErrSingboxNotRunning) {
-			response.ErrorWithStatus(w, http.StatusConflict, err.Error(), "SINGBOX_DOWN")
-			return
-		}
+	applied, err := h.svc.DeleteInstance(r.Context(), id)
+	if err != nil {
 		response.Error(w, err.Error(), "DELETE_INSTANCE_FAILED")
 		return
 	}
 
-	response.Success(w, map[string]bool{"deleted": true})
+	response.Success(w, map[string]bool{"deleted": true, "applied": applied})
 }
 
 // ApplyInstances handles POST /api/proxy/instances/apply.
@@ -627,9 +623,8 @@ func (h *DeviceProxyHandler) CheckInstanceExternalIP(w http.ResponseWriter, r *h
 		return
 	}
 
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		response.Error(w, "missing id", "MISSING_ID")
+	id, ok := requireQueryID(w, r)
+	if !ok {
 		return
 	}
 	service := r.URL.Query().Get("service")

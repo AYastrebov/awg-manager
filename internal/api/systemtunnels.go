@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	ndms "github.com/hoaxisr/awg-manager/internal/ndms"
@@ -52,15 +53,19 @@ type SystemTunnelsHandler struct {
 	settings *storage.SettingsStore
 	awgStore *storage.AWGTunnelStore
 	appLog   *logging.ScopedLogger
+	// connTracker: авто-чеки фронта повторяются при каждой навигации —
+	// в журнал идут переходы, повторы одного исхода только на debug.
+	connTracker *logging.TransitionTracker
 }
 
 // NewSystemTunnelsHandler creates a new system tunnels handler.
 func NewSystemTunnelsHandler(svc systemtunnel.Service, settings *storage.SettingsStore, awgStore *storage.AWGTunnelStore, appLogger logging.AppLogger) *SystemTunnelsHandler {
 	return &SystemTunnelsHandler{
-		svc:      svc,
-		settings: settings,
-		awgStore: awgStore,
-		appLog:   logging.NewScopedLogger(appLogger, logging.GroupSystem, logging.SubSystemTunnel),
+		svc:         svc,
+		settings:    settings,
+		awgStore:    awgStore,
+		appLog:      logging.NewScopedLogger(appLogger, logging.GroupSystem, logging.SubSystemTunnel),
+		connTracker: logging.NewTransitionTracker(),
 	}
 }
 
@@ -246,6 +251,8 @@ func (h *SystemTunnelsHandler) CheckConnectivity(w http.ResponseWriter, r *http.
 		return
 	}
 	if tunnel.Status != "up" {
+		// Сброс серии: после подъёма туннеля первый отказ снова Warn.
+		h.connTracker.Forget(name)
 		response.Success(w, testing.ConnectivityResult{
 			Connected: false,
 			Reason:    testing.ReasonTunnelNotRunning,
@@ -253,13 +260,33 @@ func (h *SystemTunnelsHandler) CheckConnectivity(w http.ResponseWriter, r *http.
 		return
 	}
 	h.appLog.Debug("connectivity-check", name, fmt.Sprintf("Starting connectivity check for system tunnel %s", name))
-	result := testing.CheckConnectivityByInterface(r.Context(), tunnel.InterfaceName)
-	if result.Connected {
-		h.appLog.Debug("connectivity-check", name, fmt.Sprintf("Connectivity check passed: latency=%dms", *result.Latency))
-	} else {
+	result := checkConnectivityByInterfaceURL(r.Context(), tunnel.InterfaceName, h.connectivityCheckURL())
+	latency := ""
+	if result.Latency != nil {
+		latency = fmt.Sprintf(", latency=%dms", *result.Latency)
+	}
+	switch obs := h.connTracker.Observe(name, result.Connected); obs.Kind {
+	case logging.TransitionNowFailing:
 		h.appLog.Warn("connectivity-check", name, fmt.Sprintf("Connectivity check failed: reason=%s", result.Reason))
+	case logging.TransitionStillFailing:
+		h.appLog.Debug("connectivity-check", name, fmt.Sprintf("Connectivity check still failing (%d in a row): reason=%s", obs.Failures, result.Reason))
+	case logging.TransitionRecovered:
+		h.appLog.Info("connectivity-check", name, fmt.Sprintf("Connectivity restored after %d failed checks%s", obs.Failures, latency))
+	default:
+		h.appLog.Debug("connectivity-check", name, fmt.Sprintf("Connectivity check passed%s", latency))
 	}
 	response.Success(w, result)
+}
+
+func (h *SystemTunnelsHandler) connectivityCheckURL() string {
+	if h == nil || h.settings == nil {
+		return storage.DefaultConnectivityCheckURL
+	}
+	settings, err := h.settings.Get()
+	if err != nil || settings == nil || strings.TrimSpace(settings.ConnectivityCheckURL) == "" {
+		return storage.DefaultConnectivityCheckURL
+	}
+	return strings.TrimSpace(settings.ConnectivityCheckURL)
 }
 
 // CheckIP tests IP through system tunnel.
@@ -279,7 +306,7 @@ func (h *SystemTunnelsHandler) CheckIP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	service := r.URL.Query().Get("service")
-	result, err := testing.CheckIPByInterface(r.Context(), tunnel.InterfaceName, service)
+	result, err := checkIPByInterface(r.Context(), tunnel.InterfaceName, service)
 	if err != nil {
 		response.Error(w, err.Error(), "IP_CHECK_FAILED")
 		return

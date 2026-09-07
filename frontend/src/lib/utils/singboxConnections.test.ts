@@ -93,6 +93,23 @@ describe('parseSnapshot', () => {
 		expect(snap.uploadTotal).toBe(567);
 		expect(snap.connectionsTotal).toBe(1);
 	});
+
+	it('пропускает битые записи (нет metadata/sourceIP/chains), не роняя снапшот', () => {
+		const raw = structuredClone(baseRaw);
+		// Данные приходят по WS без проверки формы — эмулируем мусор.
+		raw.connections!.push(
+			{ id: 'broken-1' } as unknown as NonNullable<ClashConnectionsRaw['connections']>[number],
+			{
+				id: 'broken-2',
+				metadata: { sourceIP: 42 },
+				chains: 'not-an-array',
+			} as unknown as NonNullable<ClashConnectionsRaw['connections']>[number],
+		);
+		const snap = parseSnapshot(raw, new Map());
+		expect(snap.connections).toHaveLength(1);
+		expect(snap.connections[0].id).toBe('a');
+		expect(snap.connectionsTotal).toBe(1);
+	});
 });
 
 function makeConn(
@@ -192,6 +209,14 @@ describe('aggregateBy', () => {
 		expect(buckets[0].count).toBe(2);
 		expect(buckets[1].key).toBe('B');
 		expect(buckets[1].download).toBe(50);
+	});
+	it('keeps raw key and separate display label', () => {
+		const conns = [
+			makeConn({ id: '1', chains: ['awg-awg10'], outboundLabel: 'Office VPN (t2s10)', download: 100 }),
+		];
+		const [bucket] = aggregateBy(conns, (c) => c.chains[0] ?? '', (c) => c.outboundLabel);
+		expect(bucket.key).toBe('awg-awg10');
+		expect(bucket.label).toBe('Office VPN (t2s10)');
 	});
 	it('pct rounds against total download', () => {
 		const conns = [

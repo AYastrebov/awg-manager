@@ -1,5 +1,17 @@
 package managed
 
+// DefaultMTU is applied when the server has no explicit MTU. The same value
+// is set on the router interface and written into generated peer configs.
+const DefaultMTU = 1376
+
+// effectiveMTU resolves a stored/requested MTU: 0 (unset) means DefaultMTU.
+func effectiveMTU(mtu int) int {
+	if mtu == 0 {
+		return DefaultMTU
+	}
+	return mtu
+}
+
 // CreateServerRequest contains parameters for creating a managed WireGuard server.
 type CreateServerRequest struct {
 	Address     string `json:"address"`               // e.g. "10.0.0.1"
@@ -8,7 +20,14 @@ type CreateServerRequest struct {
 	Description string `json:"description,omitempty"` // user-facing display name; defaults to ManagedServerDescription if empty
 	Endpoint    string `json:"endpoint,omitempty"`    // custom endpoint (IP or domain)
 	DNS         string `json:"dns,omitempty"`         // custom DNS for client configs
-	MTU         int    `json:"mtu,omitempty"`         // custom MTU for client configs
+	MTU         int    `json:"mtu,omitempty"`         // MTU for the server interface and client configs; 0 = DefaultMTU
+	GenerateASC *bool  `json:"generateAsc,omitempty"` // nil/true => generate ASC on create; false => skip
+}
+
+// ShouldGenerateASC resolves optional GenerateASC with backward-compatible
+// default=true for callers that do not send the field.
+func (r CreateServerRequest) ShouldGenerateASC() bool {
+	return r.GenerateASC == nil || *r.GenerateASC
 }
 
 // UpdateServerRequest contains parameters for updating the managed server.
@@ -52,7 +71,7 @@ type TogglePeerRequest struct {
 
 // ManagedServerStats holds runtime statistics for the managed server.
 type ManagedServerStats struct {
-	Status string            `json:"status"` // "up" or "down"
+	Status string             `json:"status"` // "up" or "down"
 	Peers  []ManagedPeerStats `json:"peers"`
 }
 
@@ -75,4 +94,11 @@ const ManagedServerDescription = "AWGM WG Server"
 type PolicyOption struct {
 	ID          string `json:"id"`
 	Description string `json:"description"`
+}
+
+// LANSegmentDTO is the catalog entry for a router LAN bridge segment.
+type LANSegmentDTO struct {
+	Name   string `json:"name"`
+	Label  string `json:"label"`
+	Subnet string `json:"subnet"`
 }

@@ -34,16 +34,20 @@ type HistoryFeeder interface {
 // When a HistoryFeeder is provided, each publish also feeds the rate-history
 // store so /api/tunnels/traffic backfill works for singbox tags.
 type TrafficAggregator struct {
-	clashAddr string
+	// clashAddr — ПОСТАВЩИК адреса, а не снимок: см. LogForwarder.clashAddr.
+	clashAddr func() string
 	publisher TrafficPublisher
 	feeder    HistoryFeeder
 	interval  time.Duration
 
-	mu   sync.Mutex
-	tags map[string]*TrafficSnapshot
+	mu            sync.Mutex
+	tags          map[string]*TrafficSnapshot
+	memory        int64
+	downloadTotal int64
+	uploadTotal   int64
 }
 
-func NewTrafficAggregator(clashAddr string, pub TrafficPublisher, feeder HistoryFeeder) *TrafficAggregator {
+func NewTrafficAggregator(clashAddr func() string, pub TrafficPublisher, feeder HistoryFeeder) *TrafficAggregator {
 	return &TrafficAggregator{
 		clashAddr: clashAddr,
 		publisher: pub,
@@ -71,7 +75,7 @@ func (t *TrafficAggregator) Run(ctx context.Context) {
 }
 
 func (t *TrafficAggregator) runOnce(ctx context.Context) {
-	url := fmt.Sprintf("ws://%s/connections", t.clashAddr)
+	url := fmt.Sprintf("ws://%s/connections", t.clashAddr())
 	conn, _, err := websocket.Dial(ctx, url, nil)
 	if err != nil {
 		return
@@ -133,7 +137,15 @@ func (t *TrafficAggregator) runOnce(ctx context.Context) {
 // Multiple connections sharing the same tag accumulate, as before.
 func (t *TrafficAggregator) ingest(msg []byte) {
 	var m struct {
-		Connections []struct {
+		Memory int64 `json:"memory"`
+		// downloadTotal/uploadTotal — кумулятивные счётчики Clash за всё время
+		// жизни процесса, включая ЗАКРЫТЫЕ соединения. Per-tag суммы ниже
+		// пересобираются только из открытых соединений и немонотонны —
+		// агрегатную скорость/объём «за сессию» можно честно считать только
+		// от этих полей.
+		DownloadTotal int64 `json:"downloadTotal"`
+		UploadTotal   int64 `json:"uploadTotal"`
+		Connections   []struct {
 			Chains   []string `json:"chains"`
 			Upload   int64    `json:"upload"`
 			Download int64    `json:"download"`
@@ -170,7 +182,23 @@ func (t *TrafficAggregator) ingest(msg []byte) {
 	}
 	t.mu.Lock()
 	t.tags = sums
+	t.memory = m.Memory
+	t.downloadTotal = m.DownloadTotal
+	t.uploadTotal = m.UploadTotal
 	t.mu.Unlock()
+}
+
+// MemoryEvent is the payload of the "singbox:memory" SSE event.
+type MemoryEvent struct {
+	Memory int64 `json:"memory"`
+}
+
+// TrafficTotalsEvent is the payload of the "singbox:traffic-totals" SSE
+// event: cumulative engine-lifetime byte counters from Clash (monotonic
+// while the process lives; reset to zero on engine restart).
+type TrafficTotalsEvent struct {
+	DownloadTotal int64 `json:"downloadTotal"`
+	UploadTotal   int64 `json:"uploadTotal"`
 }
 
 // publish emits the current snapshot to SSE and (optionally) feeds the
@@ -181,9 +209,13 @@ func (t *TrafficAggregator) publish() {
 	for _, s := range t.tags {
 		snap = append(snap, *s)
 	}
+	mem := t.memory
+	totals := TrafficTotalsEvent{DownloadTotal: t.downloadTotal, UploadTotal: t.uploadTotal}
 	t.mu.Unlock()
 	if t.publisher != nil {
 		t.publisher.Publish("singbox:traffic", snap)
+		t.publisher.Publish("singbox:traffic-totals", totals)
+		t.publisher.Publish("singbox:memory", MemoryEvent{Memory: mem})
 	}
 	if t.feeder != nil {
 		for _, s := range snap {

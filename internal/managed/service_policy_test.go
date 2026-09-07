@@ -14,13 +14,17 @@ import (
 
 // fakePoster records every RCI POST payload and can be primed with errors.
 type fakePoster struct {
-	posts []map[string]interface{}
-	err   error
+	posts  []map[string]interface{}
+	err    error
+	onPost func(map[string]interface{})
 }
 
 func (f *fakePoster) Post(ctx context.Context, payload any) (json.RawMessage, error) {
 	if m, ok := payload.(map[string]interface{}); ok {
 		f.posts = append(f.posts, m)
+		if f.onPost != nil {
+			f.onPost(m)
+		}
 	}
 	if f.err != nil {
 		return nil, f.err
@@ -33,6 +37,7 @@ func (f *fakePoster) Post(ctx context.Context, payload any) (json.RawMessage, er
 type fakePolicyGetter struct {
 	body []byte
 	err  error
+	raws int
 }
 
 func (f *fakePolicyGetter) Get(ctx context.Context, path string, out any) error {
@@ -40,6 +45,7 @@ func (f *fakePolicyGetter) Get(ctx context.Context, path string, out any) error 
 }
 
 func (f *fakePolicyGetter) GetRaw(ctx context.Context, path string) ([]byte, error) {
+	f.raws++
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -84,7 +90,7 @@ func TestSetPolicy_RejectsEmpty(t *testing.T) {
 
 func TestSetPolicy_RejectsMissingServer(t *testing.T) {
 	svc, _, _ := newTestService(t, nil, nil, `{}`)
-	if err := svc.SetPolicy(context.Background(), "Wireguard0", "permit"); err == nil {
+	if err := svc.SetPolicy(context.Background(), "Wireguard0", "Policy0"); err == nil {
 		t.Fatal("expected error when no managed server exists")
 	}
 }
@@ -96,30 +102,17 @@ func TestSetPolicy_RejectsUnknownPolicy(t *testing.T) {
 	}
 }
 
-func TestSetPolicy_AcceptsLiterals(t *testing.T) {
-	for _, lit := range []string{"permit", "deny", "none"} {
-		t.Run(lit, func(t *testing.T) {
-			svc, poster, store := newTestService(t, &storage.ManagedServer{InterfaceName: "Wireguard0", Policy: "none"}, nil, `{}`)
-			if lit == "none" {
-				if err := svc.SetPolicy(context.Background(), "Wireguard0", lit); err != nil {
-					t.Fatalf("unexpected error: %v", err)
-				}
-				if len(poster.posts) != 0 {
-					t.Fatalf("expected 0 RCI calls for no-op, got %d", len(poster.posts))
-				}
-				return
-			}
-			if err := svc.SetPolicy(context.Background(), "Wireguard0", lit); err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if len(poster.posts) != 1 {
-				t.Fatalf("expected 1 RCI call, got %d", len(poster.posts))
-			}
-			persisted, ok := store.GetManagedServerByID("Wireguard0")
-			if !ok || persisted.Policy != lit {
-				t.Fatalf("policy not persisted: got %+v", persisted)
-			}
-		})
+func TestSetPolicy_NoneClearsExisting(t *testing.T) {
+	svc, poster, store := newTestService(t, &storage.ManagedServer{InterfaceName: "Wireguard0", Policy: "Policy0"}, nil, `{"Policy0":{"description":"NL"}}`)
+	if err := svc.SetPolicy(context.Background(), "Wireguard0", "none"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(poster.posts) != 1 {
+		t.Fatalf("expected 1 RCI clear call, got %d", len(poster.posts))
+	}
+	persisted, ok := store.GetManagedServerByID("Wireguard0")
+	if !ok || persisted.Policy != "none" {
+		t.Fatalf("policy not persisted: got %+v", persisted)
 	}
 }
 
@@ -138,8 +131,8 @@ func TestSetPolicy_AcceptsKnownProfile(t *testing.T) {
 }
 
 func TestSetPolicy_NoopWhenSame(t *testing.T) {
-	svc, poster, _ := newTestService(t, &storage.ManagedServer{InterfaceName: "Wireguard0", Policy: "permit"}, nil, `{}`)
-	if err := svc.SetPolicy(context.Background(), "Wireguard0", "permit"); err != nil {
+	svc, poster, _ := newTestService(t, &storage.ManagedServer{InterfaceName: "Wireguard0", Policy: "Policy0"}, nil, `{}`)
+	if err := svc.SetPolicy(context.Background(), "Wireguard0", "Policy0"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(poster.posts) != 0 {
@@ -148,12 +141,17 @@ func TestSetPolicy_NoopWhenSame(t *testing.T) {
 }
 
 func TestListPolicies_ReturnsStoreContents(t *testing.T) {
-	svc, _, _ := newTestService(t, nil, nil, `{"Policy0":{"description":"NL"},"Policy1":{"description":""}}`)
+	svc, _, _ := newTestService(t, nil, nil, `{"Policy0":{"description":"NL"},"Policy1":{"description":""},"HydraRoute":{"description":""}}`)
 	got, err := svc.ListPolicies(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(got) != 2 {
-		t.Fatalf("expected 2 policies, got %d", len(got))
+		t.Fatalf("expected 2 standard policies (HydraRoute excluded), got %d", len(got))
+	}
+	for _, o := range got {
+		if o.ID == "HydraRoute" {
+			t.Fatal("HydraRoute policy must not appear in managed-server dropdown")
+		}
 	}
 }

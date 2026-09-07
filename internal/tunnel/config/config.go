@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 
@@ -14,7 +15,7 @@ import (
 // Default values for tunnel configuration.
 const (
 	DefaultMTU                 = 1280
-	DefaultPersistentKeepalive = 25
+	DefaultPersistentKeepalive = "25"
 )
 
 // Configuration parsing errors.
@@ -47,8 +48,8 @@ func writeAWGParams(b *strings.Builder, iface *storage.AWGInterface) {
 	b.WriteString(fmt.Sprintf("H2 = %s\n", iface.H2))
 	b.WriteString(fmt.Sprintf("H3 = %s\n", iface.H3))
 	b.WriteString(fmt.Sprintf("H4 = %s\n", iface.H4))
-	// Extended params (S3, S4, I1-I5) — only if any extended param is set
-	if iface.S3 > 0 || iface.S4 > 0 || iface.I1 != "" {
+	// Extended params (S3, S4, I1-I5) - only if any extended param is set
+	if iface.S3 > 0 || iface.S4 > 0 || hasAnySignaturePacket(iface) {
 		b.WriteString(fmt.Sprintf("S3 = %d\n", iface.S3))
 		b.WriteString(fmt.Sprintf("S4 = %d\n", iface.S4))
 		if iface.I1 != "" {
@@ -66,6 +67,35 @@ func writeAWGParams(b *strings.Builder, iface *storage.AWGInterface) {
 		if iface.I5 != "" {
 			b.WriteString(fmt.Sprintf("I5 = %s\n", iface.I5))
 		}
+	}
+	writeAWG3Params(b, iface)
+}
+
+// writeAWG3Params emits AWG 3.0 device parameters (kernel module feat/awg3).
+// Each is written only when set, so an AWG 1.x/2.x config stays byte-identical.
+// Key names match the case-insensitive keys accepted by `awg setconf`.
+func writeAWG3Params(b *strings.Builder, iface *storage.AWGInterface) {
+	writeIfSet := func(key, val string) {
+		if val != "" {
+			b.WriteString(fmt.Sprintf("%s = %s\n", key, val))
+		}
+	}
+	writeIfSet("HeaderProtectionKey", iface.HeaderProtectionKey)
+	writeIfSet("ContentPaddingAddition", iface.ContentPaddingAddition)
+	writeIfSet("RekeyAfterTime", iface.RekeyAfterTime)
+	writeIfSet("RekeyTimeout", iface.RekeyTimeout)
+	writeIfSet("RejectAfterTime", iface.RejectAfterTime)
+	writeIfSet("KeepaliveTimeout", iface.KeepaliveTimeout)
+	writeIfSet("MaxHandshakeAttempts", iface.MaxHandshakeAttempts)
+	// `awg` reads these through parse_bool, which takes on/off (or a number)
+	// and rejects "true" outright. Only the enabled state is written: off is
+	// the device default, and emitting it would make a showconf round-trip of
+	// a plain tunnel look like an awg3 config.
+	if iface.RandomTrailers {
+		b.WriteString("RandomTrailers = on\n")
+	}
+	if iface.DisableCookies {
+		b.WriteString("DisableCookies = on\n")
 	}
 }
 
@@ -93,10 +123,10 @@ func Generate(tunnel *storage.AWGTunnel) string {
 	b.WriteString(fmt.Sprintf("Endpoint = %s\n", tunnel.Peer.Endpoint))
 
 	keepalive := tunnel.Peer.PersistentKeepalive
-	if keepalive == 0 {
+	if keepalive.IsZero() {
 		keepalive = DefaultPersistentKeepalive
 	}
-	b.WriteString(fmt.Sprintf("PersistentKeepalive = %d\n", keepalive))
+	b.WriteString(fmt.Sprintf("PersistentKeepalive = %s\n", keepalive))
 
 	return b.String()
 }
@@ -141,10 +171,10 @@ func GenerateForExport(tunnel *storage.AWGTunnel) string {
 	b.WriteString(fmt.Sprintf("Endpoint = %s\n", tunnel.Peer.Endpoint))
 
 	keepalive := tunnel.Peer.PersistentKeepalive
-	if keepalive == 0 {
+	if keepalive.IsZero() {
 		keepalive = DefaultPersistentKeepalive
 	}
-	b.WriteString(fmt.Sprintf("PersistentKeepalive = %d\n", keepalive))
+	b.WriteString(fmt.Sprintf("PersistentKeepalive = %s\n", keepalive))
 
 	return b.String()
 }
@@ -216,6 +246,15 @@ func Parse(content string) (*storage.AWGTunnel, error) {
 	if tunnel.Peer.Endpoint == "" {
 		return nil, ErrMissingEndpoint
 	}
+	// Нормализация формата: канонизирует небракетированный IPv6-с-портом
+	// (встречается в выгрузках некоторых провайдеров) и отсекает мусорные
+	// формы (без порта, нечисловой порт) с внятной ошибкой на импорте —
+	// вместо загадочного отказа NDMS/резолвера при старте.
+	normalized, err := NormalizeEndpoint(tunnel.Peer.Endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Endpoint %q in [Peer]: %w", tunnel.Peer.Endpoint, err)
+	}
+	tunnel.Peer.Endpoint = normalized
 
 	if len(tunnel.Peer.AllowedIPs) == 0 {
 		tunnel.Peer.AllowedIPs = DefaultAllowedIPs()
@@ -288,7 +327,54 @@ func parseInterfaceField(tunnel *storage.AWGTunnel, key, value string) {
 		iface.I4 = value
 	case "i5":
 		iface.I5 = value
+	case "headerprotectionkey":
+		iface.HeaderProtectionKey = value
+	case "contentpaddingaddition":
+		iface.ContentPaddingAddition = awg3Range(value)
+	case "rekeyaftertime":
+		iface.RekeyAfterTime = awg3Range(value)
+	case "rekeytimeout":
+		iface.RekeyTimeout = awg3Range(value)
+	case "rejectaftertime":
+		iface.RejectAfterTime = awg3Range(value)
+	case "keepalivetimeout":
+		iface.KeepaliveTimeout = awg3Range(value)
+	case "maxhandshakeattempts":
+		iface.MaxHandshakeAttempts = awg3Range(value)
+	case "randomtrailers":
+		iface.RandomTrailers = awg3Bool(value)
+	case "disablecookies":
+		iface.DisableCookies = awg3Bool(value)
 	}
+}
+
+// awg3Bool разбирает булев ключ AWG 3.1 так же, как parse_bool в
+// amneziawg-tools: "on" без учёта регистра либо ненулевое число. Всё
+// остальное, включая "off" и пустую строку, — выключено.
+//
+// Отдельная функция, а не strconv.ParseBool: `awg showconf` печатает on/off,
+// которых ParseBool не знает, и печатает их ВСЕГДА — ядро кладёт оба флага в
+// дамп безусловно. Считать "off" отсутствием значения обязательно, иначе
+// импорт showconf-вывода пометил бы обычный туннель как awg3. Та же ловушка,
+// от которой защищает awg3Range.
+func awg3Bool(value string) bool {
+	v := strings.TrimSpace(value)
+	if strings.EqualFold(v, "on") {
+		return true
+	}
+	n, err := strconv.ParseUint(v, 10, 32)
+	return err == nil && n != 0
+}
+
+// awg3Range нормализует значение AWG 3.0 диапазона из .conf. `awg showconf`
+// печатает "0" для каждого незаданного параметра, поэтому импорт такого вывода
+// превращал бы обычный AWG 2.0 туннель в awg3-подобный. Диапазон "0-80" при
+// этом остаётся как есть — нулём считается только одиночный ноль.
+func awg3Range(value string) string {
+	if value == "0" {
+		return ""
+	}
+	return value
 }
 
 func parsePeerField(tunnel *storage.AWGTunnel, key, value string) {
@@ -310,8 +396,37 @@ func parsePeerField(tunnel *storage.AWGTunnel, key, value string) {
 			}
 		}
 	case "persistentkeepalive":
-		if v, err := strconv.Atoi(value); err == nil {
-			peer.PersistentKeepalive = v
+		if ValidateKeepalive(storage.Keepalive(value)) == nil {
+			peer.PersistentKeepalive = storage.Keepalive(value)
 		}
 	}
+}
+
+// NormalizeEndpoint приводит endpoint к канонической форме "host:port"
+// (IPv6 — "[addr]:port"). Небракетированный IPv6-с-портом бракетируется;
+// порт обязан быть числом 1-65535.
+func NormalizeEndpoint(endpoint string) (string, error) {
+	addr := strings.TrimSpace(endpoint)
+	if host, port, err := net.SplitHostPort(addr); err == nil {
+		if !validEndpointPort(port) {
+			return "", fmt.Errorf("port %q must be a number 1-65535", port)
+		}
+		if strings.Contains(host, ":") {
+			return net.JoinHostPort(host, port), nil
+		}
+		return host + ":" + port, nil
+	}
+	// Небракетированный IPv6:port — сплит по последнему двоеточию.
+	if i := strings.LastIndex(addr, ":"); i > 0 {
+		host, port := addr[:i], addr[i+1:]
+		if ip := net.ParseIP(host); ip != nil && strings.Contains(host, ":") && validEndpointPort(port) {
+			return net.JoinHostPort(host, port), nil
+		}
+	}
+	return "", errors.New("expected host:port")
+}
+
+func validEndpointPort(p string) bool {
+	n, err := strconv.Atoi(p)
+	return err == nil && n >= 1 && n <= 65535
 }

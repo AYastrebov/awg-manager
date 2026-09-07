@@ -3,6 +3,7 @@ package monitoring
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 	"github.com/hoaxisr/awg-manager/internal/traffic"
+	tunnelconfig "github.com/hoaxisr/awg-manager/internal/tunnel/config"
 )
 
 // Cell is a single (target × tunnel) measurement in the matrix snapshot.
@@ -66,6 +68,10 @@ type SingboxTunnelInfo struct {
 	Tag           string // sing-box outbound tag, e.g. "veesp"
 	Name          string // human-readable name (often equals Tag)
 	InterfaceName string // kernel iface, e.g. "t2s0"
+	Subscription  bool
+	Protocol      string
+	Security      string
+	Transport     string
 }
 
 // CompositeOutboundLister exposes the router's composite outbound
@@ -94,13 +100,13 @@ type ClashStateProvider interface {
 // SingboxDelayProber issues an honest end-to-end latency probe through
 // a specific sing-box outbound to a specific URL via the Clash API
 // (/proxies/<tag>/delay). Used for sing-box matrix rows in place of
-// the curl-through-interface path, which can be short-circuited by
+// the HTTP-through-interface path, which can be short-circuited by
 // the user's sing-box DNS/route config and produce nonsense (1-2 ms)
 // numbers. Returns delay in ms, or error on transport / non-2xx /
 // outbound-failed responses. Optional — when nil, sing-box rows fall
 // back to the default Prober.
 type SingboxDelayProber interface {
-	TestDelay(outboundTag, testURL string, timeout time.Duration) (int, error)
+	TestDelay(ctx context.Context, outboundTag, testURL string, timeout time.Duration) (int, error)
 }
 
 // SchedulerDeps wires Scheduler against the rest of the system.
@@ -126,6 +132,10 @@ type Scheduler struct {
 	probeTimeout time.Duration
 	workerLimit  int
 	history      *History
+	// transitions классифицирует self-пробы по туннелям: в журнал попадают
+	// только переходы ok→fail (Warn) и восстановления (Info) — сами пробы
+	// каждые 60 секунд журнал не трогают.
+	transitions *logging.TransitionTracker
 
 	mu       sync.RWMutex
 	lastSnap Snapshot
@@ -142,6 +152,7 @@ func NewScheduler(deps SchedulerDeps, history *History) *Scheduler {
 		probeTimeout: 5 * time.Second,
 		workerLimit:  10,
 		history:      history,
+		transitions:  logging.NewTransitionTracker(),
 		stopCh:       make(chan struct{}),
 	}
 }
@@ -176,7 +187,7 @@ func (s *Scheduler) SetClashState(p ClashStateProvider) {
 
 // SetSingboxDelay wires the Clash-API delay prober after construction.
 // Optional — when never set, sing-box rows fall back to the default
-// Prober (curl-through-interface).
+// Prober (HTTP-through-interface).
 func (s *Scheduler) SetSingboxDelay(p SingboxDelayProber) {
 	s.deps.SingboxDelay = p
 }
@@ -248,6 +259,12 @@ func (s *Scheduler) RunOnce(ctx context.Context) {
 
 	cells := make([]Cell, 0, len(targets)*len(tunnels))
 	var cellsMu sync.Mutex
+	// Наблюдаемые в этом проходе туннели: серии переходов живут только у
+	// них — туннель с disabled/handshake-методом или без self-цели
+	// забывается (после включения проверки первый отказ снова даст Warn,
+	// а не «повтор»; та же семантика, что у connectivity-трекера).
+	probed := make(map[string]bool, len(tunnels))
+	var probedMu sync.Mutex
 
 	sem := make(chan struct{}, s.workerLimit)
 	var wg sync.WaitGroup
@@ -255,6 +272,11 @@ func (s *Scheduler) RunOnce(ctx context.Context) {
 	for _, target := range targets {
 		for _, tun := range tunnels {
 			isSelf := tun.SelfTarget != "" && tun.SelfTarget == target.Host
+			// Cross-target probing was removed with the matrix UI; probe
+			// only each tunnel's own self-cell.
+			if !isSelf {
+				continue
+			}
 			// Skip cells the user explicitly disabled (handshake/disabled
 			// methods don't probe a host) — those tunnels still get base-
 			// target rows for visibility.
@@ -269,6 +291,11 @@ func (s *Scheduler) RunOnce(ctx context.Context) {
 
 				latency, ok := s.runProbeCell(ctx, t, tn, self)
 				now := time.Now()
+
+				probedMu.Lock()
+				probed[tn.ID] = true
+				probedMu.Unlock()
+				s.logProbeTransition(tn, t, ok)
 
 				sample := Sample{TS: now, OK: ok}
 				if ok {
@@ -314,9 +341,32 @@ func (s *Scheduler) RunOnce(ctx context.Context) {
 		keepIDs[t.ID] = true
 	}
 	s.history.PruneTunnels(keepIDs)
+	s.transitions.Retain(probed)
 
 	if s.deps.Bus != nil {
 		s.deps.Bus.Publish("monitoring:matrix-update", snap)
+	}
+}
+
+// logProbeTransition пишет в журнал только смену состояния self-пробы:
+// недостижимость — Warn, восстановление — Info с длиной серии. Пробы
+// выполняются раз в минуту на туннель; стабильное состояние журнал
+// не трогает.
+func (s *Scheduler) logProbeTransition(tn Tunnel, t Target, ok bool) {
+	if s.deps.Log == nil {
+		return
+	}
+	name := tn.Name
+	if name == "" {
+		name = tn.ID
+	}
+	switch obs := s.transitions.Observe(tn.ID, ok); obs.Kind {
+	case logging.TransitionNowFailing:
+		s.deps.Log.AppLog(logging.LevelWarn, logging.GroupSystem, logging.SubMonitoring,
+			"probe", name, fmt.Sprintf("monitoring probe unreachable: %s", t.Host))
+	case logging.TransitionRecovered:
+		s.deps.Log.AppLog(logging.LevelInfo, logging.GroupSystem, logging.SubMonitoring,
+			"probe", name, fmt.Sprintf("monitoring probe reachable again (%s) after %d failed cycles", t.Host, obs.Failures))
 	}
 }
 
@@ -369,13 +419,35 @@ func (s *Scheduler) runProbeCell(ctx context.Context, t Target, tn Tunnel, isSel
 		if probeURL == "" {
 			return 0, false
 		}
-		d, err := s.deps.SingboxDelay.TestDelay(tn.SingboxTag, probeURL, s.probeTimeout)
+		d, err := s.deps.SingboxDelay.TestDelay(ctx, tn.SingboxTag, probeURL, s.probeTimeout)
 		if err != nil || d <= 0 {
 			return 0, false
 		}
 		return d, true
 	}
-	return s.proberFor(tn, isSelf).Probe(ctx, t.Host, tn.IfaceName, s.probeTimeout)
+	target := t.Host
+	if isSelf && tn.SelfURL != "" {
+		target = tn.SelfURL
+	}
+	return s.proberFor(tn, isSelf).Probe(ctx, target, tn.IfaceName, s.probeTimeout)
+}
+
+// connectivityCheckURL returns the configured connectivity-check URL and its
+// host (settings, else the default; the default when the stored one does not
+// parse). Same source as the manual check in testing.Service.
+func (s *Scheduler) connectivityCheckURL() (rawURL, host string) {
+	rawURL = storage.DefaultConnectivityCheckURL
+	if s.deps.SettingsStore != nil {
+		if settings, err := s.deps.SettingsStore.Get(); err == nil && settings != nil && settings.ConnectivityCheckURL != "" {
+			rawURL = settings.ConnectivityCheckURL
+		}
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		rawURL = storage.DefaultConnectivityCheckURL
+		u, _ = url.Parse(rawURL)
+	}
+	return rawURL, u.Hostname()
 }
 
 // collectTunnels assembles Tunnel records from:
@@ -401,6 +473,8 @@ func (s *Scheduler) collectTunnels(ctx context.Context) []Tunnel {
 			pingTarget := ""
 			selfTarget := ""
 			selfMethod := "http" // sane default — matches connectivity-check fallback
+			awgVersion := ""
+			defaultRoute := false
 			if s.deps.TunnelStore != nil {
 				if stored, err := s.deps.TunnelStore.Get(rt.ID); err == nil && stored != nil {
 					if stored.Name != "" {
@@ -417,6 +491,8 @@ func (s *Scheduler) collectTunnels(ctx context.Context) []Tunnel {
 							selfTarget = stored.ConnectivityCheck.PingTarget
 						}
 					}
+					awgVersion = tunnelconfig.ClassifyAWGVersion(&stored.Interface)
+					defaultRoute = stored.DefaultRoute
 					// NativeWG tunnels claim a Keenetic-native NDMS name
 					// "Wireguard{NWGIndex}" — flag it so the system-tunnel
 					// pass below skips the duplicate row.
@@ -425,11 +501,12 @@ func (s *Scheduler) collectTunnels(ctx context.Context) []Tunnel {
 					}
 				}
 			}
-			// Default self-target for HTTP method matches the connectivity-
-			// check service: probe the same gstatic endpoint so the matrix
-			// cell labelled with that host shows the canonical card metric.
+			// Self-target for HTTP method is the configured connectivity-check
+			// URL — the same endpoint and probe the manual «Тест» button uses,
+			// so the card indicator cannot disagree with it.
+			selfURL := ""
 			if selfTarget == "" && selfMethod == "http" {
-				selfTarget = "connectivitycheck.gstatic.com"
+				selfURL, selfTarget = s.connectivityCheckURL()
 			}
 			if rt.IfaceName != "" {
 				managedClaimed[rt.IfaceName] = true
@@ -440,7 +517,12 @@ func (s *Scheduler) collectTunnels(ctx context.Context) []Tunnel {
 				IfaceName:       rt.IfaceName,
 				PingcheckTarget: pingTarget,
 				SelfTarget:      selfTarget,
+				SelfURL:         selfURL,
 				SelfMethod:      selfMethod,
+				Source:          "awg",
+				Backend:         rt.BackendType,
+				AWGVersion:      awgVersion,
+				DefaultRoute:    defaultRoute,
 			})
 		}
 	}
@@ -466,6 +548,8 @@ func (s *Scheduler) collectTunnels(ctx context.Context) []Tunnel {
 					Name:            name,
 					IfaceName:       st.InterfaceName,
 					PingcheckTarget: "",
+					Source:          "system",
+					Backend:         "system",
 				})
 			}
 		}
@@ -501,10 +585,14 @@ func (s *Scheduler) collectTunnels(ctx context.Context) []Tunnel {
 					IfaceName: sbt.InterfaceName,
 					// PingcheckTarget / SelfTarget left empty — sing-box
 					// tunnels don't have a per-tunnel restart pingcheck;
-					// matrix row uses BaseTargets only, augmented later
-					// with Clash data.
-					Source:     "singbox",
-					SingboxTag: sbt.Tag,
+					// connectivity targets come from EffectiveTargets,
+					// augmented later with Clash data.
+					Source:       "singbox",
+					SingboxTag:   sbt.Tag,
+					Subscription: sbt.Subscription,
+					Protocol:     sbt.Protocol,
+					Security:     sbt.Security,
+					Transport:    sbt.Transport,
 				})
 				seenID[sbt.Tag] = true
 				if sbt.InterfaceName != "" {

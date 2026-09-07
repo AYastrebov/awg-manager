@@ -4,17 +4,30 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
-	"strconv"
+	"slices"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
-	CurrentSchemaVersion = 18
-	DefaultPort          = 2222
-	DefaultInterface     = "br0"
+	CurrentSchemaVersion        = 35
+	DefaultPort                 = 2222
+	DefaultInterface            = "br0"
+	DefaultPingCheckTarget      = "8.8.8.8"
+	DefaultConnectivityCheckURL = "http://connectivitycheck.gstatic.com/generate_204"
+	// DefaultSessionTTLHours is the fallback auth session lifetime — the
+	// historical fixed value before SessionTtlHours became configurable.
+	DefaultSessionTTLHours = 24
+	// MinSessionTTLHours / MaxSessionTTLHours bound the configurable auth
+	// session lifetime. Shared by the /settings/update validation, the
+	// load-time self-heal and GetSessionTTL, so a stored out-of-range value
+	// can never silently exceed the documented cap.
+	MinSessionTTLHours = 1
+	MaxSessionTTLHours = 720
 )
 
 // SettingsStore manages application settings.
@@ -31,6 +44,11 @@ func NewSettingsStore(dataDir string) *SettingsStore {
 	}
 }
 
+// DataDir returns the awg-manager data directory (parent of settings.json).
+func (s *SettingsStore) DataDir() string {
+	return filepath.Dir(s.path)
+}
+
 // Load reads settings from disk. Returns default settings if file doesn't exist.
 func (s *SettingsStore) Load() (*Settings, error) {
 	s.mu.Lock()
@@ -40,11 +58,12 @@ func (s *SettingsStore) Load() (*Settings, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Return default settings with v2 schema
-			s.settings = s.defaultSettings()
+			def := s.defaultSettings()
 			// Try to migrate port from old port file
-			s.migratePortFile(s.settings)
-			// Save new settings
-			if saveErr := s.saveUnlocked(s.settings); saveErr != nil {
+			s.migratePortFile(def)
+			// Публикацию делает saveUnlocked на успехе; при провале кэш
+			// остаётся пустым и Get() не маскирует ошибку диска (F3).
+			if saveErr := s.saveUnlocked(def); saveErr != nil {
 				return nil, saveErr
 			}
 			return s.settings, nil
@@ -52,12 +71,32 @@ func (s *SettingsStore) Load() (*Settings, error) {
 		return nil, err
 	}
 
+	restoredFromBackup := false
 	var settings Settings
 	if err := json.Unmarshal(data, &settings); err != nil {
-		return nil, err
+		// Corrupt settings file (typically a torn write after power loss).
+		// Quarantine it and fall back to the backup kept by saveUnlocked so
+		// a single bad file does not leave the daemon permanently down.
+		quarantine := s.path + ".corrupt"
+		renamed := os.Rename(s.path, quarantine) == nil
+		where := "quarantined to " + quarantine
+		if !renamed {
+			where = "corrupt file left in place (rename to " + quarantine + " failed)"
+		}
+		bak, bakErr := os.ReadFile(s.path + ".bak")
+		if bakErr != nil {
+			return nil, fmt.Errorf("parse %s (%s, no usable backup): %w", s.path, where, err)
+		}
+		settings = Settings{}
+		if bakErr := json.Unmarshal(bak, &settings); bakErr != nil {
+			return nil, fmt.Errorf("parse %s (%s, backup also corrupt: %v): %w", s.path, where, bakErr, err)
+		}
+		fmt.Fprintf(os.Stderr, "settings: %s was corrupt (%v), %s, restored from backup\n", s.path, err, where)
+		recordNotice("backup-restore", s.path, fmt.Sprintf("settings file corrupt (%v), %s, RESTORED FROM BACKUP — recent settings changes may be lost", err, where))
+		restoredFromBackup = true
 	}
 
-	needsSave := false
+	needsSave := restoredFromBackup
 	// Migrate if needed
 	if settings.SchemaVersion < CurrentSchemaVersion {
 		needsSave = true
@@ -114,11 +153,82 @@ func (s *SettingsStore) Load() (*Settings, error) {
 		if settings.SchemaVersion < 18 {
 			s.migrateToV18(&settings)
 		}
+		if settings.SchemaVersion < 19 {
+			s.migrateToV19(&settings)
+		}
+		if settings.SchemaVersion < 20 {
+			s.migrateToV20(&settings)
+		}
+		if settings.SchemaVersion < 21 {
+			s.migrateToV21(&settings)
+		}
+		if settings.SchemaVersion < 22 {
+			s.migrateToV22(&settings)
+		}
+		if settings.SchemaVersion < 23 {
+			s.migrateToV23(&settings)
+		}
+		if settings.SchemaVersion < 24 {
+			s.migrateToV24(&settings)
+		}
+		if settings.SchemaVersion < 25 {
+			s.migrateToV25(&settings)
+		}
+		if settings.SchemaVersion < 26 {
+			s.migrateToV26(&settings)
+		}
+		if settings.SchemaVersion < 27 {
+			s.migrateToV27(&settings)
+		}
+		if settings.SchemaVersion < 28 {
+			s.migrateToV28(&settings)
+		}
+		if settings.SchemaVersion < 29 {
+			s.migrateToV29(&settings)
+		}
+		if settings.SchemaVersion < 30 {
+			s.migrateToV30(&settings)
+		}
+		if settings.SchemaVersion < 31 {
+			s.migrateToV31(&settings)
+		}
+		if settings.SchemaVersion < 32 {
+			s.migrateToV32(&settings)
+		}
+		if settings.SchemaVersion < 33 {
+			s.migrateToV33(&settings)
+		}
+		if settings.SchemaVersion < 34 {
+			s.migrateToV34(&settings)
+		}
+		if settings.SchemaVersion < 35 {
+			s.migrateToV35(&settings)
+		}
 	}
 
 	// Self-heal duplicated managed servers — see dedupManagedServers comment.
 	if deduped, removed := dedupManagedServers(settings.ManagedServers); removed > 0 {
 		settings.ManagedServers = deduped
+		needsSave = true
+	}
+
+	// Self-heal an out-of-range session TTL unconditionally (mirrors the
+	// dedup self-heal above). migrateToV29 only backfills the default when
+	// the file is below v29; a downgrade that rewrote settings.json AT v29
+	// without the field leaves a stored 0 that migration never revisits,
+	// and a hand-edited over-range value would otherwise let sessions
+	// silently outlive the documented MaxSessionTTLHours cap forever
+	// (/settings/update only validates the field when a patch carries it).
+	// Heal here so the effective and persisted values converge.
+	if settings.SessionTtlHours < MinSessionTTLHours || settings.SessionTtlHours > MaxSessionTTLHours {
+		settings.SessionTtlHours = DefaultSessionTTLHours
+		needsSave = true
+	}
+
+	// Self-heal ingress-ref'ы, оставшиеся от удалённых managed-серверов
+	// (#670). Безусловно, как дедуп выше: миграцией не обойтись — ref мог
+	// осироветь и после апгрейда.
+	if pruneOrphanIngressRefs(&settings) {
 		needsSave = true
 	}
 
@@ -135,18 +245,20 @@ func (s *SettingsStore) Load() (*Settings, error) {
 // defaultSettings returns settings with default values.
 func (s *SettingsStore) defaultSettings() *Settings {
 	return &Settings{
-		SchemaVersion: CurrentSchemaVersion,
-		AuthEnabled:   false,
-		UsageLevel:    UsageLevelBasic,
+		SchemaVersion:   CurrentSchemaVersion,
+		AuthEnabled:     false,
+		SessionTtlHours: DefaultSessionTTLHours,
+		UsageLevel:      UsageLevelBasic,
 		Server: ServerSettings{
-			Port:      DefaultPort,
-			Interface: DefaultInterface,
+			Port:       DefaultPort,
+			Interface:  DefaultInterface,
+			Interfaces: []string{DefaultInterface},
 		},
 		PingCheck: PingCheckSettings{
 			Enabled: false,
 			Defaults: PingCheckDefaults{
 				Method:        "http",
-				Target:        "8.8.8.8",
+				Target:        DefaultPingCheckTarget,
 				Interval:      45,
 				DeadInterval:  120,
 				FailThreshold: 3,
@@ -155,180 +267,42 @@ func (s *SettingsStore) defaultSettings() *Settings {
 		Logging: LoggingSettings{
 			Enabled:           true,
 			MaxAge:            2,
+			LogLevel:          "info",
+			SingboxLogLevel:   DefaultSingboxLogLevel,
 			AppMaxEntries:     5000,
 			SingboxMaxEntries: 5000,
 		},
 		Updates: UpdateSettings{
-			CheckEnabled: true,
+			CheckEnabled:            true,
+			Channel:                 "stable",
+			AutoInstallIntervalDays: 7,
+			AutoInstallTime:         "05:00",
 		},
+		Download: DownloadSettings{
+			RouteTag:  "direct",
+			RouteKind: "direct",
+		},
+		ConnectivityCheckURL: DefaultConnectivityCheckURL,
 		SingboxRouter: SingboxRouterSettings{
-			Enabled:         false,
-			RefreshMode:     "interval",
-			RefreshInterval: 24,
-			WANAutoDetect:   true, // sing-box auto_detect_interface by default
+			Enabled:        false,
+			DeviceMode:     "policy",
+			RoutingMode:    "tproxy",
+			SnifferEnabled: true,
+			WANAutoDetect:  true, // sing-box auto_detect_interface by default
+			// KeenDNS/CrazeDNS: имена резолвит сам роутер, его адреса —
+			// мимо sing-box.
+			BypassPresets: []string{"keendns"},
+			// Явный дефолт v6-пула: с v35 пустое значение ЗНАЧИМО («v6
+			// выключен»), поэтому свежая установка обязана нести его дословно.
+			// Литерал — дубль DefaultFakeIPTunParams().Inet6Range.
+			FakeIPPool6: "fc00::/18",
 		},
+		CreateNDMSProxyForSingbox: true,
+		// Fresh installs have no legacy peers — nothing to sweep. Only
+		// pre-existing configs (field absent → false) run the one-time
+		// peer allow-ips migration.
+		ManagedPeerAllowIPsMigrated: true,
 	}
-}
-
-// migrateToV2 migrates settings from v1 to v2.
-func (s *SettingsStore) migrateToV2(settings *Settings) error {
-	// Migrate port from old port file
-	s.migratePortFile(settings)
-
-	// Set defaults for new fields if not set
-	if settings.Server.Port == 0 {
-		settings.Server.Port = DefaultPort
-	}
-	if settings.Server.Interface == "" {
-		settings.Server.Interface = DefaultInterface
-	}
-
-	// Set PingCheck defaults
-	if settings.PingCheck.Defaults.Method == "" {
-		settings.PingCheck.Defaults.Method = "http"
-	}
-	if settings.PingCheck.Defaults.Target == "" {
-		settings.PingCheck.Defaults.Target = "8.8.8.8"
-	}
-	if settings.PingCheck.Defaults.Interval == 0 {
-		settings.PingCheck.Defaults.Interval = 45
-	}
-	if settings.PingCheck.Defaults.DeadInterval == 0 {
-		settings.PingCheck.Defaults.DeadInterval = 120
-	}
-	if settings.PingCheck.Defaults.FailThreshold == 0 {
-		settings.PingCheck.Defaults.FailThreshold = 3
-	}
-
-	settings.SchemaVersion = 2
-	return nil
-}
-
-// migrateToV3 migrates settings from v2 to v3.
-func (s *SettingsStore) migrateToV3(settings *Settings) {
-	// Set Logging defaults
-	if settings.Logging.MaxAge == 0 {
-		settings.Logging.MaxAge = 2
-	}
-	// Logging.Enabled defaults to false (zero value)
-
-	settings.SchemaVersion = 3
-}
-
-// migrateToV4 migrates settings from v3 to v4.
-func (s *SettingsStore) migrateToV4(settings *Settings) {
-	// Previously set default BackendMode (removed in v13)
-	settings.SchemaVersion = 4
-}
-
-// migrateToV5 migrates settings from v4 to v5.
-func (s *SettingsStore) migrateToV5(settings *Settings) {
-	settings.SchemaVersion = 5
-}
-
-// migrateToV6 migrates settings from v5 to v6.
-func (s *SettingsStore) migrateToV6(settings *Settings) {
-	// Enable update checks by default
-	settings.Updates.CheckEnabled = true
-	settings.SchemaVersion = 6
-}
-
-// migrateToV7 was a version bump for an experimental field that was
-// removed before reaching production. Kept as a no-op so the schema
-// ladder remains contiguous.
-func (s *SettingsStore) migrateToV7(settings *Settings) {
-	settings.SchemaVersion = 7
-}
-
-// migrateToV8 migrates settings from v7 to v8.
-func (s *SettingsStore) migrateToV8(settings *Settings) {
-	// v8 added ExcludedWANs (later removed) — bump version only
-	settings.SchemaVersion = 8
-}
-
-// migrateToV9 migrates settings from v8 to v9.
-func (s *SettingsStore) migrateToV9(settings *Settings) {
-	// DNSRouteSettings zero value (disabled, interval 0) is correct default
-	settings.SchemaVersion = 9
-}
-
-// migrateToV10 migrates settings from v9 to v10.
-func (s *SettingsStore) migrateToV10(settings *Settings) {
-	settings.SchemaVersion = 10
-}
-
-// migrateToV11 migrates settings from v10 to v11.
-func (s *SettingsStore) migrateToV11(settings *Settings) {
-	// ServerInterfaces zero value (nil) is correct default
-	settings.SchemaVersion = 11
-}
-
-// migrateToV12 migrates settings from v11 to v12.
-func (s *SettingsStore) migrateToV12(settings *Settings) {
-	// ManagedServer zero value (nil) is correct default
-	settings.SchemaVersion = 12
-}
-
-// migrateToV13 removes deprecated BackendMode (now per-tunnel).
-func (s *SettingsStore) migrateToV13(settings *Settings) {
-	settings.SchemaVersion = 13
-}
-
-// migrateToV14 sets SingboxRouter defaults for the new TProxy routing
-// engine. Idempotent — fields that are non-zero stay as-is.
-// Note: Mode field was removed in V15; only RefreshMode/RefreshInterval are set here.
-func (s *SettingsStore) migrateToV14(settings *Settings) {
-	if settings.SingboxRouter.RefreshMode == "" {
-		settings.SingboxRouter.RefreshMode = "interval"
-	}
-	if settings.SingboxRouter.RefreshInterval == 0 {
-		settings.SingboxRouter.RefreshInterval = 24
-	}
-	settings.SchemaVersion = 14
-}
-
-// migrateToV15 wipes deprecated SingboxRouterSettings fields (Mode,
-// ClientScope) and force-disables the router so the user re-selects
-// a policy via the new policy-mode UI. Per redesign 2026-04-28:
-// no users to preserve, simplest fail-safe.
-func (s *SettingsStore) migrateToV15(settings *Settings) {
-	settings.SingboxRouter.PolicyName = ""
-	settings.SingboxRouter.Enabled = false
-	settings.SchemaVersion = 15
-}
-
-// migrateToV16 introduces UsageLevel. Any user reaching this migration
-// already has a working settings file (the file existed on disk before
-// the upgrade), so they are an existing user — set advanced. Fresh
-// installs never run this migration: defaultSettings() ships v16 with
-// usageLevel="basic".
-func (s *SettingsStore) migrateToV16(settings *Settings) {
-	settings.UsageLevel = UsageLevelAdvanced
-	settings.SchemaVersion = 16
-}
-
-// migrateToV17 introduces per-bucket buffer caps for the logging system.
-// Existing installs default to 5000 entries each (matches the prior
-// hardcoded MaxEntries that lived in internal/logging/buffer.go).
-func (s *SettingsStore) migrateToV17(settings *Settings) {
-	if settings.Logging.AppMaxEntries == 0 {
-		settings.Logging.AppMaxEntries = 5000
-	}
-	if settings.Logging.SingboxMaxEntries == 0 {
-		settings.Logging.SingboxMaxEntries = 5000
-	}
-	settings.SchemaVersion = 17
-}
-
-// migrateToV18 sets WANAutoDetect=true on existing installs to preserve
-// the prior implicit behavior (no WAN binding in the config meant sing-box
-// picked the route automatically — the same effect as
-// auto_detect_interface=true that v18 makes explicit). WANInterface stays
-// empty, which is the only valid combination for WANAutoDetect=true.
-func (s *SettingsStore) migrateToV18(settings *Settings) {
-	settings.SingboxRouter.WANAutoDetect = true
-	settings.SingboxRouter.WANInterface = ""
-	settings.SchemaVersion = 18
 }
 
 // dedupManagedServers returns servers with duplicate InterfaceName entries
@@ -358,18 +332,43 @@ func dedupManagedServers(servers []ManagedServer) ([]ManagedServer, int) {
 	return out, removed
 }
 
-// migrateManagedServers moves a legacy singular managedServer into the
-// new ManagedServers slice. Idempotent. Caller holds s.mu.
-func (s *SettingsStore) migrateManagedServers() {
-	if s.settings == nil || s.settings.ManagedServer == nil {
-		return
+// pruneOrphanIngressRefs drops singboxRouter.ingressInterfaces entries of the
+// form "managed:<NDMS-name>" that no longer have a managed server behind them
+// (#670). Reports whether anything changed.
+//
+// Такие ref'ы ставит только тумблер ingress на карточке managed-сервера, так
+// что managed:X без сервера X — всегда мусор от удаления. Router-reconcile
+// раз в 30 секунд дёргал по нему RCI show interface system-name, и NDMS на
+// каждый запрос сыпал в журнал 'unable to find X'. iface:-ref'ы (kernel-имена)
+// не трогаем: они резолвятся локально и по определению не привязаны к
+// managed-серверам.
+func pruneOrphanIngressRefs(settings *Settings) bool {
+	refs := settings.SingboxRouter.IngressInterfaces
+	if len(refs) == 0 {
+		return false
 	}
-	// Prepend so an existing slice (theoretically already migrated) keeps
-	// its order — but in practice mass migration only fires once, when
-	// the slice is empty.
-	migrated := append([]ManagedServer{*s.settings.ManagedServer}, s.settings.ManagedServers...)
-	s.settings.ManagedServers = migrated
-	s.settings.ManagedServer = nil
+	known := make(map[string]struct{}, len(settings.ManagedServers)+1)
+	for _, sv := range settings.ManagedServers {
+		known[sv.InterfaceName] = struct{}{}
+	}
+	if settings.ManagedServer != nil {
+		known[settings.ManagedServer.InterfaceName] = struct{}{}
+	}
+	kept := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		name, isManaged := strings.CutPrefix(ref, "managed:")
+		if isManaged {
+			if _, ok := known[name]; !ok {
+				continue
+			}
+		}
+		kept = append(kept, ref)
+	}
+	if len(kept) == len(refs) {
+		return false
+	}
+	settings.SingboxRouter.IngressInterfaces = kept
+	return true
 }
 
 // GetManagedServers returns a deep copy of all managed servers, ordered
@@ -413,14 +412,16 @@ func (s *SettingsStore) AddManagedServer(server ManagedServer) error {
 	if s.settings == nil {
 		return fmt.Errorf("settings not loaded")
 	}
-	s.migrateManagedServers()
-	for _, existing := range s.settings.ManagedServers {
-		if existing.InterfaceName == server.InterfaceName {
-			return fmt.Errorf("server %q already exists", server.InterfaceName)
+	return s.updateUnlocked(func(cp *Settings) error {
+		migrateManagedServersIn(cp)
+		for _, existing := range cp.ManagedServers {
+			if existing.InterfaceName == server.InterfaceName {
+				return fmt.Errorf("server %q already exists", server.InterfaceName)
+			}
 		}
-	}
-	s.settings.ManagedServers = append(s.settings.ManagedServers, server)
-	return s.saveUnlocked(s.settings)
+		cp.ManagedServers = append(slices.Clone(cp.ManagedServers), server)
+		return nil
+	})
 }
 
 // UpdateManagedServer applies mut to the server with the given id and
@@ -436,16 +437,24 @@ func (s *SettingsStore) UpdateManagedServer(id string, mut func(*ManagedServer) 
 	if s.settings == nil {
 		return fmt.Errorf("settings not loaded")
 	}
-	s.migrateManagedServers()
-	for i := range s.settings.ManagedServers {
-		if s.settings.ManagedServers[i].InterfaceName == id {
-			if err := mut(&s.settings.ManagedServers[i]); err != nil {
-				return err
+	return s.updateUnlocked(func(cp *Settings) error {
+		migrateManagedServersIn(cp)
+		servers := slices.Clone(cp.ManagedServers)
+		for i := range servers {
+			if servers[i].InterfaceName == id {
+				// Клон Peers обязателен: мутаторы правят элементы по месту
+				// (managed/service_peers.go), и без него правка утекла бы в
+				// живой кэш даже при провале записи.
+				servers[i].Peers = slices.Clone(servers[i].Peers)
+				if err := mut(&servers[i]); err != nil {
+					return err
+				}
+				cp.ManagedServers = servers
+				return nil
 			}
-			return s.saveUnlocked(s.settings)
 		}
-	}
-	return fmt.Errorf("server %q not found", id)
+		return fmt.Errorf("server %q not found", id)
+	})
 }
 
 // DeleteManagedServer removes the server with the given id.
@@ -455,14 +464,37 @@ func (s *SettingsStore) DeleteManagedServer(id string) error {
 	if s.settings == nil {
 		return fmt.Errorf("settings not loaded")
 	}
-	s.migrateManagedServers()
-	for i, existing := range s.settings.ManagedServers {
-		if existing.InterfaceName == id {
-			s.settings.ManagedServers = append(s.settings.ManagedServers[:i], s.settings.ManagedServers[i+1:]...)
-			return s.saveUnlocked(s.settings)
+	return s.updateUnlocked(func(cp *Settings) error {
+		migrateManagedServersIn(cp)
+		for i, existing := range cp.ManagedServers {
+			if existing.InterfaceName == id {
+				// Новый backing вместо сдвига по месту: прежний сдвигал
+				// разделяемый массив под читателями старого снимка.
+				cp.ManagedServers = append(
+					append([]ManagedServer(nil), cp.ManagedServers[:i]...),
+					cp.ManagedServers[i+1:]...)
+				// Снять ingress-ref удалённого сервера в той же транзакции —
+				// иначе он висит до перезапуска демона (#670).
+				pruneOrphanIngressRefs(cp)
+				return nil
+			}
 		}
+		return fmt.Errorf("server %q not found", id)
+	})
+}
+
+// updateUnlocked — транзакция узкого мутатора: копия живого кэша → mut →
+// запись; публикацию на успехе делает saveUnlocked (F3). Вызывающий уже держит
+// s.mu, поэтому лок здесь не берётся — форма зеркалит публичный Update.
+//
+// Копия МЕЛКАЯ: mut присваивает поля, а вложенные контейнеры правит только
+// через собственные клоны (та же конвенция, что у Update).
+func (s *SettingsStore) updateUnlocked(mut func(*Settings) error) error {
+	cp := *s.settings
+	if err := mut(&cp); err != nil {
+		return err
 	}
-	return fmt.Errorf("server %q not found", id)
+	return s.saveUnlocked(&cp)
 }
 
 // SaveManagedServers replaces the entire slice — used by migration tests
@@ -473,9 +505,11 @@ func (s *SettingsStore) SaveManagedServers(servers []ManagedServer) error {
 	if s.settings == nil {
 		return fmt.Errorf("settings not loaded")
 	}
-	s.settings.ManagedServers = servers
-	s.settings.ManagedServer = nil
-	return s.saveUnlocked(s.settings)
+	return s.updateUnlocked(func(cp *Settings) error {
+		cp.ManagedServers = servers
+		cp.ManagedServer = nil
+		return nil
+	})
 }
 
 // SetSingboxManuallyStopped atomically updates the sing-box sticky-stop
@@ -488,8 +522,152 @@ func (s *SettingsStore) SetSingboxManuallyStopped(v bool) error {
 	if s.settings == nil {
 		return fmt.Errorf("settings not loaded")
 	}
-	s.settings.SingboxManuallyStopped = v
-	return s.saveUnlocked(s.settings)
+	return s.updateUnlocked(func(cp *Settings) error {
+		cp.SingboxManuallyStopped = v
+		return nil
+	})
+}
+
+// SetAuthEnabled atomically turns authentication on/off under the store
+// lock. Used by the exposure guard, which flips the flag outside the
+// settings HTTP handler and must not clobber concurrent writes to other
+// fields. Returns whether the value actually changed.
+func (s *SettingsStore) SetAuthEnabled(v bool) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return false, fmt.Errorf("settings not loaded")
+	}
+	if s.settings.AuthEnabled == v {
+		return false, nil
+	}
+	if err := s.updateUnlocked(func(cp *Settings) error {
+		cp.AuthEnabled = v
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// SetSingboxCreateNDMSProxy atomically updates the toggle under the
+// store lock. Mirrors SetSingboxManuallyStopped — required because
+// the API handler is the single writer (CLAUDE.md single-writer
+// storage pattern), and concurrent writers on other Settings fields
+// must not silently overwrite this change.
+func (s *SettingsStore) SetSingboxCreateNDMSProxy(v bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return fmt.Errorf("settings not loaded")
+	}
+	return s.updateUnlocked(func(cp *Settings) error {
+		cp.CreateNDMSProxyForSingbox = v
+		return nil
+	})
+}
+
+// IsSingboxNDMSProxyEnabled returns the current toggle value, or true
+// on read error (back-compat default — never fail-closed for this
+// flag; we'd rather create a Proxy than silently break NDMS routing).
+func (s *SettingsStore) IsSingboxNDMSProxyEnabled() bool {
+	settings, err := s.Get()
+	if err != nil {
+		return true
+	}
+	return settings.CreateNDMSProxyForSingbox
+}
+
+// IsManagedPeerAllowIPsMigrated reports whether the one-time peer allow-ips
+// sweep has completed. Returns true on read error (fail-safe: skip the sweep
+// rather than risk re-running RCI mutations on every boot).
+func (s *SettingsStore) IsManagedPeerAllowIPsMigrated() bool {
+	settings, err := s.Get()
+	if err != nil {
+		return true
+	}
+	return settings.ManagedPeerAllowIPsMigrated
+}
+
+// SetManagedPeerAllowIPsMigrated atomically sets the migration flag under the
+// store lock. Mirrors SetSingboxCreateNDMSProxy.
+func (s *SettingsStore) SetManagedPeerAllowIPsMigrated(v bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return fmt.Errorf("settings not loaded")
+	}
+	return s.updateUnlocked(func(cp *Settings) error {
+		cp.ManagedPeerAllowIPsMigrated = v
+		return nil
+	})
+}
+
+// SetOpkgTunState atomically persists the unified OpkgTun ownership record
+// under the store lock (single-writer: lifecycle only). nil очищает запись.
+// Mirrors SetSingboxManuallyStopped.
+//
+// Copy-on-write, как в SetOpkgTunNATSegments: в кэш публикуется КОПИЯ, старую
+// запись могут параллельно маршалить читатели без нашего лока, а объект
+// вызывающего остаётся его собственным. Копия ПОВЕРХНОСТНАЯ: payload
+// (FakeIP/PolicyTun) нигде не мутируется по месту — писатели присваивают
+// свежий объект (конвенция Update, см. ниже).
+func (s *SettingsStore) SetOpkgTunState(st *OpkgTunState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return fmt.Errorf("settings not loaded")
+	}
+	if st != nil {
+		cp := *st
+		st = &cp
+	}
+	return s.updateUnlocked(func(cp *Settings) error {
+		cp.OpkgTun = st
+		return nil
+	})
+}
+
+// SetOpkgTunNATSegments пишет ТОЛЬКО policy-payload записи владения, не трогая
+// ownership-поля (Mode/Provisioned/Index): у payload другой писатель
+// (NAT-reconcile) и другие моменты записи. Пустой/nil список снимает payload.
+// Copy-on-write: в кэш публикуется новая запись, старую могут параллельно
+// маршалить читатели без нашего лока. Запись отсутствует → ошибка (payload
+// без владельца не бывает).
+func (s *SettingsStore) SetOpkgTunNATSegments(segs []PolicyTunNATSegment) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return fmt.Errorf("settings not loaded")
+	}
+	if s.settings.OpkgTun == nil {
+		return fmt.Errorf("no OpkgTun ownership record")
+	}
+	return s.updateUnlocked(func(cur *Settings) error {
+		rec := *cur.OpkgTun
+		if len(segs) == 0 {
+			rec.PolicyTun = nil
+		} else {
+			rec.PolicyTun = &OpkgTunPolicyData{NATSegments: segs}
+		}
+		cur.OpkgTun = &rec
+		return nil
+	})
+}
+
+// SetDNSChainPresetState atomically persists the DNS-chain preset state under
+// the store lock (single-writer pattern; the router service is the only
+// writer). Pass nil to clear (preset off). Mirrors SetOpkgTunState.
+func (s *SettingsStore) SetDNSChainPresetState(st *DNSChainPresetState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return fmt.Errorf("settings not loaded")
+	}
+	return s.updateUnlocked(func(cp *Settings) error {
+		cp.DNSChainPreset = st
+		return nil
+	})
 }
 
 // MarkServerInterface adds an interface ID to the server interfaces list.
@@ -506,8 +684,10 @@ func (s *SettingsStore) MarkServerInterface(id string) error {
 	if !added {
 		return nil
 	}
-	settings.ServerInterfaces = next
-	return s.saveUnlocked(settings)
+	return s.updateUnlocked(func(cp *Settings) error {
+		cp.ServerInterfaces = next
+		return nil
+	})
 }
 
 // UnmarkServerInterface removes an interface ID from the server interfaces list.
@@ -520,8 +700,11 @@ func (s *SettingsStore) UnmarkServerInterface(id string) error {
 		return fmt.Errorf("settings not loaded")
 	}
 
-	settings.ServerInterfaces = filterOut(settings.ServerInterfaces, id)
-	return s.saveUnlocked(settings)
+	next := filterOut(settings.ServerInterfaces, id)
+	return s.updateUnlocked(func(cp *Settings) error {
+		cp.ServerInterfaces = next
+		return nil
+	})
 }
 
 // GetServerInterfaces returns the list of server interface IDs.
@@ -542,28 +725,144 @@ func (s *SettingsStore) IsServerInterface(id string) bool {
 	return contains(settings.ServerInterfaces, id)
 }
 
-// migratePortFile reads port from old port file and removes it.
-func (s *SettingsStore) migratePortFile(settings *Settings) {
-	portFile := filepath.Join(filepath.Dir(s.path), "port")
-	data, err := os.ReadFile(portFile)
-	if err != nil {
-		return // No port file, use default
+// GetServerInterfaceMeta returns AWG Manager metadata for a system server.
+func (s *SettingsStore) GetServerInterfaceMeta(serverID string) (ServerInterfaceMeta, bool) {
+	if _, err := s.Get(); err != nil {
+		return ServerInterfaceMeta{}, false
 	}
-
-	portStr := strings.TrimSpace(string(data))
-	if port, err := strconv.Atoi(portStr); err == nil && port > 0 && port <= 65535 {
-		settings.Server.Port = port
-	}
-
-	// Remove old port file after successful migration
-	os.Remove(portFile)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	meta, ok := s.settings.ServerInterfaceMeta[serverID]
+	return meta, ok
 }
 
-// Save writes settings to disk.
-func (s *SettingsStore) Save(settings *Settings) error {
+// UpdateServerInterfaceMeta updates metadata for a system server.
+func (s *SettingsStore) UpdateServerInterfaceMeta(serverID string, fn func(*ServerInterfaceMeta) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return fmt.Errorf("settings not loaded")
+	}
+	return s.updateUnlocked(func(cp *Settings) error {
+		m := maps.Clone(cp.ServerInterfaceMeta)
+		if m == nil {
+			m = map[string]ServerInterfaceMeta{}
+		}
+		meta := m[serverID]
+		if err := fn(&meta); err != nil {
+			return err
+		}
+		m[serverID] = meta
+		cp.ServerInterfaceMeta = m
+		return nil
+	})
+}
+
+// GetServerPeerSecret returns stored key material for a system-server peer.
+func (s *SettingsStore) GetServerPeerSecret(serverID, pubkey string) (ServerPeerSecret, bool) {
+	if _, err := s.Get(); err != nil {
+		return ServerPeerSecret{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	peers, ok := s.settings.ServerPeerSecrets[serverID]
+	if !ok {
+		return ServerPeerSecret{}, false
+	}
+	sec, ok := peers[pubkey]
+	return sec, ok
+}
+
+// SetServerPeerSecret stores key material for a system-server peer.
+func (s *SettingsStore) SetServerPeerSecret(serverID, pubkey string, sec ServerPeerSecret) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return fmt.Errorf("settings not loaded")
+	}
+	return s.updateUnlocked(func(cp *Settings) error {
+		outer := maps.Clone(cp.ServerPeerSecrets)
+		if outer == nil {
+			outer = map[string]map[string]ServerPeerSecret{}
+		}
+		inner := maps.Clone(outer[serverID])
+		if inner == nil {
+			inner = map[string]ServerPeerSecret{}
+		}
+		inner[pubkey] = sec
+		outer[serverID] = inner
+		cp.ServerPeerSecrets = outer
+		return nil
+	})
+}
+
+// DeleteServerPeerSecret removes stored key material for a system-server peer.
+func (s *SettingsStore) DeleteServerPeerSecret(serverID, pubkey string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return fmt.Errorf("settings not loaded")
+	}
+	if _, ok := s.settings.ServerPeerSecrets[serverID]; !ok {
+		return nil
+	}
+	return s.updateUnlocked(func(cp *Settings) error {
+		outer := maps.Clone(cp.ServerPeerSecrets)
+		inner := maps.Clone(outer[serverID])
+		delete(inner, pubkey)
+		if len(inner) == 0 {
+			delete(outer, serverID)
+		} else {
+			outer[serverID] = inner
+		}
+		cp.ServerPeerSecrets = outer
+		return nil
+	})
+}
+
+// save публикует переданный объект как новый кэш и пишет его на диск.
+// НЕ экспортируется намеренно: писать настройки снаружи можно только через
+// Update (копия под локом) или через узкий мутатор. Публичный Save требовал от
+// каждого вызывающего помнить, что Load/Get отдают живой кэш и мутировать надо
+// копию — контракт, невидимый в сигнатуре и потому регулярно нарушавшийся.
+func (s *SettingsStore) save(settings *Settings) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.saveUnlocked(settings)
+}
+
+// Update атомарно правит настройки под локом стора: копия живого кэша →
+// мутатор → публикация копии. Ошибка мутатора отменяет запись.
+//
+// Зачем копия, а не запись по месту: Load/Get отдают ЖИВОЙ объект кэша, и
+// читатели держат этот указатель уже без лока. Публикуется новая запись, а
+// прежнюю они дочитывают сами. Копия берётся ЗДЕСЬ, в момент коммита, а не
+// на стороне вызывающего: так в неё попадает всё, что успели записать в кэш
+// узкие мутаторы (SetOpkgTunState и прочие), пока вызывающий делал свою
+// работу, — снимок, взятый раньше, затирал бы их записи.
+//
+// Копия МЕЛКАЯ: вложенные карты и слайсы (ServerPeerSecrets, ManagedServers,
+// QoSClasses…) остаются общими с прежним объектом. Мутатор не должен править
+// их элементы по месту — только присваивать новые.
+//
+// Мутатор исполняется ПОД ЛОКОМ стора: он обязан быть чистым и быстрым.
+// Любой метод стора из него — дедлок (RWMutex нерекурсивен), любая блокирующая
+// работа (exec, RCI, диск) держит на себе все чтения настроек. Проверки,
+// которым нужно ходить наружу, делаются ДО вызова.
+func (s *SettingsStore) Update(mut func(*Settings) error) error {
+	if _, err := s.Get(); err != nil { // гарантировать загрузку кэша
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return fmt.Errorf("settings not loaded")
+	}
+	cp := *s.settings
+	if err := mut(&cp); err != nil {
+		return err
+	}
+	return s.saveUnlocked(&cp)
 }
 
 // saveUnlocked writes settings to disk without acquiring lock.
@@ -579,8 +878,24 @@ func (s *SettingsStore) saveUnlocked(settings *Settings) error {
 		return err
 	}
 
+	// Keep the previous good file as .bak (hardlink: no data copy, the old
+	// inode survives the rename below). Load() falls back to it if the main
+	// file is ever found corrupt after a power loss.
+	bakPath := s.path + ".bak"
+	if _, err := os.Stat(s.path); err == nil {
+		_ = os.Remove(bakPath)
+		_ = os.Link(s.path, bakPath)
+	}
+
+	if err := AtomicWrite(s.path, buf.Bytes()); err != nil {
+		return err
+	}
+	// Публикация ТОЛЬКО после успешной записи: при провале кэш не должен нести
+	// незаписанное (F3). Для мутаторов, передающих сюда свежую копию, это и
+	// есть весь откат; мутаторы, правящие живой кэш по месту, откатываются
+	// собственной копией (см. updateUnlocked).
 	s.settings = settings
-	return AtomicWrite(s.path, buf.Bytes())
+	return nil
 }
 
 // Get returns cached settings or loads from disk.
@@ -595,6 +910,29 @@ func (s *SettingsStore) Get() (*Settings, error) {
 	return s.Load()
 }
 
+// Snapshot возвращает глубокую копию настроек (JSON round-trip под RLock).
+// Для маршала наружу (HTTP-ответы): Get() возвращает ЖИВОЙ объект, и его
+// map-поля (ServerPeerSecrets, ServerInterfaceMeta) нельзя читать
+// одновременно с узкими мутаторами — concurrent map read/write валит
+// процесс. На горячем пути (auth middleware) НЕ использовать — там
+// остаётся дешёвый Get().
+func (s *SettingsStore) Snapshot() (*Settings, error) {
+	if _, err := s.Get(); err != nil { // гарантировать загрузку кэша
+		return nil, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	data, err := json.Marshal(s.settings)
+	if err != nil {
+		return nil, err
+	}
+	out := &Settings{}
+	if err := json.Unmarshal(data, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // IsAuthEnabled returns whether authentication is enabled.
 func (s *SettingsStore) IsAuthEnabled() bool {
 	settings, err := s.Get()
@@ -604,16 +942,83 @@ func (s *SettingsStore) IsAuthEnabled() bool {
 	return settings.AuthEnabled
 }
 
+// GetSessionTTL returns the configured auth session lifetime. Falls back
+// to the historical 24h default on load error or an unset/out-of-range
+// value (defense in depth — Load already self-heals the stored field).
+func (s *SettingsStore) GetSessionTTL() time.Duration {
+	settings, err := s.Get()
+	if err != nil || settings.SessionTtlHours < MinSessionTTLHours || settings.SessionTtlHours > MaxSessionTTLHours {
+		return DefaultSessionTTLHours * time.Hour
+	}
+	return time.Duration(settings.SessionTtlHours) * time.Hour
+}
+
+// IsEntwareAuthEnabled returns whether login via Entware system
+// credentials (/opt/etc/shadow) is enabled. Defaults to false on error.
+func (s *SettingsStore) IsEntwareAuthEnabled() bool {
+	settings, err := s.Get()
+	if err != nil {
+		return false
+	}
+	return settings.EntwareAuthEnabled
+}
+
+// IsMcpEnabled reports whether the MCP endpoint is switched on. Read on
+// every /mcp request, so it uses the cheap Get() path like IsAuthEnabled.
+func (s *SettingsStore) IsMcpEnabled() bool {
+	settings, err := s.Get()
+	if err != nil {
+		return false
+	}
+	return settings.McpEnabled
+}
+
 // GetApiKey returns the configured API key, or empty string if none.
 // Used by the auth middleware to accept `Authorization: Bearer <key>` as
 // an alternative to a session cookie. On error returns empty (no key
 // match → request falls through to the session check).
 func (s *SettingsStore) GetApiKey() string {
-	settings, err := s.Get()
-	if err != nil {
+	if _, err := s.Get(); err != nil {
 		return ""
 	}
-	return settings.ApiKey
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.settings.ApiKey
+}
+
+// SetApiKey сохраняет новый API-ключ под локом стора. Копия вместо правки
+// s.settings по месту: указатель из Get() читают без лока, in-place
+// запись строки гонялась бы с этими чтениями.
+func (s *SettingsStore) SetApiKey(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return fmt.Errorf("settings not loaded")
+	}
+	updated := *s.settings
+	updated.ApiKey = key
+	return s.saveUnlocked(&updated)
+}
+
+// SetServerListen сохраняет адрес прослушивания HTTP-сервера под локом.
+// Легаси-поле Interface — для downgrade-совместимости: старый бинарь
+// биндится на FirstIPv4(Interface); при нескольких интерфейсах — первый,
+// при «всех» — пусто (0.0.0.0). Копия — по той же причине, что в SetApiKey.
+func (s *SettingsStore) SetServerListen(port int, interfaces []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return fmt.Errorf("settings not loaded")
+	}
+	updated := *s.settings
+	updated.Server.Port = port
+	updated.Server.Interfaces = interfaces
+	if len(interfaces) > 0 {
+		updated.Server.Interface = interfaces[0]
+	} else {
+		updated.Server.Interface = ""
+	}
+	return s.saveUnlocked(&updated)
 }
 
 // IsMemorySavingDisabled returns whether memory saving mode is disabled.
@@ -641,6 +1046,47 @@ func (s *SettingsStore) GetLogLevel() string {
 		return "info"
 	}
 	return settings.Logging.LogLevel
+}
+
+// GetSingboxLogLevel returns normalized sing-box log level.
+func (s *SettingsStore) GetSingboxLogLevel() string {
+	settings, err := s.Get()
+	if err != nil {
+		return DefaultSingboxLogLevel
+	}
+	return NormalizeSingboxLogLevel(settings.Logging.SingboxLogLevel)
+}
+
+// GetSingboxBootstrapDNS returns the configured dns-bootstrap address.
+// Empty means "not configured" — 00-base.json is left alone.
+func (s *SettingsStore) GetSingboxBootstrapDNS() string {
+	settings, err := s.Get()
+	if err != nil {
+		return ""
+	}
+	return settings.SingboxBootstrapDNS
+}
+
+// GetSingboxClashPort returns the configured Clash API port.
+// 0 means "not configured" — the operator falls back to its default.
+func (s *SettingsStore) GetSingboxClashPort() int {
+	settings, err := s.Get()
+	if err != nil {
+		return 0
+	}
+	return settings.SingboxClashPort
+}
+
+// GetSingboxCacheFileLocation returns the configured cache.db location
+// ("flash" or "tmp"). Empty means "not configured": an absolute path in
+// 00-base.json stays, a relative or legacy one is replaced by the flash
+// default (see singbox.cacheDBPathFor).
+func (s *SettingsStore) GetSingboxCacheFileLocation() string {
+	settings, err := s.Get()
+	if err != nil {
+		return ""
+	}
+	return settings.SingboxRouter.CacheFileLocation
 }
 
 // GetLoggingMaxAge returns the max age for log entries in hours.
@@ -693,8 +1139,10 @@ func (s *SettingsStore) AddManagedPolicy(name string) error {
 	if !added {
 		return nil
 	}
-	settings.ManagedPolicies = next
-	return s.saveUnlocked(settings)
+	return s.updateUnlocked(func(cp *Settings) error {
+		cp.ManagedPolicies = next
+		return nil
+	})
 }
 
 // RemoveManagedPolicy removes a policy name from the managed policies list.
@@ -707,8 +1155,11 @@ func (s *SettingsStore) RemoveManagedPolicy(name string) error {
 		return fmt.Errorf("settings not loaded")
 	}
 
-	settings.ManagedPolicies = filterOut(settings.ManagedPolicies, name)
-	return s.saveUnlocked(settings)
+	next := filterOut(settings.ManagedPolicies, name)
+	return s.updateUnlocked(func(cp *Settings) error {
+		cp.ManagedPolicies = next
+		return nil
+	})
 }
 
 // GetManagedPolicies returns the list of policy names created by AWG Manager.

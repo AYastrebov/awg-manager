@@ -1,7 +1,7 @@
 <script lang="ts" module>
   export type VersionBadgeKind = 'backend' | 'awg';
   export type BackendValue = 'kernel' | 'nativewg' | string;
-  export type AwgValue = 'awg2.0' | 'awg1.5' | 'awg1.0' | 'wg' | string;
+  export type AwgValue = 'awg3.1' | 'awg3' | 'awg2.0' | 'awg1.5' | 'awg1.0' | 'wg' | string;
 </script>
 
 <script lang="ts">
@@ -13,16 +13,22 @@
   let { kind, value }: Props = $props();
 
   const label = $derived.by(() => {
-    if (kind === 'backend') return value === 'nativewg' ? 'NativeWG' : 'Kernel';
+    if (kind === 'backend') {
+      if (value === 'nativewg') return 'NativeWG';
+      if (value === 'wdtt-raw') return 'WDTT Raw';
+      return 'Kernel';
+    }
     return ({
+      'awg3.1': 'AWG 3.1',
+      'awg3': 'AWG 3.0',
       'awg2.0': 'AWG 2.0',
       'awg1.5': 'AWG 1.5',
       'awg1.0': 'AWG 1.0',
-      'wg': 'WG',
+      'wg': 'WireGuard',
     } as Record<string, string>)[value as string] ?? '';
   });
 
-  const tone = $derived(kind === 'awg' && value !== 'wg' ? 'accent' : 'muted');
+  const tone = $derived(kind === 'awg' && value !== 'wg' ? 'accent' : kind === 'backend' && value === 'wdtt-raw' ? 'accent' : 'muted');
 </script>
 
 {#if label}

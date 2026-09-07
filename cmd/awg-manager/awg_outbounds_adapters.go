@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/hoaxisr/awg-manager/internal/api"
+	"github.com/hoaxisr/awg-manager/internal/awg3endpoint"
 	"github.com/hoaxisr/awg-manager/internal/deviceproxy"
 	"github.com/hoaxisr/awg-manager/internal/monitoring"
 	"github.com/hoaxisr/awg-manager/internal/singbox"
@@ -69,6 +71,7 @@ func (a *awgStoreAdapter) List(ctx context.Context) ([]awgoutbounds.AWGTunnelInf
 			ID:           t.ID,
 			Name:         t.Name,
 			BackendIface: awgKernelIface(&t),
+			DNS:          t.Interface.DNS,
 		})
 	}
 	return out, nil
@@ -145,6 +148,41 @@ func (a *awgoutboundsSingboxAdapter) Reload() error {
 	return a.op.Process().Reload()
 }
 
+// awg3TagLister exposes AWG3 endpoint tags for merging into outbound
+// catalogs. Satisfied by *awg3endpoint.Service.
+type awg3TagLister interface {
+	ListTags() []awg3endpoint.TagInfo
+}
+
+// awg3MergedAWGOutbounds wraps the awgoutbounds catalog and appends AWG3
+// endpoint tags. It feeds api.NewAWGOutboundsHandler — the source of the
+// router rule-editor outbound dropdown — so AWG3 endpoints are selectable
+// there. Injected only at this handler adapter, NOT in
+// awgoutbounds.ServiceImpl, so the deviceproxy adapter (a separate
+// consumer) does not gain AWG3 tags (they lack a kernel iface for
+// bind_interface — out of scope for v1).
+// inner needs only ListTags, so it is typed to the narrow
+// api.AWGOutboundsService rather than the full awgoutbounds.Service.
+type awg3MergedAWGOutbounds struct {
+	inner api.AWGOutboundsService
+	awg3  awg3TagLister
+}
+
+func (a *awg3MergedAWGOutbounds) ListTags(ctx context.Context) ([]awgoutbounds.TagInfo, error) {
+	tags, err := a.inner.ListTags(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if a.awg3 != nil {
+		for _, t := range a.awg3.ListTags() {
+			tags = append(tags, awgoutbounds.TagInfo{
+				Tag: t.Tag, Label: t.Tag, Kind: "awg3", Iface: "",
+			})
+		}
+	}
+	return tags, nil
+}
+
 // deviceproxyAWGOutboundsAdapter projects awgoutbounds.TagInfo into
 // deviceproxy.AWGTagInfo. main.go owns this projection so neither
 // downstream package imports the other's types.
@@ -160,7 +198,7 @@ func (a *deviceproxyAWGOutboundsAdapter) ListTags(ctx context.Context) ([]device
 	out := make([]deviceproxy.AWGTagInfo, 0, len(tags))
 	for _, t := range tags {
 		out = append(out, deviceproxy.AWGTagInfo{
-			Tag: t.Tag, Label: t.Label, Kind: t.Kind, Iface: t.Iface,
+			Tag: t.Tag, Label: t.Label, Iface: t.Iface,
 		})
 	}
 	return out, nil
@@ -170,7 +208,8 @@ func (a *deviceproxyAWGOutboundsAdapter) ListTags(ctx context.Context) ([]device
 // router.AWGTag. main.go owns this projection so router doesn't
 // import awgoutbounds types.
 type routerAWGTagAdapter struct {
-	src awgoutbounds.Service
+	src  awgoutbounds.Service
+	awg3 awg3TagLister
 }
 
 func (a *routerAWGTagAdapter) ListTags(ctx context.Context) ([]router.AWGTag, error) {
@@ -181,6 +220,11 @@ func (a *routerAWGTagAdapter) ListTags(ctx context.Context) ([]router.AWGTag, er
 	out := make([]router.AWGTag, 0, len(tags))
 	for _, t := range tags {
 		out = append(out, router.AWGTag{Tag: t.Tag})
+	}
+	if a.awg3 != nil {
+		for _, t := range a.awg3.ListTags() {
+			out = append(out, router.AWGTag{Tag: t.Tag})
+		}
 	}
 	return out, nil
 }
@@ -207,6 +251,30 @@ func (a *routerSingboxTunnelAdapter) ListTunnelTags(ctx context.Context) ([]stri
 	return out, nil
 }
 
+// subscriptionBindValidator bridges router bindable-interface validation
+// into the subscription service and sing-box tunnel endpoints (#709).
+// It validates against the unfiltered list of bindable interfaces so
+// interfaces with direct outbounds remain usable by subscriptions and tunnels.
+type subscriptionBindValidator struct {
+	adapter *routerWANInterfaceAdapter
+}
+
+func (v subscriptionBindValidator) ValidateBindInterface(ctx context.Context, name string) error {
+	if v.adapter == nil {
+		return nil
+	}
+	ifaces, err := v.adapter.ListAllBindable(ctx)
+	if err != nil {
+		return err
+	}
+	for _, i := range ifaces {
+		if i.Name == name {
+			return nil
+		}
+	}
+	return fmt.Errorf("bind_interface %q is not a selectable interface", name)
+}
+
 // monitoringSingboxTunnelAdapter projects sing-box tunnels into the
 // shape monitoring.Scheduler expects. Lives here so the monitoring
 // package stays free of singbox imports.
@@ -223,6 +291,13 @@ func (a *monitoringSingboxTunnelAdapter) List(ctx context.Context) ([]monitoring
 	out := make([]monitoring.SingboxTunnelInfo, 0, len(tunnels))
 	seen := make(map[string]bool, len(tunnels))
 	subLabelByActiveTag := make(map[string]string)
+	subMemberByTag := make(map[string]subscription.MemberInfo)
+	type tunnelMeta struct {
+		protocol  string
+		security  string
+		transport string
+	}
+	metaByTag := make(map[string]tunnelMeta, len(tunnels))
 	for _, t := range tunnels {
 		// Keep config-backed sing-box rows probeable by interface.
 		// Runtime-only subscription member tags are appended separately below.
@@ -230,10 +305,18 @@ func (a *monitoringSingboxTunnelAdapter) List(ctx context.Context) ([]monitoring
 			continue
 		}
 		seen[t.Tag] = true
+		metaByTag[t.Tag] = tunnelMeta{
+			protocol:  strings.TrimSpace(t.Protocol),
+			security:  strings.TrimSpace(t.Security),
+			transport: strings.TrimSpace(t.Transport),
+		}
 		out = append(out, monitoring.SingboxTunnelInfo{
 			Tag:           t.Tag,
 			Name:          t.Tag, // sing-box TunnelInfo doesn't carry a separate Name field
 			InterfaceName: t.KernelInterface,
+			Protocol:      strings.TrimSpace(t.Protocol),
+			Security:      strings.TrimSpace(t.Security),
+			Transport:     strings.TrimSpace(t.Transport),
 		})
 	}
 	if a.sub != nil {
@@ -265,6 +348,7 @@ func (a *monitoringSingboxTunnelAdapter) List(ctx context.Context) ([]monitoring
 				if tag == "" {
 					continue
 				}
+				subMemberByTag[tag] = member
 				if _, exists := subLabelByActiveTag[tag]; !exists {
 					subLabelByActiveTag[tag] = label
 				}
@@ -285,11 +369,45 @@ func (a *monitoringSingboxTunnelAdapter) List(ctx context.Context) ([]monitoring
 			if label := subLabelByActiveTag[tag]; label != "" {
 				name = label
 			}
+			member := subMemberByTag[tag]
 			out = append(out, monitoring.SingboxTunnelInfo{
 				Tag:           tag,
 				Name:          name,
 				InterfaceName: "",
+				Subscription:  true,
+				Protocol:      strings.TrimSpace(member.Protocol),
+				Security:      strings.TrimSpace(member.Security),
+				Transport:     strings.TrimSpace(member.Transport),
 			})
+		}
+	}
+	if a.sub != nil {
+		for i := range out {
+			if _, ok := subLabelByActiveTag[out[i].Tag]; !ok {
+				continue
+			}
+			out[i].Subscription = true
+			if member, ok := subMemberByTag[out[i].Tag]; ok {
+				if out[i].Protocol == "" {
+					out[i].Protocol = strings.TrimSpace(member.Protocol)
+				}
+				if out[i].Security == "" {
+					out[i].Security = strings.TrimSpace(member.Security)
+				}
+				if out[i].Transport == "" {
+					out[i].Transport = strings.TrimSpace(member.Transport)
+				}
+			} else if meta, ok := metaByTag[out[i].Tag]; ok {
+				if out[i].Protocol == "" {
+					out[i].Protocol = meta.protocol
+				}
+				if out[i].Security == "" {
+					out[i].Security = meta.security
+				}
+				if out[i].Transport == "" {
+					out[i].Transport = meta.transport
+				}
+			}
 		}
 	}
 	return out, nil

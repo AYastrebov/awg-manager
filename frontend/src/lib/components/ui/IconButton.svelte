@@ -10,6 +10,7 @@
     size?: IconButtonSize;
     disabled?: boolean;
     ariaLabel: string;
+    title?: string;
     href?: string;
     onclick?: (e: MouseEvent) => void;
     children: Snippet;
@@ -20,6 +21,7 @@
     size = 'sm',
     disabled = false,
     ariaLabel,
+    title,
     href,
     onclick,
     children,
@@ -36,6 +38,7 @@
     class:size-md={size === 'md'}
     class:is-disabled={disabled}
     {href}
+    {title}
     aria-label={ariaLabel}
     aria-disabled={disabled}
     tabindex={disabled ? -1 : 0}
@@ -54,6 +57,7 @@
     {disabled}
     aria-label={ariaLabel}
     {onclick}
+    {title}
   >
     {@render children()}
   </button>

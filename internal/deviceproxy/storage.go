@@ -102,12 +102,7 @@ func (s *Store) SaveInstance(in Instance) error {
 }
 
 // DeleteInstance removes one proxy instance by id.
-// The default instance cannot be deleted.
 func (s *Store) DeleteInstance(id string) error {
-	if id == "default" {
-		return nil
-	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -146,9 +141,15 @@ func (s *Store) load() {
 		return
 	}
 
-	var snap Snapshot
-	if err := json.Unmarshal(raw, &snap); err == nil && len(snap.Instances) > 0 {
-		s.snapshot = snap
+	// Новый формат распознаётся по наличию ключа "instances" (указатель),
+	// а не по len>0: файл с пустым списком — результат удаления всех
+	// инстансов, а не legacy-конфиг, иначе load() воскрешал бы удалённый
+	// default из нулевого Config.
+	var snap struct {
+		Instances *[]Instance `json:"instances"`
+	}
+	if err := json.Unmarshal(raw, &snap); err == nil && snap.Instances != nil {
+		s.snapshot = Snapshot{Instances: *snap.Instances}
 		return
 	}
 
@@ -156,6 +157,11 @@ func (s *Store) load() {
 	if err := json.Unmarshal(raw, &cfg); err == nil {
 		s.snapshot = Snapshot{Instances: []Instance{configToDefaultInstance(cfg)}}
 		return
+	} else {
+		// Corrupt (not just legacy) file: set it aside for recovery instead
+		// of silently replacing user instances with the default one — the
+		// next save would otherwise persist the wipe.
+		storage.QuarantineCorrupt(s.path, err)
 	}
 
 	s.snapshot = Snapshot{Instances: []Instance{defaultInstance()}}

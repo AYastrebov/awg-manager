@@ -31,7 +31,7 @@ func testQueries() *query.Queries {
 func newTestInterfaceCommands(_ *testing.T) (*InterfaceCommands, *fakePoster, *SaveCoordinator, *query.Queries, *spyHookNotifier) {
 	poster := &fakePoster{}
 	pub := &fakePublisher{}
-	sc := NewSaveCoordinator(poster, pub, 500*time.Millisecond, 5*time.Second)
+	sc := NewSaveCoordinator(poster, pub, 500*time.Millisecond, 5*time.Second, 0, nil)
 	q := testQueries()
 	hn := &spyHookNotifier{}
 	return NewInterfaceCommands(poster, sc, q, hn), poster, sc, q, hn
@@ -56,6 +56,21 @@ func TestInterfaceCommands_CreateOpkgTun(t *testing.T) {
 	}
 	if sc.Status().State != SaveStatePending {
 		t.Errorf("save state: want Pending, got %v", sc.Status().State)
+	}
+}
+
+func TestCreateOpkgTunWithSecurityLevel_Private(t *testing.T) {
+	cmds, poster, _, _, _ := newTestInterfaceCommands(t)
+	if err := cmds.CreateOpkgTunWithSecurityLevel(context.Background(), "OpkgTun10", "fakeip-tun", "private"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	iface := poster.Payloads()[0].(map[string]any)["interface"].(map[string]any)["OpkgTun10"].(map[string]any)
+	sl := iface["security-level"].(map[string]any)
+	if sl["private"] != true {
+		t.Errorf("want security-level.private=true, got %#v", sl)
+	}
+	if _, hasPublic := sl["public"]; hasPublic {
+		t.Errorf("public must not be set in private mode: %#v", sl)
 	}
 }
 
@@ -125,7 +140,7 @@ func TestInterfaceCommands_InterfaceDown_WithHookNotifier(t *testing.T) {
 func TestInterfaceCommands_InterfaceUp_NilHookNotifier(t *testing.T) {
 	poster := &fakePoster{}
 	pub := &fakePublisher{}
-	sc := NewSaveCoordinator(poster, pub, 500*time.Millisecond, 5*time.Second)
+	sc := NewSaveCoordinator(poster, pub, 500*time.Millisecond, 5*time.Second, 0, nil)
 	q := testQueries()
 	cmds := NewInterfaceCommands(poster, sc, q, nil)
 	if err := cmds.InterfaceUp(context.Background(), "OpkgTun0"); err != nil {

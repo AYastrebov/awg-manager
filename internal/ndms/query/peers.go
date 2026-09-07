@@ -16,14 +16,13 @@ import (
 // interval (~10s). This TTL mostly serves fast-back-to-back reads.
 const peerTTL = 8 * time.Second
 
-// PeerStore caches /show/interface/{name}/wireguard/peer — the narrow
-// endpoint used for metrics. Per-interface key.
+// PeerStore caches the .wireguard.peer list of /show/interface/{name} —
+// the per-interface peer metrics. Per-interface key.
 type PeerStore struct {
 	getter Getter
 	log    Logger
 
-	cache    *cache.TTL[string, []ndms.Peer]
-	inFlight *cache.SingleFlight[string, []ndms.Peer]
+	store *cache.KeyedStore[string, []ndms.Peer]
 }
 
 func NewPeerStore(g Getter, log Logger) *PeerStore {
@@ -34,41 +33,24 @@ func NewPeerStoreWithTTL(g Getter, log Logger, ttl time.Duration) *PeerStore {
 	if log == nil {
 		log = NopLogger()
 	}
-	return &PeerStore{
-		getter:   g,
-		log:      log,
-		cache:    cache.NewTTL[string, []ndms.Peer](ttl),
-		inFlight: cache.NewSingleFlight[string, []ndms.Peer](),
-	}
+	s := &PeerStore{getter: g, log: log}
+	s.store = cache.NewKeyedStore(ttl, log, "peers", s.fetch)
+	return s
 }
 
 // GetPeers returns the peer list for a wireguard interface.
 func (s *PeerStore) GetPeers(ctx context.Context, name string) ([]ndms.Peer, error) {
-	if v, ok := s.cache.Get(name); ok {
-		return v, nil
-	}
-	return s.inFlight.Do(name, func() ([]ndms.Peer, error) {
-		v, err := s.fetch(ctx, name)
-		if err != nil {
-			if stale, ok := s.cache.Peek(name); ok {
-				s.log.Warnf("peers %s fetch failed, serving stale cache: %v", name, err)
-				return stale, nil
-			}
-			return nil, err
-		}
-		s.cache.Set(name, v)
-		return v, nil
-	})
+	return s.store.Get(ctx, name)
 }
 
 // Invalidate drops cache for a single interface. Called by events.Dispatcher.
-func (s *PeerStore) Invalidate(name string) { s.cache.Invalidate(name) }
+func (s *PeerStore) Invalidate(name string) { s.store.Invalidate(name) }
 
 // InvalidateAll drops every cached entry (daemon reconfigure).
-func (s *PeerStore) InvalidateAll() { s.cache.InvalidateAll() }
+func (s *PeerStore) InvalidateAll() { s.store.InvalidateAll() }
 
-// peerWire mirrors the JSON shape of one element from
-// /show/interface/{name}/wireguard/peer.
+// peerWire mirrors the JSON shape of one element of the
+// .wireguard.peer array inside /show/interface/{name}.
 type peerWire struct {
 	PublicKey               string `json:"public-key"`
 	Description             string `json:"description"`
@@ -86,20 +68,33 @@ type peerWire struct {
 }
 
 func (s *PeerStore) fetch(ctx context.Context, name string) ([]ndms.Peer, error) {
-	var wire []peerWire
-	path := "/show/interface/" + name + "/wireguard/peer"
-	if err := s.getter.Get(ctx, path, &wire); err != nil {
-		// NDMS responds 404 when the interface has no peers configured
-		// (typical right after creating a server before any clients
-		// have been added). That's a legitimate "empty" state, not a
-		// failure — treat it as zero peers so the poller doesn't log
-		// warnings on every tick.
+	// Peers are NOT a standalone RCI command — there is no
+	// "show interface <name> wireguard peer" command. The peer list is a
+	// data sub-field of "show interface <name>" (.wireguard.peer). A direct
+	// GET /show/interface/<name>/wireguard/peer happens to work (the GET
+	// handler descends the response tree by URL segment), but that path is
+	// not expressible as a batch-POST command — NDMS parses wireguard/peer
+	// as a command continuation and answers "not found". Querying the
+	// interface and reading .wireguard.peer works in both the direct-GET and
+	// batch-POST transports. Verified against Keenetic RCI 2026-05-23.
+	var wrap struct {
+		Wireguard struct {
+			Peer []peerWire `json:"peer"`
+		} `json:"wireguard"`
+	}
+	path := "/show/interface/" + name
+	if err := s.getter.Get(ctx, path, &wrap); err != nil {
+		// 404 means the interface itself doesn't exist (e.g. torn down) —
+		// treat as zero peers so the poller doesn't log warnings on every
+		// tick. A live interface with no peers returns an empty
+		// .wireguard.peer instead.
 		var httpErr *transport.HTTPError
 		if errors.As(err, &httpErr) && httpErr.Status == http.StatusNotFound {
 			return []ndms.Peer{}, nil
 		}
 		return nil, fmt.Errorf("fetch peers %s: %w", name, err)
 	}
+	wire := wrap.Wireguard.Peer
 	out := make([]ndms.Peer, 0, len(wire))
 	for _, w := range wire {
 		out = append(out, ndms.Peer{

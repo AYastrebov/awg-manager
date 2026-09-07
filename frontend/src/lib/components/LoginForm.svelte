@@ -7,6 +7,10 @@
 	let password = $state('');
 	let submitting = $state(false);
 
+	// Бэкенд с Entware-авторизацией сообщает об этом в /auth/status
+	// (auth.checkStatus); на легаси-бэкендах флага нет → false.
+	const entwareAuthEnabled = $derived($auth.entwareAuthEnabled);
+
 	async function handleSubmit() {
 		if (!login || !password) return;
 
@@ -29,7 +33,11 @@
 				<BrandLogoMark dimension={52} />
 			</div>
 			<h1>AWG Manager</h1>
-			<p class="login-subtitle">Введите данные от входа в админ-панель роутера</p>
+			<p class="login-subtitle">
+				{entwareAuthEnabled
+					? 'Данные роутера или учётной записи Entware'
+					: 'Введите данные от входа в админ-панель роутера'}
+			</p>
 		</div>
 
 		{#if $auth.error}
@@ -83,7 +91,9 @@
 		</form>
 
 	<p class="login-hint">
-		Используйте логин и пароль администратора роутера
+		{entwareAuthEnabled
+			? 'Используйте логин и пароль администратора роутера или учётной записи Entware'
+			: 'Используйте логин и пароль администратора роутера'}
 	</p>
 
 	<p class="login-hint" style="margin-top: 0.2rem;">
@@ -94,7 +104,7 @@
 
 <style>
 	.login-container {
-		min-height: 100vh;
+		min-height: calc(100dvh - 56px);
 		display: flex;
 		align-items: center;
 		justify-content: center;
@@ -123,6 +133,22 @@
 		margin-bottom: 0.75rem;
 	}
 
+	.login-brand :global(.brand-logo-mark) {
+		width: 52px;
+		height: 52px;
+	}
+
+	@media (min-width: 641px) and (max-width: 1050px) {
+		.login-brand :global(.brand-logo-mark) {
+			width: 44px;
+			height: 44px;
+		}
+
+		.login-header h1 {
+			font-size: 1.375rem;
+		}
+	}
+
 	.login-header h1 {
 		font-size: 1.5rem;
 		margin-bottom: 0.25rem;
@@ -147,7 +173,7 @@
 	.login-form {
 		display: flex;
 		flex-direction: column;
-		gap: 1rem;
+		gap: 0rem;
 	}
 
 	.form-group {
@@ -157,7 +183,7 @@
 	}
 
 	.login-button {
-		margin-top: 0.5rem;
+		margin-top: 1rem;
 	}
 
 	.login-hint {

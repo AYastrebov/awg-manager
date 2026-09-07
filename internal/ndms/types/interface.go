@@ -31,6 +31,9 @@ type WGPeer struct {
 	RxBytes       int64  `json:"rxbytes"`
 	TxBytes       int64  `json:"txbytes"`
 	Via           string `json:"via"`
+
+	RemoteEndpointAddress string `json:"remote-endpoint-address"`
+	RemotePort            int    `json:"remote-port"`
 }
 
 // WGSummary holds the layer summary nested under WGInterface.

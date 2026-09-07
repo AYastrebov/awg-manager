@@ -1,5 +1,11 @@
 <script lang="ts">
 	import type { AccessPolicy } from '$lib/types';
+	import { pluralize, DEVICE_WORDS } from '$lib/utils/pluralize';
+	import { Badge } from '$lib/components/ui';
+	import { SquarePen, Trash2 } from 'lucide-svelte';
+	import RoutingTargetBadges from '$lib/components/routing/RoutingTargetBadges.svelte';
+	import PolicyIcon from './PolicyIcon.svelte';
+	import { isHydraRouteAccessPolicy } from '$lib/utils/accessPolicy';
 
 	interface Props {
 		policies: AccessPolicy[];
@@ -13,70 +19,89 @@
 	let { policies, onedit, ondelete, selectable, selectedNames, onselect }: Props = $props();
 </script>
 
-<div class="policy-grid">
+<div class="route-grid">
 	{#each policies as policy}
-		<div class="policy-card">
-			{#if selectable}
-				<div class="select-cell">
+		{@const isHrPolicy = isHydraRouteAccessPolicy(policy)}
+		{@const policyLabel = policy.description || policy.name}
+		<div class="policy-card" class:policy-card-hr={isHrPolicy}>
+			<div class="card-main">
+				{#if selectable}
 					<input
 						type="checkbox"
 						class="select-check"
 						checked={selectedNames?.has(policy.name)}
+						disabled={isHrPolicy}
 						onchange={() => onselect?.(policy.name)}
 					/>
-				</div>
-			{/if}
-			<div class="policy-body">
-				<div class="policy-meta">
-					{policy.deviceCount} устройств
-				</div>
-				<div class="policy-title-row">
-					<span class="policy-name">{policy.description || policy.name}</span>
-					{#if policy.standalone}
-						<span class="badge-standalone">standalone</span>
+				{/if}
+				<PolicyIcon
+					label={policy.description}
+					policyName={policy.name}
+					isHydraRoute={isHrPolicy}
+				/>
+				<div class="card-info">
+					<div class="card-title">
+						<h3 title={policyLabel}>{policyLabel}</h3>
+						<div class="routing-badges">
+							{#if isHrPolicy}
+								<Badge variant="warning" uppercase size="xs" pill>HydraRoute</Badge>
+							{/if}
+							{#if policy.standalone}
+								<Badge variant="accent" uppercase size="xs" pill>standalone</Badge>
+							{/if}
+						</div>
+					</div>
+					<span class="card-stat">{pluralize(policy.deviceCount, DEVICE_WORDS)}</span>
+					{#if policy.interfaces?.length}
+						{@const sortedIfaces = [...policy.interfaces].sort((a, b) => a.order - b.order)}
+						<div class="card-route">
+							<RoutingTargetBadges
+								labels={sortedIfaces.map((iface) => iface.label || iface.name)}
+								titles={sortedIfaces.map((iface) => iface.name)}
+								overflowNoun="интерфейсов"
+							/>
+						</div>
 					{/if}
 				</div>
-				{#if policy.interfaces?.length}
-					<div class="policy-ifaces">
-						{#each [...policy.interfaces].sort((a, b) => a.order - b.order) as iface}
-							<span class="badge-iface" title={iface.name}>{iface.label || iface.name}</span>
-						{/each}
-					</div>
-				{/if}
 			</div>
-			<div class="policy-actions">
-				<button class="action-btn edit" title="Изменить" onclick={() => onedit(policy.name)}>
-					<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-						<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-						<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-					</svg>
-				</button>
-				<button class="action-btn danger" title="Удалить" onclick={() => ondelete(policy.name)}>
-					<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-						<polyline points="3 6 5 6 21 6"/>
-						<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-					</svg>
-				</button>
+			<div class="card-actions">
+				<div class="action-row">
+					<button
+						type="button"
+						class="route-action-btn"
+						title={isHrPolicy
+							? `Открыть HydraRoute-политику «${policy.description || policy.name}»`
+							: `Изменить политику «${policy.description || policy.name}»`}
+						onclick={() => onedit(policy.name)}
+					>
+						<SquarePen size={15} />
+					</button>
+					{#if !isHrPolicy}
+						<button
+							type="button"
+							class="route-action-btn danger"
+							title={`Удалить политику «${policy.description || policy.name}»`}
+							onclick={() => ondelete(policy.name)}
+						>
+							<Trash2 size={15} />
+						</button>
+					{/if}
+				</div>
 			</div>
 		</div>
 	{/each}
 </div>
 
 <style>
-	.policy-grid {
-		display: grid;
-		grid-template-columns: repeat(3, minmax(0, 1fr));
-		gap: 12px;
-	}
-
 	.policy-card {
+		display: flex;
+		justify-content: space-between;
+		min-width: 0;
 		background: var(--bg-secondary);
 		border: 1px solid var(--border);
 		border-radius: 8px;
-		padding: 14px 16px;
-		display: flex;
-		align-items: flex-start;
-		gap: 12px;
+		padding: 14px;
+		gap: 10px;
 		transition: border-color 0.15s;
 	}
 
@@ -84,104 +109,64 @@
 		border-color: var(--border-hover);
 	}
 
-	.policy-body {
+	.policy-card .card-main {
+		display: flex;
 		flex: 1;
+		gap: 10px;
 		min-width: 0;
 	}
 
-	.policy-meta {
-		font-size: 0.6875rem;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-		color: var(--text-muted);
-		margin-bottom: 2px;
+	.policy-card .card-info {
+		display: flex;
+		flex-direction: column;
+		flex: 1;
+		gap: 1px;
+		min-width: 0;
 	}
 
-	.policy-title-row {
+	.policy-card .card-title {
 		display: flex;
 		align-items: center;
-		gap: 8px;
-		margin-bottom: 6px;
+		flex-wrap: wrap;
+		gap: 6px;
+		min-width: 0;
 	}
 
-	.policy-name {
-		font-weight: 500;
-		font-size: 0.9375rem;
+	.policy-card .card-title h3 {
+		flex: 0 1 auto;
+		font-size: 0.875rem;
+		font-weight: 600;
 		color: var(--text-primary);
+		margin: 0;
+		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
-		white-space: nowrap;
+		min-width: 0;
 	}
 
-	.badge-standalone {
-		font-size: 0.625rem;
-		padding: 1px 6px;
-		border-radius: 9999px;
-		background: var(--accent);
-		color: var(--color-accent-contrast, #ffffff);
-		font-weight: 500;
-		white-space: nowrap;
-		flex-shrink: 0;
-	}
-
-	.policy-ifaces {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 4px;
-	}
-
-	.badge-iface {
+	.policy-card .card-stat {
 		font-size: 0.6875rem;
-		padding: 2px 8px;
-		border-radius: 9999px;
-		background: var(--bg-hover);
-		color: var(--text-primary);
-		border: 1px solid var(--border);
-		white-space: nowrap;
+		color: var(--text-muted);
 	}
 
-	.policy-actions {
+	.policy-card-hr {
+		border-color: rgba(245, 158, 11, 0.35);
+	}
+
+	.policy-card .card-actions {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-end;
+		flex-shrink: 0;
+		margin-left: 8px;
+		align-self: stretch;
+	}
+
+	.policy-card .action-row {
 		display: flex;
 		gap: 4px;
-		flex-shrink: 0;
-		align-self: center;
-	}
-
-	.action-btn {
-		display: flex;
-		padding: 5px;
-		background: none;
-		border: 1px solid transparent;
-		color: var(--text-muted);
-		cursor: pointer;
-		border-radius: 6px;
-		transition: all 0.15s;
-	}
-
-	.action-btn.edit {
-		color: var(--accent);
-	}
-
-	.action-btn.danger {
-		color: var(--error);
-	}
-
-	.action-btn.edit:hover {
-		color: var(--accent);
-		background: var(--bg-hover);
-	}
-
-	.action-btn.danger:hover {
-		color: var(--error);
-		background: rgba(247, 118, 142, 0.1);
-	}
-
-	.select-cell {
-		width: 2rem;
-		padding: 0.5rem;
-		display: flex;
 		align-items: center;
-		flex-shrink: 0;
+		margin-top: auto;
 	}
 
 	.select-check {
@@ -189,17 +174,7 @@
 		width: 1rem;
 		height: 1rem;
 		cursor: pointer;
-	}
-
-	@media (max-width: 1024px) {
-		.policy-grid {
-			grid-template-columns: repeat(2, minmax(0, 1fr));
-		}
-	}
-
-	@media (max-width: 768px) {
-		.policy-grid {
-			grid-template-columns: 1fr;
-		}
+		flex-shrink: 0;
+		margin-top: 10px;
 	}
 </style>

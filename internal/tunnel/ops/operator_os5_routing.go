@@ -112,11 +112,6 @@ func (o *OperatorOS5Impl) CleanupEndpointRoute(ctx context.Context, tunnelID str
 	}
 	o.endpointRoutesMu.Unlock()
 
-	// Clear resolved ISP tracking
-	o.resolvedISPMu.Lock()
-	delete(o.resolvedISP, tunnelID)
-	o.resolvedISPMu.Unlock()
-
 	if !exists || endpointIP == "" {
 		return nil
 	}
@@ -138,7 +133,7 @@ func (o *OperatorOS5Impl) CleanupEndpointRoute(ctx context.Context, tunnelID str
 	}
 
 	// Remove kernel route + NDMS route (NDMS caches kernel routes but doesn't track their removal)
-	o.delKernelHostRoute(ctx, endpointIP)
+	_ = o.delKernelHostRoute(ctx, endpointIP)
 	_ = o.commands.Routes.RemoveHostRoute(ctx, endpointIP)
 	o.logInfo("cleanup_route", tunnelID, "Removed kernel endpoint route to "+endpointIP)
 	o.appLog.Info("stop", tunnelID, "Маршрут до endpoint "+endpointIP+" удалён")
@@ -149,7 +144,7 @@ func (o *OperatorOS5Impl) CleanupEndpointRoute(ctx context.Context, tunnelID str
 // RestoreEndpointTracking restores endpoint route tracking without creating the route.
 // Used on daemon restart for tunnels that are already running.
 // Returns the resolved endpoint IP on success, empty string on non-fatal failure.
-func (o *OperatorOS5Impl) RestoreEndpointTracking(ctx context.Context, tunnelID, endpoint, ispInterface string) (string, error) {
+func (o *OperatorOS5Impl) RestoreEndpointTracking(ctx context.Context, tunnelID, endpoint string) (string, error) {
 	if endpoint == "" {
 		return "", nil
 	}
@@ -165,13 +160,6 @@ func (o *OperatorOS5Impl) RestoreEndpointTracking(ctx context.Context, tunnelID,
 	o.endpointRoutesMu.Lock()
 	o.endpointRoutes[tunnelID] = endpointIP
 	o.endpointRoutesMu.Unlock()
-
-	// Restore resolved ISP for dashboard display
-	if ispInterface != "" {
-		o.resolvedISPMu.Lock()
-		o.resolvedISP[tunnelID] = ispInterface
-		o.resolvedISPMu.Unlock()
-	}
 
 	o.logInfo("restore_tracking", tunnelID, "Restored endpoint tracking for "+endpointIP)
 	return endpointIP, nil
@@ -240,7 +228,7 @@ func isIPv6LinkLocal(ip string) bool {
 }
 
 // delKernelHostRoute removes a host route.
-func (o *OperatorOS5Impl) delKernelHostRoute(ctx context.Context, endpointIP string) {
+func (o *OperatorOS5Impl) delKernelHostRoute(ctx context.Context, endpointIP string) error {
 	prefix := "/32"
 	family := []string{}
 	if isIPv6(endpointIP) {
@@ -249,7 +237,8 @@ func (o *OperatorOS5Impl) delKernelHostRoute(ctx context.Context, endpointIP str
 	}
 	args := append([]string{}, family...)
 	args = append(args, "route", "del", endpointIP+prefix)
-	o.ipRun(ctx, "/opt/sbin/ip", args...)
+	_, err := o.ipRun(ctx, "/opt/sbin/ip", args...)
+	return err
 }
 
 // resolveKernelRouteTarget determines how the kernel currently routes to dstIP.

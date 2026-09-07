@@ -7,6 +7,8 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 	"github.com/hoaxisr/awg-manager/internal/tunnel"
+	"github.com/hoaxisr/awg-manager/internal/tunnel/nwg"
+	"github.com/hoaxisr/awg-manager/internal/tunnel/wan"
 )
 
 // === Mock implementations ===
@@ -33,33 +35,37 @@ func (m *MockStateManager) SetState(tunnelID string, state tunnel.StateInfo) {
 
 // MockOperator is a mock operator.
 type MockOperator struct {
-	createError        error
-	startError         error
-	stopError          error
-	deleteError        error
-	recoverError       error
-	applyConfigError   error
-	setMTUError        error
+	createError      error
+	startError       error
+	stopError        error
+	deleteError      error
+	applyConfigError error
+	setMTUError      error
 
 	// SetupEndpointRouteIP is the IP returned by SetupEndpointRoute.
 	SetupEndpointRouteIP string
 	// TrackedEndpointIPs maps tunnelID -> IP for GetTrackedEndpointIP.
 	TrackedEndpointIPs map[string]string
 
-	CreateCalls              []tunnel.Config
-	StartCalls               []tunnel.Config
-	StopCalls                []string
-	DeleteCalls              []string
-	RecoverCalls             []struct{ ID string; State tunnel.StateInfo }
-	ReconcileCalls           []tunnel.Config
-	ApplyConfigCalls         []struct{ ID, Path string }
-	SetupEndpointRouteCalls  []struct{ ID, Endpoint, ISP string }
-	CleanupEndpointRouteCalls []string
+	CreateCalls                  []tunnel.Config
+	StartCalls                   []tunnel.Config
+	StopCalls                    []string
+	DeleteCalls                  []string
+	ReconcileCalls               []tunnel.Config
+	ApplyConfigCalls             []struct{ ID, Path string }
+	SetupEndpointRouteCalls      []struct{ ID, Endpoint, ISP string }
+	CleanupEndpointRouteCalls    []string
 	RestoreEndpointTrackingCalls []struct{ ID, Endpoint string }
-	SetMTUCalls              []struct{ ID string; MTU int }
-	UpdateDescriptionCalls   []struct{ ID, Desc string }
-	SyncDNSCalls             [][]string
-	SyncAddressCalls         []struct{ ID, Addr, IPv6 string }
+	SetMTUCalls                  []struct {
+		ID  string
+		MTU int
+	}
+	UpdateDescriptionCalls []struct{ ID, Desc string }
+	SyncDNSCalls           [][]string
+	SyncAddressCalls       []struct {
+		ID, Addr, IPv6 string
+		Prefix         int
+	}
 }
 
 func (m *MockOperator) Create(ctx context.Context, cfg tunnel.Config) error {
@@ -72,11 +78,6 @@ func (m *MockOperator) ColdStart(ctx context.Context, cfg tunnel.Config) error {
 	return m.startError
 }
 
-func (m *MockOperator) Start(ctx context.Context, cfg tunnel.Config) error {
-	m.StartCalls = append(m.StartCalls, cfg)
-	return m.startError
-}
-
 func (m *MockOperator) Stop(ctx context.Context, tunnelID string) error {
 	m.StopCalls = append(m.StopCalls, tunnelID)
 	return m.stopError
@@ -85,11 +86,6 @@ func (m *MockOperator) Stop(ctx context.Context, tunnelID string) error {
 func (m *MockOperator) Delete(ctx context.Context, stored *storage.AWGTunnel) error {
 	m.DeleteCalls = append(m.DeleteCalls, stored.ID)
 	return m.deleteError
-}
-
-func (m *MockOperator) Recover(ctx context.Context, tunnelID string, state tunnel.StateInfo) error {
-	m.RecoverCalls = append(m.RecoverCalls, struct{ ID string; State tunnel.StateInfo }{tunnelID, state})
-	return m.recoverError
 }
 
 func (m *MockOperator) Reconcile(ctx context.Context, cfg tunnel.Config) error {
@@ -112,7 +108,7 @@ func (m *MockOperator) CleanupEndpointRoute(ctx context.Context, tunnelID string
 	return nil
 }
 
-func (m *MockOperator) RestoreEndpointTracking(ctx context.Context, tunnelID, endpoint, ispInterface string) (string, error) {
+func (m *MockOperator) RestoreEndpointTracking(ctx context.Context, tunnelID, endpoint string) (string, error) {
 	m.RestoreEndpointTrackingCalls = append(m.RestoreEndpointTrackingCalls, struct{ ID, Endpoint string }{tunnelID, endpoint})
 	return m.SetupEndpointRouteIP, nil
 }
@@ -125,7 +121,10 @@ func (m *MockOperator) GetTrackedEndpointIP(tunnelID string) string {
 }
 
 func (m *MockOperator) SetMTU(ctx context.Context, tunnelID string, mtu int) error {
-	m.SetMTUCalls = append(m.SetMTUCalls, struct{ ID string; MTU int }{tunnelID, mtu})
+	m.SetMTUCalls = append(m.SetMTUCalls, struct {
+		ID  string
+		MTU int
+	}{tunnelID, mtu})
 	return m.setMTUError
 }
 
@@ -145,10 +144,6 @@ func (m *MockOperator) RemoveDefaultRoute(ctx context.Context, tunnelID string) 
 	return nil
 }
 
-func (m *MockOperator) GetResolvedISP(tunnelID string) string {
-	return ""
-}
-
 func (m *MockOperator) UpdateDescription(ctx context.Context, tunnelID, description string) error {
 	m.UpdateDescriptionCalls = append(m.UpdateDescriptionCalls, struct{ ID, Desc string }{tunnelID, description})
 	return nil
@@ -161,16 +156,17 @@ func (m *MockOperator) SyncDNS(ctx context.Context, tunnelID string, dns []strin
 	return nil
 }
 
-func (m *MockOperator) SyncAddress(ctx context.Context, tunnelID string, address, ipv6 string) error {
-	m.SyncAddressCalls = append(m.SyncAddressCalls, struct{ ID, Addr, IPv6 string }{tunnelID, address, ipv6})
+func (m *MockOperator) SyncAddress(ctx context.Context, tunnelID string, address string, prefix int, ipv6 string) error {
+	m.SyncAddressCalls = append(m.SyncAddressCalls, struct {
+		ID, Addr, IPv6 string
+		Prefix         int
+	}{tunnelID, address, ipv6, prefix})
 	return nil
 }
 
 func (m *MockOperator) GetDefaultGatewayInterface(ctx context.Context) (string, error) {
 	return "PPPoE1", nil
 }
-
-func (m *MockOperator) HasWANIPv6(ctx context.Context, ifaceName string) bool { return false }
 
 func (m *MockOperator) GetSystemName(_ context.Context, ndmsID string) string { return ndmsID }
 
@@ -233,6 +229,64 @@ func TestUpdate_RejectsIDMismatch(t *testing.T) {
 	new_ := &storage.AWGTunnel{ID: "awg1", Interface: storage.AWGInterface{Address: "10.0.0.1", MTU: 1420}}
 	if err := s.Update(context.Background(), old, new_); err == nil {
 		t.Fatal("expected error for id mismatch")
+	}
+}
+
+func TestUpdate_KernelAddressChangeBeforeFirstStart(t *testing.T) {
+	dir := t.TempDir()
+	oldConfDir := tunnel.ConfDir
+	tunnel.ConfDir = dir
+	t.Cleanup(func() { tunnel.ConfDir = oldConfDir })
+
+	sm := NewMockStateManager()
+	sm.SetState("awg10", tunnel.StateInfo{State: tunnel.StateNotCreated})
+	s := &ServiceImpl{state: sm}
+
+	old := &storage.AWGTunnel{ID: "awg10", Backend: "kernel", Interface: storage.AWGInterface{Address: "10.0.0.1/32", MTU: 1420}}
+	new_ := &storage.AWGTunnel{ID: "awg10", Backend: "kernel", Interface: storage.AWGInterface{Address: "10.0.0.2/32", MTU: 1420}}
+	if err := s.Update(context.Background(), old, new_); err != nil {
+		t.Fatalf("expected address change before first start to succeed, got: %v", err)
+	}
+}
+
+func TestUpdate_KernelAddressChangeRejectedWhenOpkgTunExists(t *testing.T) {
+	sm := NewMockStateManager()
+	sm.SetState("awg10", tunnel.StateInfo{State: tunnel.StateStopped, OpkgTunExists: true, BackendType: "kernel"})
+	s := &ServiceImpl{state: sm}
+
+	old := &storage.AWGTunnel{ID: "awg10", Backend: "kernel", Interface: storage.AWGInterface{Address: "10.0.0.1/32", MTU: 1420}}
+	new_ := &storage.AWGTunnel{ID: "awg10", Backend: "kernel", Interface: storage.AWGInterface{Address: "10.0.0.2/32", MTU: 1420}}
+	if err := s.Update(context.Background(), old, new_); err == nil {
+		t.Fatal("expected error when OpkgTun exists")
+	}
+}
+
+func TestUpdate_KernelAddressChangeRejectedWhenProcessRunning(t *testing.T) {
+	sm := NewMockStateManager()
+	sm.SetState("awgm0", tunnel.StateInfo{State: tunnel.StateRunning, ProcessRunning: true, BackendType: "kernel"})
+	s := &ServiceImpl{state: sm}
+
+	old := &storage.AWGTunnel{ID: "awgm0", Backend: "kernel", Interface: storage.AWGInterface{Address: "10.0.0.1/32", MTU: 1420}}
+	new_ := &storage.AWGTunnel{ID: "awgm0", Backend: "kernel", Interface: storage.AWGInterface{Address: "10.0.0.2/32", MTU: 1420}}
+	if err := s.Update(context.Background(), old, new_); err == nil {
+		t.Fatal("expected error when backend process is running")
+	}
+}
+
+func TestUpdate_UserspaceAddressChangeAllowedWhenCreated(t *testing.T) {
+	dir := t.TempDir()
+	oldConfDir := tunnel.ConfDir
+	tunnel.ConfDir = dir
+	t.Cleanup(func() { tunnel.ConfDir = oldConfDir })
+
+	sm := NewMockStateManager()
+	sm.SetState("awg10", tunnel.StateInfo{State: tunnel.StateStopped, OpkgTunExists: true, BackendType: "userspace"})
+	s := &ServiceImpl{state: sm}
+
+	old := &storage.AWGTunnel{ID: "awg10", Interface: storage.AWGInterface{Address: "10.0.0.1/32", MTU: 1420}}
+	new_ := &storage.AWGTunnel{ID: "awg10", Interface: storage.AWGInterface{Address: "10.0.0.2/32", MTU: 1420}}
+	if err := s.Update(context.Background(), old, new_); err != nil {
+		t.Fatalf("userspace address change must stay allowed (pre-PR behavior), got: %v", err)
 	}
 }
 
@@ -303,6 +357,80 @@ func TestAWGParamsEqual_IgnoresNonAWGFields(t *testing.T) {
 	b := storage.AWGInterface{Address: "10.0.0.2", MTU: 1280, DNS: "8.8.8.8", AWGObfuscation: storage.AWGObfuscation{Jc: 5, Qlen: 1000}}
 	if !awgParamsEqual(a, b) {
 		t.Fatal("AWG params helper should ignore Address/MTU/DNS")
+	}
+}
+
+// === kmodShapingChanged (#234 C-1 Option B) ===
+//
+// applyDiffNWG calls SyncKmodSlot exactly when one of the kmod-shaping
+// fields changes. If a future edit forgets to include a new field that
+// reaches /proc/awg_proxy/add, the kmod slot survives Update with stale
+// params silently — these tests pin the four current shaping inputs.
+
+func storedWith(privateKey, peerPubKey, endpoint string, obf storage.AWGObfuscation) *storage.AWGTunnel {
+	return &storage.AWGTunnel{
+		Interface: storage.AWGInterface{
+			PrivateKey:     privateKey,
+			AWGObfuscation: obf,
+		},
+		Peer: storage.AWGPeer{
+			PublicKey: peerPubKey,
+			Endpoint:  endpoint,
+		},
+	}
+}
+
+func TestKmodShapingChanged_PrivateKey(t *testing.T) {
+	obf := storage.AWGObfuscation{Jc: 5}
+	a := storedWith("priv-A", "pub-1", "1.2.3.4:5060", obf)
+	b := storedWith("priv-B", "pub-1", "1.2.3.4:5060", obf)
+	if !kmodShapingChanged(a, b) {
+		t.Fatal("PrivateKey change must rebuild kmod slot")
+	}
+}
+
+func TestKmodShapingChanged_PeerPublicKey(t *testing.T) {
+	obf := storage.AWGObfuscation{Jc: 5}
+	a := storedWith("priv-A", "pub-1", "1.2.3.4:5060", obf)
+	b := storedWith("priv-A", "pub-2", "1.2.3.4:5060", obf)
+	if !kmodShapingChanged(a, b) {
+		t.Fatal("Peer.PublicKey change must rebuild kmod slot")
+	}
+}
+
+func TestKmodShapingChanged_PeerEndpoint(t *testing.T) {
+	obf := storage.AWGObfuscation{Jc: 5}
+	a := storedWith("priv-A", "pub-1", "1.2.3.4:5060", obf)
+	b := storedWith("priv-A", "pub-1", "9.8.7.6:5060", obf)
+	if !kmodShapingChanged(a, b) {
+		t.Fatal("Peer.Endpoint change must rebuild kmod slot")
+	}
+}
+
+func TestKmodShapingChanged_Obfuscation(t *testing.T) {
+	a := storedWith("priv-A", "pub-1", "1.2.3.4:5060", storage.AWGObfuscation{Jc: 5})
+	b := storedWith("priv-A", "pub-1", "1.2.3.4:5060", storage.AWGObfuscation{Jc: 7})
+	if !kmodShapingChanged(a, b) {
+		t.Fatal("AWG obfuscation change must rebuild kmod slot")
+	}
+}
+
+func TestKmodShapingChanged_IgnoresNonShapingFields(t *testing.T) {
+	// Address/MTU/DNS and PresharedKey don't reach /proc/awg_proxy/add
+	// — they should NOT trigger a slot rebuild.
+	obf := storage.AWGObfuscation{Jc: 5}
+	a := storedWith("priv-A", "pub-1", "1.2.3.4:5060", obf)
+	a.Interface.Address = "10.0.0.1"
+	a.Interface.MTU = 1420
+	a.Interface.DNS = "1.1.1.1"
+	a.Peer.PresharedKey = "psk-A"
+	b := storedWith("priv-A", "pub-1", "1.2.3.4:5060", obf)
+	b.Interface.Address = "10.0.0.2"
+	b.Interface.MTU = 1280
+	b.Interface.DNS = "8.8.8.8"
+	b.Peer.PresharedKey = "psk-B"
+	if kmodShapingChanged(a, b) {
+		t.Fatal("Address/MTU/DNS/PSK don't shape the kmod slot; expected no rebuild trigger")
 	}
 }
 
@@ -453,3 +581,30 @@ func TestApplyDiffKernel_AggregatesErrors(t *testing.T) {
 type errStub string
 
 func (e errStub) Error() string { return string(e) }
+
+// TestNew_NativeWGStateWiring пинует шов присваивания svc.nwgState (RT76):
+// New гардирует typed-nil явной проверкой `nwgOp != nil` — без гарда
+// *nwg.OperatorNativeWG(nil), упакованный в интерфейс nativeWGStateReader,
+// дал бы non-nil интерфейс, и последующий код читал бы состояние через
+// nil-указатель.
+func TestNew_NativeWGStateWiring(t *testing.T) {
+	store := &storage.AWGTunnelStore{}
+	legacyOp := &MockOperator{}
+	stateMgr := NewMockStateManager()
+	wanModel := wan.NewModel()
+
+	t.Run("nil operator", func(t *testing.T) {
+		var nwgOp *nwg.OperatorNativeWG
+		svc := New(store, nwgOp, legacyOp, stateMgr, wanModel, nil)
+		if svc.nwgState != nil {
+			t.Error("nwgState должен остаться nil при nil-операторе")
+		}
+	})
+
+	t.Run("live operator", func(t *testing.T) {
+		svc := New(store, &nwg.OperatorNativeWG{}, legacyOp, stateMgr, wanModel, nil)
+		if svc.nwgState == nil {
+			t.Error("nwgState должен быть установлен при живом операторе")
+		}
+	})
+}

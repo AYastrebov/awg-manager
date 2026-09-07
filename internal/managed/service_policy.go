@@ -4,13 +4,13 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/hoaxisr/awg-manager/internal/accesspolicy"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 )
 
 // SetPolicy applies an ip hotspot policy to the managed server's
 // interface and persists the choice to storage. Accepted values:
 //   - "none"  → clears the policy via RCI (no policy <iface>)
-//   - "permit" / "deny" → literal RCI policy values
 //   - "<PolicyName>" → must match an existing IP Policy profile name
 //     from the router (queries.Policies.List)
 //
@@ -31,7 +31,7 @@ func (s *Service) SetPolicy(ctx context.Context, id, policy string) error {
 		return nil
 	}
 
-	if policy != "none" && policy != "permit" && policy != "deny" {
+	if policy != "none" {
 		opts, err := s.ListPolicies(ctx)
 		if err != nil {
 			return fmt.Errorf("list policies: %w", err)
@@ -84,6 +84,9 @@ func (s *Service) ListPolicies(ctx context.Context) ([]PolicyOption, error) {
 	}
 	out := make([]PolicyOption, 0, len(policies))
 	for _, p := range policies {
+		if !accesspolicy.IsStandardPolicyName(p.Name) {
+			continue
+		}
 		out = append(out, PolicyOption{
 			ID:          p.Name,
 			Description: p.Description,

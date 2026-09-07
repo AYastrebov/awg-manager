@@ -6,11 +6,26 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+
+	"github.com/hoaxisr/awg-manager/internal/storage"
 )
 
 // activePath returns the path where the slot's file lives when enabled.
 func (o *Orchestrator) activePath(meta SlotMeta) string {
 	return filepath.Join(o.configDir, meta.Filename)
+}
+
+// ActivePath returns the enabled-location path for a registered slot, so
+// callers persist to the orchestrator-owned filename instead of re-joining
+// ConfigDir() with a hardcoded literal that would silently desync on rename.
+func (o *Orchestrator) ActivePath(slot Slot) (string, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	meta, ok := o.slots[slot]
+	if !ok {
+		return "", ErrUnknownSlot
+	}
+	return o.activePath(meta), nil
 }
 
 // disabledPath returns the path where the slot's file lives when disabled.
@@ -44,18 +59,11 @@ func (o *Orchestrator) ensureDirs() error {
 	return nil
 }
 
-// writeAtomic writes data to path via a sibling .tmp file + rename.
-// Truncates and replaces any existing file.
+// writeAtomic writes data to path atomically (unique temp + rename) via
+// storage.AtomicWrite, so a crash or concurrent writer can't leave a partial
+// or collided file.
 func writeAtomic(path string, data []byte) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return storage.AtomicWrite(path, data)
 }
 
 // fileExists returns true iff path exists and is a regular file.
@@ -102,7 +110,15 @@ func (o *Orchestrator) renameForToggle(meta SlotMeta, enable bool) error {
 		return err
 	}
 	if _, err := os.Stat(dst); err == nil {
-		// Both exist — pathological. Prefer src as truth, remove dst.
+		// Both exist — drift. Prefer the ACTIVE side as truth (mirrors
+		// Bootstrap's both-locations policy). При enable активный файл —
+		// dst и он новее (штатный случай: ApplyDraft на припаркованный слот
+		// уже положил черновик в active/, а в disabled/ остался устаревший
+		// дубль) — сносим только его источник-дубль. При disable активный
+		// файл — src: убираем застоявшийся dst и переносим src как раньше.
+		if enable {
+			return os.Remove(src)
+		}
 		if err := os.Remove(dst); err != nil {
 			return err
 		}

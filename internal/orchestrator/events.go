@@ -1,35 +1,39 @@
 package orchestrator
 
 import (
-	"github.com/hoaxisr/awg-manager/internal/storage"
-	"github.com/hoaxisr/awg-manager/internal/tunnel"
+	"strconv"
+	"time"
 )
 
 // EventType identifies the kind of event.
 type EventType int
 
 const (
-	EventBoot            EventType = iota // Router boot — start all enabled
-	EventReconnect                         // Daemon restart — restore state
-	EventStart                             // User clicks Start
-	EventStop                              // User clicks Stop
-	EventRestart                           // User clicks Restart
-	EventCreate                            // User creates tunnel
-	EventDelete                            // User deletes tunnel
-	EventUpdate                            // User updates config
-	EventImport                            // User imports .conf
-	EventSetEnabled                        // User toggles enabled
-	EventSetDefaultRoute                   // User toggles default route
-	EventWANUp                             // WAN interface came up
-	EventWANDown                           // WAN interface went down
-	EventNDMSHook                          // NDMS iflayerchanged.d hook
-	EventPingCheckFailed                   // Connectivity loss detected
+	EventBoot      EventType = iota // Router boot — start all enabled
+	EventReconnect                  // Daemon restart — restore state
+	EventStart                      // User clicks Start
+	EventStop                       // User clicks Stop
+	EventRestart                    // User clicks Restart
+	EventDelete                     // User deletes tunnel
+	EventWANUp                      // WAN interface came up
+	EventWANDown                    // WAN interface went down
+	EventNDMSHook                   // NDMS iflayerchanged.d hook
+	EventQuiesce                    // Stop running tunnels without disabling (backup/restore)
+
+	// eventTypeCount — сентинель для теста полноты String(). Держать
+	// последним: новое событие, добавленное после него, останется
+	// безымянным в логе держателя замка и тест этого не заметит.
+	eventTypeCount
 )
 
 // Event is the input to the orchestrator.
 type Event struct {
-	Type    EventType
-	Tunnel  string // tunnel ID for tunnel-specific events
+	Type   EventType
+	Tunnel string // tunnel ID for tunnel-specific events
+
+	// Now is the decision-time clock, stamped by HandleEvent. Lets the pure
+	// decide functions compare against per-tunnel time windows without I/O.
+	Now time.Time
 
 	// NDMS hook data
 	NDMSName string
@@ -38,17 +42,32 @@ type Event struct {
 
 	// WAN event data
 	WANIface string
+}
 
-	// Create/Update data
-	Config *tunnel.Config
-	Stored *storage.AWGTunnel
-
-	// Import data
-	ConfContent   string
-	ImportName    string
-	ImportBackend string
-
-	// Toggle data
-	Enabled      *bool
-	DefaultRoute *bool
+// String names the event for logs — notably the per-tunnel lock holder
+// (issue #795), where a bare int told nobody which operation was wedged.
+func (t EventType) String() string {
+	switch t {
+	case EventBoot:
+		return "boot"
+	case EventReconnect:
+		return "reconnect"
+	case EventStart:
+		return "start"
+	case EventStop:
+		return "stop"
+	case EventRestart:
+		return "restart"
+	case EventDelete:
+		return "delete"
+	case EventWANUp:
+		return "wan-up"
+	case EventWANDown:
+		return "wan-down"
+	case EventNDMSHook:
+		return "ndms-hook"
+	case EventQuiesce:
+		return "quiesce"
+	}
+	return "event-" + strconv.Itoa(int(t))
 }

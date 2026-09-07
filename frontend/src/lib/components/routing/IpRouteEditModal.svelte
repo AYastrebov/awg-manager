@@ -2,6 +2,8 @@
 	import type { StaticRouteList, RoutingTunnel } from '$lib/types';
 	import { Modal, Button, Dropdown, type DropdownOption } from '$lib/components/ui';
 	import { ServiceIcon, IconPickerModal } from '$lib/components/dnsroutes';
+	import { formatIconUrlHint } from '$lib/utils/custom-icon';
+	import { Upload } from 'lucide-svelte';
 
 	interface Props {
 		open: boolean;
@@ -208,7 +210,7 @@
 			<div class="icon-meta">
 				{#if iconUrl}
 					<div class="icon-src">Кастомная иконка</div>
-					<div class="icon-hint" title={iconUrl}>{iconUrl}</div>
+					<div class="icon-hint" title={iconUrl}>{formatIconUrlHint(iconUrl)}</div>
 				{:else}
 					<div class="icon-src">Авто-определение по имени</div>
 					<div class="icon-hint">
@@ -217,7 +219,7 @@
 				{/if}
 			</div>
 			<Button variant="ghost" size="sm" onclick={() => (iconPickerOpen = true)}>
-				{iconUrl ? 'Сменить' : 'Выбрать'}
+				{iconUrl ? 'Сменить иконку' : 'Выбрать иконку'}
 			</Button>
 		</div>
 	</div>
@@ -259,11 +261,7 @@
 		<div class="section-header">
 			<div class="section-title">Подсети (по одной на строку, CIDR)</div>
 			<button class="btn-bat-import" onclick={handleBatImport}>
-				<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-					<path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
-					<polyline points="17 8 12 3 7 8"/>
-					<line x1="12" y1="3" x2="12" y2="15"/>
-				</svg>
+				<Upload size={12} aria-hidden="true" />
 				Из .bat файла
 			</button>
 			<input
@@ -346,6 +344,23 @@
 		padding: 3px 10px;
 		border-radius: var(--radius-sm);
 		transition: border-color var(--t-fast) ease, color var(--t-fast) ease;
+	}
+
+	@media (max-width: 640px) {
+		.section-header {
+			display: grid;
+			grid-template-columns: minmax(0, 1fr);
+			align-items: stretch;
+		}
+
+		.btn-bat-import {
+			width: 50%;
+			min-height: 2.25rem;
+			margin-left: auto;
+			justify-content: flex-start;
+			padding-inline: 0.75rem;
+			gap: 0.5rem;
+		}
 	}
 
 	.btn-bat-import:hover {

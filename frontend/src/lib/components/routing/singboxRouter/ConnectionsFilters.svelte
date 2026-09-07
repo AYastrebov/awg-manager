@@ -6,7 +6,7 @@
 
 	interface Props {
 		filters: ConnectionFilters;
-		outboundOptions: string[];
+		outboundOptions: DropdownOption[];
 		ruleOptions: string[];
 		onChange: (next: ConnectionFilters) => void;
 	}
@@ -15,10 +15,14 @@
 
 	// svelte-ignore state_referenced_locally
 	let searchValue = $state(filters.search);
+	// svelte-ignore state_referenced_locally
+	let lastExternalSearch = filters.search;
 
 	$effect(() => {
-		if (searchValue !== filters.search) {
-			searchValue = filters.search;
+		const externalSearch = filters.search;
+		if (externalSearch !== lastExternalSearch) {
+			lastExternalSearch = externalSearch;
+			searchValue = externalSearch;
 		}
 	});
 
@@ -29,6 +33,11 @@
 	});
 
 	function commitSearch(): void {
+		if (debounceTimer !== null) {
+			clearTimeout(debounceTimer);
+			debounceTimer = null;
+		}
+		lastExternalSearch = searchValue;
 		onChange({ ...filters, search: searchValue });
 	}
 
@@ -40,7 +49,7 @@
 
 	const outboundDropdown = $derived<DropdownOption[]>([
 		{ value: '', label: 'Все' },
-		...outboundOptions.map((o) => ({ value: o, label: o })),
+		...outboundOptions,
 	]);
 
 	const networkDropdown: DropdownOption<NetworkFilter>[] = [

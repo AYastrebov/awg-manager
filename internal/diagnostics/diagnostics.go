@@ -15,35 +15,53 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/singbox"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 	"github.com/hoaxisr/awg-manager/internal/sys/kmod"
-	"github.com/hoaxisr/awg-manager/internal/tunnel/backend"
+	"github.com/hoaxisr/awg-manager/internal/sys/routerclock"
+	"github.com/hoaxisr/awg-manager/internal/sys/routerinfo"
 	"github.com/hoaxisr/awg-manager/internal/tunnel/service"
 	"github.com/hoaxisr/awg-manager/internal/tunnel/wan"
 )
 
 // Report is the top-level diagnostics report.
 type Report struct {
-	Version     string             `json:"version"`
-	GeneratedAt    time.Time          `json:"generatedAt"`
-	DurationMs     int64              `json:"durationMs"`
-	System         SystemInfo         `json:"system"`
-	WAN            WANInfo            `json:"wan"`
-	BootHealth     BootHealth         `json:"bootHealth"`
-	AWGProxyModule AWGProxyModule     `json:"awgProxyModule"`
-	Tunnels        []TunnelInfo       `json:"tunnels"`
-	Tests          []TestResult       `json:"tests"`
-	Logs           []logging.LogEntry `json:"logs"`
+	Version         string               `json:"version"`
+	GeneratedAt     time.Time            `json:"generatedAt"`
+	RouterClock     RouterClockInfo      `json:"routerClock"`
+	Privacy         PrivacyInfo          `json:"privacy,omitempty"`
+	DurationMs      int64                `json:"durationMs"`
+	System          SystemInfo           `json:"system"`
+	WAN             WANInfo              `json:"wan"`
+	BootHealth      BootHealth           `json:"bootHealth"`
+	AWGProxyModule  AWGProxyModule       `json:"awgProxyModule"`
+	SingboxConfig   *SingboxConfigInfo   `json:"singboxConfig,omitempty"`
+	JournalWarnings *JournalWarningsInfo `json:"journalWarnings,omitempty"`
+	Tunnels         []TunnelInfo         `json:"tunnels"`
+	Tests           []TestResult         `json:"tests"`
+}
+
+type PrivacyInfo struct {
+	Sanitized bool     `json:"sanitized"`
+	Rules     []string `json:"rules,omitempty"`
+}
+
+type RouterClockInfo struct {
+	Time          time.Time `json:"time"`
+	Timezone      string    `json:"timezone"`
+	OffsetMinutes int       `json:"offsetMinutes"`
+	Source        string    `json:"source,omitempty"`
+	RawTZ         string    `json:"rawTZ,omitempty"`
 }
 
 // SystemInfo contains system-level diagnostics.
 type SystemInfo struct {
-	AppVersion    string           `json:"appVersion"`
-	KeeneticOS    string           `json:"keeneticOS"`
-	IsOS5         bool             `json:"isOS5"`
-	Arch          string           `json:"arch"`
-	Backend       string           `json:"backend"`
-	KernelModule  KernelModuleInfo `json:"kernelModule"`
-	TotalMemoryMB int              `json:"totalMemoryMB"`
-	Uptime        string           `json:"uptime"`
+	AppVersion    string                    `json:"appVersion"`
+	KeeneticOS    string                    `json:"keeneticOS"`
+	IsOS5         bool                      `json:"isOS5"`
+	Arch          string                    `json:"arch"`
+	Backend       string                    `json:"backend"`
+	KernelModule  KernelModuleInfo          `json:"kernelModule"`
+	TotalMemoryMB int                       `json:"totalMemoryMB"`
+	Uptime        string                    `json:"uptime"`
+	RouterDetails *routerinfo.RouterDetails `json:"routerDetails,omitempty"`
 }
 
 // KernelModuleInfo contains kernel module status.
@@ -98,6 +116,33 @@ type AWGProxyModule struct {
 	DmesgLines    []string `json:"dmesgLines,omitempty"`
 }
 
+// SingboxConfigInfo holds the merged sing-box config (sanitized) in the report.
+type SingboxConfigInfo struct {
+	Available bool           `json:"available"`
+	Error     string         `json:"error,omitempty"`
+	Config    map[string]any `json:"config,omitempty"`
+}
+
+// JournalWarningsInfo contains WARN/ERROR journal entries from both log buckets.
+type JournalWarningsInfo struct {
+	Levels         []string             `json:"levels"`
+	LimitPerBucket int                  `json:"limitPerBucket"`
+	AWGM           JournalWarningBucket `json:"awgm"`
+	Singbox        JournalWarningBucket `json:"singbox"`
+}
+
+// JournalWarningBucket is one diagnostics journal excerpt for a concrete log bucket.
+type JournalWarningBucket struct {
+	Bucket                string             `json:"bucket"`
+	Total                 int                `json:"total"`
+	Included              int                `json:"included"`
+	Truncated             bool               `json:"truncated"`
+	BufferSize            int                `json:"bufferSize"`
+	BufferCapacity        int                `json:"bufferCapacity"`
+	BufferOldestTimestamp string             `json:"bufferOldestTimestamp,omitempty"`
+	Entries               []logging.LogEntry `json:"entries"`
+}
+
 // TunnelInfo contains per-tunnel diagnostics.
 type TunnelInfo struct {
 	ID                   string         `json:"id"`
@@ -128,7 +173,7 @@ type IfaceInfo struct {
 
 // ConnectionInfo contains tunnel connection state (unified for kernel and nativewg).
 type ConnectionInfo struct {
-	RawOutput       string `json:"rawOutput"`
+	RawOutput       string `json:"rawOutput,omitempty"`
 	LatestHandshake string `json:"latestHandshake"`
 	TransferRx      string `json:"transferRx"`
 	TransferTx      string `json:"transferTx"`
@@ -345,7 +390,9 @@ type TunnelServiceForDiag interface {
 
 // LogServiceForDiag is the subset of logging.Service used by diagnostics.
 type LogServiceForDiag interface {
-	GetLogs(category, level string) []logging.LogEntry
+	// Bucket helpers used by journalWarnings report section.
+	GetBucketLogs(bucket logging.Bucket, group, subgroup, level string, limit, offset int) ([]logging.LogEntry, int)
+	GetBucketStats(bucket logging.Bucket) logging.BufferStats
 }
 
 // PingCheckForDiag is the subset of pingcheck facade used by diagnostics.
@@ -377,18 +424,18 @@ type SingboxSubMember struct {
 
 // Deps holds all dependencies needed by the diagnostics runner.
 type Deps struct {
-	TunnelService     TunnelServiceForDiag
-	NDMSQueries       *query.Queries
-	NDMSTransport     *transport.Client
-	Backend           backend.Backend
-	KmodLoader        *kmod.Loader
-	TunnelStore       *storage.AWGTunnelStore
-	LogService        LogServiceForDiag
-	AppVersion        string
-	PingCheckFacade   PingCheckForDiag
-	Singbox           SingboxForDiag
-	SingboxSubMembers func() []SingboxSubMember
-	AppLogger         logging.AppLogger
+	TunnelService        TunnelServiceForDiag
+	NDMSQueries          *query.Queries
+	NDMSTransport        *transport.Client
+	KmodLoader           *kmod.Loader
+	TunnelStore          *storage.AWGTunnelStore
+	LogService           LogServiceForDiag
+	AppVersion           string
+	PingCheckFacade      PingCheckForDiag
+	Singbox              SingboxForDiag
+	SingboxSubMembers    func() []SingboxSubMember
+	SingboxConfigPreview func() (string, error)
+	AppLogger            logging.AppLogger
 }
 
 // Runner executes diagnostic runs.
@@ -458,17 +505,6 @@ func (r *Runner) subscribe() chan DiagEvent {
 	ch := make(chan DiagEvent, 64)
 	r.subscribers = append(r.subscribers, ch)
 	return ch
-}
-
-func (r *Runner) unsubscribe(ch chan DiagEvent) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for i, sub := range r.subscribers {
-		if sub == ch {
-			r.subscribers = append(r.subscribers[:i], r.subscribers[i+1:]...)
-			break
-		}
-	}
 }
 
 func (r *Runner) emit(ev DiagEvent) {
@@ -541,11 +577,10 @@ func (r *Runner) execute(ctx context.Context) {
 
 func (r *Runner) executeStream(ctx context.Context) {
 	start := time.Now()
+	clock := routerclock.Get()
+	generatedAt := clock.Now
 	r.appLog.Info("run", "", "Diagnostics started")
-	report := &Report{
-		Version:     "1.0",
-		GeneratedAt: start,
-	}
+	report := newReport(generatedAt, clock)
 
 	singleTunnel := r.opts.TunnelID
 	isGlobalOnly := singleTunnel == "__global__"
@@ -582,6 +617,7 @@ func (r *Runner) executeStream(ctx context.Context) {
 
 		// Full report only available for complete runs, not quick single-target probes.
 		if singleTunnel == "" && !isGlobalOnly {
+			sanitizeReportPrivacy(report)
 			anonymize(report)
 			r.mu.Lock()
 			r.result = report
@@ -612,6 +648,9 @@ func (r *Runner) executeStream(ctx context.Context) {
 
 		r.emitPhase("collect_proxy_module", "Состояние awg-proxy...")
 		report.AWGProxyModule = r.collectAWGProxyModule(ctx)
+
+		r.emitPhase("collect_singbox_config", "Сбор sing-box config...")
+		report.SingboxConfig = r.collectSingboxConfig()
 	}
 
 	// AWG tunnel collection: needed for full runs and single AWG-tunnel probes.
@@ -620,10 +659,27 @@ func (r *Runner) executeStream(ctx context.Context) {
 		report.Tunnels = r.collectTunnels(ctx)
 	}
 
+	allResults = r.runTestsWithEvents(ctx, report)
+
 	if singleTunnel == "" {
-		r.emitPhase("collect_logs", "Сбор логов...")
-		report.Logs = r.collectLogs()
+		r.emitPhase("collect_journal_warnings", "Сбор WARN/ERROR из журнала...")
+		report.JournalWarnings = r.collectJournalWarnings()
+		convertJournalWarningsToRouterTime(report.JournalWarnings, clock.Location)
 	}
 
-	allResults = r.runTestsWithEvents(ctx, report)
+	convertReportTimesToRouterTime(report, clock.Location)
+}
+
+func newReport(generatedAt time.Time, clock routerclock.Info) *Report {
+	return &Report{
+		Version:     "1.0",
+		GeneratedAt: generatedAt,
+		RouterClock: RouterClockInfo{
+			Time:          generatedAt,
+			Timezone:      clock.ZoneName,
+			OffsetMinutes: clock.OffsetMinutes,
+			Source:        clock.Source,
+			RawTZ:         clock.RawTZ,
+		},
+	}
 }

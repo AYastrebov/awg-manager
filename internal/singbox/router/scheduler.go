@@ -4,31 +4,25 @@ import (
 	"context"
 	"time"
 
-	"github.com/hoaxisr/awg-manager/internal/logger"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 )
 
 const (
 	schedulerInitialDelay = 2 * time.Minute
 	schedulerTick         = 30 * time.Second
-	dailyTickWindow       = 30 * time.Second
 )
 
 type Scheduler struct {
 	svc      *ServiceImpl
 	settings *storage.SettingsStore
-	log      *logger.Logger
 	stop     chan struct{}
 	done     chan struct{}
-
-	lastRefresh time.Time
 }
 
-func NewScheduler(svc *ServiceImpl, settings *storage.SettingsStore, log *logger.Logger) *Scheduler {
+func NewScheduler(svc *ServiceImpl, settings *storage.SettingsStore) *Scheduler {
 	return &Scheduler{
 		svc:      svc,
 		settings: settings,
-		log:      log,
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
 	}
@@ -53,7 +47,6 @@ func (s *Scheduler) run() {
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		s.tickPolicySync(ctx)
-		s.tickRuleSetRefresh(ctx)
 		cancel()
 
 		select {
@@ -66,69 +59,21 @@ func (s *Scheduler) run() {
 
 func (s *Scheduler) tickPolicySync(ctx context.Context) {
 	settings, err := s.settings.Load()
-	if err != nil || !settings.SingboxRouter.Enabled {
-		return
-	}
-	if err := s.svc.Reconcile(ctx); err != nil && s.log != nil {
-		s.log.Warnf("router scheduler: policy sync: %v", err)
-	}
-}
-
-func (s *Scheduler) tickRuleSetRefresh(ctx context.Context) {
-	settings, err := s.settings.Load()
-	if err != nil || !settings.SingboxRouter.Enabled {
-		return
-	}
-	sr := settings.SingboxRouter
-	if sr.RefreshMode == "" {
-		sr.RefreshMode = "interval"
-	}
-	now := time.Now()
-	var should bool
-	switch sr.RefreshMode {
-	case "interval":
-		should = shouldRefreshInterval(now, s.lastRefresh, sr.RefreshInterval)
-	case "daily":
-		should = shouldRefreshDaily(now, s.lastRefresh, sr.RefreshDaily)
-	}
-	if !should {
-		return
-	}
-	if s.svc.deps.Singbox != nil {
-		if err := s.svc.deps.Singbox.Reload(); err != nil {
-			if s.log != nil {
-				s.log.Warnf("router scheduler: reload for refresh: %v", err)
-			}
-			return
-		}
-	}
-	s.lastRefresh = now
-}
-
-func shouldRefreshInterval(now, last time.Time, intervalHours int) bool {
-	if intervalHours < 1 {
-		return false
-	}
-	if last.IsZero() {
-		return true
-	}
-	return now.Sub(last) >= time.Duration(intervalHours)*time.Hour
-}
-
-func shouldRefreshDaily(now, last time.Time, targetTime string) bool {
-	if targetTime == "" {
-		return false
-	}
-	t, err := time.Parse("15:04", targetTime)
 	if err != nil {
-		return false
+		return
 	}
-	target := time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, now.Location())
-	if now.Before(target) || now.After(target.Add(dailyTickWindow)) {
-		return false
+	if !settings.SingboxRouter.Enabled {
+		// Движок выключен — Reconcile не гоняем, но reap fakeip-сирот обязан
+		// работать и здесь: runtime-сирота (провал delete при disable)
+		// возникает именно в выключенном состоянии. В steady-state дёшево —
+		// скан читает кэш InterfaceStore. При включённом движке reap делает
+		// сам Reconcile.
+		if err := s.svc.ReapOrphanedFakeIPTun(ctx); err != nil {
+			s.svc.appLog.Warn("fakeip-reap", "", err.Error())
+		}
+		return
 	}
-	if !last.IsZero() && last.After(target) {
-		return false
+	if err := s.svc.Reconcile(ctx); err != nil {
+		s.svc.appLog.Warn("scheduler-policy-sync", "", err.Error())
 	}
-	return true
 }

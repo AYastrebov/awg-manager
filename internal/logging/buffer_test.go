@@ -359,6 +359,59 @@ func TestLogBuffer_LevelCumulative(t *testing.T) {
 	}
 }
 
+func TestLogBuffer_GetPaginatedMulti(t *testing.T) {
+	buf := NewLogBuffer(BucketApp)
+	defer buf.Stop()
+
+	base := time.Now()
+	entries := []LogEntry{
+		{Timestamp: base.Add(1 * time.Second), Group: GroupTunnel, Subgroup: SubLifecycle, Level: string(LevelInfo), Target: "t1"},
+		{Timestamp: base.Add(2 * time.Second), Group: GroupRouting, Subgroup: SubDnsRoute, Level: string(LevelInfo), Target: "r1"},
+		{Timestamp: base.Add(3 * time.Second), Group: GroupSystem, Subgroup: SubSettings, Level: string(LevelInfo), Target: "s1"},
+		{Timestamp: base.Add(4 * time.Second), Group: GroupTunnel, Subgroup: SubConnectivity, Level: string(LevelWarn), Target: "t2"},
+	}
+	for _, e := range entries {
+		buf.Add(e)
+	}
+
+	// groups work as OR
+	page, total := buf.GetPaginatedMulti([]string{GroupTunnel, GroupRouting}, nil, "", time.Time{}, 50, 0)
+	if total != 3 || len(page) != 3 {
+		t.Fatalf("groups OR: total=%d len=%d want 3/3", total, len(page))
+	}
+
+	// subgroups work as OR
+	page, total = buf.GetPaginatedMulti(nil, []string{SubSettings, SubDnsRoute}, "", time.Time{}, 50, 0)
+	if total != 2 || len(page) != 2 {
+		t.Fatalf("subgroups OR: total=%d len=%d want 2/2", total, len(page))
+	}
+
+	// group + subgroup works as AND
+	page, total = buf.GetPaginatedMulti([]string{GroupTunnel}, []string{SubLifecycle}, "", time.Time{}, 50, 0)
+	if total != 1 || len(page) != 1 || page[0].Subgroup != SubLifecycle {
+		t.Fatalf("group+subgroup AND mismatch: total=%d len=%d page=%v", total, len(page), page)
+	}
+
+	// empty filters = no restriction
+	page, total = buf.GetPaginatedMulti(nil, nil, "", time.Time{}, 50, 0)
+	if total != 4 || len(page) != 4 {
+		t.Fatalf("empty filters: total=%d len=%d want 4/4", total, len(page))
+	}
+
+	// offset/limit after filtering
+	page, total = buf.GetPaginatedMulti([]string{GroupTunnel, GroupRouting, GroupSystem}, nil, "", time.Time{}, 2, 1)
+	if total != 4 || len(page) != 2 {
+		t.Fatalf("offset/limit: total=%d len=%d want 4/2", total, len(page))
+	}
+
+	// strict since: timestamp equal to since should be excluded
+	since := base.Add(3 * time.Second)
+	page, total = buf.GetPaginatedMulti(nil, nil, "", since, 50, 0)
+	if total != 1 || len(page) != 1 || !page[0].Timestamp.After(since) {
+		t.Fatalf("since strict-after mismatch: total=%d len=%d", total, len(page))
+	}
+}
+
 func TestLogBuffer_SinceFilter(t *testing.T) {
 	lb := NewLogBuffer(BucketApp)
 	defer lb.Stop()

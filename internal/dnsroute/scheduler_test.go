@@ -24,7 +24,7 @@ func (m *mockRefreshService) List(ctx context.Context) ([]DomainList, error) { r
 func (m *mockRefreshService) Update(ctx context.Context, list DomainList) (*DomainList, error) {
 	return nil, nil
 }
-func (m *mockRefreshService) Delete(ctx context.Context, id string) error            { return nil }
+func (m *mockRefreshService) Delete(ctx context.Context, id string) error { return nil }
 func (m *mockRefreshService) DeleteBatch(ctx context.Context, ids []string) (int, error) {
 	return 0, nil
 }
@@ -54,7 +54,7 @@ func newTestSettings(t *testing.T, ds storage.DNSRouteSettings) *storage.Setting
 		t.Fatal(err)
 	}
 	settings.DNSRoute = ds
-	if err := store.Save(settings); err != nil {
+	if err := store.Update(func(cur *storage.Settings) error { *cur = *settings; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	return store
@@ -180,7 +180,7 @@ func TestScheduler_StartStop(t *testing.T) {
 		RefreshIntervalHours: 0,
 	})
 
-	sched := NewScheduler(mock, store, noopLogger())
+	sched := NewScheduler(mock, store, nil)
 	sched.Start()
 
 	// Stop should return promptly (scheduler is in initial delay).
@@ -204,7 +204,7 @@ func TestScheduler_DoRefreshCallsService(t *testing.T) {
 		RefreshIntervalHours: 1,
 	})
 
-	sched := NewScheduler(mock, store, noopLogger())
+	sched := NewScheduler(mock, store, nil)
 	sched.doRefresh()
 
 	if mock.count() != 1 {

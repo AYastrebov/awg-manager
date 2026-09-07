@@ -58,7 +58,7 @@ func (h *StaticRouteHandler) SetEventBus(bus *events.Bus) { h.bus = bus }
 // the caller's store can applyMutationResponse without waiting for the
 // hint.
 func (h *StaticRouteHandler) publishStaticUpdated(reason string) {
-	publishInvalidated(h.bus, ResourceRoutingStaticRoutes, reason)
+	h.bus.PublishInvalidated(events.ResourceRoutingStaticRoutes, reason)
 }
 
 // NewStaticRouteHandler creates a new static route handler.
@@ -102,7 +102,7 @@ func (h *StaticRouteHandler) List(w http.ResponseWriter, r *http.Request) {
 //	@Accept			json
 //	@Produce		json
 //	@Security		CookieAuth
-//	@Success		200	{object}	StaticRoutesListResponse
+//	@Success		200	{object}	APIEnvelope{data=StaticRouteDTO}
 //	@Failure		400	{object}	APIErrorEnvelope
 //	@Failure		500	{object}	APIErrorEnvelope
 //	@Router			/static-routes/create [post]
@@ -131,7 +131,7 @@ func (h *StaticRouteHandler) Create(w http.ResponseWriter, r *http.Request) {
 //	@Accept			json
 //	@Produce		json
 //	@Security		CookieAuth
-//	@Success		200	{object}	StaticRoutesListResponse
+//	@Success		200	{object}	APIEnvelope{data=StaticRouteDTO}
 //	@Failure		400	{object}	APIErrorEnvelope
 //	@Failure		500	{object}	APIErrorEnvelope
 //	@Router			/static-routes/update [post]
@@ -170,9 +170,8 @@ func (h *StaticRouteHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		response.ErrorWithStatus(w, http.StatusBadRequest, "Missing id parameter", "MISSING_ID")
+	id, ok := requireQueryID(w, r)
+	if !ok {
 		return
 	}
 
@@ -205,9 +204,8 @@ func (h *StaticRouteHandler) SetEnabled(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		response.ErrorWithStatus(w, http.StatusBadRequest, "Missing id parameter", "MISSING_ID")
+	id, ok := requireQueryID(w, r)
+	if !ok {
 		return
 	}
 
@@ -240,7 +238,7 @@ type staticRouteImportReq struct {
 //	@Accept			json
 //	@Produce		json
 //	@Security		CookieAuth
-//	@Success		200	{object}	StaticRoutesListResponse
+//	@Success		200	{object}	APIEnvelope{data=StaticRouteDTO}
 //	@Failure		400	{object}	APIErrorEnvelope
 //	@Failure		500	{object}	APIErrorEnvelope
 //	@Router			/static-routes/import [post]

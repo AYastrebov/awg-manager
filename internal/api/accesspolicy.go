@@ -25,6 +25,7 @@ type AccessPolicyDTO struct {
 	Standalone  bool                       `json:"standalone" example:"false"`
 	Interfaces  []AccessPolicyInterfaceDTO `json:"interfaces"`
 	DeviceCount int                        `json:"deviceCount" example:"5"`
+	IsStandard  bool                       `json:"isStandard" example:"true"`
 }
 
 // AccessPoliciesListResponse is the envelope for GET /access-policies.
@@ -120,12 +121,12 @@ func (h *AccessPolicyHandler) SetEventBus(bus *events.Bus) { h.bus = bus }
 // publishPoliciesUpdated posts a resource:invalidated hint for the access
 // policy list so clients refetch.
 func (h *AccessPolicyHandler) publishPoliciesUpdated(reason string) {
-	publishInvalidated(h.bus, ResourceRoutingAccessPolicies, reason)
+	h.bus.PublishInvalidated(events.ResourceRoutingAccessPolicies, reason)
 }
 
 // publishDevicesUpdated posts a resource:invalidated hint for the device list.
 func (h *AccessPolicyHandler) publishDevicesUpdated(reason string) {
-	publishInvalidated(h.bus, ResourceRoutingPolicyDevices, reason)
+	h.bus.PublishInvalidated(events.ResourceRoutingPolicyDevices, reason)
 }
 
 // NewAccessPolicyHandler creates a new access policy handler.
@@ -137,7 +138,7 @@ func NewAccessPolicyHandler(svc accesspolicy.Service) *AccessPolicyHandler {
 // GET /api/access-policies
 //
 //	@Summary		List access policies
-//	@Description	KeeneticOS 5 only when route is registered.
+//	@Description	Works on both KeeneticOS 4.x and 5.x: `ip policy` exists since firmware 2.12.
 //	@Tags			access-policy
 //	@Produce		json
 //	@Security		CookieAuth
@@ -145,6 +146,7 @@ func NewAccessPolicyHandler(svc accesspolicy.Service) *AccessPolicyHandler {
 //	@Success		200		{object}	AccessPoliciesListResponse
 //	@Failure		500		{object}	APIErrorEnvelope
 //	@Router			/access-policies [get]
+//	@Router			/routing/access-policies [get]
 func (h *AccessPolicyHandler) List(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		response.MethodNotAllowed(w)
@@ -479,6 +481,7 @@ func (h *AccessPolicyHandler) ListDevices(w http.ResponseWriter, r *http.Request
 //	@Success		200	{object}	PolicyInterfacesListResponse
 //	@Failure		500	{object}	APIErrorEnvelope
 //	@Router			/access-policies/interfaces [get]
+//	@Router			/routing/policy-interfaces [get]
 func (h *AccessPolicyHandler) ListGlobalInterfaces(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		response.MethodNotAllowed(w)
@@ -520,5 +523,7 @@ func (h *AccessPolicyHandler) SetInterfaceUp(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	response.Success(w, map[string]bool{"ok": true})
-	publishInvalidated(h.bus, ResourceRoutingPolicyInterfaces, "set-interface-up")
+	h.bus.PublishInvalidated(events.ResourceRoutingPolicyInterfaces, "set-interface-up")
+	h.bus.PublishInvalidated(events.ResourceRoutingTunnels, "set-interface-up")
+	h.bus.PublishInvalidated(events.ResourceTunnels, "set-interface-up")
 }

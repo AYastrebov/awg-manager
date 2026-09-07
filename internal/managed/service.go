@@ -31,9 +31,14 @@ type ManagedServerService interface {
 
 	// Enable/disable
 	SetEnabled(ctx context.Context, id string, enabled bool) error
+	RestartOrStart(ctx context.Context, id string) error
 
 	// NAT
-	SetNAT(ctx context.Context, id string, enabled bool) error
+	SetNATMode(ctx context.Context, id, mode string) error
+
+	// LAN segments
+	SetLANSegments(ctx context.Context, id string, segments []string) error
+	ListLANSegments(ctx context.Context) ([]LANSegmentDTO, error)
 
 	// Policy
 	SetPolicy(ctx context.Context, id, policy string) error
@@ -61,6 +66,10 @@ type ManagedServerService interface {
 	// frontend re-fetch) sees fresh NDMS state instead of cached
 	// pre-mutation values.
 	InvalidateCache(id string)
+
+	// ForeignAccessGroups returns access-group names bound to the interface
+	// via `ip access-group … in`, excluding our own AWGM_<iface>.
+	ForeignAccessGroups(ctx context.Context, iface string) ([]string, error)
 }
 
 // rciPoster is the minimal POST surface managed needs from the NDMS transport.
@@ -80,6 +89,9 @@ type Service struct {
 	settings  *storage.SettingsStore
 	log       *slog.Logger
 	appLog    *logging.ScopedLogger
+	// wgRun is the wg-tools execution seam. Production uses realWgRunner;
+	// tests inject a stub to avoid forking real binaries.
+	wgRun wgRunner
 }
 
 // New creates a new managed server service.
@@ -100,6 +112,7 @@ func New(
 		settings:  settings,
 		log:       log,
 		appLog:    logging.NewScopedLogger(appLogger, logging.GroupServer, logging.SubManaged),
+		wgRun:     realWgRunner,
 	}
 }
 
@@ -112,4 +125,15 @@ func (s *Service) InvalidateCache(id string) {
 		return
 	}
 	s.queries.WGServers.Invalidate(id)
+}
+
+// resolveKernelName maps an NDMS interface name (e.g. "Wireguard0") to its
+// kernel-side device name (e.g. "nwg0") via the interface store cache.
+// Returns "" if the queries layer is unavailable or the name cannot be
+// resolved — callers treat empty as "skip the wg-tools call".
+func (s *Service) resolveKernelName(ctx context.Context, ndmsName string) string {
+	if s.queries == nil || s.queries.Interfaces == nil {
+		return ""
+	}
+	return s.queries.Interfaces.ResolveSystemName(ctx, ndmsName)
 }

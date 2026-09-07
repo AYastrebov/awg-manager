@@ -198,6 +198,15 @@ void compute_mac1_key(const u8 pubkey[32], u8 mac1key[32])
 	blake2s_256(input, 40, mac1key);
 }
 
+void compute_cookie_key(const u8 pubkey[32], u8 cookie_key[32])
+{
+	u8 input[40];
+
+	memcpy(input, "cookie--", 8);
+	memcpy(input + 8, pubkey, 32);
+	blake2s_256(input, 40, cookie_key);
+}
+
 void recompute_mac1(u8 *buf, const u8 mac1key[32])
 {
 	u8 mac1[16];
@@ -212,4 +221,16 @@ void recompute_mac1_response(u8 *buf, const u8 mac1key[32])
 
 	blake2s_128mac(mac1key, buf, 60, mac1);
 	memcpy(buf + 60, mac1, 16);
+}
+
+void compute_mac2(const u8 cookie[16], const void *data, size_t len,
+		  u8 out[16])
+{
+	struct blake2s_state st;
+	u8 full[32];
+
+	blake2s_init(&st, 16, cookie, 16);
+	blake2s_update(&st, data, len);
+	blake2s_final(&st, full);
+	memcpy(out, full, 16);
 }

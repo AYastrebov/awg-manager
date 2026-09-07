@@ -1,14 +1,16 @@
 package dnsroute
 
 import (
+	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/hoaxisr/awg-manager/internal/ndms"
 )
 
-func TestChunkWithFirstBudget(t *testing.T) {
+func TestChunkWithReserve(t *testing.T) {
 	t.Run("empty", func(t *testing.T) {
-		got := chunkWithFirstBudget(nil, 300, 0)
+		got := chunkWithReserve(nil, 300, 0)
 		if got != nil {
 			t.Errorf("expected nil, got %v", got)
 		}
@@ -16,7 +18,7 @@ func TestChunkWithFirstBudget(t *testing.T) {
 
 	t.Run("under limit no reserve", func(t *testing.T) {
 		items := []string{"a", "b"}
-		got := chunkWithFirstBudget(items, 300, 0)
+		got := chunkWithReserve(items, 300, 0)
 		if len(got) != 1 || len(got[0]) != 2 {
 			t.Errorf("expected 1 chunk of 2, got %v", got)
 		}
@@ -24,7 +26,7 @@ func TestChunkWithFirstBudget(t *testing.T) {
 
 	t.Run("exact limit no reserve", func(t *testing.T) {
 		items := make([]string, 300)
-		got := chunkWithFirstBudget(items, 300, 0)
+		got := chunkWithReserve(items, 300, 0)
 		if len(got) != 1 || len(got[0]) != 300 {
 			t.Errorf("expected 1 chunk of 300, got %d chunks", len(got))
 		}
@@ -32,7 +34,7 @@ func TestChunkWithFirstBudget(t *testing.T) {
 
 	t.Run("over limit splits no reserve", func(t *testing.T) {
 		items := make([]string, 500)
-		got := chunkWithFirstBudget(items, 300, 0)
+		got := chunkWithReserve(items, 300, 0)
 		if len(got) != 2 {
 			t.Fatalf("expected 2 chunks, got %d", len(got))
 		}
@@ -41,34 +43,28 @@ func TestChunkWithFirstBudget(t *testing.T) {
 		}
 	})
 
-	t.Run("first chunk shrunk by reserve", func(t *testing.T) {
-		items := make([]string, 400)
-		got := chunkWithFirstBudget(items, 300, 10)
-		if len(got) != 2 {
-			t.Fatalf("expected 2 chunks, got %d", len(got))
+	t.Run("every chunk shrunk by reserve", func(t *testing.T) {
+		items := make([]string, 700)
+		got := chunkWithReserve(items, 300, 10)
+		if len(got) != 3 {
+			t.Fatalf("expected 3 chunks, got %d", len(got))
 		}
-		if len(got[0]) != 290 || len(got[1]) != 110 {
-			t.Errorf("chunk sizes = %d,%d; want 290,110", len(got[0]), len(got[1]))
+		if len(got[0]) != 290 || len(got[1]) != 290 || len(got[2]) != 120 {
+			t.Errorf("chunk sizes = %d,%d,%d; want 290,290,120", len(got[0]), len(got[1]), len(got[2]))
 		}
 	})
 
-	t.Run("reserve exceeds max leaves empty first chunk", func(t *testing.T) {
-		items := make([]string, 100)
-		got := chunkWithFirstBudget(items, 300, 500)
-		if len(got) != 2 {
-			t.Fatalf("expected 2 chunks, got %d", len(got))
-		}
-		if len(got[0]) != 0 {
-			t.Errorf("chunk 0 should be empty, got %d", len(got[0]))
-		}
-		if len(got[1]) != 100 {
-			t.Errorf("chunk 1 size = %d, want 100", len(got[1]))
+	t.Run("reserve exceeds max still makes progress", func(t *testing.T) {
+		items := make([]string, 3)
+		got := chunkWithReserve(items, 300, 500)
+		if len(got) != 3 {
+			t.Fatalf("expected 3 chunks of 1, got %d", len(got))
 		}
 	})
 
 	t.Run("1200 items splits into four groups", func(t *testing.T) {
 		items := make([]string, 1200)
-		got := chunkWithFirstBudget(items, 300, 0)
+		got := chunkWithReserve(items, 300, 0)
 		if len(got) != 4 {
 			t.Fatalf("expected 4 chunks, got %d", len(got))
 		}
@@ -129,6 +125,35 @@ func TestBuildTargetState(t *testing.T) {
 		}
 	})
 
+	// #489: "auto" не материализуется на роутере отдельно от "" (UpsertRoutes
+	// всегда шлёт auto:true), поэтому target обязан нормализовать его в "" —
+	// иначе shape-сравнение с current (умеет только ""/"reject") никогда не
+	// сходится и каждый reconcile гонит upsert вместо дешёвого toggle.
+	t.Run("fallback auto normalized to empty, reject preserved", func(t *testing.T) {
+		data := &StoreData{Lists: []DomainList{
+			{
+				ID: "list_1", Name: "foo", Enabled: true,
+				Domains: []string{"a.com"},
+				Routes:  []RouteTarget{{Interface: "OpkgTun0", TunnelID: "t1", Fallback: "auto"}},
+			},
+			{
+				ID: "list_2", Name: "bar", Enabled: true,
+				Domains: []string{"b.com"},
+				Routes:  []RouteTarget{{Interface: "OpkgTun0", TunnelID: "t1", Fallback: "reject"}},
+			},
+		}}
+		ts := buildTargetState(data, nil)
+		if len(ts.routes) != 2 {
+			t.Fatalf("expected 2 routes, got %d", len(ts.routes))
+		}
+		if ts.routes[0].fallback != "" {
+			t.Errorf("fallback auto must normalize to \"\", got %q", ts.routes[0].fallback)
+		}
+		if ts.routes[1].fallback != "reject" {
+			t.Errorf("fallback reject must be preserved, got %q", ts.routes[1].fallback)
+		}
+	})
+
 	t.Run("single list single chunk", func(t *testing.T) {
 		data := &StoreData{Lists: []DomainList{
 			{
@@ -173,11 +198,12 @@ func TestBuildTargetState(t *testing.T) {
 		if len(ts.groups) != 2 {
 			t.Fatalf("expected 2 groups, got %d", len(ts.groups))
 		}
-		if len(ts.groups[0].excludes) != 1 {
-			t.Errorf("group 0 excludes = %d, want 1", len(ts.groups[0].excludes))
-		}
-		if len(ts.groups[1].excludes) != 0 {
-			t.Errorf("group 1 excludes = %d, want 0", len(ts.groups[1].excludes))
+		// NDMS applies an exclude only inside its own object-group, so every
+		// chunk needs the full exclude set.
+		for i, g := range ts.groups {
+			if len(g.excludes) != 1 {
+				t.Errorf("group %d excludes = %d, want 1", i, len(g.excludes))
+			}
 		}
 		if len(ts.routes) != 2 {
 			t.Errorf("expected 2 routes, got %d", len(ts.routes))
@@ -263,26 +289,20 @@ func TestBuildTargetState(t *testing.T) {
 			},
 		}}
 		ts := buildTargetState(data, nil)
-		// 600 items, first chunk budget = 300 - 10 excludes = 290; remainder 310 -> 300 + 10.
+		// 600 items, every chunk budget = 300 - 10 excludes = 290 -> 290 + 290 + 20.
 		if len(ts.groups) != 3 {
 			t.Fatalf("expected 3 groups, got %d: sizes=%d,%d,%d",
 				len(ts.groups),
 				safeLen(ts.groups, 0), safeLen(ts.groups, 1), safeLen(ts.groups, 2))
 		}
-		if len(ts.groups[0].includes) != 290 {
-			t.Errorf("group[0].includes = %d, want 290", len(ts.groups[0].includes))
-		}
-		if len(ts.groups[0].excludes) != 10 {
-			t.Errorf("group[0].excludes = %d, want 10", len(ts.groups[0].excludes))
-		}
-		if len(ts.groups[1].includes) != 300 {
-			t.Errorf("group[1].includes = %d, want 300", len(ts.groups[1].includes))
-		}
-		if len(ts.groups[1].excludes) != 0 {
-			t.Errorf("group[1] must not carry excludes, got %d", len(ts.groups[1].excludes))
-		}
-		if len(ts.groups[2].includes) != 10 {
-			t.Errorf("group[2].includes = %d, want 10", len(ts.groups[2].includes))
+		wantIncludes := []int{290, 290, 20}
+		for i, want := range wantIncludes {
+			if len(ts.groups[i].includes) != want {
+				t.Errorf("group[%d].includes = %d, want %d", i, len(ts.groups[i].includes), want)
+			}
+			if len(ts.groups[i].excludes) != 10 {
+				t.Errorf("group[%d].excludes = %d, want 10", i, len(ts.groups[i].excludes))
+			}
 		}
 	})
 }
@@ -301,7 +321,9 @@ func TestBuildTargetState_SkipsFailedTunnel(t *testing.T) {
 			Domains: []string{"a.com"},
 			Routes: []RouteTarget{
 				{Interface: "Wireguard0", TunnelID: "tun0"},
-				{Interface: "Wireguard1", TunnelID: "tun1", Fallback: "auto"},
+				// "reject" (а не "auto"): "auto" нормализуется в "" (#489), и
+				// наследование fallback стало бы неотличимо от его отсутствия.
+				{Interface: "Wireguard1", TunnelID: "tun1", Fallback: "reject"},
 			},
 		}},
 	}
@@ -315,8 +337,8 @@ func TestBuildTargetState_SkipsFailedTunnel(t *testing.T) {
 	if ts.routes[0].iface != "Wireguard1" {
 		t.Errorf("expected Wireguard1, got %s", ts.routes[0].iface)
 	}
-	if ts.routes[0].fallback != "auto" {
-		t.Errorf("expected fallback 'auto', got %q", ts.routes[0].fallback)
+	if ts.routes[0].fallback != "reject" {
+		t.Errorf("expected fallback 'reject', got %q", ts.routes[0].fallback)
 	}
 }
 
@@ -522,8 +544,8 @@ func TestComputeDiff(t *testing.T) {
 		if len(diff.groupUpdates) != 1 || !diff.groupUpdates[0].isNew {
 			t.Errorf("expected 1 new group update, got %+v", diff.groupUpdates)
 		}
-		if len(diff.routeUpserts) != 1 {
-			t.Errorf("expected 1 route upsert, got %+v", diff.routeUpserts)
+		if len(diff.routeRebuilds) != 1 || len(diff.routeRebuilds[0].upserts) != 1 {
+			t.Errorf("expected 1 route write, got %+v", diff.routeRebuilds)
 		}
 	})
 
@@ -573,12 +595,40 @@ func TestComputeDiff(t *testing.T) {
 			t.Error("should not be new")
 		}
 		// Routes unchanged
-		if len(diff.routeUpserts) != 0 {
-			t.Errorf("routes unchanged, should have 0 upserts, got %d", len(diff.routeUpserts))
+		if len(diff.routeRebuilds) != 0 {
+			t.Errorf("routes unchanged, should have 0 rewrites, got %d", len(diff.routeRebuilds))
 		}
 	})
 
-	t.Run("route interface change triggers upsert", func(t *testing.T) {
+	// #489: включение/выключение списка при неизменном shape обязано идти
+	// через дешёвый disable-toggle по index, а не через upsert — NDMS при
+	// upsert существующего маршрута сохраняет его флаг disable (проверено на
+	// 5.1.1), т.е. upsert НЕ включает маршрут обратно.
+	t.Run("disabled flip alone yields toggle, not upsert", func(t *testing.T) {
+		current := currentState{
+			groups: map[string]currentGroupData{
+				"test_p1": {includes: []string{"a.com"}},
+			},
+			routes: []currentRoute{{group: "test_p1", iface: "OpkgTun0", index: "idx1", disabled: true}},
+		}
+		target := targetState{
+			groups: []targetGroup{{name: "test_p1", includes: []string{"a.com"}}},
+			routes: []targetRoute{{group: "test_p1", iface: "OpkgTun0", disabled: false}},
+		}
+		diff := computeDiff(current, target)
+		if len(diff.routeRebuilds) != 0 {
+			t.Errorf("expected 0 rewrites, got %+v", diff.routeRebuilds)
+		}
+		if len(diff.routeDisables) != 1 {
+			t.Fatalf("expected 1 disable toggle, got %+v", diff.routeDisables)
+		}
+		rd := diff.routeDisables[0]
+		if rd.Index != "idx1" || rd.Disabled {
+			t.Errorf("toggle = %+v, want index=idx1 disabled=false", rd)
+		}
+	})
+
+	t.Run("route interface change rewrites the block", func(t *testing.T) {
 		current := currentState{
 			groups: map[string]currentGroupData{
 				"test_p1": {includes: []string{"a.com"}},
@@ -590,11 +640,167 @@ func TestComputeDiff(t *testing.T) {
 			routes: []targetRoute{{group: "test_p1", iface: "OpkgTun1"}},
 		}
 		diff := computeDiff(current, target)
-		if len(diff.routeDeletes) != 1 {
-			t.Errorf("expected 1 route delete (old iface), got %d", len(diff.routeDeletes))
+		if len(diff.routeDeletes) != 0 {
+			t.Errorf("снос обязан ехать внутри перезаписи, а не отдельной фазой: %+v", diff.routeDeletes)
 		}
-		if len(diff.routeUpserts) != 1 || diff.routeUpserts[0].Iface != "OpkgTun1" {
-			t.Errorf("expected 1 route upsert for OpkgTun1, got %+v", diff.routeUpserts)
+		if len(diff.routeRebuilds) != 1 {
+			t.Fatalf("expected 1 rewrite, got %+v", diff.routeRebuilds)
+		}
+		rb := diff.routeRebuilds[0]
+		if fmt.Sprint(rb.deletes) != "[OpkgTun0]" {
+			t.Errorf("deletes = %v, want [OpkgTun0]", rb.deletes)
+		}
+		if len(rb.upserts) != 1 || rb.upserts[0].Iface != "OpkgTun1" {
+			t.Errorf("upserts = %+v, want OpkgTun1", rb.upserts)
+		}
+	})
+
+	// #801: порядок routes и есть приоритет. Переставить строку в NDMS нечем,
+	// поэтому перестановка обязана давать перезапись блока целиком.
+	t.Run("reorder rewrites the whole block in target order", func(t *testing.T) {
+		current := currentState{
+			groups: map[string]currentGroupData{"test_p1": {includes: []string{"a.com"}}},
+			routes: []currentRoute{
+				{group: "test_p1", iface: "Wireguard0", index: "i0"},
+				{group: "test_p1", iface: "Wireguard1", index: "i1"},
+				{group: "test_p1", iface: "Wireguard2", index: "i2"},
+			},
+		}
+		target := targetState{
+			groups: []targetGroup{{name: "test_p1", includes: []string{"a.com"}}},
+			routes: []targetRoute{
+				{group: "test_p1", iface: "Wireguard2"},
+				{group: "test_p1", iface: "Wireguard0"},
+				{group: "test_p1", iface: "Wireguard1"},
+			},
+		}
+		diff := computeDiff(current, target)
+		if diff.isEmpty() {
+			t.Fatal("перестановка приоритета осталась без команд")
+		}
+		if len(diff.routeRebuilds) != 1 {
+			t.Fatalf("expected 1 rewrite, got %+v", diff.routeRebuilds)
+		}
+		rb := diff.routeRebuilds[0]
+		if fmt.Sprint(rb.deletes) != "[Wireguard0 Wireguard1 Wireguard2]" {
+			t.Errorf("сносятся не все строки блока: %v", rb.deletes)
+		}
+		var got []string
+		for _, u := range rb.upserts {
+			got = append(got, u.Iface)
+		}
+		if fmt.Sprint(got) != "[Wireguard2 Wireguard0 Wireguard1]" {
+			t.Errorf("порядок записи = %v, want [Wireguard2 Wireguard0 Wireguard1]", got)
+		}
+	})
+
+	// Новый приоритетный туннель нельзя дописать одной строкой: NDMS положит
+	// её в хвост, и высший приоритет станет низшим.
+	t.Run("new top-priority route rewrites the block", func(t *testing.T) {
+		current := currentState{
+			groups: map[string]currentGroupData{"test_p1": {includes: []string{"a.com"}}},
+			routes: []currentRoute{
+				{group: "test_p1", iface: "Wireguard1", index: "i1"},
+				{group: "test_p1", iface: "Wireguard2", index: "i2"},
+			},
+		}
+		target := targetState{
+			groups: []targetGroup{{name: "test_p1", includes: []string{"a.com"}}},
+			routes: []targetRoute{
+				{group: "test_p1", iface: "Wireguard0"},
+				{group: "test_p1", iface: "Wireguard1"},
+				{group: "test_p1", iface: "Wireguard2"},
+			},
+		}
+		diff := computeDiff(current, target)
+		if len(diff.routeRebuilds) != 1 {
+			t.Fatalf("expected 1 rewrite, got %+v", diff.routeRebuilds)
+		}
+		rb := diff.routeRebuilds[0]
+		if len(rb.deletes) != 2 || len(rb.upserts) != 3 || rb.upserts[0].Iface != "Wireguard0" {
+			t.Errorf("rewrite = %+v", rb)
+		}
+	})
+
+	// Форма fallback различается — тоже перезапись, но именно блоком: иначе
+	// upsert одной строки сохранил бы её позицию, а порядок остальных поехал.
+	t.Run("fallback change rewrites the block", func(t *testing.T) {
+		current := currentState{
+			groups: map[string]currentGroupData{"test_p1": {includes: []string{"a.com"}}},
+			routes: []currentRoute{
+				{group: "test_p1", iface: "Wireguard0", index: "i0"},
+				{group: "test_p1", iface: "Wireguard1", index: "i1"},
+			},
+		}
+		target := targetState{
+			groups: []targetGroup{{name: "test_p1", includes: []string{"a.com"}}},
+			routes: []targetRoute{
+				{group: "test_p1", iface: "Wireguard0"},
+				{group: "test_p1", iface: "Wireguard1", fallback: "reject"},
+			},
+		}
+		diff := computeDiff(current, target)
+		if len(diff.routeRebuilds) != 1 {
+			t.Fatalf("expected 1 rewrite, got %+v", diff.routeRebuilds)
+		}
+		rb := diff.routeRebuilds[0]
+		if len(rb.upserts) != 2 || !rb.upserts[1].Reject || rb.upserts[0].Reject {
+			t.Errorf("rewrite = %+v", rb)
+		}
+	})
+
+	// Пауза при неизменном порядке — по-прежнему дешёвый toggle по index, а не
+	// перезапись блока (#489).
+	t.Run("disabled flip in a multi-route block stays a toggle", func(t *testing.T) {
+		current := currentState{
+			groups: map[string]currentGroupData{"test_p1": {includes: []string{"a.com"}}},
+			routes: []currentRoute{
+				{group: "test_p1", iface: "Wireguard0", index: "i0", disabled: true},
+				{group: "test_p1", iface: "Wireguard1", index: "i1", disabled: true},
+			},
+		}
+		target := targetState{
+			groups: []targetGroup{{name: "test_p1", includes: []string{"a.com"}}},
+			routes: []targetRoute{
+				{group: "test_p1", iface: "Wireguard0"},
+				{group: "test_p1", iface: "Wireguard1"},
+			},
+		}
+		diff := computeDiff(current, target)
+		if len(diff.routeRebuilds) != 0 {
+			t.Errorf("пауза не должна переписывать блок: %+v", diff.routeRebuilds)
+		}
+		if len(diff.routeDisables) != 2 {
+			t.Fatalf("expected 2 toggles, got %+v", diff.routeDisables)
+		}
+		if diff.routeDisables[0].Index != "i0" || diff.routeDisables[1].Index != "i1" {
+			t.Errorf("toggles = %+v", diff.routeDisables)
+		}
+	})
+
+	// Группа ЖИВА в target (в groupDeletes не попадает), но целевых маршрутов у неё
+	// нет — маршруты роутера на неё осиротели и обязаны сноситься второй ветвью
+	// computeDiff. Десять прежних подтестов через неё не проходили.
+	t.Run("orphan routes of surviving group", func(t *testing.T) {
+		current := currentState{
+			groups: map[string]currentGroupData{
+				"test_p1": {includes: []string{"a.com"}},
+			},
+			routes: []currentRoute{{group: "test_p1", iface: "OpkgTun0"}, {group: "test_p1", iface: "OpkgTun2"}},
+		}
+		target := targetState{
+			groups: []targetGroup{{name: "test_p1", includes: []string{"a.com"}}},
+		}
+		diff := computeDiff(current, target)
+		if len(diff.groupDeletes) != 0 {
+			t.Fatalf("группа жива в target, groupDeletes = %v", diff.groupDeletes)
+		}
+		want := []rciRouteDelete{
+			{Group: "test_p1", Iface: "OpkgTun0", No: true},
+			{Group: "test_p1", Iface: "OpkgTun2", No: true},
+		}
+		if !reflect.DeepEqual(diff.routeDeletes, want) {
+			t.Fatalf("routeDeletes = %+v, want %+v", diff.routeDeletes, want)
 		}
 	})
 }

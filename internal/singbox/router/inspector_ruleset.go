@@ -13,12 +13,9 @@ import (
 	"strings"
 	"sync"
 	"time"
-)
 
-// ruleSetMatchTimeout caps each `sing-box rule-set match` invocation.
-// Mirrors the routebox approach — the CLI is local-only, so failure to
-// finish quickly almost always means a hung binary or missing file.
-const ruleSetMatchTimeout = 10 * time.Second
+	"github.com/hoaxisr/awg-manager/internal/sys/httpclient"
+)
 
 // ruleSetCacheTTL is how long a downloaded remote rule-set stays valid in
 // the on-disk cache before getOrDownload fetches a fresh copy.
@@ -83,13 +80,27 @@ func (c *ruleSetCache) urlLock(url string) *sync.Mutex {
 
 // httpClient is package-level so tests can swap it via the unexported
 // ruleSetHTTPClient hook. Do not swap from tests using t.Parallel().
-var ruleSetHTTPClient = &http.Client{Timeout: ruleSetDownloadTimeout}
+// Built on the canonical httpclient base for the pinned HTTP/1.1 ALPN +
+// ForceAttemptHTTP2=false — rule-set mirrors like raw.githubusercontent.com
+// return EOF/malformed h2 otherwise.
+var ruleSetHTTPClient = newRuleSetHTTPClient()
+
+func newRuleSetHTTPClient() *http.Client {
+	c := &http.Client{Timeout: ruleSetDownloadTimeout}
+	if tr, err := httpclient.NewTransport(httpclient.TransportConfig{}); err == nil && tr != nil {
+		c.Transport = tr
+	}
+	return c
+}
 
 // getOrDownload returns the local file path for url, downloading and
 // caching it on first call (or after the TTL expires). Format only
 // influences the cache filename extension — the file content is whatever
 // the URL serves.
-func (c *ruleSetCache) getOrDownload(url, format string) (string, error) {
+func (c *ruleSetCache) getOrDownload(url, format string, emit InspectProgressFunc, tag string) (string, error) {
+	if emit != nil {
+		emit(InspectProgress{Phase: "rule_set_cache_check", Message: fmt.Sprintf("Проверяем cache rule_set %s", tag), RuleSetTag: tag})
+	}
 	hash := sha256.Sum256([]byte(url))
 	cacheKey := hex.EncodeToString(hash[:8])
 	ext := ".srs"
@@ -110,6 +121,9 @@ func (c *ruleSetCache) getOrDownload(url, format string) (string, error) {
 		if _, err := os.Stat(entry.path); err == nil {
 			path := entry.path
 			c.mu.Unlock()
+			if emit != nil {
+				emit(InspectProgress{Phase: "rule_set_cache_hit", Message: fmt.Sprintf("Используем cache rule_set %s", tag), RuleSetTag: tag})
+			}
 			return path, nil
 		}
 		// File vanished — fall through and re-download.
@@ -121,12 +135,21 @@ func (c *ruleSetCache) getOrDownload(url, format string) (string, error) {
 	}
 	filePath := filepath.Join(c.cacheDir, filename)
 
+	if emit != nil {
+		emit(InspectProgress{Phase: "rule_set_download_start", Message: fmt.Sprintf("Скачиваем rule_set %s…", tag), RuleSetTag: tag})
+	}
 	resp, err := ruleSetHTTPClient.Get(url)
 	if err != nil {
+		if emit != nil {
+			emit(InspectProgress{Phase: "rule_set_download_error", Message: fmt.Sprintf("Ошибка скачивания rule_set %s", tag), RuleSetTag: tag})
+		}
 		return "", fmt.Errorf("http get: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		if emit != nil {
+			emit(InspectProgress{Phase: "rule_set_download_error", Message: fmt.Sprintf("Ошибка скачивания rule_set %s", tag), RuleSetTag: tag})
+		}
 		return "", fmt.Errorf("download %s: %s", url, resp.Status)
 	}
 
@@ -166,6 +189,9 @@ func (c *ruleSetCache) getOrDownload(url, format string) (string, error) {
 		expiresAt: time.Now().Add(ruleSetCacheTTL),
 	}
 	c.mu.Unlock()
+	if emit != nil {
+		emit(InspectProgress{Phase: "rule_set_download_done", Message: fmt.Sprintf("rule_set %s скачан", tag), RuleSetTag: tag})
+	}
 
 	return filePath, nil
 }
@@ -196,7 +222,7 @@ var ruleSetMatchExec = func(binary string, args []string) (stdout, stderr string
 //     wrote real diagnostic output on stderr that does not contain a
 //     match marker). Even then, callers prefer to surface the message
 //     via Note rather than aborting Inspect.
-func matchRuleSet(input string, rs RuleSet, singboxBinary string, cache *ruleSetCache) (matched, supported bool, err error) {
+func matchRuleSet(input string, rs RuleSet, singboxBinary string, cache *ruleSetCache, emit InspectProgressFunc) (matched, supported bool, err error) {
 	if singboxBinary == "" {
 		return false, false, nil
 	}
@@ -214,7 +240,7 @@ func matchRuleSet(input string, rs RuleSet, singboxBinary string, cache *ruleSet
 		if cache == nil {
 			return false, false, nil
 		}
-		p, dlErr := cache.getOrDownload(rs.URL, format)
+		p, dlErr := cache.getOrDownload(rs.URL, format, emit, rs.Tag)
 		if dlErr != nil {
 			return false, false, fmt.Errorf("download: %w", dlErr)
 		}
@@ -233,7 +259,13 @@ func matchRuleSet(input string, rs RuleSet, singboxBinary string, cache *ruleSet
 	}
 
 	if _, statErr := os.Stat(ruleSetPath); statErr != nil {
+		if emit != nil {
+			emit(InspectProgress{Phase: "rule_set_local_check", Message: fmt.Sprintf("Файл rule_set %s не найден", rs.Tag), RuleSetTag: rs.Tag})
+		}
 		return false, false, nil
+	}
+	if emit != nil {
+		emit(InspectProgress{Phase: "rule_set_match_start", Message: fmt.Sprintf("Проверяем rule_set %s через sing-box…", rs.Tag), RuleSetTag: rs.Tag})
 	}
 
 	if format == "" {

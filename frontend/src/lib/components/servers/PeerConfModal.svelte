@@ -10,29 +10,44 @@
 		serverId: string;
 		pubkey: string;
 		peerName: string;
+		kind?: 'managed' | 'system';
 		onclose: () => void;
 	}
 
-	let { open = $bindable(false), serverId, pubkey, peerName, onclose }: Props = $props();
+	let { open = $bindable(false), serverId, pubkey, peerName, kind = 'managed', onclose }: Props = $props();
 
 	let conf = $state('');
 	let loading = $state(false);
 	let showQR = $state(false);
 	let qrDataUrl = $state('');
 	let qrGenerating = $state(false);
+	let loadedForKey = $state('');
 
+	function confLoadKey(): string {
+		return `${serverId}\0${pubkey}\0${kind}`;
+	}
+
+	// Load once per open cycle / peer — polling updates on the servers page
+	// re-run parent effects and would otherwise flash "Загрузка..." and reset QR.
 	$effect(() => {
-		if (open && pubkey) {
-			showQR = false;
-			qrDataUrl = '';
-			loadConf();
+		if (!open || !pubkey) {
+			if (!open) loadedForKey = '';
+			return;
 		}
+		const key = confLoadKey();
+		if (loadedForKey === key) return;
+		loadedForKey = key;
+		showQR = false;
+		qrDataUrl = '';
+		void loadConf();
 	});
 
 	async function loadConf() {
 		loading = true;
 		try {
-			conf = await api.getManagedPeerConf(serverId, pubkey);
+			conf = kind === 'system'
+				? await api.getSystemServerPeerConf(serverId, pubkey)
+				: await api.getManagedPeerConf(serverId, pubkey);
 		} catch (e) {
 			notifications.error(e instanceof Error ? e.message : 'Ошибка загрузки');
 			conf = '';
@@ -151,10 +166,22 @@
 	}
 
 	.qr-image {
-		width: 360px;
-		height: 360px;
+		width: min(360px, 100%);
+		aspect-ratio: 1 / 1;
+		height: auto;
+		object-fit: contain;
 		border-radius: 8px;
 		image-rendering: pixelated;
+	}
+
+	@media (max-width: 640px) {
+		.qr-container {
+			padding: 1rem;
+		}
+
+		.qr-image {
+			width: min(320px, 100%);
+		}
 	}
 
 	.qr-hint {

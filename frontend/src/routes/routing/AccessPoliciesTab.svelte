@@ -2,18 +2,23 @@
     import { api } from '$lib/api/client';
     import type { AccessPolicy, PolicyDevice, PolicyGlobalInterface } from '$lib/types';
     import { ConfirmModal, StoreStatusBadge, Button } from '$lib/components/ui';
+    import RoutingCreateButton from '$lib/components/routing/RoutingCreateButton.svelte';
     import { PolicyTable, PolicyCreateModal, PolicyEditView } from '$lib/components/accesspolicy';
     import { notifications } from '$lib/stores/notifications';
     import { accessPoliciesStore, policyDevicesStore, policyInterfacesStore, invalidateAllRouting } from '$lib/stores/routing';
+    import { isHydraRouteAccessPolicy } from '$lib/utils/accessPolicy';
+    import { ERROR_WORDS, pluralForm, pluralize, DEVICE_WORDS, POLICY_WORDS } from '$lib/utils/pluralize';
 
     interface Props {
         accessPolicies: AccessPolicy[];
         policyDevices: PolicyDevice[];
         policyInterfaces: PolicyGlobalInterface[];
         missing?: boolean;
+        /** Deep-link из настроек sing-box: открыть редактор этой политики (#573). */
+        openPolicy?: string | null;
     }
 
-    let { accessPolicies, policyDevices, policyInterfaces, missing = false }: Props = $props();
+    let { accessPolicies, policyDevices, policyInterfaces, missing = false, openPolicy = null }: Props = $props();
 
     let policyCreateOpen = $state(false);
     let policyCreating = $state(false);
@@ -27,12 +32,26 @@
 	let policyRefreshing = $state(false);
 
     let policyCount = $derived(accessPolicies.length);
+    let policyDeviceCount = $derived(accessPolicies.reduce((n, p) => n + p.deviceCount, 0));
 
     // Keep editingPolicyData in sync with store-driven accessPolicies
     $effect(() => {
         if (editingPolicy) {
             editingPolicyData = accessPolicies.find(p => p.name === editingPolicy) ?? null;
         }
+    });
+
+    // Одноразовое открытие по deep-link: политики приезжают из стора, поэтому
+    // ждём появления нужной. Отмечаем имя обработанным, иначе «Назад» из
+    // редактора тут же открывал бы его снова.
+    let appliedOpenPolicy = $state<string | null>(null);
+    $effect(() => {
+        if (!openPolicy || openPolicy === appliedOpenPolicy) return;
+        const target = accessPolicies.find(p => p.name === openPolicy);
+        if (!target) return;
+        appliedOpenPolicy = openPolicy;
+        editingPolicy = target.name;
+        editingPolicyData = target;
     });
 
     async function createPolicy(description: string) {
@@ -61,8 +80,9 @@
         }
     }
 
-    // No-op: SSE updates the store; PolicyEditView expects an async callback
-    async function refreshPolicyData() {}
+    async function refreshPolicyData() {
+        invalidateAllRouting();
+    }
 
     async function refreshPolicies() {
         if (policyRefreshing) return;
@@ -91,6 +111,8 @@
     }
 
     function togglePolicySelect(name: string) {
+        const pol = accessPolicies.find((p) => p.name === name);
+        if (pol && isHydraRouteAccessPolicy(pol)) return;
         const next = new Set(policySelected);
         if (next.has(name)) next.delete(name);
         else next.add(name);
@@ -98,7 +120,9 @@
     }
 
     function policySelectAll() {
-        policySelected = new Set(accessPolicies.map(p => p.name));
+        policySelected = new Set(
+            accessPolicies.filter((p) => !isHydraRouteAccessPolicy(p)).map((p) => p.name),
+        );
     }
 
     function exitPolicySelection() {
@@ -114,8 +138,8 @@
                 try { await api.deleteAccessPolicy(name); ok++; } catch { fail++; }
             }
             exitPolicySelection();
-            if (fail > 0) notifications.warning(`Удалено ${ok} из ${ok + fail} политик (${fail} ошибок)`);
-            else notifications.success(`Удалено ${ok} политик`);
+            if (fail > 0) notifications.warning(`Удалено ${ok} из ${ok + fail} ${pluralForm(ok + fail, POLICY_WORDS)} (${pluralize(fail, ERROR_WORDS)})`);
+            else notifications.success(`Удалено ${pluralize(ok, POLICY_WORDS)}`);
         } finally {
             policyBulkLoading = false;
             policyBulkDeleteConfirm = false;
@@ -124,6 +148,7 @@
 </script>
 
 {#if editingPolicyData}
+    <div class="policy-tab policy-tab--edit">
         <PolicyEditView
             policy={editingPolicyData}
             devices={policyDevices}
@@ -133,10 +158,14 @@
             ondeviceassigned={handleDeviceAssigned}
             ondeviceunassigned={handleDeviceUnassigned}
         />
+    </div>
 {:else}
+    <div class="policy-tab policy-tab--list">
     <div class="section-header">
         {#if !policySelectionMode}
-            <span class="section-summary">{policyCount} политик</span>
+            <span class="section-summary">
+                {pluralize(policyCount, POLICY_WORDS)}, {pluralize(policyDeviceCount, DEVICE_WORDS)}
+            </span>
             <div class="section-buttons">
                 <StoreStatusBadge store={accessPoliciesStore} />
                 <StoreStatusBadge store={policyDevicesStore} />
@@ -153,7 +182,7 @@
                 {#if accessPolicies.length > 0}
                     <Button variant="ghost" size="sm" onclick={() => { policySelectionMode = true; policySelected = new Set(); }}>Выбрать</Button>
                 {/if}
-                <Button variant="primary" size="sm" onclick={() => policyCreateOpen = true}>+ Создать</Button>
+                <RoutingCreateButton onclick={() => (policyCreateOpen = true)} />
             </div>
         {:else}
             <div class="bulk-bar">
@@ -180,14 +209,16 @@
             </div>
         {/if}
     {:else}
-        <PolicyTable
-            policies={accessPolicies}
-            onedit={(name) => { editingPolicy = name; editingPolicyData = accessPolicies.find(p => p.name === name) ?? null; }}
-            ondelete={(name) => policyDeleteName = name}
-            selectable={policySelectionMode}
-            selectedNames={policySelected}
-            onselect={togglePolicySelect}
-        />
+        <div class="policy-list-scroll">
+            <PolicyTable
+                policies={accessPolicies}
+                onedit={(name) => { editingPolicy = name; editingPolicyData = accessPolicies.find(p => p.name === name) ?? null; }}
+                ondelete={(name) => policyDeleteName = name}
+                selectable={policySelectionMode}
+                selectedNames={policySelected}
+                onselect={togglePolicySelect}
+            />
+        </div>
     {/if}
 
     <PolicyCreateModal
@@ -213,9 +244,50 @@
         <ConfirmModal
             open={true}
             title="Удаление"
-            message={`Удалить ${policySelected.size} политик? Все устройства будут отвязаны.`}
+            message={`Удалить ${pluralize(policySelected.size, POLICY_WORDS)}? Все устройства будут отвязаны.`}
             onConfirm={bulkPolicyDelete}
             onClose={() => policyBulkDeleteConfirm = false}
         />
     {/if}
+    </div>
 {/if}
+
+<style>
+    /* Высота под viewport: скролл внутри панелей, не у всей страницы */
+    .policy-tab {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        overflow: hidden;
+    }
+
+    .policy-tab--edit,
+    .policy-tab--list {
+        height: calc(100dvh - 12.5rem);
+        min-height: 280px;
+        max-height: calc(100dvh - 12.5rem);
+    }
+
+    .policy-list-scroll {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        padding-right: 2px;
+    }
+
+    @media (max-width: 768px) {
+        .policy-tab--edit,
+        .policy-tab--list {
+            height: auto;
+            max-height: none;
+            overflow: visible;
+        }
+
+        .policy-list-scroll {
+            flex: none;
+            overflow-y: visible;
+        }
+    }
+
+
+</style>

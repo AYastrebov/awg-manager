@@ -12,6 +12,7 @@
 
 #include "transform.h"
 #include "blake2s.h"
+#include "cookie.h"	/* awg_chacha20_xor for header protection */
 
 void config_compute(awg_config_t *cfg)
 {
@@ -20,6 +21,9 @@ void config_compute(awg_config_t *cfg)
 
 	cfg->has_server_pub = memcmp(cfg->server_pub, z, 32) != 0;
 	cfg->has_client_pub = memcmp(cfg->client_pub, z, 32) != 0;
+
+	cfg->has_cps = cfg->cps[0] || cfg->cps[1] || cfg->cps[2] ||
+		       cfg->cps[3] || cfg->cps[4];
 
 	compute_mac1_key(cfg->server_pub, cfg->mac1key_server);
 	compute_mac1_key(cfg->client_pub, cfg->mac1key_client);
@@ -53,25 +57,83 @@ static inline void write32_le(u8 *p, u32 v)
 	memcpy(p, &le, 4);
 }
 
+/*
+ * AWG 3.0 header protection (see amneziawg-go device/send.go, receive.go).
+ * XOR the WireGuard header with a raw ChaCha20 keystream: key = cfg->hp_key
+ * used directly, nonce = pkt[0..12) (the first on-wire junk-padding bytes),
+ * counter 0. Handshakes (init/resp/cookie) encrypt the whole message; transport
+ * encrypts only the 16-byte header (type|receiver|counter), leaving the AEAD
+ * payload untouched. XOR is its own inverse, so the same call encrypts (egress,
+ * after mac1/mac2) and decrypts (ingress, before the type is trusted).
+ *
+ * Callers gate on cfg->hp_key_set and guarantee s_prefix >= AWG_HP_MIN_PADDING
+ * (enforced in awg_config_parse), so the 12-byte nonce is always present.
+ */
+void hp_crypt(const awg_config_t *cfg, u8 *pkt, int s_prefix, int n, u32 msgType)
+{
+	int len = (msgType == WG_TRANSPORT_DATA) ? AWG_HP_TRANSPORT_HDR : n;
+
+	awg_chacha20_xor(cfg->hp_key, pkt, 0, pkt + s_prefix, len);
+}
+
+/*
+ * Recover the plaintext WireGuard type of an encrypted candidate at
+ * pkt + s_prefix, WITHOUT mutating pkt: XOR the ciphertext type field with the
+ * first 4 keystream bytes. Used for size+H dispatch on ingress before deciding
+ * whether to decrypt the whole message.
+ */
+u32 hp_peek_type(const awg_config_t *cfg, const u8 *pkt, int s_prefix)
+{
+	u8 ks[4] = {0};
+
+	awg_chacha20_xor(cfg->hp_key, pkt, 0, ks, sizeof(ks));
+	return read32_le(pkt + s_prefix) ^ read32_le(ks);
+}
+
+/*
+ * AWG 3.1 random-trailer length: a value in [0, udp_window - packet_size),
+ * or 0 when the window has not yet exceeded the packet. udp_window is the
+ * per-slot largest datagram observed (seeded to DefaultUdpWindow=500), so
+ * trailers track the connection's natural size envelope. Mirrors
+ * amneziawg-go Peer.randomTrailer / mikrotik trailer_len.
+ */
+int awg_trailer_len(u32 udp_window, int packet_size)
+{
+	u32 span, r;
+
+	if (packet_size < 0 || udp_window <= (u32)packet_size)
+		return 0;
+	span = udp_window - (u32)packet_size;
+	get_random_bytes(&r, sizeof(r));
+	return (int)(r % span);
+}
+
 u8 *transform_outbound(u8 *buf, int dataoff, int n,
 		       const awg_config_t *cfg, u64 rand_val,
-		       int *out_len, int *sendJunk)
+		       int *out_len, int *sendCps, int *sendJunk,
+		       u32 *out_msgType)
 {
 	u8 *data = buf + dataoff;
 	u32 msgType;
 
+	*sendCps = 0;
 	*sendJunk = 0;
+	*out_msgType = 0;
 	if (n < 4) {
 		*out_len = n;
 		return data;
 	}
 
 	msgType = read32_le(data);
+	*out_msgType = msgType;
 
 	if (msgType == WG_HANDSHAKE_INIT && n == WG_INIT_SIZE) {
 		write32_le(data, hrange_pick(&cfg->h1, rand_val));
 		if (cfg->has_server_pub)
 			recompute_mac1(data, cfg->mac1key_server);
+		/* CPS (I1-I5) and Jc junk are independently gated, matching the
+		 * reference: ispecs fire whenever configured, junk only on jc>0. */
+		*sendCps = cfg->has_cps;
 		*sendJunk = (cfg->jc > 0);
 		if (cfg->s1 > 0) {
 			if (WARN_ON_ONCE(dataoff < cfg->s1)) {
@@ -88,6 +150,8 @@ u8 *transform_outbound(u8 *buf, int dataoff, int n,
 
 	if (msgType == WG_HANDSHAKE_RESPONSE && n == WG_RESP_SIZE) {
 		write32_le(data, hrange_pick(&cfg->h2, rand_val));
+		if (cfg->has_server_pub)
+			recompute_mac1_response(data, cfg->mac1key_server);
 		if (cfg->s2 > 0) {
 			if (WARN_ON_ONCE(dataoff < cfg->s2)) {
 				*out_len = n;
@@ -126,8 +190,9 @@ u8 *transform_outbound(u8 *buf, int dataoff, int n,
 		else
 			write32_le(data, hrange_pick(&cfg->h4, rand_val));
 		if (cfg->s4 > 0 && dataoff >= cfg->s4) {
+			get_random_bytes(data - cfg->s4, cfg->s4);
 			*out_len = cfg->s4 + n;
-			return buf + dataoff - cfg->s4;
+			return data - cfg->s4;
 		}
 		*out_len = n;
 		return data;
@@ -143,8 +208,9 @@ u8 *transform_inbound(u8 *buf, int n, const awg_config_t *cfg, int *out_len)
 	if (n < 4)
 		return NULL;
 
-	/* Fast path: identity transport */
-	if (cfg->h4_noop) {
+	/* Fast path: identity transport. Never under header protection — the
+	 * type field is encrypted, and HP requires s4 >= 12 so h4_noop is false. */
+	if (cfg->h4_noop && !cfg->hp_key_set) {
 		if (read32_le(buf) == WG_TRANSPORT_DATA &&
 		    n >= WG_TRANSPORT_MIN) {
 			*out_len = n;
@@ -152,45 +218,72 @@ u8 *transform_inbound(u8 *buf, int n, const awg_config_t *cfg, int *out_len)
 		}
 	}
 
-	/* Size-based dispatch: handshake first, transport last */
-	if (n == cfg->init_total) {
-		u32 h = read32_le(buf + cfg->s1);
+	/* Size-based dispatch: handshake first, transport last. Under header
+	 * protection the type is recovered via hp_peek_type (keystream XOR) and,
+	 * once a candidate matches its H-range, the message is decrypted in place
+	 * before the canonical WG type is written and MAC1 recomputed. */
+	/* Handshakes: exact size, or (under random_trailers) longer — the extra
+	 * bytes are a cleartext trailer stripped by returning the fixed size. */
+	if (n == cfg->init_total ||
+	    (cfg->random_trailers && n > cfg->init_total)) {
+		u32 h = cfg->hp_key_set ? hp_peek_type(cfg, buf, cfg->s1)
+				       : read32_le(buf + cfg->s1);
 
 		if (hrange_contains(&cfg->h1, h)) {
+			if (cfg->hp_key_set)
+				hp_crypt(cfg, buf, cfg->s1, WG_INIT_SIZE,
+					 WG_HANDSHAKE_INIT);
 			write32_le(buf + cfg->s1, WG_HANDSHAKE_INIT);
-			*out_len = n - cfg->s1;
+			if (cfg->has_client_pub)
+				recompute_mac1(buf + cfg->s1,
+					       cfg->mac1key_client);
+			*out_len = WG_INIT_SIZE;
 			return buf + cfg->s1;
 		}
 	}
 
-	if (n == cfg->resp_total) {
-		u32 h = read32_le(buf + cfg->s2);
+	if (n == cfg->resp_total ||
+	    (cfg->random_trailers && n > cfg->resp_total)) {
+		u32 h = cfg->hp_key_set ? hp_peek_type(cfg, buf, cfg->s2)
+				       : read32_le(buf + cfg->s2);
 
 		if (hrange_contains(&cfg->h2, h)) {
+			if (cfg->hp_key_set)
+				hp_crypt(cfg, buf, cfg->s2, WG_RESP_SIZE,
+					 WG_HANDSHAKE_RESPONSE);
 			write32_le(buf + cfg->s2, WG_HANDSHAKE_RESPONSE);
 			if (cfg->has_client_pub)
 				recompute_mac1_response(buf + cfg->s2,
 							cfg->mac1key_client);
-			*out_len = n - cfg->s2;
+			*out_len = WG_RESP_SIZE;
 			return buf + cfg->s2;
 		}
 	}
 
-	if (n == cfg->cookie_total) {
-		u32 h = read32_le(buf + cfg->s3);
+	if (n == cfg->cookie_total ||
+	    (cfg->random_trailers && n > cfg->cookie_total)) {
+		u32 h = cfg->hp_key_set ? hp_peek_type(cfg, buf, cfg->s3)
+				       : read32_le(buf + cfg->s3);
 
 		if (hrange_contains(&cfg->h3, h)) {
+			if (cfg->hp_key_set)
+				hp_crypt(cfg, buf, cfg->s3, WG_COOKIE_SIZE,
+					 WG_COOKIE_REPLY);
 			write32_le(buf + cfg->s3, WG_COOKIE_REPLY);
-			*out_len = n - cfg->s3;
+			*out_len = WG_COOKIE_SIZE;
 			return buf + cfg->s3;
 		}
 	}
 
 	/* Transport data: variable size, checked last */
 	if (n >= cfg->s4 + WG_TRANSPORT_MIN) {
-		u32 h = read32_le(buf + cfg->s4);
+		u32 h = cfg->hp_key_set ? hp_peek_type(cfg, buf, cfg->s4)
+				       : read32_le(buf + cfg->s4);
 
 		if (hrange_contains(&cfg->h4, h)) {
+			if (cfg->hp_key_set)
+				hp_crypt(cfg, buf, cfg->s4, n - cfg->s4,
+					 WG_TRANSPORT_DATA);
 			write32_le(buf + cfg->s4, WG_TRANSPORT_DATA);
 			*out_len = n - cfg->s4;
 			return buf + cfg->s4;
@@ -198,6 +291,34 @@ u8 *transform_inbound(u8 *buf, int n, const awg_config_t *cfg, int *out_len)
 	}
 
 	return NULL;
+}
+
+/*
+ * MAC1/MAC2 layout per messages.h (vanilla WG, identical in AWG):
+ *   init (148B):     [0..116] data | [116..132] mac1 | [132..148] mac2
+ *   response (92B):  [0..60]  data | [60..76]  mac1 | [76..92]   mac2
+ * MAC2 is keyed by the 16-byte decrypted cookie (cookie.c:88).
+ */
+void recompute_mac2_if_present(u8 *buf, int n, u32 msgType,
+			       const u8 cookie[16])
+{
+	static const u8 zeros[16] = {0};
+	int mac1_end, mac2_off;
+
+	if (msgType == WG_HANDSHAKE_INIT && n == WG_INIT_SIZE) {
+		mac1_end = 116;
+		mac2_off = 132;
+	} else if (msgType == WG_HANDSHAKE_RESPONSE && n == WG_RESP_SIZE) {
+		mac1_end = 60;
+		mac2_off = 76;
+	} else {
+		return;
+	}
+
+	if (memcmp(buf + mac2_off, zeros, 16) == 0)
+		return;
+
+	compute_mac2(cookie, buf, mac1_end + 16, buf + mac2_off);
 }
 
 int generate_junk(const awg_config_t *cfg, u8 *junk_buf,

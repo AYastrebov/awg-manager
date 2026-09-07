@@ -3,13 +3,11 @@ package dnsroute
 import (
 	"context"
 	"fmt"
-	"net"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/hoaxisr/awg-manager/internal/hydraroute"
-	"github.com/hoaxisr/awg-manager/internal/logger"
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/ndms/command"
 	"github.com/hoaxisr/awg-manager/internal/ndms/query"
@@ -28,27 +26,43 @@ type InterfaceResolver interface {
 // concurrent HTTP handlers, background scheduler, and tunnel lifecycle hooks.
 type ServiceImpl struct {
 	opMu               sync.Mutex
+	dlMu               sync.RWMutex
 	store              *Store
 	queries            *query.Queries
 	commands           *command.Commands
 	resolver           InterfaceResolver
-	log                *logger.Logger
 	appLog             *logging.ScopedLogger
 	failover           *FailoverManager
 	hydra              *hydraroute.Service
 	policyOrchestrator policyOrchestrator
+	dl                 Downloader
+}
+
+type Downloader interface {
+	ReadAll(ctx context.Context, req SubscriptionDownloadRequest) ([]byte, SubscriptionDownloadMeta, error)
 }
 
 // NewService creates a new DNS route service.
-func NewService(store *Store, queries *query.Queries, commands *command.Commands, resolver InterfaceResolver, log *logger.Logger, appLogger logging.AppLogger) *ServiceImpl {
+func NewService(store *Store, queries *query.Queries, commands *command.Commands, resolver InterfaceResolver, appLogger logging.AppLogger) *ServiceImpl {
 	return &ServiceImpl{
 		store:    store,
 		queries:  queries,
 		commands: commands,
 		resolver: resolver,
-		log:      log,
 		appLog:   logging.NewScopedLogger(appLogger, logging.GroupRouting, logging.SubDnsRoute),
 	}
+}
+
+func (s *ServiceImpl) SetDownloader(d Downloader) {
+	s.dlMu.Lock()
+	defer s.dlMu.Unlock()
+	s.dl = d
+}
+
+func (s *ServiceImpl) downloader() Downloader {
+	s.dlMu.RLock()
+	defer s.dlMu.RUnlock()
+	return s.dl
 }
 
 // SetFailoverManager sets the failover manager for DNS route failover.
@@ -150,60 +164,6 @@ func (s *ServiceImpl) LookupAffectedLists(tunnelID string, action string) []Affe
 	return result
 }
 
-// validateExcludes checks that every Excludes entry has a matching
-// include in the same list. Domain-style excludes must be subdomains
-// of one of list.Domains (or equal to one); CIDR-style excludes must
-// lie inside one of list.Subnets (or equal one).
-//
-// Returns the first error found.
-func validateExcludes(domains, subnets, exclDomains, exclSubnets []string) error {
-	for _, e := range exclDomains {
-		ne := normalizeDomain(e)
-		if ne == "" {
-			continue
-		}
-		ok := false
-		for _, d := range domains {
-			nd := normalizeDomain(d)
-			if nd == "" {
-				continue
-			}
-			if ne == nd {
-				ok = true
-				break
-			}
-			if strings.HasSuffix(ne, "."+nd) {
-				ok = true
-				break
-			}
-		}
-		if !ok {
-			return fmt.Errorf("exclude %q has no matching include in this list", e)
-		}
-	}
-	for _, e := range exclSubnets {
-		_, en, err := net.ParseCIDR(e)
-		if err != nil {
-			return fmt.Errorf("exclude subnet %q is not a valid CIDR", e)
-		}
-		ok := false
-		for _, s := range subnets {
-			_, sn, err := net.ParseCIDR(s)
-			if err != nil {
-				continue
-			}
-			if cidrCovers(sn, en) {
-				ok = true
-				break
-			}
-		}
-		if !ok {
-			return fmt.Errorf("exclude subnet %q has no matching include in this list", e)
-		}
-	}
-	return nil
-}
-
 // Create adds a new domain list, persists it, and reconciles router state.
 func (s *ServiceImpl) Create(ctx context.Context, list DomainList) (*DomainList, error) {
 	s.opMu.Lock()
@@ -221,6 +181,10 @@ func (s *ServiceImpl) Create(ctx context.Context, list DomainList) (*DomainList,
 	if strings.TrimSpace(list.Name) == "" {
 		return nil, fmt.Errorf("name must not be empty")
 	}
+
+	applyManualText(&list)
+	applyExcludesText(&list)
+
 	if len(list.ManualDomains) == 0 && len(list.Subscriptions) == 0 {
 		return nil, fmt.Errorf("at least one domain or subscription is required")
 	}
@@ -240,10 +204,6 @@ func (s *ServiceImpl) Create(ctx context.Context, list DomainList) (*DomainList,
 	// the same handling used for ManualDomains → Domains/Subnets.
 	list.Excludes, list.ExcludeSubnets = splitDomainsAndSubnets(deduplicateDomains(list.Excludes))
 
-	if err := validateExcludes(list.Domains, list.Subnets, list.Excludes, list.ExcludeSubnets); err != nil {
-		return nil, err
-	}
-
 	// Resolve tunnel IDs to NDMS interface names for RCI commands.
 	if err := s.resolveRouteInterfaces(ctx, list.Routes); err != nil {
 		return nil, fmt.Errorf("resolve routes: %w", err)
@@ -257,7 +217,7 @@ func (s *ServiceImpl) Create(ctx context.Context, list DomainList) (*DomainList,
 		return nil, fmt.Errorf("save after create: %w", err)
 	}
 
-	s.log.Infof("created dns route list %q (%s)", list.Name, list.ID)
+	s.appLog.Info("create", list.ID, "list created: "+list.Name)
 
 	// Validate subscriptions by fetching them. If any URL fails (wrong
 	// Content-Type, unreachable, etc.), reject the entire Create.
@@ -325,7 +285,7 @@ func (s *ServiceImpl) List(ctx context.Context) ([]DomainList, error) {
 
 	hrLists, err := s.listHydraRoute(ctx)
 	if err != nil {
-		s.log.Warnf("hydraroute: list rules failed: %v", err)
+		s.appLog.Warn("hydraroute-list-rules", "", err.Error())
 	}
 	result = append(result, hrLists...)
 
@@ -358,6 +318,9 @@ func (s *ServiceImpl) Update(ctx context.Context, list DomainList) (*DomainList,
 	}
 
 	existing := &data.Lists[idx]
+	excludesProvided := list.Excludes != nil
+	excludeSubnetsProvided := list.ExcludeSubnets != nil
+	excludesTextProvided := list.ExcludesText != nil
 
 	// Preserve fields not sent by the frontend update payload.
 	list.CreatedAt = existing.CreatedAt
@@ -405,6 +368,23 @@ func (s *ServiceImpl) Update(ctx context.Context, list DomainList) (*DomainList,
 	if list.HRPolicyName == "" {
 		list.HRPolicyName = existing.HRPolicyName
 	}
+	if list.ManualText == nil {
+		list.ManualText = existing.ManualText
+	} else {
+		applyManualText(&list)
+	}
+	if excludesTextProvided {
+		applyExcludesText(&list)
+	} else if excludesProvided || excludeSubnetsProvided {
+		// Legacy/API caller updated active excludes without raw text.
+		// Do not keep stale raw ExcludesText; UI will fall back to active arrays.
+		list.ExcludesText = nil
+	} else {
+		list.ExcludesText = existing.ExcludesText
+		if list.ExcludesText != nil {
+			applyExcludesText(&list)
+		}
+	}
 
 	// Validate any new subscription URLs before saving.
 	newSubs := findNewSubscriptions(existing.Subscriptions, list.Subscriptions)
@@ -426,10 +406,6 @@ func (s *ServiceImpl) Update(ctx context.Context, list DomainList) (*DomainList,
 
 	list.Excludes, list.ExcludeSubnets = splitDomainsAndSubnets(deduplicateDomains(list.Excludes))
 
-	if err := validateExcludes(list.Domains, list.Subnets, list.Excludes, list.ExcludeSubnets); err != nil {
-		return nil, err
-	}
-
 	// Resolve tunnel IDs to NDMS interface names for RCI commands.
 	if err := s.resolveRouteInterfaces(ctx, list.Routes); err != nil {
 		return nil, fmt.Errorf("resolve routes: %w", err)
@@ -443,7 +419,7 @@ func (s *ServiceImpl) Update(ctx context.Context, list DomainList) (*DomainList,
 		return nil, fmt.Errorf("save after update: %w", err)
 	}
 
-	s.log.Infof("updated dns route list %q (%s)", list.Name, list.ID)
+	s.appLog.Info("update", list.ID, "list updated: "+list.Name)
 
 	if err := s.reconcileAll(ctx); err != nil {
 		s.logError("update", list.ID, "Reconcile failed", err.Error())
@@ -461,7 +437,19 @@ func (s *ServiceImpl) Delete(ctx context.Context, id string) error {
 		if !s.hrReady() {
 			return fmt.Errorf("HydraRoute Neo is not installed")
 		}
-		return s.hydra.DeleteRule(nameFromHRID(id))
+		name := nameFromHRID(id)
+		if err := s.hydra.DeleteRule(name); err != nil {
+			return err
+		}
+		if data := s.store.GetCached(); data != nil && data.HRRuleIcons != nil {
+			if _, ok := data.HRRuleIcons[name]; ok {
+				delete(data.HRRuleIcons, name)
+				if err := s.store.Save(data); err != nil {
+					return fmt.Errorf("save after HR icon delete: %w", err)
+				}
+			}
+		}
+		return nil
 	}
 
 	data := s.store.GetCached()
@@ -487,7 +475,7 @@ func (s *ServiceImpl) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("save after delete: %w", err)
 	}
 
-	s.log.Infof("deleted dns route list %q (%s)", name, id)
+	s.appLog.Info("delete", id, "list deleted: "+name)
 
 	if err := s.reconcileAll(ctx); err != nil {
 		s.logError("delete", id, "Reconcile failed", err.Error())
@@ -516,7 +504,7 @@ func (s *ServiceImpl) DeleteBatch(ctx context.Context, ids []string) (int, error
 	deleted := 0
 	for _, list := range data.Lists {
 		if toDelete[list.ID] {
-			s.log.Infof("deleted dns route list %q (%s)", list.Name, list.ID)
+			s.appLog.Info("delete", list.ID, "list deleted: "+list.Name)
 			deleted++
 		} else {
 			kept = append(kept, list)
@@ -553,13 +541,34 @@ func (s *ServiceImpl) CreateBatch(ctx context.Context, lists []DomainList) ([]*D
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	var createdIDs []string
+	var hrCreated []*DomainList
 	hasSubs := false
 
 	for _, list := range lists {
 		if strings.TrimSpace(list.Name) == "" {
 			continue
 		}
+
+		applyManualText(&list)
+		applyExcludesText(&list)
+
 		if len(list.ManualDomains) == 0 && len(list.Subscriptions) == 0 {
+			continue
+		}
+
+		// HydraRoute-backed entries go through the real HR creation path
+		// (HR files = SoT); they must NOT land in data.Lists. HR has no
+		// subscriptions — create from ManualDomains and log-ignore any.
+		if isHydraRoute(list.Backend) {
+			if len(list.Subscriptions) > 0 {
+				s.logInfo("create-batch", list.Name, "HR rule: subscriptions unsupported, ignored")
+			}
+			dl, err := s.createHydraRoute(ctx, list)
+			if err != nil {
+				s.logError("create-batch", list.Name, "HR create failed", err.Error())
+				continue
+			}
+			hrCreated = append(hrCreated, dl)
 			continue
 		}
 
@@ -576,7 +585,7 @@ func (s *ServiceImpl) CreateBatch(ctx context.Context, lists []DomainList) ([]*D
 		s.dedup(&list)
 		data.Lists = append(data.Lists, list)
 		createdIDs = append(createdIDs, list.ID)
-		s.log.Infof("created dns route list %q (%s)", list.Name, list.ID)
+		s.appLog.Info("create", list.ID, "list created: "+list.Name)
 
 		if len(list.Subscriptions) > 0 {
 			hasSubs = true
@@ -584,7 +593,9 @@ func (s *ServiceImpl) CreateBatch(ctx context.Context, lists []DomainList) ([]*D
 	}
 
 	if len(createdIDs) == 0 {
-		return []*DomainList{}, nil
+		// Никаких NDMS-изменений: Save/reconcile не нужны. Чисто-HR батч
+		// (каталог OS4) возвращает созданные HR-правила напрямую.
+		return hrCreated, nil
 	}
 
 	if err := s.store.Save(data); err != nil {
@@ -621,6 +632,7 @@ func (s *ServiceImpl) CreateBatch(ctx context.Context, lists []DomainList) ([]*D
 		}
 	}
 
+	result = append(result, hrCreated...)
 	return result, nil
 }
 
@@ -628,6 +640,21 @@ func (s *ServiceImpl) CreateBatch(ctx context.Context, lists []DomainList) ([]*D
 func (s *ServiceImpl) SetEnabled(ctx context.Context, id string, enabled bool) error {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
+
+	if isHRID(id) {
+		if !s.hrReady() {
+			return fmt.Errorf("HydraRoute Neo is not installed")
+		}
+		name := nameFromHRID(id)
+		if name == "" {
+			return fmt.Errorf("invalid HR rule id %q", id)
+		}
+		if err := s.hydra.SetRuleEnabled(name, enabled); err != nil {
+			return err
+		}
+		s.logInfo("set-enabled", id, fmt.Sprintf("enabled=%v name=%q backend=hydraroute", enabled, name))
+		return nil
+	}
 
 	data := s.store.GetCached()
 	if data == nil {
@@ -668,7 +695,7 @@ func (s *ServiceImpl) SetEnabled(ctx context.Context, id string, enabled bool) e
 func (s *ServiceImpl) validateSubscriptions(ctx context.Context, subs []Subscription) error {
 	seenSubnets := make(map[string]struct{})
 	for _, sub := range subs {
-		domains, err := fetchSubscription(ctx, sub.URL)
+		domains, err := s.fetchSubscription(ctx, sub.URL)
 		if err != nil {
 			return fmt.Errorf("подписка %q: %w", sub.URL, err)
 		}
@@ -717,14 +744,12 @@ func (s *ServiceImpl) refreshSubscriptions(ctx context.Context, id string) error
 	var allSubDomains [][]string
 	for i := range list.Subscriptions {
 		sub := &list.Subscriptions[i]
-		domains, err := fetchSubscription(ctx, sub.URL)
+		domains, err := s.fetchSubscription(ctx, sub.URL)
 		sub.LastFetched = now
 		if err != nil {
 			sub.LastError = err.Error()
 			sub.LastCount = 0
-			s.log.Warn("subscription fetch failed", map[string]interface{}{
-				"list": id, "url": sub.URL, "error": err.Error(),
-			})
+			s.appLog.Warn("subscription-fetch", id, fmt.Sprintf("url=%s err=%s", sub.URL, err.Error()))
 			// Keep going — one failed subscription shouldn't block others
 			continue
 		}
@@ -747,9 +772,7 @@ func (s *ServiceImpl) refreshSubscriptions(ctx context.Context, id string) error
 		return fmt.Errorf("save after refresh: %w", err)
 	}
 
-	s.log.Info("subscriptions refreshed", map[string]interface{}{
-		"list": id, "totalDomains": len(list.Domains),
-	})
+	s.appLog.Info("subscription-refresh", id, fmt.Sprintf("totalDomains=%d", len(list.Domains)))
 
 	return s.reconcileAll(ctx)
 }
@@ -825,7 +848,7 @@ func (s *ServiceImpl) OnTunnelDelete(ctx context.Context, tunnelID string) error
 		if err := s.store.Save(data); err != nil {
 			return fmt.Errorf("save after tunnel delete cleanup: %w", err)
 		}
-		s.log.Infof("removed deleted tunnel %s from dns route targets", tunnelID)
+		s.appLog.Info("cleanup-targets", tunnelID, "removed from dns route targets")
 	}
 
 	return s.reconcileAll(ctx)

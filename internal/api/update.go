@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/response"
@@ -17,6 +18,12 @@ type UpdateInfoData struct {
 	LatestVersion  string `json:"latestVersion,omitempty" example:"2.5.0"`
 	CheckedAt      string `json:"checkedAt" example:"2024-01-15T10:00:00Z"`
 	Checking       bool   `json:"checking" example:"false"`
+	// NextAutoInstallAt/LastAutoInstallAt are computed by the auto-install
+	// scheduler (internal/updater.Service.NextAutoInstallAt), not stored on
+	// the cached UpdateInfo — they are injected into the response in both
+	// the cached and force=true branches of Check (task #559-4, MAJOR-2).
+	NextAutoInstallAt string `json:"nextAutoInstallAt,omitempty" example:"2024-01-16T05:00:00Z"`
+	LastAutoInstallAt string `json:"lastAutoInstallAt,omitempty" example:"2024-01-15T05:00:00Z"`
 }
 
 // UpdateCheckResponse is the envelope for GET /system/update/check.
@@ -60,6 +67,18 @@ type UpdateApplyResponse struct {
 	Data    UpdateApplyData `json:"data"`
 }
 
+// updateCheckResponseData is the actual JSON payload of GET
+// /system/update/check. It copies the cached/fresh UpdateInfo and adds the
+// auto-install schedule fields at the response layer — UpdateInfo itself
+// (internal/updater/types.go) stays untouched because it doubles as the
+// scheduler's on-disk-adjacent cache, which doCheck/CheckNow replace
+// wholesale on every check (task #559-4, MAJOR-2).
+type updateCheckResponseData struct {
+	updater.UpdateInfo
+	NextAutoInstallAt string `json:"nextAutoInstallAt,omitempty"`
+	LastAutoInstallAt string `json:"lastAutoInstallAt,omitempty"`
+}
+
 // UpdateHandler handles update check and apply endpoints.
 type UpdateHandler struct {
 	updater *updater.Service
@@ -101,7 +120,16 @@ func (h *UpdateHandler) Check(w http.ResponseWriter, r *http.Request) {
 		info = h.updater.GetCached()
 	}
 
-	response.Success(w, info)
+	data := updateCheckResponseData{UpdateInfo: *info}
+	next, last := h.updater.NextAutoInstallAt()
+	if !next.IsZero() {
+		data.NextAutoInstallAt = next.Format(time.RFC3339)
+	}
+	if !last.IsZero() {
+		data.LastAutoInstallAt = last.Format(time.RFC3339)
+	}
+
+	response.Success(w, data)
 }
 
 // Apply starts the opkg upgrade process.
@@ -141,9 +169,8 @@ func (h *UpdateHandler) Apply(w http.ResponseWriter, r *http.Request) {
 
 // Changelog returns changelog entries. Two modes:
 //   - Range: from and to both supplied → entries in (from, to], newest-first.
-//   - Single: only to supplied → entry matching to exactly (used by the
-//     "what's new" button when no upgrade is pending, so the user can
-//     still review what's in their current release).
+//   - Minor line: only to supplied → all entries with the same major.minor
+//     as to, with version <= to (used when no upgrade is pending).
 //
 // GET /api/system/update/changelog?from=2.7.5&to=2.8.0
 // GET /api/system/update/changelog?to=2.8.1
@@ -171,14 +198,10 @@ func (h *UpdateHandler) Changelog(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if from == "" {
-		entry, err := h.updater.GetChangelogSingle(r.Context(), to)
+		entries, err := h.updater.GetChangelogMinor(r.Context(), to)
 		if err != nil {
 			response.ErrorWithStatus(w, http.StatusBadGateway, err.Error(), "CHANGELOG_FETCH_FAILED")
 			return
-		}
-		entries := []updater.Entry{}
-		if entry != nil {
-			entries = []updater.Entry{*entry}
 		}
 		response.Success(w, map[string]interface{}{"entries": entries})
 		return

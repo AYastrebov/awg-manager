@@ -49,8 +49,8 @@ func (s *Service) AddPeer(ctx context.Context, id string, req AddPeerRequest) (*
 	iface := server.InterfaceName
 
 	// Add peer with all parameters in a single RCI call:
-	// key, preshared-key, comment, allow-ips (/32 + 0.0.0.0/0), connect
-	if err := s.rciAddPeer(ctx, iface, pubKey, psk, strings.TrimSpace(req.Description), ip.String()); err != nil {
+	// key, preshared-key, comment, allow-ips (peer /32 only), connect
+	if err := s.rciAddPeer(ctx, iface, pubKey, psk, strings.TrimSpace(req.Description), ip.String(), true); err != nil {
 		return nil, fmt.Errorf("add peer: %w", err)
 	}
 
@@ -145,7 +145,7 @@ func (s *Service) UpdatePeer(ctx context.Context, id, pubkey string, req UpdateP
 	}
 
 	s.log.Info("peer updated", "interface", iface, "pubkey", pubkey[:8]+"...")
-	s.appLog.Full("update-peer", req.Description, fmt.Sprintf("Peer %s updated", req.Description))
+	s.appLog.Info("update-peer", req.Description, fmt.Sprintf("Peer %s updated", req.Description))
 	return nil
 }
 
@@ -164,9 +164,12 @@ func (s *Service) DeletePeer(ctx context.Context, id, pubkey string) error {
 	peerName := server.Peers[idx].Description
 	iface := server.InterfaceName
 
-	// Remove via RCI
+	// Remove via RCI — fail-closed: a peer that stayed on the router while the
+	// card says "revoked" keeps the client connected. No tolerance for "already
+	// gone" (owner decision 2026-09-05): the NDMS reply form for that case has
+	// not been captured on a live router yet.
 	if err := s.rciRemovePeer(ctx, iface, pubkey); err != nil {
-		s.log.Warn("failed to remove peer via RCI", "error", err)
+		return fmt.Errorf("remove peer via RCI: %w", err)
 	}
 
 	// Remove from storage
@@ -202,11 +205,11 @@ func (s *Service) TogglePeer(ctx context.Context, id, pubkey string, enabled boo
 
 	iface := server.InterfaceName
 
-	if err := s.rciSetPeerConnect(ctx, iface, pubkey, enabled); err != nil {
+	peerName := server.Peers[idx].Description
+	if err := s.rciSetPeerConnect(ctx, iface, pubkey, enabled, peerName); err != nil {
 		return fmt.Errorf("toggle peer: %w", err)
 	}
 
-	peerName := server.Peers[idx].Description
 	if err := s.settings.UpdateManagedServer(id, func(sv *storage.ManagedServer) error {
 		// Re-resolve under the storage lock — the index from the pre-lock copy
 		// may be stale if another goroutine added/removed peers in between.
@@ -225,7 +228,7 @@ func (s *Service) TogglePeer(ctx context.Context, id, pubkey string, enabled boo
 	if enabled {
 		state = "enabled"
 	}
-	s.appLog.Full("toggle-peer", peerName, fmt.Sprintf("Peer %s %s", peerName, state))
+	s.appLog.Info("toggle-peer", peerName, fmt.Sprintf("Peer %s %s", peerName, state))
 	return nil
 }
 
@@ -252,31 +255,5 @@ func (s *Service) validateTunnelIP(server *storage.ManagedServer, tunnelIP strin
 	}
 	serverNet := &net.IPNet{IP: serverIP.Mask(serverMask), Mask: serverMask}
 
-	if !serverNet.Contains(ip) {
-		return fmt.Errorf("tunnel IP %s is not in server subnet %s", ip, serverNet)
-	}
-
-	// Must not be the server's own address
-	if ip.Equal(serverIP) {
-		return fmt.Errorf("tunnel IP cannot be the server's own address")
-	}
-
-	// Must not be network or broadcast address (for subnets larger than /31)
-	ones, bits := serverNet.Mask.Size()
-	if ones < bits-1 { // /31 and /32 have no network/broadcast
-		networkAddr := serverNet.IP
-		if ip.Equal(networkAddr) {
-			return fmt.Errorf("tunnel IP %s is the network address", ip)
-		}
-		// Calculate broadcast: network OR (NOT mask)
-		broadcast := make(net.IP, len(networkAddr))
-		for i := range networkAddr {
-			broadcast[i] = networkAddr[i] | ^serverNet.Mask[i]
-		}
-		if ip.Equal(broadcast) {
-			return fmt.Errorf("tunnel IP %s is the broadcast address", ip)
-		}
-	}
-
-	return nil
+	return validatePeerTunnelIP(serverNet, serverIP, ip)
 }

@@ -2,164 +2,64 @@ package monitoring
 
 import (
 	"context"
-	"strconv"
-	"strings"
 	"time"
 
-	"github.com/hoaxisr/awg-manager/internal/sys/exec"
+	"github.com/hoaxisr/awg-manager/internal/httpprobe"
+	"github.com/hoaxisr/awg-manager/internal/icmpprobe"
 )
 
-// Prober probes a single host through a specific interface and returns
-// latency in milliseconds + success flag. Implementations must be safe for
-// concurrent use.
+// Prober probes a single target through a specific interface and returns
+// latency in milliseconds + success flag. target is a URL for HTTPProber and
+// a host/IP for ICMPProber. Implementations must be safe for concurrent use.
 type Prober interface {
-	Probe(ctx context.Context, host, ifaceName string, timeout time.Duration) (latencyMs int, ok bool)
+	Probe(ctx context.Context, target, ifaceName string, timeout time.Duration) (latencyMs int, ok bool)
 }
 
-// Runner abstracts the exec call so tests can stub responses.
-type Runner interface {
-	Run(ctx context.Context, name string, args ...string) (*exec.Result, error)
-}
+// HTTPProber is the very probe the manual «Тест» button runs
+// (testing.Service.checkHTTP → httpprobe): HTTP GET of the configured
+// connectivity-check URL bound to the tunnel interface, success = 2xx/3xx.
+// One code path for the card indicator and the manual check means they can
+// never disagree. target is the full URL, not a bare host. The default URL is
+// plain http, so no TLS handshake burns softfloat-MIPS CPU per tick; an
+// https URL chosen by the user costs the same here as in the manual check.
+type HTTPProber struct{}
 
-// HTTPProber probes via curl HTTPS HEAD and reports the **TCP RTT** —
-// `time_connect - time_namelookup` — as latency. This matches the metric
-// reported by the per-tunnel connectivity-check service so numbers in the
-// matrix line up with what cards used to display.
-//
-// "Reachable" is defined as: curl received any HTTP status code (>0)
-// before the timeout. 4xx/5xx still counts — TCP+TLS handshake completed
-// through the tunnel, so the host is alive.
-type HTTPProber struct {
-	Runner Runner
-}
+// NewHTTPProber builds the prober shared with the manual connectivity check.
+func NewHTTPProber() *HTTPProber { return &HTTPProber{} }
 
-// NewHTTPProber builds a curl-based prober backed by the package-level
-// exec.Run.
-func NewHTTPProber() *HTTPProber {
-	return &HTTPProber{Runner: defaultRunner{}}
-}
-
-type defaultRunner struct{}
-
-func (defaultRunner) Run(ctx context.Context, name string, args ...string) (*exec.Result, error) {
-	return exec.Run(ctx, name, args...)
-}
-
-// Probe issues a single HTTPS HEAD request through ifaceName.
-// ok=false on context cancellation, exec error, non-zero exit code, or
-// http_code == 0 (no response received).
-func (p *HTTPProber) Probe(ctx context.Context, host, ifaceName string, timeout time.Duration) (int, bool) {
-	timeoutCtx, cancel := context.WithTimeout(ctx, timeout+1*time.Second)
+// Probe performs one HTTP GET of target (URL) through ifaceName.
+// ok=false on transport error, non-success status or timeout.
+func (p *HTTPProber) Probe(ctx context.Context, target, ifaceName string, timeout time.Duration) (int, bool) {
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	timeoutSec := int(timeout.Seconds())
-	if timeoutSec < 1 {
-		timeoutSec = 1
-	}
-	args := []string{
-		"-sI",
-		"-o", "/dev/null",
-		"--max-time", strconv.Itoa(timeoutSec),
-		"--connect-timeout", "3",
-		"--interface", ifaceName,
-		"-w", "%{http_code}|%{time_namelookup}|%{time_connect}|%{time_total}",
-		"https://" + host + "/",
-	}
-	res, err := p.Runner.Run(timeoutCtx, "/opt/bin/curl", args...)
-	if err != nil || res == nil {
+	res, err := httpprobe.ByInterface(timeoutCtx, ifaceName, target, nil)
+	if err != nil || !httpprobe.SuccessCode(res.HTTPCode) {
 		return 0, false
 	}
-
-	output := strings.TrimSpace(res.Stdout)
-	parts := strings.Split(output, "|")
-	if len(parts) != 4 {
-		return 0, false
-	}
-	httpCode, _ := strconv.Atoi(parts[0])
-	if httpCode == 0 {
-		return 0, false
-	}
-	timeNameLookup, _ := strconv.ParseFloat(parts[1], 64)
-	timeConnect, _ := strconv.ParseFloat(parts[2], 64)
-	timeTotal, _ := strconv.ParseFloat(parts[3], 64)
-
-	// Prefer pure TCP RTT — DNS resolution can dominate time_total on first
-	// requests after a tunnel comes up. Fall back to time_total when the
-	// per-phase timings look bogus.
-	var latencyMs int
-	if timeConnect > 0 && timeConnect >= timeNameLookup {
-		latencyMs = int((timeConnect - timeNameLookup) * 1000)
-	} else {
-		latencyMs = int(timeTotal * 1000)
-	}
-	if latencyMs <= 0 {
-		latencyMs = 1
-	}
-	return latencyMs, true
+	return res.LatencyMs, true
 }
 
-// ICMPProber sends a single ICMP echo via Entware ping bound to the tunnel
+// ICMPProber sends a single native ICMP echo bound to the tunnel
 // interface. Used for matrix cells whose target is the tunnel's
 // connectivity-check self host AND the tunnel's method is "ping".
 type ICMPProber struct {
-	Runner Runner
+	Pinger func(ctx context.Context, ifaceName, target string, dnsServers []string) (icmpprobe.Result, error)
 }
 
-// NewICMPProber builds an ICMP prober backed by the package-level exec.Run.
+// NewICMPProber builds an ICMP prober backed by the native icmpprobe.
 func NewICMPProber() *ICMPProber {
-	return &ICMPProber{Runner: defaultRunner{}}
+	return &ICMPProber{Pinger: icmpprobe.ByInterface}
 }
 
-// Probe sends a single ICMP echo. ok=false on exec error, non-zero exit
-// code, or unparseable timing.
+// Probe sends a single ICMP echo. ok=false on resolve/socket/timeout error.
 func (p *ICMPProber) Probe(ctx context.Context, host, ifaceName string, timeout time.Duration) (int, bool) {
-	timeoutCtx, cancel := context.WithTimeout(ctx, timeout+1*time.Second)
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	timeoutSec := int(timeout.Seconds())
-	if timeoutSec < 1 {
-		timeoutSec = 1
-	}
-	res, err := p.Runner.Run(timeoutCtx, "/opt/bin/ping",
-		"-I", ifaceName,
-		"-c", "1",
-		"-W", strconv.Itoa(timeoutSec),
-		host,
-	)
-	if err != nil || res == nil || res.ExitCode != 0 {
-		return 0, false
-	}
-
-	// busybox ping may report timing on either stdout or stderr.
-	if ms, ok := parsePingTime(res.Stdout); ok {
-		return ms, true
-	}
-	if ms, ok := parsePingTime(res.Stderr); ok {
-		return ms, true
-	}
-	// Exit 0 without parseable timing — treat as success with floor latency.
-	return 1, true
-}
-
-// parsePingTime extracts the round-trip time in milliseconds from
-// `time=NN.N ms` in ping output.
-func parsePingTime(output string) (int, bool) {
-	idx := strings.Index(output, "time=")
-	if idx < 0 {
-		return 0, false
-	}
-	rest := output[idx+5:]
-	end := strings.IndexAny(rest, " m")
-	if end <= 0 {
-		return 0, false
-	}
-	val, err := strconv.ParseFloat(rest[:end], 64)
+	res, err := p.Pinger(timeoutCtx, ifaceName, host, nil)
 	if err != nil {
 		return 0, false
 	}
-	ms := int(val)
-	if ms < 1 {
-		ms = 1
-	}
-	return ms, true
+	return res.LatencyMs, true
 }

@@ -236,6 +236,79 @@ func (s *InterfaceStore) GetProxy(ctx context.Context, name string) (*ndms.Proxy
 	}, nil
 }
 
+// FetchSummary returns InterfaceDetails by issuing a fresh batch-POST
+// show.interface query on every call — no cache read. Used by
+// state.Manager for kernel-tunnel state determination because NDMS
+// `iflayerchanged link=running` hooks are not reliable for OpkgTun:
+// the cache that GetDetails consults can stay frozen with Link != "up"
+// after `ip link set up`, producing a permanent StateStarting for a
+// working tunnel. The direct query sees the layer truth NDMS reports
+// right now.
+//
+// Uptime is consulted from the same daemon-tracked startedAt map as
+// GetDetails (cache helper, not authoritative).
+func (s *InterfaceStore) FetchSummary(ctx context.Context, name string) (*ndms.InterfaceDetails, error) {
+	if name == "" {
+		return nil, nil
+	}
+	// Batch POST вместо прямого GET /summary: NDMS обрабатывает GET с
+	// фиксированной стоимостью ~115мс независимо от размера ответа, POST
+	// ~10x быстрее и коалесцируется батчером (замеры в спеке
+	// 2026-06-10-getstate-cache-rci-post-design.md). Свежесть сохранена:
+	// это по-прежнему прямой запрос к NDMS на каждый вызов, мимо кеша
+	// снапшота.
+	raw, err := s.getter.Post(ctx, transport.ShowInterface(name, nil))
+	if err != nil {
+		return nil, err
+	}
+	inner, err := unwrapShowInterface(raw)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		State     string `json:"state"`
+		Link      string `json:"link"`
+		ConfLayer string `json:"conf-layer"`
+		Summary   struct {
+			Layer struct {
+				Conf string `json:"conf"`
+				Link string `json:"link"`
+				Ctrl string `json:"ctrl"`
+			} `json:"layer"`
+		} `json:"summary"`
+	}
+	if len(inner) > 0 {
+		if err := json.Unmarshal(inner, &resp); err != nil {
+			return nil, err
+		}
+	}
+
+	d := &ndms.InterfaceDetails{
+		ConfLayer: resp.Summary.Layer.Conf,
+		Link:      layerLevelToUpDown(resp.Summary.Layer.Link),
+		State:     layerLevelToUpDown(resp.Summary.Layer.Ctrl),
+	}
+	if resp.Summary.Layer.Conf == "" {
+		// Полный объект без summary-подсекции (или status-error на
+		// отсутствующий интерфейс): берём верхнеуровневые поля.
+		d.ConfLayer = resp.ConfLayer
+		d.Link = resp.Link
+		d.State = resp.State
+	}
+	if d.ConfLayer == "" && d.Link == "" && d.State == "" {
+		// Ни данных, ни ошибки транспорта — интерфейса нет. nil details
+		// = showInterfaceFailed в state-матрице (паритет с прежним 404).
+		return nil, nil
+	}
+
+	s.mu.RLock()
+	if t, ok := s.startedAt[name]; ok && !t.IsZero() {
+		d.Uptime = int(time.Since(t).Seconds())
+	}
+	s.mu.RUnlock()
+	return d, nil
+}
+
 // GetDetails returns InterfaceDetails synthesised from the cached
 // snapshot. Returns (nil, nil) when the interface is absent. Uptime is
 // computed live from the daemon-tracked startedAt timestamp — survives
@@ -367,11 +440,30 @@ func (s *InterfaceStore) ResolveSystemName(ctx context.Context, ndmsName string)
 	return resolved
 }
 
-// fetchSystemName queries `/show/interface/system-name?name=X`. NDMS
-// returns the kernel name as either a bare JSON string ("nwg0") or an
-// object ({"result":"nwg0"}). Returns "" on any error or empty body.
+// fetchSystemName resolves an NDMS interface id to its kernel name via
+// {"show":{"interface":{"system-name":{"name":X}}}} POST payload.
+//
+// Earlier this used GET /show/interface/system-name?name=X. NDMS treats
+// slashes inside <X> as URL path separators, so names like
+// "WifiMaster0/WifiStation0" or "GigabitEthernet0/Vlan2" came back with
+// 'Core::Configurator: not found: "show/interface/system-name?name=..."'
+// in the router log. Same gotcha that fetchOne already solves by using
+// POST — see the comment block on that function. The POST form carries
+// the name inside the JSON body where the RCI parser handles it
+// regardless of contained slashes.
+//
+// NDMS response shape (verified curl'd on 5.00.C.11):
+//
+//	{"show":{"interface":{"system-name":"apcli0"}}}
+//
+// Older firmware also produced bare "nwg0" or {"result":"nwg0"} for the
+// GET form — kept as fallbacks for safety.
 func (s *InterfaceStore) fetchSystemName(ctx context.Context, ndmsName string) string {
-	raw, err := s.getter.GetRaw(ctx, "/show/interface/system-name?name="+ndmsName)
+	payload := transport.ShowQuery(
+		[]string{"interface", "system-name"},
+		map[string]any{"name": ndmsName},
+	)
+	raw, err := s.getter.Post(ctx, payload)
 	if err != nil {
 		return ""
 	}
@@ -379,6 +471,37 @@ func (s *InterfaceStore) fetchSystemName(ctx context.Context, ndmsName string) s
 	if len(trimmed) == 0 {
 		return ""
 	}
+
+	// POST-form: walk into .show.interface."system-name"; value is the
+	// bare kernel-name string.
+	var wrap struct {
+		Show struct {
+			Interface struct {
+				SystemName json.RawMessage `json:"system-name"`
+			} `json:"interface"`
+		} `json:"show"`
+	}
+	if err := json.Unmarshal(trimmed, &wrap); err == nil && len(wrap.Show.Interface.SystemName) > 0 {
+		inner := bytes.TrimSpace(wrap.Show.Interface.SystemName)
+		if len(inner) > 0 {
+			if inner[0] == '"' {
+				var str string
+				if json.Unmarshal(inner, &str) == nil {
+					return str
+				}
+			}
+			if inner[0] == '{' {
+				var resp struct {
+					Result string `json:"result"`
+				}
+				if json.Unmarshal(inner, &resp) == nil {
+					return resp.Result
+				}
+			}
+		}
+	}
+
+	// Legacy GET-form fallbacks: bare string или {"result": "..."}.
 	if trimmed[0] == '"' {
 		var str string
 		if json.Unmarshal(trimmed, &str) == nil {
@@ -389,7 +512,7 @@ func (s *InterfaceStore) fetchSystemName(ctx context.Context, ndmsName string) s
 		var resp struct {
 			Result string `json:"result"`
 		}
-		if json.Unmarshal(trimmed, &resp) == nil {
+		if json.Unmarshal(trimmed, &resp) == nil && resp.Result != "" {
 			return resp.Result
 		}
 	}
@@ -408,6 +531,26 @@ func (s *InterfaceStore) List(ctx context.Context) ([]ndms.Interface, error) {
 	out := make([]ndms.Interface, 0, len(s.byID))
 	for _, iface := range s.byID {
 		out = append(out, *iface)
+	}
+	return out, nil
+}
+
+// LANBridge — LAN-сегмент (бридж) с подсетью, для выбора в LAN-forward.
+// Description — человекочитаемое имя сегмента (NDMS description, напр. "LAN").
+type LANBridge struct{ Name, Description, Address, Mask string }
+
+// ListLANBridges возвращает LAN-бриджи (type=Bridge) с адресом/маской.
+func (s *InterfaceStore) ListLANBridges(ctx context.Context) ([]LANBridge, error) {
+	ifaces, err := s.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := []LANBridge{}
+	for _, i := range ifaces {
+		if !strings.EqualFold(i.Type, "Bridge") || i.Address == "" {
+			continue
+		}
+		out = append(out, LANBridge{Name: i.ID, Description: i.Description, Address: i.Address, Mask: i.Mask})
 	}
 	return out, nil
 }
@@ -473,9 +616,11 @@ func (s *InterfaceStore) ListAll(ctx context.Context) ([]ndms.AllInterface, erro
 			continue
 		}
 		candidate := ndms.AllInterface{
-			Name:  kernelName,
-			Label: allInterfaceLabel(iface.Type, kernelName, iface.Description),
-			Up:    iface.State == "up" && iface.IPv4 == "running",
+			Name:          kernelName,
+			Label:         allInterfaceLabel(iface.Type, kernelName, iface.Description),
+			Up:            iface.State == "up" && iface.IPv4 == "running",
+			Type:          iface.Type,
+			SecurityLevel: iface.SecurityLevel,
 		}
 		existing, dup := seen[kernelName]
 		if !dup {
@@ -490,7 +635,7 @@ func (s *InterfaceStore) ListAll(ctx context.Context) ([]ndms.AllInterface, erro
 			winnerID[kernelName] = iface.ID
 			kept, dropped = iface.ID, prevWinner
 		}
-		s.log.Warnf("ListAll: duplicate kernel name %q from NDMS IDs %q and %q; kept %q", kernelName, kept, dropped, kept)
+		s.log.Debugf("ListAll: duplicate kernel name %q from NDMS IDs %q and %q; kept %q", kernelName, kept, dropped, kept)
 	}
 	out := make([]ndms.AllInterface, 0, len(seen))
 	for _, v := range seen {
@@ -614,12 +759,14 @@ func (s *InterfaceStore) OnLayerChanged(id, layer, level string) {
 }
 
 // OnIPChanged handles ifipchanged NDMS events. Patches address only.
-// State is owned by the ctrl layer (see OnLayerChanged); Connected is
-// also a derived signal we don't trust from this hook payload alone
-// because the NDMS event-script forwarder doesn't always populate up/
-// connected fields, leading to spurious "down" / "no" overwrites of
-// genuinely running interfaces.
-func (s *InterfaceStore) OnIPChanged(id, address string, _, _ bool) {
+//
+// Состояние линка сюда не приходит СОЗНАТЕЛЬНО: оно принадлежит ctrl-слою
+// (OnLayerChanged), а поля up/connected из этого хука недостоверны —
+// форвардер событий NDMS заполняет их не всегда, и доверие к ним затирало
+// живые интерфейсы ложными "down"/"no". Раньше они принимались параметрами и
+// выбрасывались внутри; параметр, который никто не читает, приглашает начать
+// его читать, поэтому их здесь нет вовсе.
+func (s *InterfaceStore) OnIPChanged(id, address string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	iface, ok := s.byID[id]
@@ -860,7 +1007,8 @@ func wireToInterface(w ifaceWire) ndms.Interface {
 //   - opkgtun/awg: our own managed tunnels
 //   - wireguard/nwg/wg: WireGuard (Keenetic native or third-party)
 //   - ipsec/sstp/openvpn: pure VPN protocols
-//   - proxy: Keenetic proxy interfaces (t2s), depend on underlying WAN
+//   - proxy/t2s: Keenetic sing-box proxy interfaces, depend on underlying WAN.
+//     NDMS id is ProxyN but the hook's system_name carries the kernel name t2sN.
 //
 // NOT excluded (ISPs do use these): PPTP, L2TP, GRE, IPIP, EoIP, PPPoE, IPoE.
 func IsNonISPInterface(name string) bool {
@@ -873,7 +1021,8 @@ func IsNonISPInterface(name string) bool {
 		strings.HasPrefix(n, "ipsec") ||
 		strings.HasPrefix(n, "sstp") ||
 		strings.HasPrefix(n, "openvpn") ||
-		strings.HasPrefix(n, "proxy")
+		strings.HasPrefix(n, "proxy") ||
+		strings.HasPrefix(n, "t2s")
 }
 
 // isOwnTunnel returns true for interfaces owned by awg-manager itself
@@ -951,4 +1100,3 @@ func allInterfaceLabel(ifaceType, kernelName, description string) string {
 	}
 	return kernelName
 }
-

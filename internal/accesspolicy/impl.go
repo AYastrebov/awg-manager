@@ -5,10 +5,8 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 
-	"github.com/hoaxisr/awg-manager/internal/logger"
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/ndms/command"
 	"github.com/hoaxisr/awg-manager/internal/ndms/query"
@@ -44,6 +42,22 @@ type PolicyTracker interface {
 	GetManagedPolicies() []string
 }
 
+// TunnelLifecycle starts/stops a MANAGED tunnel through the orchestrator
+// (full lifecycle, incl. NativeWG kmod proxy setup + peer endpoint rewrite).
+// Optional — nil disables managed-tunnel routing and SetInterfaceUp falls
+// back to a raw NDMS interface flip.
+type TunnelLifecycle interface {
+	Start(ctx context.Context, tunnelID string) error
+	Stop(ctx context.Context, tunnelID string) error
+}
+
+// ManagedTunnelResolver maps an NDMS interface name (e.g. "Wireguard4") to a
+// managed tunnel ID. ok=false means the interface is not a managed tunnel
+// (a plain system interface) and should use the raw NDMS flip.
+type ManagedTunnelResolver interface {
+	ManagedTunnelByNDMSName(ctx context.Context, ndmsName string) (id string, ok bool)
+}
+
 // ServiceImpl implements Service on top of the NDMS CQRS layer
 // (command.PolicyCommands for writes, query.Queries for reads).
 // InterfaceCommands is plumbed in so SetInterfaceUp can reuse the
@@ -54,21 +68,35 @@ type ServiceImpl struct {
 	interfaces  *command.InterfaceCommands
 	queries     *query.Queries
 	tracker     PolicyTracker
-	log         *logger.Logger
 	appLog      *logging.ScopedLogger
 	policyMarks PolicyMarkSource
+
+	// lifecycle + tunnelResolver route SetInterfaceUp for managed tunnels
+	// through the orchestrator instead of a raw NDMS flip. Both optional;
+	// nil → raw flip (system interfaces, or wiring contexts without a
+	// lifecycle such as the startup cleanup sweep). Wired via
+	// SetTunnelLifecycle after construction.
+	lifecycle      TunnelLifecycle
+	tunnelResolver ManagedTunnelResolver
+}
+
+// SetTunnelLifecycle wires managed-tunnel lifecycle routing for
+// SetInterfaceUp. Call once after construction. Pass nil resolver or
+// lifecycle to keep the raw-flip behaviour.
+func (s *ServiceImpl) SetTunnelLifecycle(lc TunnelLifecycle, resolver ManagedTunnelResolver) {
+	s.lifecycle = lc
+	s.tunnelResolver = resolver
 }
 
 // New creates a new access policy service backed by the NDMS CQRS layer.
 // Stores handle their own caching and single-flight — no boot-time
 // pre-warm is needed.
-func New(policies *command.PolicyCommands, interfaces *command.InterfaceCommands, queries *query.Queries, tracker PolicyTracker, log *logger.Logger, appLogger logging.AppLogger, policyMarks PolicyMarkSource) *ServiceImpl {
+func New(policies *command.PolicyCommands, interfaces *command.InterfaceCommands, queries *query.Queries, tracker PolicyTracker, appLogger logging.AppLogger, policyMarks PolicyMarkSource) *ServiceImpl {
 	return &ServiceImpl{
 		policies:    policies,
 		interfaces:  interfaces,
 		queries:     queries,
 		tracker:     tracker,
-		log:         log.WithComponent("accesspolicy"),
 		appLog:      logging.NewScopedLogger(appLogger, logging.GroupRouting, logging.SubAccessPolicy),
 		policyMarks: policyMarks,
 	}
@@ -90,7 +118,7 @@ func (s *ServiceImpl) List(ctx context.Context) ([]Policy, error) {
 	// Count devices per policy from hotspot
 	deviceCounts, err := s.countDevicesPerPolicy(ctx)
 	if err != nil {
-		s.log.Warnf("failed to count devices per policy: %v", err)
+		s.appLog.Warn("count-devices", "", err.Error())
 		deviceCounts = map[string]int{}
 	}
 
@@ -102,6 +130,7 @@ func (s *ServiceImpl) List(ctx context.Context) ([]Policy, error) {
 			Standalone:  rc.Standalone,
 			Interfaces:  make([]PermittedIface, 0, len(rc.Interfaces)),
 			DeviceCount: deviceCounts[rc.Name],
+			IsStandard:  IsStandardPolicyName(rc.Name),
 		}
 		for _, pi := range rc.Interfaces {
 			p.Interfaces = append(p.Interfaces, PermittedIface{
@@ -132,7 +161,7 @@ func (s *ServiceImpl) List(ctx context.Context) ([]Policy, error) {
 
 	// Stable sort: PolicyN by number first, then custom policies alphabetically
 	sort.Slice(policies, func(i, j int) bool {
-		pi, pj := policyIndex(policies[i].Name), policyIndex(policies[j].Name)
+		pi, pj := query.PolicyIndex(policies[i].Name), query.PolicyIndex(policies[j].Name)
 		if pi != pj {
 			return pi < pj
 		}
@@ -192,7 +221,7 @@ func (s *ServiceImpl) Create(ctx context.Context, description string) (*Policy, 
 	// Track as managed by AWG Manager
 	if s.tracker != nil {
 		if err := s.tracker.AddManagedPolicy(name); err != nil {
-			s.log.Warnf("failed to track managed policy %s: %v", name, err)
+			s.appLog.Warn("track-managed", name, err.Error())
 		}
 	}
 
@@ -216,10 +245,17 @@ func (s *ServiceImpl) CleanupAll(ctx context.Context) error {
 	return nil
 }
 
+func errHydraRoutePolicy(name string) error {
+	return fmt.Errorf("policy %q is managed by HydraRoute Neo and cannot be modified here", name)
+}
+
 // Delete removes a policy by name.
 func (s *ServiceImpl) Delete(ctx context.Context, name string) error {
 	if !isValidPolicyName(name) {
 		return fmt.Errorf("invalid policy name: %s", name)
+	}
+	if !IsStandardPolicyName(name) {
+		return errHydraRoutePolicy(name)
 	}
 
 	if err := s.policies.DeletePolicy(ctx, name); err != nil {
@@ -241,6 +277,9 @@ func (s *ServiceImpl) SetDescription(ctx context.Context, name, description stri
 	if !isValidPolicyName(name) {
 		return fmt.Errorf("invalid policy name: %s", name)
 	}
+	if !IsStandardPolicyName(name) {
+		return errHydraRoutePolicy(name)
+	}
 	if err := validateDescription(description); err != nil {
 		return err
 	}
@@ -250,7 +289,7 @@ func (s *ServiceImpl) SetDescription(ctx context.Context, name, description stri
 		return err
 	}
 
-	s.appLog.Full("set-description", name, fmt.Sprintf("Policy %s description updated", name))
+	s.appLog.Info("set-description", name, fmt.Sprintf("Policy %s description updated", name))
 	return nil
 }
 
@@ -258,6 +297,9 @@ func (s *ServiceImpl) SetDescription(ctx context.Context, name, description stri
 func (s *ServiceImpl) SetStandalone(ctx context.Context, name string, enabled bool) error {
 	if !isValidPolicyName(name) {
 		return fmt.Errorf("invalid policy name: %s", name)
+	}
+	if !IsStandardPolicyName(name) {
+		return errHydraRoutePolicy(name)
 	}
 
 	if err := s.policies.SetStandalone(ctx, name, enabled); err != nil {
@@ -269,7 +311,7 @@ func (s *ServiceImpl) SetStandalone(ctx context.Context, name string, enabled bo
 	if enabled {
 		state = "enabled"
 	}
-	s.appLog.Full("set-standalone", name, fmt.Sprintf("Policy %s standalone %s", name, state))
+	s.appLog.Info("set-standalone", name, fmt.Sprintf("Policy %s standalone %s", name, state))
 	return nil
 }
 
@@ -307,6 +349,9 @@ func (s *ServiceImpl) DenyInterface(ctx context.Context, name, iface string) err
 func (s *ServiceImpl) AssignDevice(ctx context.Context, mac, policyName string) error {
 	if !isValidPolicyName(policyName) {
 		return fmt.Errorf("invalid policy name: %s", policyName)
+	}
+	if !IsStandardPolicyName(policyName) {
+		return errHydraRoutePolicy(policyName)
 	}
 
 	if err := s.policies.AssignDevice(ctx, mac, policyName); err != nil {
@@ -347,7 +392,7 @@ func (s *ServiceImpl) ListDevices(ctx context.Context) ([]Device, error) {
 	if !osdetect.AtLeast(5, 1) {
 		rcHostPolicies, err = s.parseHotspotPolicies(ctx)
 		if err != nil {
-			s.log.Warnf("failed to parse hotspot policies from running-config: %v", err)
+			s.appLog.Warn("parse-hotspot-policies", "", err.Error())
 		}
 	}
 
@@ -425,6 +470,32 @@ func (s *ServiceImpl) SetInterfaceUp(ctx context.Context, ndmsName string, up bo
 	if !up {
 		action = "down"
 	}
+
+	// Managed tunnels must go through the orchestrator lifecycle, not a raw
+	// NDMS interface flip. A bare "up" brings the NDMS interface running with
+	// its stored peer endpoint, but NativeWG needs the orchestrator to
+	// (re)build the kmod proxy and rewrite the peer endpoint to the local
+	// proxy port — otherwise the handshake never completes (issue #183).
+	// The reverse (down) needs the full stop so the kmod slot is removed and
+	// the disabled state is persisted instead of diverging from NDMS.
+	if s.lifecycle != nil && s.tunnelResolver != nil {
+		if id, ok := s.tunnelResolver.ManagedTunnelByNDMSName(ctx, ndmsName); ok {
+			var lerr error
+			if up {
+				lerr = s.lifecycle.Start(ctx, id)
+			} else {
+				lerr = s.lifecycle.Stop(ctx, id)
+			}
+			if lerr != nil {
+				s.appLog.Warn("set-interface", ndmsName, fmt.Sprintf("Failed to %s managed tunnel %s: %v", action, id, lerr))
+				return lerr
+			}
+			s.refreshInterfaceAfterLifecycle(ndmsName)
+			s.appLog.Info("set-interface", ndmsName, fmt.Sprintf("Managed tunnel %s set %s via lifecycle", id, action))
+			return nil
+		}
+	}
+
 	var err error
 	if up {
 		err = s.interfaces.InterfaceUp(ctx, ndmsName)
@@ -435,8 +506,23 @@ func (s *ServiceImpl) SetInterfaceUp(ctx context.Context, ndmsName string, up bo
 		s.appLog.Warn("set-interface", ndmsName, fmt.Sprintf("Failed to set %s: %v", action, err))
 		return err
 	}
-	s.appLog.Full("set-interface", ndmsName, fmt.Sprintf("Interface %s set %s", ndmsName, action))
+	s.appLog.Info("set-interface", ndmsName, fmt.Sprintf("Interface %s set %s", ndmsName, action))
 	return nil
+}
+
+func (s *ServiceImpl) refreshInterfaceAfterLifecycle(ndmsName string) {
+	if s.queries == nil {
+		return
+	}
+	if s.queries.Interfaces != nil {
+		s.queries.Interfaces.Invalidate(ndmsName)
+	}
+	if s.queries.Peers != nil {
+		s.queries.Peers.Invalidate(ndmsName)
+	}
+	if s.queries.RunningConfig != nil {
+		s.queries.RunningConfig.InvalidateAll()
+	}
 }
 
 // interfaceLabel builds a human-readable label from NDMS interface data.
@@ -480,7 +566,7 @@ func (s *ServiceImpl) countDevicesPerPolicy(ctx context.Context) (map[string]int
 	if !osdetect.AtLeast(5, 1) {
 		rcHostPolicies, err = s.parseHotspotPolicies(ctx)
 		if err != nil {
-			s.log.Warnf("failed to parse hotspot policies from running-config: %v", err)
+			s.appLog.Warn("parse-hotspot-policies", "", err.Error())
 		}
 	}
 
@@ -552,18 +638,6 @@ func (s *ServiceImpl) parseHotspotPolicies(ctx context.Context) (map[string]stri
 // Accepts both standard PolicyN names and custom names (e.g. from HR Neo).
 func isValidPolicyName(name string) bool {
 	return name != ""
-}
-
-// policyIndex extracts a sort key from a policy name.
-// Standard PolicyN names sort by number (0-63), custom names sort after them (1000+).
-func policyIndex(name string) int {
-	if strings.HasPrefix(name, "Policy") {
-		numStr := strings.TrimPrefix(name, "Policy")
-		if n, err := strconv.Atoi(numStr); err == nil {
-			return n
-		}
-	}
-	return 1000 // custom policies sort after standard PolicyN
 }
 
 // IsStandardPolicyName reports whether name is a built-in NDMS access

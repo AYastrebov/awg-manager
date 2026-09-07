@@ -12,15 +12,22 @@
 	import ConnectionsTab from './ConnectionsTab.svelte';
 	import ChecksTab from './ChecksTab.svelte';
 	import AwgConfigAnalyzerTab from './AwgConfigAnalyzerTab.svelte';
+	import AboutDeviceTab from './AboutDeviceTab.svelte';
+	import DnsInfoTab from './DnsInfoTab.svelte';
+	import { MonitoringTab } from '$lib/components/pingcheck';
 
-	type ActiveTab = 'logs' | 'connections' | 'checks' | 'awgConfig';
+	type ActiveTab = 'logs' | 'monitoring' | 'connections' | 'checks' | 'about' | 'awgConfig' | 'dns' | 'system';
 
 	function initialDiagnosticsTab(): ActiveTab {
 		const tab = $page.url.searchParams.get('tab');
 
+		if (tab === 'monitoring') return 'monitoring';
 		if (tab === 'connections') return 'connections';
 		if (tab === 'checks') return 'checks';
+		if (tab === 'about') return 'about';
 		if (tab === 'awgConfig') return 'awgConfig';
+		if (tab === 'dns') return 'dns';
+		if (tab === 'system') return 'system';
 
 		// legacy aliases, чтобы первый render тоже сразу попадал в checks
 		if (tab === 'tests' || tab === 'dnscheck') return 'checks';
@@ -42,11 +49,17 @@
 	const diagnosticsTabs = $derived.by((): { id: ActiveTab; label: string }[] => {
 		const base: { id: ActiveTab; label: string }[] = [
 			{ id: 'logs', label: 'Журнал' },
+			{ id: 'monitoring', label: 'Мониторинг' },
 			{ id: 'connections', label: 'Соединения' },
 			{ id: 'checks', label: 'Проверки' },
+			{ id: 'about', label: 'Окружение' },
 		];
 		if ($usageLevel === 'expert') {
 			base.push({ id: 'awgConfig', label: 'Конфиг AWG' });
+		}
+		if ($usageLevel === 'expert') {
+			base.push({ id: 'dns', label: 'Сведения о DNS' });
+			base.push({ id: 'system', label: 'Система' });
 		}
 		return base;
 	});
@@ -57,13 +70,14 @@
 		// Ждём загрузки settings — Tabs сам восстановит вкладку из URL.
 		if ($settings === null) return;
 		if ($usageLevel === 'expert') return;
-		if (activeTab === 'awgConfig') {
+		if (activeTab === 'awgConfig' || activeTab === 'dns' || activeTab === 'system') {
 			activeTab = 'logs';
 		}
 		const tab = $page.url.searchParams.get('tab');
-		if (tab === 'awgConfig') {
+		if (tab === 'awgConfig' || tab === 'dns' || tab === 'system') {
 			const url = new URL($page.url);
 			url.searchParams.delete('tab');
+			url.searchParams.delete('view');
 			const q = url.searchParams.toString();
 			const target = url.pathname + (q ? `?${q}` : '') + url.hash;
 			void goto(target, { replaceState: true, keepFocus: true, noScroll: true });
@@ -145,10 +159,14 @@
 	});
 
 	const pageTitle = $derived(
-		activeTab === 'connections' ? 'Соединения · Диагностика' :
-		activeTab === 'checks' ? 'Проверки · Диагностика' :
-		activeTab === 'awgConfig' ? 'Конфиг AWG · Диагностика' :
-		'Журнал · Диагностика',
+		activeTab === 'connections' ? 'Соединения · Инструменты' :
+		activeTab === 'checks' ? 'Проверки · Инструменты' :
+		activeTab === 'about' ? 'Окружение · Инструменты' :
+		activeTab === 'awgConfig' ? 'Конфиг AWG · Инструменты' :
+		activeTab === 'dns' ? 'Сведения о DNS · Инструменты' :
+		activeTab === 'system' ? 'Система · Инструменты' :
+		activeTab === 'monitoring' ? 'Мониторинг · Инструменты' :
+		'Журнал · Инструменты',
 	);
 </script>
 
@@ -157,7 +175,7 @@
 </svelte:head>
 
 <PageContainer width="full">
-	<PageHeader title="Диагностика" />
+	<PageHeader title="Инструменты" />
 
 	<Tabs
 		tabs={diagnosticsTabs}
@@ -168,12 +186,24 @@
 	/>
 
 	{#if activeTab === 'logs'}
-		<LogsTerminal />
+		<!-- Журнал — только действия приложения; логи sing-box смотрятся на своих
+		     вкладках (Sing-box: TProxy → «Логи», Sing-box: FakeIP → «Журнал»). -->
+		<LogsTerminal lockBucket="app" />
+	{:else if activeTab === 'monitoring'}
+		<MonitoringTab />
 	{:else if activeTab === 'connections'}
 		<ConnectionsTab />
 	{:else if activeTab === 'checks'}
 		<ChecksTab {tunnels} />
+	{:else if activeTab === 'about'}
+		<AboutDeviceTab />
 	{:else if activeTab === 'awgConfig'}
 		<AwgConfigAnalyzerTab />
+	{:else if activeTab === 'dns'}
+		<DnsInfoTab />
+	{:else if activeTab === 'system'}
+		{#await import('$lib/components/system/SystemTab.svelte') then { default: SystemTab }}
+			<SystemTab />
+		{/await}
 	{/if}
 </PageContainer>

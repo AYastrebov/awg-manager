@@ -29,8 +29,8 @@ func (nopLogger) Warnf(string, ...any) {}
 func NopLogger() Logger { return nopLogger{} }
 
 // Poller is a ticker that fetches peer metrics for non-managed system
-// WG tunnels and server interfaces at a fixed cadence. It uses the
-// narrow /show/interface/<name>/wireguard/peer endpoint, publishes
+// WG tunnels and server interfaces at a fixed cadence. Peers come from
+// the .wireguard.peer field of /show/interface/<name>; it publishes
 // tunnel:traffic (non-managed system tunnels) and triggers
 // server:updated snapshots (server interfaces).
 //
@@ -45,8 +45,8 @@ type Poller struct {
 	interval    time.Duration
 	log         Logger
 
-	mu          sync.Mutex
-	prev        map[string]peerDigest
+	mu   sync.Mutex
+	prev map[string]peerDigest
 	// emptyUntil holds per-interface cooldown timestamps. Once an
 	// interface is observed with zero peers, we skip polling it for
 	// emptyCooldown — no point hitting NDMS every 5s for an empty
@@ -64,12 +64,11 @@ type Poller struct {
 }
 
 // emptyCooldown is how long an interface observed with zero peers is
-// skipped before being polled again. One minute keeps RCI load low
-// for idle servers (NDMS responds 404 on /wireguard/peer when empty
-// and logs Core::Scgi::ThreadPool: not found on every hit) while
-// still bounding how long a freshly-added peer waits to appear in
-// metrics. Newly-added peers also surface via SSE on mutation, so
-// fast polling here is not what drives UI freshness.
+// skipped before being polled again. One minute keeps RCI load low for
+// idle servers (each poll otherwise refetches the whole interface via
+// /show/interface/<name>) while still bounding how long a freshly-added
+// peer waits to appear in metrics. Newly-added peers also surface via
+// SSE on mutation, so fast polling here is not what drives UI freshness.
 const emptyCooldown = 60 * time.Second
 
 // InterfaceRef names one interface to poll metrics for, plus its role.
@@ -204,9 +203,9 @@ func (p *Poller) tick() {
 	}
 
 	// Drop interfaces that are within their known-empty cooldown. For
-	// a server with zero peers there's nothing useful to poll — the
-	// narrow /wireguard/peer endpoint just 404s or returns [] and we
-	// don't want to hammer NDMS every 5s for each idle server.
+	// a server with zero peers there's nothing useful to poll — its
+	// /show/interface/<name> just returns an empty .wireguard.peer and
+	// we don't want to hammer NDMS every 5s for each idle server.
 	now := time.Now()
 	p.mu.Lock()
 	pollRefs := make([]InterfaceRef, 0, len(refs))

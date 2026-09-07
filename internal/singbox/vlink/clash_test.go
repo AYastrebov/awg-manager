@@ -293,6 +293,43 @@ func TestParseClashBody_EmptyProxies(t *testing.T) {
 	}
 }
 
+func TestParseClashBody_Mieru(t *testing.T) {
+	body := []byte(`
+proxies:
+  - name: m1
+    type: mieru
+    server: 12.34.56.78
+    port: 2027
+    transport: TCP
+    username: user
+    password: pass
+    multiplexing: MULTIPLEXING_HIGH
+  - name: m2
+    type: mieru
+    server: 12.34.56.78
+    port-range: 2012-2022
+    transport: UDP
+    username: user
+    password: pass
+`)
+	res := ParseClashBody(body)
+	if len(res.Errors) != 0 {
+		t.Fatalf("errors: %+v", res.Errors)
+	}
+	if len(res.Outbounds) != 2 {
+		t.Fatalf("got %d outbounds, want 2", len(res.Outbounds))
+	}
+	first := decodeOutbound(t, res.Outbounds[0])
+	if first["type"] != "mieru" || first["transport"] != "TCP" || first["server_port"] != float64(2027) {
+		t.Fatalf("bad first outbound: %+v", first)
+	}
+	second := decodeOutbound(t, res.Outbounds[1])
+	if second["transport"] != "UDP" {
+		t.Fatalf("bad second outbound: %+v", second)
+	}
+	assertStringSlice(t, second["server_ports"], []string{"2012-2022"})
+}
+
 func TestParseClashBody_InvalidYAML(t *testing.T) {
 	res := ParseClashBody([]byte("\x00\x01\x02not valid: : :\n  - %"))
 	if len(res.Outbounds) != 0 {
@@ -320,5 +357,31 @@ proxies:
 	}
 	if res.Errors[0].Scheme != "clash:vless" {
 		t.Errorf("Scheme=%q want clash:vless", res.Errors[0].Scheme)
+	}
+}
+
+func TestClashFieldsToValues_XHTTP(t *testing.T) {
+	in := map[string]any{
+		"server":  "h",
+		"port":    443,
+		"network": "xhttp",
+		"xhttp-opts": map[string]any{
+			"path": "/xh",
+			"host": "example.com",
+			"mode": "packet-up",
+		},
+	}
+	got := clashFieldsToValues(in)
+	if got.Get("type") != "xhttp" {
+		t.Errorf("type=%q want xhttp", got.Get("type"))
+	}
+	if got.Get("path") != "/xh" {
+		t.Errorf("path=%q want /xh", got.Get("path"))
+	}
+	if got.Get("host") != "example.com" {
+		t.Errorf("host=%q want example.com", got.Get("host"))
+	}
+	if got.Get("mode") != "packet-up" {
+		t.Errorf("mode=%q want packet-up", got.Get("mode"))
 	}
 }

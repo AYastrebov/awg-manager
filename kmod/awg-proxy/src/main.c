@@ -15,10 +15,10 @@
 #include <linux/slab.h>
 #include <linux/proc_fs.h>
 #include <linux/uaccess.h>
-#include <linux/inet.h>
 #include <linux/version.h>
 
 #include "proxy.h"
+#include "tunnel.h"
 
 #ifndef AWG_PROXY_VERSION
 #define AWG_PROXY_VERSION "dev"
@@ -28,6 +28,8 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("hoaxisr");
 MODULE_DESCRIPTION("AWG Proxy - Kernel UDP proxy for WG<->AWG transformation");
 MODULE_VERSION(AWG_PROXY_VERSION);
+/* cookie_reply AEAD translation needs rfc7539(chacha20,poly1305). */
+MODULE_SOFTDEP("pre: chacha20poly1305");
 
 /* ────────────────────────── Procfs ───────────────────────────────── */
 
@@ -35,7 +37,8 @@ static struct proc_dir_entry *proc_dir;
 
 /*
  * /proc/awg_proxy/add - write tunnel config to create a proxy
- * Format: "IP:PORT H1=min-max H2=... S1=N ... PUB_SERVER=hex PUB_CLIENT=hex I1=\"...\" ..."
+ * Format: "ENDPOINT H1=min-max H2=... S1=N ... PUB_SERVER=hex PUB_CLIENT=hex I1=\"...\" ..."
+ * ENDPOINT is "IP:PORT" (IPv4) or "[IPV6]:PORT" (bracketed IPv6, kmod >= 1.3.0).
  */
 static ssize_t proc_add_write(struct file *file, const char __user *buf,
 			      size_t count, loff_t *ppos)
@@ -80,16 +83,15 @@ static const struct file_operations proc_add_ops = {
 #endif
 
 /*
- * /proc/awg_proxy/del - write "IP:PORT" to remove a proxy
+ * /proc/awg_proxy/del - write "IP:PORT" (or "[IPV6]:PORT") to remove a proxy
  */
 static ssize_t proc_del_write(struct file *file, const char __user *buf,
 			      size_t count, loff_t *ppos)
 {
 	char kbuf[64];
-	char *colon;
-	__be32 ip;
+	struct awg_endpoint_addr addr;
 	__be16 port;
-	int port_int, ret;
+	int ret;
 
 	if (count >= sizeof(kbuf))
 		return -EINVAL;
@@ -101,17 +103,11 @@ static ssize_t proc_del_write(struct file *file, const char __user *buf,
 	if (count > 0 && kbuf[count - 1] == '\n')
 		kbuf[count - 1] = '\0';
 
-	colon = strrchr(kbuf, ':');
-	if (!colon)
+	/* Same parser as /proc add — both endpoint forms work for del. */
+	if (awg_endpoint_parse(kbuf, &addr, &port))
 		return -EINVAL;
-	*colon = '\0';
 
-	ip = in_aton(kbuf);
-	if (kstrtoint(colon + 1, 10, &port_int) || port_int <= 0 || port_int > 65535)
-		return -EINVAL;
-	port = htons(port_int);
-
-	ret = awg_proxy_del(ip, port);
+	ret = awg_proxy_del(&addr, port);
 	if (ret)
 		return ret;
 	return count;
@@ -130,6 +126,13 @@ static const struct file_operations proc_del_ops = {
 
 /*
  * /proc/awg_proxy/list - read active proxy list (includes listen_port)
+ *
+ * Position-aware raw read: serves the snapshot across successive read()
+ * calls keyed on *ppos, so readers with small buffers (Go os.ReadFile
+ * starts at 512 bytes) get the full list instead of a truncated first
+ * chunk (issue #362). The Keenetic kernel does not export seq_write
+ * (CONFIG_TRIM_UNUSED_KSYMS strips it), so seq_file is unavailable -
+ * this uses only copy_to_user.
  */
 static ssize_t proc_list_read(struct file *file, char __user *buf,
 			      size_t count, loff_t *ppos)
@@ -138,24 +141,27 @@ static ssize_t proc_list_read(struct file *file, char __user *buf,
 	int len;
 	ssize_t ret;
 
-	if (*ppos > 0)
-		return 0;
-
 	kbuf = kmalloc(4096, GFP_KERNEL);
 	if (!kbuf)
 		return -ENOMEM;
 
+	/* ponytail: re-snapshots per read() like 1.1.1; torn view only if the
+	   list mutates mid-read - negligible for a microsecond status read. */
 	len = awg_proxy_list(kbuf, 4096);
 
-	if ((size_t)len > count)
-		len = count;
-	if (copy_to_user(buf, kbuf, len)) {
-		kfree(kbuf);
-		return -EFAULT;
+	if (*ppos >= len) {
+		ret = 0;			/* EOF once fully served */
+		goto out;
 	}
-
-	*ppos += len;
-	ret = len;
+	if (count > (size_t)len - *ppos)
+		count = (size_t)len - *ppos;	/* clamp to remaining */
+	if (copy_to_user(buf, kbuf + *ppos, count)) {
+		ret = -EFAULT;
+		goto out;
+	}
+	*ppos += count;
+	ret = count;
+out:
 	kfree(kbuf);
 	return ret;
 }
@@ -208,6 +214,8 @@ static const struct file_operations proc_version_ops = {
 
 static int __init awg_proxy_init(void)
 {
+	int ret;
+
 	pr_info("awg_proxy: loading v%s (UDP proxy mode)\n", AWG_PROXY_VERSION);
 
 	/* Create procfs directory */
@@ -215,6 +223,15 @@ static int __init awg_proxy_init(void)
 	if (!proc_dir) {
 		pr_err("awg_proxy: failed to create /proc/awg_proxy\n");
 		return -ENOMEM;
+	}
+
+	/* Dummy netdev for the udp_tunnel_xmit_skb TX path — must exist before
+	 * any /proc/awg_proxy/add can install a proxy. */
+	ret = awg_xmit_dev_create();
+	if (ret) {
+		pr_err("awg_proxy: failed to create xmit dev: %d\n", ret);
+		remove_proc_entry("awg_proxy", NULL);
+		return ret;
 	}
 
 	proc_create("add", 0220, proc_dir, &proc_add_ops);
@@ -237,6 +254,10 @@ static void __exit awg_proxy_exit(void)
 
 	/* Stop all proxies */
 	awg_proxy_cleanup();
+
+	/* Free the TX dummy netdev after all proxies (and their c2s threads,
+	 * the only xmit users) are gone. */
+	awg_xmit_dev_destroy();
 
 	pr_info("awg_proxy: unloaded\n");
 }

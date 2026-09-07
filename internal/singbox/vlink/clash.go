@@ -19,7 +19,7 @@ import (
 
 // scanLimit is how many bytes IsClashYAML inspects. A real Clash subscription
 // has "proxies:" within the first few hundred bytes; 4 KB is a forgiving cap.
-const scanLimit = 4 * 1024
+const scanLimit = 64 * 1024
 
 // matches a top-level "proxies:" key — accepts block (proxies: + newline),
 // inline ("proxies: []"), null marker ("proxies: null"), and any other
@@ -55,7 +55,7 @@ func IsClashYAML(body []byte) bool {
 // security, sni, alpn, fp, insecure, pbk, sid.
 //
 // Reality is detected when reality-opts is present; otherwise tls:true →
-// security=tls. Network is read from "network" (ws/grpc/http/h2/tcp).
+// security=tls. Network is read from "network" (ws/grpc/http/h2/xhttp/tcp).
 func clashFieldsToValues(p map[string]any) url.Values {
 	v := url.Values{}
 
@@ -75,6 +75,16 @@ func clashFieldsToValues(p map[string]any) url.Values {
 		hdrs := nestedMap(ws, "headers")
 		if host := asString(hdrs["Host"]); host != "" {
 			v.Set("host", host)
+		}
+		// mihomo encodes httpupgrade as network: ws + ws-opts.v2ray-http-upgrade.
+		// sing-box has a distinct httpupgrade transport, so remap to it (path/
+		// host above are shared) instead of emitting a plain ws outbound.
+		if asBool(ws["v2ray-http-upgrade"]) {
+			v.Set("type", "httpupgrade")
+		}
+		if n, ok := asInt(ws["max-early-data"]); ok && n > 0 {
+			v.Set("ed", strconv.Itoa(n))
+			v.Set("eh", asString(ws["early-data-header-name"]))
 		}
 	case "grpc":
 		gp := nestedMap(p, "grpc-opts")
@@ -100,6 +110,29 @@ func clashFieldsToValues(p map[string]any) url.Values {
 		if hosts := asStringSlice(hp["host"]); len(hosts) > 0 {
 			v.Set("host", hosts[0])
 		}
+	case "xhttp", "splithttp":
+		// mihomo carries xhttp under xhttp-opts with top-level string path/host
+		// (not []string) plus a mode. We don't run mihomo — convert to our
+		// sing-box xhttp transport. The remaining options, xmux among them,
+		// go through the share-link extra= path (#797).
+		xh := nestedMap(p, "xhttp-opts")
+		if path := asString(xh["path"]); path != "" {
+			v.Set("path", path)
+		}
+		if host := asString(xh["host"]); host != "" {
+			v.Set("host", host)
+		}
+		if mode := asString(xh["mode"]); mode != "" {
+			v.Set("mode", mode)
+		}
+		if extra := xhttpExtraFromClash(xh); extra != "" {
+			v.Set("extra", extra)
+		}
+	}
+
+	// mihomo привязывает исходящий интерфейс per-proxy через interface-name.
+	if iface := asString(p["interface-name"]); iface != "" {
+		v.Set("bind_interface", iface)
 	}
 
 	// TLS / Reality
@@ -261,6 +294,8 @@ func ParseClashBody(body []byte) BatchResult {
 			parsed, err = mapClashShadowsocks(p)
 		case "hysteria2":
 			parsed, err = mapClashHysteria2(p)
+		case "mieru":
+			parsed, err = mapClashMieru(p)
 		case "vmess":
 			out.SkippedVmess++
 			continue

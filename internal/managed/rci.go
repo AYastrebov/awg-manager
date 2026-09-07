@@ -2,6 +2,7 @@ package managed
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 )
 
@@ -15,6 +16,7 @@ import (
 // subsequent reads see fresh data.
 func (s *Service) rciPost(ctx context.Context, payload interface{}) error {
 	if _, err := s.transport.Post(ctx, payload); err != nil {
+		s.sysLog().Warn("managed rci post failed", "error", err)
 		return err
 	}
 	if s.saveCoord != nil {
@@ -55,7 +57,7 @@ func (s *Service) rciDeleteInterface(ctx context.Context, name string) error {
 }
 
 // rciConfigureServer sets all server interface properties in a single RCI call.
-func (s *Service) rciConfigureServer(ctx context.Context, name, description, address, mask string, port int) error {
+func (s *Service) rciConfigureServer(ctx context.Context, name, description, address, mask string, port, mtu int) error {
 	return s.rciPost(ctx, map[string]interface{}{
 		"interface": map[string]interface{}{
 			name: map[string]interface{}{
@@ -73,6 +75,7 @@ func (s *Service) rciConfigureServer(ctx context.Context, name, description, add
 						"address": address,
 						"mask":    mask,
 					},
+					"mtu":          mtu,
 					"name-servers": true,
 					"tcp": map[string]interface{}{
 						"adjust-mss": map[string]interface{}{
@@ -81,18 +84,6 @@ func (s *Service) rciConfigureServer(ctx context.Context, name, description, add
 					},
 				},
 				"up": true,
-			},
-		},
-	})
-}
-
-// rciSetDescription updates the NDMS description for the interface.
-// The description is the user-facing display name on the router and in our UI.
-func (s *Service) rciSetDescription(ctx context.Context, ifaceName, description string) error {
-	return s.rciPost(ctx, map[string]interface{}{
-		"interface": map[string]interface{}{
-			ifaceName: map[string]interface{}{
-				"description": description,
 			},
 		},
 	})
@@ -108,9 +99,12 @@ type updateServerChanges struct {
 	portSet bool
 	port    int
 
-	addressChanged                  bool
-	oldAddress, oldMask             string
-	newAddress, newMask             string
+	addressChanged      bool
+	oldAddress, oldMask string
+	newAddress, newMask string
+
+	mtuSet bool
+	mtu    int
 }
 
 // rciUpdateServer applies multiple managed-server property changes in a
@@ -134,13 +128,18 @@ func (s *Service) rciUpdateServer(ctx context.Context, ifaceName string, c updat
 			},
 		}
 	}
+	ip := map[string]interface{}{}
 	if c.addressChanged {
-		iface["ip"] = map[string]interface{}{
-			"address": []map[string]interface{}{
-				{"no": true, "address": c.oldAddress, "mask": c.oldMask},
-				{"address": c.newAddress, "mask": c.newMask},
-			},
+		ip["address"] = []map[string]interface{}{
+			{"no": true, "address": c.oldAddress, "mask": c.oldMask},
+			{"address": c.newAddress, "mask": c.newMask},
 		}
+	}
+	if c.mtuSet {
+		ip["mtu"] = c.mtu
+	}
+	if len(ip) > 0 {
+		iface["ip"] = ip
 	}
 	if len(iface) == 0 {
 		return nil
@@ -148,54 +147,6 @@ func (s *Service) rciUpdateServer(ctx context.Context, ifaceName string, c updat
 	return s.rciPost(ctx, map[string]interface{}{
 		"interface": map[string]interface{}{
 			ifaceName: iface,
-		},
-	})
-}
-
-// rciSetListenPort updates the listen port.
-func (s *Service) rciSetListenPort(ctx context.Context, ifaceName string, port int) error {
-	return s.rciPost(ctx, map[string]interface{}{
-		"interface": map[string]interface{}{
-			ifaceName: map[string]interface{}{
-				"wireguard": map[string]interface{}{
-					"listen-port": map[string]interface{}{
-						"port": port,
-					},
-				},
-			},
-		},
-	})
-}
-
-// rciRemoveAddress removes an IP address from the interface.
-func (s *Service) rciRemoveAddress(ctx context.Context, ifaceName, address, mask string) error {
-	return s.rciPost(ctx, map[string]interface{}{
-		"interface": map[string]interface{}{
-			ifaceName: map[string]interface{}{
-				"ip": map[string]interface{}{
-					"address": map[string]interface{}{
-						"no":      true,
-						"address": address,
-						"mask":    mask,
-					},
-				},
-			},
-		},
-	})
-}
-
-// rciSetAddress sets an IP address on the interface.
-func (s *Service) rciSetAddress(ctx context.Context, ifaceName, address, mask string) error {
-	return s.rciPost(ctx, map[string]interface{}{
-		"interface": map[string]interface{}{
-			ifaceName: map[string]interface{}{
-				"ip": map[string]interface{}{
-					"address": map[string]interface{}{
-						"address": address,
-						"mask":    mask,
-					},
-				},
-			},
 		},
 	})
 }
@@ -220,22 +171,97 @@ func (s *Service) rciSetNAT(ctx context.Context, ifaceName string, enabled bool)
 	})
 }
 
+// rciSetStaticNAT добавляет/снимает Static NAT (`ip static <iface> <wan>`)
+// для интерфейса. wanIface — NDMS-имя WAN (to-interface, трекает динамический адрес).
+func (s *Service) rciSetStaticNAT(ctx context.Context, ifaceName, wanIface string, enabled bool) error {
+	if enabled {
+		return s.rciPost(ctx, map[string]interface{}{
+			"ip": map[string]interface{}{
+				"static": map[string]interface{}{
+					"interface":    ifaceName,
+					"to-interface": wanIface,
+				},
+			},
+		})
+	}
+	return s.rciPost(ctx, map[string]interface{}{
+		"ip": map[string]interface{}{
+			"static": []map[string]interface{}{
+				{"no": true, "interface": ifaceName, "to-interface": wanIface},
+			},
+		},
+	})
+}
+
+// rciSetPrivateKey installs an explicit WireGuard private key on the
+// interface via RCI. Verified against NDMS 4.x: POST returns "set private
+// key." status and the next /show/interface/<name>.wireguard.public-key
+// reflects the public key derived from the supplied private key. Used
+// during Restore to install the backup's keypair so previously-distributed
+// client .conf files keep working.
+func (s *Service) rciSetPrivateKey(ctx context.Context, ifaceName, privateKey string) error {
+	return s.rciPost(ctx, map[string]interface{}{
+		"interface": map[string]interface{}{
+			ifaceName: map[string]interface{}{
+				"wireguard": map[string]interface{}{
+					"private-key": privateKey,
+				},
+			},
+		},
+	})
+}
+
+// rciSetASCParams sets AWG ASC params on interface wireguard.asc.
+// Caller must pass JSON object shape accepted by NDMS and already stripped
+// from client-only signature fields (i1..i5).
+func (s *Service) rciSetASCParams(ctx context.Context, ifaceName string, params json.RawMessage) error {
+	var asc map[string]any
+	if err := json.Unmarshal(params, &asc); err != nil {
+		return fmt.Errorf("parse ASC params: %w", err)
+	}
+	return s.rciPost(ctx, map[string]interface{}{
+		"interface": map[string]interface{}{
+			ifaceName: map[string]interface{}{
+				"wireguard": map[string]interface{}{
+					"asc": asc,
+				},
+			},
+		},
+	})
+}
+
+// rciClearASCParams clears ASC settings from interface wireguard.asc.
+func (s *Service) rciClearASCParams(ctx context.Context, ifaceName string) error {
+	return s.rciPost(ctx, map[string]interface{}{
+		"interface": map[string]interface{}{
+			ifaceName: map[string]interface{}{
+				"wireguard": map[string]interface{}{
+					"asc": map[string]interface{}{
+						"no": true,
+					},
+				},
+			},
+		},
+	})
+}
+
 // rciSetHotspotPolicy applies an ip hotspot policy to the interface.
-// policy is "permit", "deny", or an IP Policy profile name. For "none"
-// use rciClearHotspotPolicy.
+// policy is an IP Policy profile name. For "none" use
+// rciClearHotspotPolicy.
 //
-// JSON shape verified against /show/rc/ip/hotspot on a live router:
+// Write form verified on a live router. NB: the /show/rc/ip/hotspot read
+// form is an array keyed by "access"; the write command is a single
+// object keyed by "policy" (router replies "policy ... applied to
+// interface ..."):
 //
-//	"policy": [{"interface":"Bridge0","access":"permit"}, ...]
-//
-// access carries the literal value, including a profile name when the
-// chosen policy is a named IP Policy profile.
+//	{"ip":{"hotspot":{"policy":{"interface":"Wireguard0","policy":"Policy0"}}}}
 func (s *Service) rciSetHotspotPolicy(ctx context.Context, ifaceName, policy string) error {
 	return s.rciPost(ctx, map[string]interface{}{
 		"ip": map[string]interface{}{
 			"hotspot": map[string]interface{}{
-				"policy": []map[string]interface{}{
-					{"interface": ifaceName, "access": policy},
+				"policy": map[string]interface{}{
+					"interface": ifaceName,
+					"policy":    policy,
 				},
 			},
 		},
@@ -244,12 +270,18 @@ func (s *Service) rciSetHotspotPolicy(ctx context.Context, ifaceName, policy str
 
 // rciClearHotspotPolicy removes the ip hotspot policy from the interface
 // (default-permit). Mirrors `no policy <iface>` in (config-hotspot) mode.
+//
+// Write form verified on a live router (router replies "interface ...
+// policy cleared."):
+//
+//	{"ip":{"hotspot":{"policy":{"interface":"Wireguard0","no":true}}}}
 func (s *Service) rciClearHotspotPolicy(ctx context.Context, ifaceName string) error {
 	return s.rciPost(ctx, map[string]interface{}{
 		"ip": map[string]interface{}{
 			"hotspot": map[string]interface{}{
-				"policy": []map[string]interface{}{
-					{"no": true, "interface": ifaceName},
+				"policy": map[string]interface{}{
+					"interface": ifaceName,
+					"no":        true,
 				},
 			},
 		},
@@ -279,14 +311,13 @@ func (s *Service) rciInterfaceDown(ctx context.Context, ifaceName string) error 
 }
 
 // rciAddPeer adds a peer with all parameters in a single RCI call.
-func (s *Service) rciAddPeer(ctx context.Context, ifaceName, pubKey, psk, comment, peerIP string) error {
+func (s *Service) rciAddPeer(ctx context.Context, ifaceName, pubKey, psk, comment, peerIP string, enabled bool) error {
 	peer := map[string]interface{}{
 		"key":           pubKey,
 		"preshared-key": psk,
-		"connect":       true,
+		"connect":       enabled,
 		"allow-ips": []map[string]interface{}{
 			{"address": peerIP, "mask": "255.255.255.255"},
-			{"address": "0.0.0.0", "mask": "0.0.0.0"},
 		},
 	}
 	if comment != "" {
@@ -318,15 +349,19 @@ func (s *Service) rciRemovePeer(ctx context.Context, ifaceName, pubKey string) e
 	})
 }
 
-// rciSetPeerConnect enables or disables a peer.
-func (s *Service) rciSetPeerConnect(ctx context.Context, ifaceName, pubKey string, connect bool) error {
+// rciSetPeerConnect enables or disables a peer. comment must carry the peer's
+// current name: a partial peer update without it makes NDMS wipe the stored
+// comment (psk/allow-ips survive, comment does not).
+func (s *Service) rciSetPeerConnect(ctx context.Context, ifaceName, pubKey string, connect bool, comment string) error {
+	peer := map[string]interface{}{"key": pubKey, "connect": connect}
+	if comment != "" {
+		peer["comment"] = comment
+	}
 	return s.rciPost(ctx, map[string]interface{}{
 		"interface": map[string]interface{}{
 			ifaceName: map[string]interface{}{
 				"wireguard": map[string]interface{}{
-					"peer": []map[string]interface{}{
-						{"key": pubKey, "connect": connect},
-					},
+					"peer": []map[string]interface{}{peer},
 				},
 			},
 		},
@@ -348,6 +383,28 @@ func (s *Service) rciSetPeerComment(ctx context.Context, ifaceName, pubKey, comm
 	})
 }
 
+// rciRemovePeerDefaultRoute strips the legacy 0.0.0.0/0 entry from a peer's
+// allow-ips, leaving its /32 intact. Used by the one-time MigratePeerAllowIPs
+// sweep over peers created by older builds.
+func (s *Service) rciRemovePeerDefaultRoute(ctx context.Context, ifaceName, pubKey string) error {
+	return s.rciPost(ctx, map[string]interface{}{
+		"interface": map[string]interface{}{
+			ifaceName: map[string]interface{}{
+				"wireguard": map[string]interface{}{
+					"peer": []map[string]interface{}{
+						{
+							"key": pubKey,
+							"allow-ips": []map[string]interface{}{
+								{"no": true, "address": "0.0.0.0", "mask": "0.0.0.0"},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+}
+
 // rciUpdatePeerAllowIPs removes old allow-ips and sets new ones.
 func (s *Service) rciUpdatePeerAllowIPs(ctx context.Context, ifaceName, pubKey, oldIP, newIP string) error {
 	// Remove old
@@ -361,7 +418,6 @@ func (s *Service) rciUpdatePeerAllowIPs(ctx context.Context, ifaceName, pubKey, 
 								"key": pubKey,
 								"allow-ips": []map[string]interface{}{
 									{"no": true, "address": oldIP, "mask": "255.255.255.255"},
-									{"no": true, "address": "0.0.0.0", "mask": "0.0.0.0"},
 								},
 							},
 						},
@@ -383,7 +439,6 @@ func (s *Service) rciUpdatePeerAllowIPs(ctx context.Context, ifaceName, pubKey, 
 							"key": pubKey,
 							"allow-ips": []map[string]interface{}{
 								{"address": newIP, "mask": "255.255.255.255"},
-								{"address": "0.0.0.0", "mask": "0.0.0.0"},
 							},
 						},
 					},

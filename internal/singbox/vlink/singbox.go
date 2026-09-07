@@ -29,6 +29,7 @@ var supportedSingboxTypes = map[string]bool{
 	"trojan":      true,
 	"shadowsocks": true,
 	"hysteria2":   true,
+	"mieru":       true,
 }
 
 // servicedSingboxTypes is the set of outbound types that are infrastructural
@@ -71,18 +72,51 @@ func IsSingboxJSON(body []byte) bool {
 	return rootHasOutbounds(root)
 }
 
+func isXrayOutbounds(rawOutbounds any) bool {
+	obs, ok := rawOutbounds.([]any)
+	if !ok {
+		return false
+	}
+	for _, el := range obs {
+		if m, ok := el.(map[string]any); ok {
+			if _, hasProto := m["protocol"].(string); hasProto {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasSingboxTypeOutbounds(rawOutbounds any) bool {
+	obs, ok := rawOutbounds.([]any)
+	if !ok {
+		return false
+	}
+	if len(obs) == 0 {
+		return true
+	}
+	if isXrayOutbounds(rawOutbounds) {
+		return false
+	}
+	for _, el := range obs {
+		if m, ok := el.(map[string]any); ok {
+			if _, hasType := m["type"].(string); hasType {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // rootHasOutbounds checks the parsed JSON root for any of the three
 // recognised sing-box shapes. Used by IsSingboxJSON.
 func rootHasOutbounds(root any) bool {
 	switch r := root.(type) {
 	case map[string]any:
-		// Shape 1: single config object with outbounds key.
-		if _, ok := r["outbounds"].([]any); ok {
+		// Shape 1: single config object with outbounds key containing sing-box "type" fields.
+		if raw, ok := r["outbounds"]; ok && hasSingboxTypeOutbounds(raw) {
 			return true
 		}
-		// A single bare outbound object (type + tag) without a config
-		// envelope is not a recognised subscription shape — sing-box
-		// JSON exports always use one of the three documented shapes.
 		return false
 	case []any:
 		if len(r) == 0 {
@@ -93,8 +127,8 @@ func rootHasOutbounds(root any) bool {
 			if !ok {
 				continue
 			}
-			// Shape 2: array element is a config with outbounds.
-			if _, ok := obj["outbounds"].([]any); ok {
+			// Shape 2: array element is a config with outbounds containing sing-box "type" fields.
+			if raw, ok := obj["outbounds"]; ok && hasSingboxTypeOutbounds(raw) {
 				return true
 			}
 			// Shape 3: array element looks like a bare outbound
@@ -257,7 +291,7 @@ func buildSingboxOutbound(ob map[string]any, typ string) (*ParsedOutbound, error
 //   - server: non-empty
 //   - server_port: int in [1..65535]
 //   - per-type auth: vless→uuid, trojan→password, shadowsocks→method+password,
-//     hysteria2→password
+//     hysteria2→password, mieru→transport+username+password+port(s)
 //
 // Anything beyond this (transport/tls/multiplex shape) is left to sing-box
 // itself — if it can't load the outbound at Reload time, the user sees the
@@ -293,6 +327,21 @@ func validateSingboxOutbound(ob map[string]any, typ string) error {
 	case "hysteria2":
 		if asString(ob["password"]) == "" {
 			return fmt.Errorf("missing password")
+		}
+	case "mieru":
+		if asString(ob["transport"]) != "TCP" && asString(ob["transport"]) != "UDP" {
+			return fmt.Errorf("missing or invalid transport")
+		}
+		if asString(ob["username"]) == "" {
+			return fmt.Errorf("missing username")
+		}
+		if asString(ob["password"]) == "" {
+			return fmt.Errorf("missing password")
+		}
+		_, hasServerPort := asInt(ob["server_port"])
+		ports, hasServerPorts := ob["server_ports"].([]any)
+		if !hasServerPort && (!hasServerPorts || len(ports) == 0) {
+			return fmt.Errorf("missing server_port or server_ports")
 		}
 	}
 	return nil

@@ -17,11 +17,16 @@ import (
 type LogEntryDTO struct {
 	Timestamp string `json:"timestamp" example:"2024-01-15T10:30:00Z"`
 	Level     string `json:"level" example:"info"`
-	Group     string `json:"group" example:"tunnel"`
-	Subgroup  string `json:"subgroup" example:"tun_abc123"`
-	Action    string `json:"action" example:"connect"`
-	Target    string `json:"target" example:"vpn.example.com:51820"`
-	Message   string `json:"message" example:"Tunnel connected"`
+	Group     string `json:"group" example:"singbox"`
+	Subgroup  string `json:"subgroup" example:"dns"`
+	Action    string `json:"action" example:"run"`
+	Target    string `json:"target" example:"dns"`
+	Message   string `json:"message" example:"lookup succeed for node.example.org: 203.0.113.77"`
+	Sanitized bool   `json:"sanitized" example:"false"`
+	// Схлопнутые повторы: Repeats — сколько идентичных записей свёрнуто в
+	// эту (0 = уникальна), LastSeen — время последнего повтора.
+	Repeats  int    `json:"repeats,omitempty" example:"4"`
+	LastSeen string `json:"lastSeen,omitempty" example:"2024-01-15T10:35:00Z"`
 }
 
 // LogsData mirrors frontend LogsResponse.
@@ -29,9 +34,10 @@ type LogsData struct {
 	Enabled         bool          `json:"enabled" example:"true"`
 	Logs            []LogEntryDTO `json:"logs"`
 	Total           int           `json:"total" example:"42"`
-	Bucket          string        `json:"bucket" example:"app"`
+	Bucket          string        `json:"bucket" example:"singbox"`
 	BufferSize      int           `json:"bufferSize" example:"123"`
 	BufferCapacity  int           `json:"bufferCapacity" example:"5000"`
+	Sanitized       bool          `json:"sanitized" example:"false"`
 	OldestTimestamp string        `json:"oldestTimestamp,omitempty" example:"2024-01-15T08:00:00Z"`
 }
 
@@ -79,13 +85,14 @@ func (h *LoggingHandler) PublishSnapshot() {}
 
 // LogsResponse represents the response for get logs endpoint.
 type LogsResponse struct {
-	Enabled         bool               `json:"enabled"`
-	Logs            []logging.LogEntry `json:"logs"`
-	Total           int                `json:"total"`
-	Bucket          string             `json:"bucket"`
-	BufferSize      int                `json:"bufferSize"`
-	BufferCapacity  int                `json:"bufferCapacity"`
-	OldestTimestamp string             `json:"oldestTimestamp,omitempty"`
+	Enabled         bool          `json:"enabled"`
+	Logs            []LogEntryDTO `json:"logs"`
+	Total           int           `json:"total"`
+	Bucket          string        `json:"bucket"`
+	BufferSize      int           `json:"bufferSize"`
+	BufferCapacity  int           `json:"bufferCapacity"`
+	Sanitized       bool          `json:"sanitized"`
+	OldestTimestamp string        `json:"oldestTimestamp,omitempty"`
 }
 
 func parseBucket(raw string, def logging.Bucket) (logging.Bucket, bool) {
@@ -101,23 +108,97 @@ func parseBucket(raw string, def logging.Bucket) (logging.Bucket, bool) {
 	return "", false
 }
 
+func parseBoolQuery(raw string, def bool) (bool, bool) {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	switch v {
+	case "":
+		return def, true
+	case "1", "true", "t", "yes", "y", "on":
+		return true, true
+	case "0", "false", "f", "no", "n", "off":
+		return false, true
+	}
+	return false, false
+}
+
+func logEntryDTO(entry logging.LogEntry, sanitized bool) LogEntryDTO {
+	target := entry.Target
+	message := entry.Message
+	if sanitized {
+		target = logging.SanitizeLogText(target)
+		message = logging.SanitizeLogText(message)
+	}
+
+	dto := LogEntryDTO{
+		Timestamp: entry.Timestamp.UTC().Format(time.RFC3339Nano),
+		Level:     entry.Level,
+		Group:     entry.Group,
+		Subgroup:  entry.Subgroup,
+		Action:    entry.Action,
+		Target:    target,
+		Message:   message,
+		Sanitized: sanitized,
+		Repeats:   entry.Repeats,
+	}
+	if entry.LastSeen != nil {
+		dto.LastSeen = entry.LastSeen.UTC().Format(time.RFC3339Nano)
+	}
+	return dto
+}
+
+func logEntryDTOs(entries []logging.LogEntry, sanitized bool) []LogEntryDTO {
+	if len(entries) == 0 {
+		return []LogEntryDTO{}
+	}
+	out := make([]LogEntryDTO, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, logEntryDTO(entry, sanitized))
+	}
+	return out
+}
+
+// queryList reads repeated query params and comma-separated values.
+// For example: group=a&group=b and group=a,b.
+func queryList(q map[string][]string, key string) []string {
+	values := q[key]
+	out := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+
+	for _, raw := range values {
+		for _, part := range strings.Split(raw, ",") {
+			v := strings.TrimSpace(part)
+			if v == "" {
+				continue
+			}
+			if _, ok := seen[v]; ok {
+				continue
+			}
+			seen[v] = struct{}{}
+			out = append(out, v)
+		}
+	}
+
+	return out
+}
+
 // GetLogs returns log entries from the requested bucket with optional
 // filtering and pagination.
 //
-// GET /api/logs?bucket=app|singbox&group=&subgroup=&level=&limit=&offset=&since=
+// GET /api/logs?bucket=app|singbox&group=&subgroup=&level=&limit=&offset=&since=&sanitize=
 //
 //	@Summary		Get logs
-//	@Description	Returns log entries from the selected bucket. `bucket=app` (default) covers tunnel/routing/server/system events; `bucket=singbox` covers sing-box forwarder events isolated from app history.
+//	@Description	Returns log entries from the selected bucket. `bucket=app` (default) covers tunnel/routing/server/system events; `bucket=singbox` covers sing-box forwarder events isolated from app history. By default target/message are backend-masked; pass `sanitize=false` only when the authenticated admin UI explicitly reveals raw logs.
 //	@Tags			logs
 //	@Produce		json
 //	@Security		CookieAuth
 //	@Param			bucket		query		string	false	"Bucket selector"		Enums(app, singbox)
-//	@Param			group		query		string	false	"Filter by group"
-//	@Param			subgroup	query		string	false	"Filter by subgroup"
+//	@Param			group		query		[]string	false	"Filter by group (repeat param or comma-separated values)"	collectionFormat(multi)
+//	@Param			subgroup	query		[]string	false	"Filter by subgroup (repeat param or comma-separated values)"	collectionFormat(multi)
 //	@Param			level		query		string	false	"Filter by level"
 //	@Param			limit		query		int		false	"Max entries to return (default 200)"
 //	@Param			offset		query		int		false	"Skip first N matching entries"
 //	@Param			since		query		int		false	"Unix seconds — return only entries strictly after this"
+//	@Param			sanitize	query		bool	false	"Return backend-sanitized target/message values; default true, set false to reveal raw values"
 //	@Success		200	{object}	LogsResponseEnvelope
 //	@Failure		400	{object}	APIErrorEnvelope
 //	@Failure		500	{object}	APIErrorEnvelope
@@ -128,28 +209,36 @@ func (h *LoggingHandler) GetLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	bucket, ok := parseBucket(r.URL.Query().Get("bucket"), logging.BucketApp)
+	q := r.URL.Query()
+	bucket, ok := parseBucket(q.Get("bucket"), logging.BucketApp)
 	if !ok {
 		response.ErrorWithStatus(w, http.StatusBadRequest,
 			"invalid bucket: must be 'app' or 'singbox'", "INVALID_BUCKET")
 		return
 	}
 
-	group := r.URL.Query().Get("group")
-	subgroup := r.URL.Query().Get("subgroup")
-	level := r.URL.Query().Get("level")
+	sanitize, ok := parseBoolQuery(q.Get("sanitize"), true)
+	if !ok {
+		response.ErrorWithStatus(w, http.StatusBadRequest,
+			"invalid sanitize: must be true or false", "INVALID_SANITIZE")
+		return
+	}
+
+	groups := queryList(q, "group")
+	subgroups := queryList(q, "subgroup")
+	level := q.Get("level")
 
 	// Backward compat for old "category" param
-	if cat := r.URL.Query().Get("category"); cat != "" && group == "" {
+	if cat := q.Get("category"); cat != "" && len(groups) == 0 {
 		switch cat {
 		case "tunnel":
-			group = logging.GroupTunnel
+			groups = []string{logging.GroupTunnel}
 		case "settings":
-			group, subgroup = logging.GroupSystem, logging.SubSettings
+			groups, subgroups = []string{logging.GroupSystem}, []string{logging.SubSettings}
 		case "system":
-			group = logging.GroupSystem
+			groups = []string{logging.GroupSystem}
 		case "dns-route":
-			group, subgroup = logging.GroupRouting, logging.SubDnsRoute
+			groups, subgroups = []string{logging.GroupRouting}, []string{logging.SubDnsRoute}
 		}
 	}
 
@@ -175,19 +264,17 @@ func (h *LoggingHandler) GetLogs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	logs, total := h.svc.GetLogs(bucket, group, subgroup, level, since, limit, offset)
-	if logs == nil {
-		logs = []logging.LogEntry{}
-	}
+	entries, total := h.svc.GetLogsMulti(bucket, groups, subgroups, level, since, limit, offset)
 
 	stats := h.svc.Stats(bucket)
 	resp := LogsResponse{
 		Enabled:        h.svc.IsEnabled(),
-		Logs:           logs,
+		Logs:           logEntryDTOs(entries, sanitize),
 		Total:          total,
 		Bucket:         string(bucket),
 		BufferSize:     stats.Size,
 		BufferCapacity: stats.Capacity,
+		Sanitized:      sanitize,
 	}
 	if !stats.Oldest.IsZero() {
 		resp.OldestTimestamp = stats.Oldest.UTC().Format(time.RFC3339)

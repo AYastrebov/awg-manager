@@ -63,6 +63,11 @@ type Status struct {
 	// sing-box integration cannot route any traffic — the binary may be
 	// installed, but nothing works end-to-end.
 	ProxyComponent bool `json:"proxyComponent"`
+	// NDMSProxyEnabled mirrors Settings.CreateNDMSProxyForSingbox. When
+	// false, the UI hides ProxyComponent warnings and renders sing-box
+	// tunnel cards with a neutral "via sing-box" badge instead of the
+	// per-tunnel ProxyN label.
+	NDMSProxyEnabled bool `json:"ndmsProxyEnabled"`
 	// Features enumerates the build tags of the installed sing-box
 	// binary (parsed from the `Tags:` line of `sing-box version`).
 	// Example: ["with_gvisor","with_quic","with_naive_outbound",…].
@@ -78,8 +83,21 @@ type Status struct {
 	CurrentVersion string `json:"currentVersion,omitempty"`
 	// RequiredVersion is the version this awg-manager build is pinned to.
 	RequiredVersion string `json:"requiredVersion"`
-	// UpdateAvailable is true when CurrentVersion != "" and differs from RequiredVersion.
+	// CurrentSHA256 is the checksum of the binary on disk.
+	CurrentSHA256 string `json:"currentSha256,omitempty"`
+	// RequiredSHA256 is the checksum this awg-manager build is pinned to.
+	RequiredSHA256 string `json:"requiredSha256,omitempty"`
+	// UpdateAvailable is true when version or SHA256 differs from the pinned binary.
 	UpdateAvailable bool `json:"updateAvailable"`
+	// InstallState классифицирует состояние managed binary относительно
+	// pin-версии и доступного места. UI рендерит на его основе.
+	InstallState string `json:"installState"`
+	// RequiredBytes — размер требуемого бинарника + safetyMargin (байты).
+	// 0 когда RequiredSize неизвестен (старая схема).
+	RequiredBytes int64 `json:"requiredBytes"`
+	// FreeBytes — свободное место на FS managed binary dir (после diskReserveBytes-минус).
+	// 0 когда statfs недоступен.
+	FreeBytes int64 `json:"freeBytes"`
 }
 
 // ProcessState is the internal lifecycle state.

@@ -1,7 +1,6 @@
 <script lang="ts">
 	import type { SingboxTunnel } from '$lib/types';
 	import { goto } from '$app/navigation';
-	import { browser } from '$app/environment';
 	import { api } from '$lib/api/client';
 	import {
 		singboxTunnels,
@@ -9,14 +8,31 @@
 		singboxTraffic,
 		triggerDelayCheck,
 	} from '$lib/stores/singbox';
-	import { onMount, untrack } from 'svelte';
-	import { Modal, Button, TrafficChart, TrafficSparkline } from '$lib/components/ui';
+	import { untrack } from 'svelte';
+	import { Modal, Button, TrafficSparkline, TrafficChart } from '$lib/components/ui';
+	import { TunnelListActions } from '$lib/components/ui';
+	import {
+		TunnelDelaySparkBars,
+		TunnelListEndpointLine,
+		TunnelListTrafficCell,
+		TunnelMetaText,
+		TunnelSingboxPingButton,
+		TunnelTitleRow,
+	} from '$lib/components/tunnels';
+	import { singboxDelayStatusDot } from '$lib/utils/statusDot';
+	import { formatBitRate, formatBytes } from '$lib/utils/format';
 	import { getTrafficRates, subscribeTraffic, loadHistory } from '$lib/stores/traffic';
+	import { singboxDelayFromHistory } from '$lib/utils/singboxDelay';
 	import type { SingboxLayoutMode } from '$lib/constants/singboxLayout';
+	import { Eye, EyeOff } from 'lucide-svelte';
+	import TunnelDiagnosticsModal from '$lib/components/testing/TunnelDiagnosticsModal.svelte';
+	import { notifications } from '$lib/stores/notifications';
+	import { showOutboundReferencedError } from '$lib/utils/outboundReferenced';
 
 	interface Props {
 		tunnel: SingboxTunnel;
 		layout?: SingboxLayoutMode;
+		renderMode?: import('$lib/constants/singboxLayout').TunnelRenderMode;
 		autoDelayCheckNonce?: number;
 		autoDelayCheckDelayMs?: number;
 		ondetail?: (tag: string) => void;
@@ -24,7 +40,8 @@
 
 	let {
 		tunnel,
-		layout = 'grid',
+		layout = 'compact',
+		renderMode = 'compact',
 		autoDelayCheckNonce = 0,
 		autoDelayCheckDelayMs = 0,
 		ondetail,
@@ -32,19 +49,15 @@
 
 	let deleting = $state(false);
 	let confirmDeleteOpen = $state(false);
+	let diagnosticsOpen = $state(false);
 	let showServer = $state(false);
 	let checking = $state(false);
 
-	const DELAY_OK = 200;
-	const DELAY_SLOW = 500;
-
 	const history = $derived($singboxDelayHistory.get(tunnel.tag) ?? []);
-	const latest = $derived(history.length > 0 ? history[history.length - 1] : undefined);
-	const hasConsecutiveTimeout = $derived(
-		history.length >= 2 &&
-			history[history.length - 1] <= 0 &&
-			history[history.length - 2] <= 0,
+	const delayPresentation = $derived(
+		singboxDelayFromHistory(history, { running: tunnel.running !== false }),
 	);
+	const latest = $derived(delayPresentation.latest);
 	const positiveHistory = $derived(history.filter((v) => v > 0));
 	const avg = $derived(
 		positiveHistory.length > 0
@@ -53,46 +66,43 @@
 	);
 	const traffic = $derived($singboxTraffic.get(tunnel.tag));
 
-	const trafficSparkData = $derived.by(() => {
+	const trafficSparkSeries = $derived.by(() => {
 		const n = Math.min(rxRates.length, txRates.length);
-		if (n === 0) return [];
+		if (n === 0) return { rx: [] as number[], tx: [] as number[] };
 		const take = Math.min(36, n);
-		const out: number[] = [];
-		for (let i = n - take; i < n; i++) {
-			out.push(Math.max(0, rxRates[i] ?? 0) + Math.max(0, txRates[i] ?? 0));
-		}
-		return out;
+		const start = n - take;
+		return {
+			rx: rxRates.slice(start, n),
+			tx: txRates.slice(start, n),
+		};
 	});
 
-	type State = 'ok' | 'slow' | 'fail' | 'unknown' | 'stopped';
-	const cardState: State = $derived.by(() => {
-		// Runtime truth takes priority over delay history: if the process
-		// is dead or the TUN is missing, recent latency numbers are stale
-		// noise. Show 'stopped' so the user knows to restart the daemon
-		// instead of debugging a timeout that isn't actually a timeout.
-		if (tunnel.running === false) return 'stopped';
-		if (latest === undefined) return 'unknown';
-		if (latest <= 0) return hasConsecutiveTimeout ? 'fail' : 'slow';
-		if (latest < DELAY_OK) return 'ok';
-		if (latest < DELAY_SLOW) return 'slow';
-		return 'slow';
-	});
-
-	const latText = $derived.by(() => {
-		if (cardState === 'stopped') return 'stopped';
-		if (cardState === 'unknown') return '—';
-		if (cardState === 'fail') return 'timeout';
-		if (latest !== undefined && latest <= 0) return 'проверка...';
-		return `${latest}ms`;
-	});
-
-	const testHref = $derived(`/singbox/${encodeURIComponent(tunnel.tag)}/test`);
-	const resolvedTestHref = $derived(tunnel.kernelInterface ? testHref : undefined);
+	const cardState = $derived(delayPresentation.state);
+	const latText = $derived(delayPresentation.label);
+	const statusDot = $derived(singboxDelayStatusDot(cardState, tunnel.running !== false));
 
 	const protocolLabel = $derived.by(() => {
-		if (tunnel.protocol === 'vless') return 'VLESS';
-		if (tunnel.protocol === 'hysteria2') return 'Hysteria2';
-		return 'NaiveProxy';
+		// Widen locally: the generated/static type is currently an exhaustive union,
+		// but runtime data may contain a newer sing-box protocol before frontend types
+		// are updated. Keep a safe fallback without making the default branch `never`.
+		const protocol = tunnel.protocol as string | undefined;
+
+		switch (protocol) {
+			case 'vless':
+				return 'VLESS';
+			case 'hysteria2':
+				return 'Hysteria2';
+			case 'trojan':
+				return 'Trojan';
+			case 'shadowsocks':
+				return 'Shadowsocks';
+			case 'naive':
+				return 'Naive';
+			case 'mieru':
+				return 'Mieru';
+			default:
+				return protocol ? protocol.charAt(0).toUpperCase() + protocol.slice(1) : '—';
+		}
 	});
 
 	async function triggerCheck(): Promise<void> {
@@ -126,6 +136,10 @@
 			const fresh = await api.singboxDeleteTunnel(tunnel.tag);
 			// Instant update — beats waiting for the poll or SSE hint refetch.
 			singboxTunnels.applyMutationResponse(fresh);
+		} catch (e) {
+			if (!showOutboundReferencedError(e, tunnel.tag, 'Туннель')) {
+				notifications.error(e instanceof Error ? e.message : 'Не удалось удалить туннель');
+			}
 		} finally {
 			deleting = false;
 		}
@@ -135,17 +149,13 @@
 		goto(`/singbox/${encodeURIComponent(tunnel.tag)}`);
 	}
 
-	function formatBytes(n: number): string {
-		if (n < 1024) return `${n} B`;
-		if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-		if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-		return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-	}
-
 	// ─── Traffic sparkline (rate history fed by +layout SSE handler) ─
 	let rxRates = $state<number[]>([]);
 	let txRates = $state<number[]>([]);
 	let tunnelTag = $derived(tunnel.tag);
+
+	let inlineRxRate = $derived(rxRates.length > 0 ? rxRates[rxRates.length - 1] : 0);
+	let inlineTxRate = $derived(txRates.length > 0 ? txRates[txRates.length - 1] : 0);
 
 	$effect(() => {
 		const tag = tunnelTag;
@@ -166,22 +176,10 @@
 		untrack(() => loadHistory(tag));
 	});
 
-	const CHART_KEY_PREFIX = 'sbx_chart_expanded_';
-	let chartStorageKey = $derived(`${CHART_KEY_PREFIX}${tunnel.tag}`);
-	let chartExpanded = $state(true);
-	onMount(() => {
-		chartExpanded = localStorage.getItem(chartStorageKey) !== 'false';
-	});
-	function toggleCharts() {
-		chartExpanded = !chartExpanded;
-		if (browser) {
-			localStorage.setItem(chartStorageKey, String(chartExpanded));
-		}
-	}
 </script>
 
-{#if layout === 'list'}
-	<div
+{#if renderMode === 'table'}
+	<tr
 		class="sbx-tunnel-list-row"
 		class:ok={cardState === 'ok'}
 		class:slow={cardState === 'slow'}
@@ -189,27 +187,34 @@
 		class:unknown={cardState === 'unknown'}
 		class:stopped={cardState === 'stopped'}
 	>
-		<div class="list-cell list-cell-delay" data-label="Delay">
-			<span class="dot {cardState}" aria-hidden="true"></span>
-			<button
-				type="button"
-				class="lat-btn {cardState}"
-				class:checking
+		<td class="tunnel-list-cell tunnel-list-cell--delay list-cell list-cell-delay">
+			<TunnelSingboxPingButton
+				layout="list"
+				label={latText}
+				state={cardState}
+				{checking}
 				onclick={triggerCheck}
-				title="Обновить delay"
-				disabled={checking}
-			>
-				{checking ? '...' : latText}
-			</button>
-		</div>
-		<div class="list-cell list-cell-name" data-label="Туннель">
-			<button type="button" class="name-btn" onclick={edit}>{tunnel.tag}</button>
-			<div class="list-sub mono">
-				{tunnel.proxyInterface}
-				{#if tunnel.kernelInterface}<span> · {tunnel.kernelInterface}</span>{/if}
+			/>
+		</td>
+		<td class="tunnel-list-cell tunnel-list-cell--name list-cell list-cell-name">
+			<div class="tunnel-list-name-stack">
+				<TunnelTitleRow
+					title={tunnel.tag}
+					dotVariant={statusDot.variant}
+					dotPulse={statusDot.pulse}
+					dotLabel={tunnel.tag}
+					onTitleClick={edit}
+				/>
+				<TunnelMetaText mono>
+					<span>{tunnel.proxyInterface || 'via sing-box'}</span>
+					{#if tunnel.kernelInterface}
+						<span class="meta-dot" aria-hidden="true">·</span><span>{tunnel.kernelInterface}</span>
+					{/if}
+				</TunnelMetaText>
+				<TunnelListEndpointLine host={tunnel.server} port={tunnel.port} bind:show={showServer} />
 			</div>
-		</div>
-		<div class="list-cell list-cell-badges" data-label="Протокол">
+		</td>
+		<td class="list-cell list-cell-badges">
 			<div class="badges-inline">
 				<span class="badge b-{tunnel.protocol}">{protocolLabel}</span>
 				{#if tunnel.security === 'reality'}
@@ -219,145 +224,197 @@
 				{/if}
 				<span class="badge b-transport">{tunnel.transport.toUpperCase()}</span>
 			</div>
-		</div>
-		<div class="list-cell list-cell-server" data-label="Сервер">
-			<div class="server-line">
-				{#if showServer}
-					<span class="mono">{tunnel.server}</span>
-				{:else}
-					<span class="muted">••••••••</span>
-				{/if}
-				<button
-					type="button"
-					class="eye-inline"
-					onclick={() => (showServer = !showServer)}
-					aria-label={showServer ? 'Скрыть' : 'Показать'}
-				>
-					{#if showServer}
-						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-					{:else}
-						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
-					{/if}
-				</button>
-				<span class="mono">:{tunnel.port}</span>
-			</div>
-		</div>
-		<div class="list-cell list-cell-run" data-label="Процесс">
+		</td>
+		<td class="list-cell list-cell-run">
 			<span class="run-pill" class:run-on={tunnel.running === true}>{tunnel.running === true ? 'running' : 'stopped'}</span>
-		</div>
-		<div class="list-cell list-cell-traffic" data-label="Трафик">
-			<div class="traffic-row-list">
-				<div
-					role="button"
-					tabindex="0"
-					class="traffic-mini-click"
-					onclick={() => ondetail?.(tunnel.tag)}
-					onkeydown={(e) => {
-						if (e.key === 'Enter' || e.key === ' ') {
-							e.preventDefault();
-							ondetail?.(tunnel.tag);
-						}
-					}}
-					title="Открыть детальный график"
-				>
-					<TrafficSparkline
-						data={trafficSparkData}
-						width={84}
-						height={22}
-						color={tunnel.running === true ? 'var(--color-accent)' : 'var(--color-border-hover)'}
-					/>
-				</div>
-				<div class="traffic-mini-col mono">
-					<span>↓ {formatBytes(traffic?.download ?? 0)}</span>
-					<span>↑ {formatBytes(traffic?.upload ?? 0)}</span>
-				</div>
+		</td>
+		<td class="tunnel-list-cell tunnel-list-cell--traffic list-cell list-cell-traffic">
+			<TunnelListTrafficCell
+				rxRate={inlineRxRate}
+				txRate={inlineTxRate}
+				rxData={trafficSparkSeries.rx}
+				txData={trafficSparkSeries.tx}
+				onclick={() => ondetail?.(tunnel.tag)}
+				title="Открыть детальный график"
+			/>
+		</td>
+		<td class="tunnel-list-cell tunnel-list-cell--ping list-cell list-cell-ping-mini">
+			<TunnelDelaySparkBars history={history} state={cardState} layout="list" onclick={triggerCheck} />
+		</td>
+		<td class="tunnel-list-cell tunnel-list-cell--actions list-cell list-cell-actions col-actions">
+			<TunnelListActions
+				onEdit={edit}
+				editTitle="Изменить туннель «{tunnel.tag}»"
+				onTest={() => (diagnosticsOpen = true)}
+				testDisabled={!tunnel.kernelInterface}
+				testTitle="Тест туннеля «{tunnel.tag}»"
+				onDelete={() => (confirmDeleteOpen = true)}
+				deleteDisabled={deleting}
+				deleting={deleting}
+				deleteTitle="Удалить туннель «{tunnel.tag}»"
+			/>
+		</td>
+	</tr>
+{:else if layout === 'dense' || renderMode === 'list-card'}
+<div
+	class="card view-dense"
+	class:view-list={renderMode === 'list-card'}
+	class:ok={cardState === 'ok'}
+	class:slow={cardState === 'slow'}
+	class:fail={cardState === 'fail'}
+	class:unknown={cardState === 'unknown'}
+	class:stopped={cardState === 'stopped'}
+>
+	<div class="header header-dense">
+		<div class="header-dense-body">
+			<div class="title-row-dense">
+				<TunnelTitleRow
+					title={tunnel.tag}
+					dotVariant={statusDot.variant}
+					dotPulse={statusDot.pulse}
+					dense
+					onTitleClick={edit}
+				/>
 			</div>
-		</div>
-		<div class="list-cell list-cell-ping-mini" data-label="Ping">
-			<div
-				class="spark-mini spark {cardState}"
-				onclick={triggerCheck}
-				onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && triggerCheck()}
-				role="button"
-				tabindex="0"
-				title="Клик — обновить delay"
-			>
-				{#if history.length === 0}
-					{#each Array(10) as _, i (i)}
-						<div class="bar empty"></div>
-					{/each}
-				{:else}
-					{@const max = Math.max(...history.map((v) => (v <= 0 ? 100 : v)), 100)}
-					{#each history.slice(-14) as d, i (i)}
-						<div class="bar" style="height: {Math.max((d <= 0 ? max : d) / max, 0.08) * 100}%;"></div>
-					{/each}
+			<div class="meta-tags-dense">
+				<span class="iface-dense" title="{tunnel.proxyInterface || 'via sing-box'}{tunnel.kernelInterface ? ` · ${tunnel.kernelInterface}` : ''}">
+					<span>{tunnel.proxyInterface || 'via sing-box'}</span>
+					{#if tunnel.kernelInterface}<span class="meta-dot" aria-hidden="true">·</span><span>{tunnel.kernelInterface}</span>{/if}
+				</span>
+				<span class="badge b-{tunnel.protocol}">{protocolLabel}</span>
+				{#if tunnel.security === 'reality'}
+					<span class="badge b-reality">Reality</span>
+				{:else if tunnel.security === 'tls'}
+					<span class="badge b-tls">TLS</span>
 				{/if}
+				<span class="badge b-transport">{tunnel.transport.toUpperCase()}</span>
 			</div>
 		</div>
-		<div class="list-cell list-cell-actions" data-label="Действия">
-			<div class="list-actions">
-				<button class="action-btn" type="button" onclick={edit}>
-					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-						<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-						<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-					</svg>
-					Изменить
-				</button>
-				{#if resolvedTestHref}
-					<a class="action-btn" href={resolvedTestHref}>
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-							<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
-							<polyline points="22,4 12,14.01 9,11.01"/>
-						</svg>
-						Тест
-					</a>
-				{:else}
-					<button class="action-btn" type="button" disabled>
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-							<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
-							<polyline points="22,4 12,14.01 9,11.01"/>
-						</svg>
-						Тест
-					</button>
-				{/if}
-				<button class="action-btn action-danger" type="button" onclick={() => (confirmDeleteOpen = true)} disabled={deleting}>
-					{#if deleting}
-						<span class="action-spinner"></span>
-					{:else}
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-							<polyline points="3,6 5,6 21,6"/>
-							<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-						</svg>
-					{/if}
-					Удалить
-				</button>
+		<div class="dense-toolbar">
+			<div class="dense-toolbar-bottom">
+				<TunnelSingboxPingButton layout="dense" label={latText} state={cardState} {checking} onclick={triggerCheck} />
 			</div>
 		</div>
-	</div>
-{:else}
-<div class="card" class:ok={cardState === 'ok'} class:slow={cardState === 'slow'} class:fail={cardState === 'fail'} class:unknown={cardState === 'unknown'} class:stopped={cardState === 'stopped'}>
-	<div class="led-wrap">
-		<span class="dot {cardState}" aria-hidden="true"></span>
-		<button
-			class="lat-btn {cardState}"
-			class:checking
-			onclick={triggerCheck}
-			title="Обновить delay"
-			disabled={checking}
-		>
-			<span>{latText}</span>
-			<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-				<path d="M23 4v6h-6M1 20v-6h6"/>
-				<path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
-			</svg>
-		</button>
 	</div>
 
-	<h3 class="title">{tunnel.tag}</h3>
+	{#if renderMode !== 'list-card'}
+	<div class="details">
+	<div class="details-dense-cols">
+		<div class="details-dense-col details-dense-col-lead">
+			<div class="kv-stacked-stat">
+				<span class="kv-stacked-label">Сервер</span>
+				<span class="kv-endpoint">
+					<span class="kv-stacked-value" title={showServer ? tunnel.server : ''}>
+						{showServer ? tunnel.server : '••••••••'}
+					</span>
+					<button class="icon-btn" onclick={() => (showServer = !showServer)} aria-label={showServer ? 'Скрыть' : 'Показать'}>
+						{#if showServer}
+							<Eye size={12} aria-hidden="true" />
+						{:else}
+							<EyeOff size={12} aria-hidden="true" />
+						{/if}
+					</button>
+				</span>
+			</div>
+			{#if tunnel.protocol === 'naive'}
+				<div class="kv-stacked-stat">
+					<span class="kv-stacked-label">Логин</span>
+					<span class="kv-stacked-value">{tunnel.username || '—'}</span>
+				</div>
+			{:else if tunnel.sni}
+				<div class="kv-stacked-stat">
+					<span class="kv-stacked-label">SNI</span>
+					<span class="kv-stacked-value">{showServer ? tunnel.sni : '••••••••'}</span>
+				</div>
+			{/if}
+		</div>
+		<div class="details-dense-col details-dense-col-right">
+			<div class="kv-stacked-stat">
+				<span class="kv-stacked-label">Порт</span>
+				<span class="kv-stacked-value">:{tunnel.port}</span>
+			</div>
+			<div class="kv-stacked-stat">
+				<span class="kv-stacked-label">Delay</span>
+				<span class="kv-stacked-value">
+					{#if cardState === 'unknown'}—{:else if cardState === 'fail'}fail{:else}avg {avg}ms{/if}
+				</span>
+			</div>
+		</div>
+	</div>
+	</div>
+	{/if}
+
+	<div class="actions">
+		<TunnelListActions
+			variant="labeled"
+			onEdit={edit}
+			editTitle="Изменить туннель «{tunnel.tag}»"
+			onTest={() => (diagnosticsOpen = true)}
+			testDisabled={!tunnel.kernelInterface}
+			testTitle="Тест туннеля «{tunnel.tag}»"
+			onDelete={() => (confirmDeleteOpen = true)}
+			deleteDisabled={deleting}
+			deleting={deleting}
+			deleteTitle="Удалить туннель «{tunnel.tag}»"
+		/>
+	</div>
+
+	{#if renderMode !== 'list-card'}
+	<div class="charts-dense">
+		<button
+			type="button"
+			class="traffic-inline"
+			onclick={() => ondetail?.(tunnel.tag)}
+			title="Открыть график трафика"
+		>
+			<TrafficSparkline
+				rxData={trafficSparkSeries.rx}
+				txData={trafficSparkSeries.tx}
+				responsive
+				height={20}
+			/>
+			<div class="traffic-inline-rates">
+				<span class="traffic-inline-rate rx">↓ {formatBitRate(inlineRxRate)}</span>
+				<span class="traffic-inline-rate tx">↑ {formatBitRate(inlineTxRate)}</span>
+			</div>
+		</button>
+		<div class="chart-inline delay-inline">
+			<div class="chart-inline-head">
+				<span class="chart-inline-label">Delay (5 мин)</span>
+			</div>
+			<TunnelDelaySparkBars
+				history={history}
+				state={cardState}
+				layout="dense"
+				onclick={() => void triggerCheck()}
+			/>
+		</div>
+	</div>
+	{/if}
+</div>
+{:else}
+<div
+	class="card view-compact"
+	class:ok={cardState === 'ok'}
+	class:slow={cardState === 'slow'}
+	class:fail={cardState === 'fail'}
+	class:unknown={cardState === 'unknown'}
+	class:stopped={cardState === 'stopped'}
+>
+	<div class="tunnel-card-intro">
+	<div class="title-row">
+		<TunnelTitleRow
+			title={tunnel.tag}
+			dotVariant={statusDot.variant}
+			dotPulse={statusDot.pulse}
+			onTitleClick={edit}
+		/>
+		<TunnelSingboxPingButton layout="compact" label={latText} state={cardState} {checking} onclick={triggerCheck} />
+	</div>
 	<div class="iface">
-		{tunnel.proxyInterface}
+		<span>{tunnel.proxyInterface || 'via sing-box'}</span>
 		{#if tunnel.kernelInterface}
-			<span class="kernel">· {tunnel.kernelInterface}</span>
+			<span class="meta-dot" aria-hidden="true">·</span><span>{tunnel.kernelInterface}</span>
 		{/if}
 	</div>
 
@@ -370,6 +427,9 @@
 		{/if}
 		<span class="badge b-transport">{tunnel.transport.toUpperCase()}</span>
 	</div>
+	</div>
+
+	<div class="divider divider-dashed"></div>
 
 	<div class="row">
 		<span class="label">Сервер</span>
@@ -380,10 +440,7 @@
 				<span class="server-hidden">●●●●●●●●</span>
 			{/if}
 			<button class="icon-btn" onclick={() => (showServer = !showServer)} aria-label={showServer ? 'Скрыть' : 'Показать'}>
-				<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-					<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
-					<circle cx="12" cy="12" r="3"/>
-				</svg>
+				<Eye size={12} aria-hidden="true" />
 			</button>
 			<span class="port">:{tunnel.port}</span>
 		</div>
@@ -407,66 +464,32 @@
 		</div>
 	{/if}
 
-	<div class="actions">
-		<Button variant="ghost" size="sm" onclick={edit} iconBefore={editIcon}>Изменить</Button>
-		<Button
-			variant="ghost"
-			size="sm"
-			href={resolvedTestHref}
-			disabled={!tunnel.kernelInterface}
-			iconBefore={testIcon}
-		>
-			Тест
-		</Button>
-		<button
-			class="action-btn action-danger"
-			type="button"
-			onclick={() => (confirmDeleteOpen = true)}
-			disabled={deleting}
-			title="Удалить туннель"
-		>
-			{#if deleting}
-				<span class="action-spinner"></span>
-			{:else}
-				{@render deleteIcon()}
-			{/if}
-			Удалить
-		</button>
+	<div class="actions actions--bar">
+		<TunnelListActions
+			variant="labeled"
+			onEdit={edit}
+			editTitle="Изменить туннель «{tunnel.tag}»"
+			onTest={() => (diagnosticsOpen = true)}
+			testDisabled={!tunnel.kernelInterface}
+			testTitle="Тест туннеля «{tunnel.tag}»"
+			onDelete={() => (confirmDeleteOpen = true)}
+			deleteDisabled={deleting}
+			deleting={deleting}
+			deleteTitle="Удалить туннель «{tunnel.tag}»"
+		/>
 	</div>
 
 	<div class="chart-section">
-		<button type="button" class="chart-header" onclick={toggleCharts}>
-			<span class="chart-label">Графики</span>
-			<span class="chart-chevron" class:expanded={chartExpanded}>▾</span>
-		</button>
-		<div class="chart-body" class:expanded={chartExpanded}>
+		<div class="chart-body">
 			<div class="chart-head">
 				<span>Delay (5 мин)</span>
-				<span class="stats">
-					{#if cardState === 'unknown'}
-						ещё не тестировали
-					{:else if cardState === 'fail'}
-						<span class="err">не отвечает</span>
-					{:else}
-						avg {avg}ms
-					{/if}
-				</span>
 			</div>
-			<div
-				class="spark {cardState}"
-				title="Delay за последние проверки"
-			>
-				{#if history.length === 0}
-					{#each Array(6) as _}
-						<div class="bar empty"></div>
-					{/each}
-				{:else}
-					{@const max = Math.max(...history.map((v) => (v <= 0 ? 100 : v)), 100)}
-					{#each history as d}
-						<div class="bar" style="height: {Math.max((d <= 0 ? max : d) / max, 0.1) * 100}%;"></div>
-					{/each}
-				{/if}
-			</div>
+			<TunnelDelaySparkBars
+				history={history}
+				state={cardState}
+				layout="compact"
+				onclick={() => void triggerCheck()}
+			/>
 			<div class="chart-head traffic-head">
 				<span>Трафик</span>
 				<span class="stats">
@@ -486,6 +509,18 @@
 </div>
 {/if}
 
+<TunnelDiagnosticsModal
+	open={diagnosticsOpen}
+	kind="singbox"
+	targetId={tunnel.tag}
+	displayName={tunnel.tag}
+	subjectLabel="туннель"
+	iface={tunnel.kernelInterface}
+	loading={false}
+	unavailableReason={tunnel.kernelInterface ? undefined : 'У этого sing-box туннеля нет kernel interface, расширенные тесты недоступны.'}
+	onclose={() => (diagnosticsOpen = false)}
+/>
+
 <Modal
 	open={confirmDeleteOpen}
 	title="Удаление"
@@ -499,129 +534,364 @@
 	{/snippet}
 </Modal>
 
-{#snippet testIcon()}
-	<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-		<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
-		<polyline points="22,4 12,14.01 9,11.01"/>
-	</svg>
-{/snippet}
-
-{#snippet editIcon()}
-	<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-		<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-		<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
-	</svg>
-{/snippet}
-
-{#snippet deleteIcon()}
-	<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-		<polyline points="3,6 5,6 21,6"/>
-		<path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-	</svg>
-{/snippet}
-
 <style>
 	.card {
 		display: flex;
 		flex-direction: column;
-		padding: 16px;
-		border: 1px solid var(--border);
-		border-radius: 10px;
-		background: var(--bg-card);
-		color: var(--text);
+		gap: 10px;
+		padding: 12px 14px;
+		background: var(--color-bg-secondary);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius);
+		color: var(--color-text-primary);
 		position: relative;
-		transition: border-color 0.2s;
+		transition: border-color var(--t-fast) ease;
 	}
-	.card.ok { border-color: rgba(16, 185, 129, 0.3); }
-	.card.slow { border-color: rgba(245, 158, 11, 0.3); }
-	.card.fail { border-color: rgba(239, 68, 68, 0.3); }
-	.card.stopped { border-color: rgba(148, 163, 184, 0.4); opacity: 0.7; }
+	.card.ok { border-color: var(--color-success-border); }
+	.card.slow { border-color: var(--color-warning-border); }
+	.card.fail { border-color: var(--color-error-border); }
+	.card.unknown { border-color: var(--color-border); }
+	.card.stopped { border-color: var(--color-muted-border); opacity: 0.7; }
 
-	.led-wrap {
-		position: absolute;
-		top: 14px;
-		right: 14px;
+	.card.view-dense {
+		gap: 8px;
+		padding: 10px 12px;
+		position: relative;
+	}
+
+	.card.view-dense .header.header-dense {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto;
+		align-items: flex-start;
+		gap: 6px;
+	}
+
+	.header-dense-body {
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+		min-width: 0;
+	}
+
+	.title-row-dense {
+		display: grid;
+		grid-template-columns: auto minmax(0, 1fr);
+		align-items: center;
+		gap: 6px;
+		min-width: 0;
+	}
+
+	.title-dense {
+		margin: 0;
+		padding: 0;
+		border: none;
+		background: none;
+		font: inherit;
+		font-size: 13px;
+		font-weight: 600;
+		color: inherit;
+		cursor: pointer;
+		text-align: left;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.title-dense:hover {
+		color: var(--color-accent);
+	}
+
+	.meta-tags-dense {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		margin-top: 3px;
+		gap: 3px;
+		min-width: 0;
+	}
+
+	.iface-dense {
+		display: inline-flex;
+		flex-wrap: wrap;
+		align-items: center;
+		font-size: 9px;
+		font-weight: 500;
+		font-family: var(--font-mono, monospace);
+		color: var(--color-text-muted);
+		min-width: 0;
+	}
+
+	.meta-dot {
+		margin: 0 0.35em;
+		opacity: 0.75;
+	}
+
+	.card.view-dense .meta-tags-dense .badge {
+		font-size: 9px;
+		padding: 1px 5px;
+		line-height: 1.3;
+	}
+
+	.dense-toolbar {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-end;
+		flex-shrink: 0;
+	}
+
+	.dense-toolbar-bottom {
+		display: flex;
+		align-items: center;
+	}
+
+	.details-dense-cols {
+		display: grid;
+		grid-template-columns: minmax(0, 1.2fr) 5.75rem;
+		gap: 10px 10px;
+		align-items: start;
+	}
+
+	.details-dense-col {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		min-width: 0;
+	}
+
+	.kv-stacked-stat {
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+		min-width: 0;
+	}
+
+	.card.view-dense .kv-endpoint {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+		min-width: 0;
+	}
+
+	.kv-stacked-label {
+		font-size: 9px;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--color-text-muted);
+		line-height: 1.2;
+	}
+
+	.kv-stacked-value {
+		font-size: 10px;
+		font-family: var(--font-mono, monospace);
+		color: var(--color-text-secondary);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		line-height: 1.25;
+	}
+
+	.card.view-dense .details {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		padding: 4px 0;
+		border-top: 1px solid var(--color-border);
+		border-bottom: 1px solid var(--color-border);
+	}
+
+	.charts-dense {
+		display: flex;
+		flex-direction: row;
+		align-items: stretch;
+		gap: 4px;
+		width: 100%;
+		min-width: 0;
+	}
+
+	.charts-dense > .delay-inline,
+	.charts-dense > .traffic-inline {
+		flex: 1 1 0;
+		min-width: 0;
+		width: auto;
+	}
+
+	.chart-inline {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+		min-width: 0;
+		padding: 5px 6px;
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-sm);
+		background: var(--color-bg-secondary);
+		font: inherit;
+		color: inherit;
+		text-align: left;
+	}
+
+	.chart-inline.delay-inline {
+		padding: 5px 6px 4px;
+	}
+
+	.charts-dense .traffic-inline {
+		display: flex;
+		align-items: center;
+		gap: 0.3rem;
+		padding: 5px 4px 5px 5px;
+		margin: 0;
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-sm);
+		background: var(--color-bg-secondary);
+		cursor: pointer;
+		font: inherit;
+		color: inherit;
+		text-align: left;
+		transition: background var(--t-fast) ease, border-color var(--t-fast) ease;
+	}
+
+	.charts-dense .traffic-inline :global(svg.responsive) {
+		flex: 1 1 auto;
+		width: 100%;
+		min-width: 0;
+	}
+
+	.traffic-inline:hover {
+		background: var(--color-bg-hover);
+		border-color: var(--color-border-hover);
+	}
+
+	.traffic-inline:focus-visible {
+		outline: 2px solid var(--color-accent);
+		outline-offset: 2px;
+	}
+
+	.charts-dense .traffic-inline-rates {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 0.06rem;
+		padding-block: 2px;
+		min-width: 0;
+		flex: 0 0 auto;
+		font-size: 9px;
+		line-height: 1.1;
+		font-family: var(--font-mono, monospace);
+		font-variant-numeric: tabular-nums;
+	}
+
+	.charts-dense .traffic-inline-rate {
+		max-width: 100%;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.traffic-inline-rate.rx {
+		color: var(--color-accent);
+	}
+
+	.traffic-inline-rate.tx {
+		color: var(--color-success);
+	}
+
+	.chart-inline-head {
+		display: flex;
+		justify-content: space-between;
+		align-items: baseline;
+		gap: 6px;
+		font-size: 9px;
+		line-height: 1.2;
+	}
+
+	.chart-inline-label {
+		color: var(--color-text-muted);
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		font-weight: 500;
+	}
+
+	.chart-inline-stats {
+		color: var(--color-text-muted);
+		font-family: var(--font-mono, monospace);
+		font-variant-numeric: tabular-nums;
+		white-space: nowrap;
+	}
+
+	.charts-dense .chart-inline-head {
+		gap: 4px;
+	}
+
+	.card.view-dense .chart-inline.delay-inline {
+		gap: 3px;
+		padding: 5px 4px 5px 5px;
+		overflow: hidden;
+	}
+
+	.card.view-dense .chart-inline.delay-inline .chart-inline-head {
+		padding: 0;
+	}
+
+	.title-row {
 		display: flex;
 		align-items: center;
 		gap: 6px;
+		min-width: 0;
 	}
+
+	.title-row :global(.ping-btn) {
+		flex-shrink: 0;
+		margin-left: auto;
+	}
+
 	.dot {
-		width: 9px;
-		height: 9px;
+		width: var(--sbx-status-dot);
+		height: var(--sbx-status-dot);
 		border-radius: 50%;
 		background: var(--text-muted);
 	}
-	.dot.ok { background: #10b981; box-shadow: 0 0 6px rgba(16, 185, 129, 0.6); }
-	.dot.slow { background: #f59e0b; box-shadow: 0 0 6px rgba(245, 158, 11, 0.6); }
-	.dot.fail { background: #ef4444; box-shadow: 0 0 6px rgba(239, 68, 68, 0.6); }
-	.dot.stopped { background: #94a3b8; }
-
-	.lat-btn {
-		background: none;
-		border: 1px solid transparent;
-		color: var(--text-muted);
-		font-family: inherit;
-		font-size: 12px;
-		font-weight: 500;
-		padding: 2px 8px;
-		border-radius: 4px;
-		cursor: pointer;
-		display: inline-flex;
-		align-items: center;
-		gap: 5px;
-		font-variant-numeric: tabular-nums;
-		transition: background 0.15s, border-color 0.15s;
-	}
-	.lat-btn:hover:not(:disabled) {
-		background: var(--bg-tertiary);
-		border-color: var(--border);
-	}
-	.lat-btn.ok { color: #10b981; }
-	.lat-btn.slow { color: #fbbf24; }
-	.lat-btn.fail { color: #ef4444; }
-	.lat-btn.stopped { color: #94a3b8; }
-	.lat-btn svg {
-		width: 11px;
-		height: 11px;
-		opacity: 0.5;
-		transition: opacity 0.15s, transform 0.3s;
-	}
-	.lat-btn:hover:not(:disabled) svg { opacity: 1; }
-	.lat-btn.checking svg { animation: spin 1s linear infinite; }
-	@keyframes spin { to { transform: rotate(360deg); } }
+	.dot.ok   { background: var(--latency-color-ok); box-shadow: 0 0 6px var(--latency-dot-ok-shadow); }
+	.dot.slow { background: var(--latency-color-slow); box-shadow: 0 0 6px var(--latency-dot-slow-shadow); }
+	.dot.fail { background: var(--latency-color-fail); box-shadow: 0 0 6px var(--latency-dot-fail-shadow); }
+	.dot.stopped { background: var(--color-text-muted); }
 
 	.title {
-		margin: 0 0 3px;
-		font-size: 15px;
+		margin: 0;
+		min-width: 0;
+		flex: 1 1 auto;
+		font-size: var(--sbx-card-title);
+		line-height: var(--sbx-card-title-line-height);
 		font-weight: 600;
-		padding-right: 80px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 	.iface {
-		color: var(--text-muted);
-		font-size: 11px;
-		margin-bottom: 10px;
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		color: var(--color-text-muted);
+		font-size: var(--sbx-card-meta);
+		margin-bottom: 0;
 		font-family: var(--font-mono, monospace);
-	}
-	.iface .kernel {
-		color: var(--text-muted);
-		opacity: 0.7;
-		margin-left: 4px;
 	}
 
 	.badges {
 		display: flex;
 		gap: 5px;
 		flex-wrap: wrap;
-		margin-bottom: 12px;
 	}
 	.badge {
 		padding: 2px 8px;
-		font-size: 10px;
+		font-size: var(--sbx-card-badge);
 		border-radius: 10px;
 		font-weight: 500;
 	}
 	.b-vless { background: rgba(59, 130, 246, 0.15); color: #60a5fa; }
 	.b-hysteria2 { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }
+	.b-trojan { background: rgba(244, 63, 94, 0.15); color: #fb7185; }
+	.b-shadowsocks { background: rgba(16, 185, 129, 0.15); color: #34d399; }
+	.b-mieru { background: rgba(20, 184, 166, 0.18); color: #5eead4; }
 	/* Cyan-400 on 15% alpha perceptually washed out against the dark
 	   bg — bump to cyan-300 text with slightly denser background so
 	   NaiveProxy matches the contrast of the other protocol badges. */
@@ -633,18 +903,21 @@
 	.row {
 		display: flex;
 		align-items: center;
-		margin: 4px 0;
-		font-size: 11px;
+		margin: 0;
 	}
 	.row .label {
-		color: var(--text-muted);
-		font-size: 10px;
+		color: var(--color-text-muted);
+		font-size: var(--sbx-card-label);
 		text-transform: uppercase;
-		letter-spacing: 0.05em;
+		letter-spacing: 0.04em;
 		width: 60px;
 		flex-shrink: 0;
 	}
-	.row .value { color: var(--text-secondary, var(--text)); font-family: var(--font-mono, monospace); }
+	.row .value {
+		font-size: var(--sbx-card-value);
+		color: var(--color-text-secondary);
+		font-family: var(--font-mono, monospace);
+	}
 	.server-row {
 		display: flex;
 		align-items: center;
@@ -662,64 +935,40 @@
 		display: inline-flex;
 	}
 	.icon-btn:hover { color: var(--text); }
-	.icon-btn svg { width: 12px; height: 12px; }
+
 	.port { color: var(--text); margin-left: auto; font-variant-numeric: tabular-nums; }
 
 	.divider {
-		height: 1px;
-		background: var(--border);
-		margin: 12px 0 10px;
+		height: 0;
+		border: none;
+		margin: 0;
+		background: none;
+	}
+	.divider-dashed {
+		border-top: 1px dashed var(--color-border);
 	}
 
 	.chart-block { margin-bottom: 10px; }
 	.chart-head {
 		display: flex;
 		justify-content: space-between;
-		color: var(--text-muted);
-		font-size: 10px;
+		color: var(--color-text-muted);
+		font-size: var(--sbx-card-label);
 		text-transform: uppercase;
-		letter-spacing: 0.05em;
+		letter-spacing: 0.04em;
 		margin-bottom: 4px;
 	}
 	.chart-head .stats {
-		color: var(--text-muted);
-		font-size: 10px;
+		color: var(--color-text-muted);
+		font-size: var(--sbx-card-value);
 		text-transform: none;
 		letter-spacing: normal;
 	}
+	.chart-head.traffic-head .stats {
+		font-size: 0.6875rem;
+	}
 	.traffic-head { margin-top: 8px; }
-	.chart-head .err { color: #ef4444; }
 
-	.spark {
-		height: 26px;
-		display: flex;
-		align-items: flex-end;
-		gap: 2px;
-		padding: 2px 0;
-	}
-	.spark .bar {
-		flex: 1;
-		background: linear-gradient(to top, rgba(59, 130, 246, 0.6), rgba(96, 165, 250, 0.9));
-		border-radius: 1px;
-		min-height: 2px;
-	}
-	.spark.fail .bar { background: rgba(239, 68, 68, 0.4); height: 100% !important; }
-	.spark.unknown .bar,
-	.spark .bar.empty {
-		background: var(--border);
-		height: 30% !important;
-	}
-
-	.spark-mini {
-		height: 22px;
-		max-width: 100%;
-		gap: 1px;
-		padding: 1px 0;
-	}
-	.spark-mini .bar {
-		min-width: 0;
-		min-height: 2px;
-	}
 	.list-cell-ping-mini {
 		justify-content: flex-start;
 		padding-right: 0.6rem;
@@ -734,9 +983,8 @@
 		display: flex;
 		flex-direction: column;
 		gap: 0.1rem;
-		font-size: 0.7rem;
+		font-size: var(--sbx-card-note);
 		line-height: 1.15;
-		color: var(--text-muted);
 		flex-shrink: 0;
 	}
 	.traffic-mini-click {
@@ -753,104 +1001,43 @@
 		outline-offset: 1px;
 	}
 
-	.actions {
-		display: flex;
-		gap: 6px;
-		justify-content: flex-end;
-		margin-top: 12px;
-		padding: 10px 0;
-		border-top: 1px solid var(--border);
-		border-bottom: 1px solid var(--border);
-	}
-	.action-btn {
-		display: inline-flex;
-		align-items: center;
-		gap: 4px;
-		padding: 5px 9px;
-		font-size: 11px;
-		font-weight: 500;
-		border: none;
-		background: transparent;
-		color: var(--text-secondary, var(--text));
-		cursor: pointer;
-		border-radius: var(--radius-sm);
-		text-decoration: none;
-		font-family: inherit;
-		transition: background var(--t-fast) ease, color var(--t-fast) ease;
-	}
-	.action-btn:hover:not(:disabled) {
-		background: var(--bg-hover, var(--color-bg-hover));
-		color: var(--text);
-	}
-	.action-btn:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
 	.chart-section {
-		margin: 0 -16px -16px;
+		margin: 0 -14px -12px;
 		border-radius: 0 0 var(--radius) var(--radius);
-		background: var(--bg-card);
+		background: var(--color-bg-secondary);
 		overflow: hidden;
-	}
-	.chart-header {
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-		width: 100%;
-		padding: 6px 12px;
-		border: none;
-		background: none;
-		cursor: pointer;
-		user-select: none;
-		font: inherit;
-		transition: background var(--t-fast) ease;
-	}
-	.chart-header:hover {
-		background: var(--bg-tertiary);
-	}
-	.chart-label {
-		font-size: 11px;
-		font-weight: 500;
-		color: var(--text-muted);
-		text-transform: uppercase;
-		letter-spacing: 0.03em;
-	}
-	.chart-chevron {
-		font-size: 14px;
-		color: var(--text-muted);
-		transition: transform var(--t-fast) ease;
-		transform: rotate(-90deg);
-	}
-	.chart-chevron.expanded {
-		transform: rotate(0deg);
 	}
 	.chart-body {
-		max-height: 0;
-		overflow: hidden;
-		transition: max-height var(--t-med) ease;
-		padding: 0 12px;
+		padding: 8px 12px 8px;
 	}
-	.chart-body.expanded {
-		max-height: 300px;
-		padding: 0 12px 8px;
+
+	.chart-body :global(.tunnel-delay-spark--compact) {
+		height: 36px;
 	}
 
 	/* List row (grid columns set on parent .singbox-tunnel-list-table) */
 	.sbx-tunnel-list-row {
-		align-items: center;
 		min-width: 0;
 	}
 	.sbx-tunnel-list-row .list-cell {
 		min-width: 0;
+		vertical-align: middle;
 	}
 	.sbx-tunnel-list-row .list-cell-delay {
 		display: flex;
 		align-items: center;
 		gap: 0.4rem;
 	}
+	.sbx-tunnel-list-row .list-title-row {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+		min-width: 0;
+		max-width: 100%;
+	}
 	.sbx-tunnel-list-row .name-btn {
 		font: inherit;
-		font-size: 0.9375rem;
+		font-size: var(--sbx-card-title);
 		font-weight: 600;
 		color: var(--text);
 		background: none;
@@ -863,38 +1050,79 @@
 		color: var(--color-accent, #58a6ff);
 	}
 	.sbx-tunnel-list-row .list-sub {
-		margin-top: 0.2rem;
-		font-size: 0.75rem;
-		color: var(--text-muted);
+		margin-top: 0;
+		font-size: var(--sbx-card-meta);
+		color: var(--color-text-muted);
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+
+	.sbx-tunnel-list-row .traffic-row-list {
+		display: flex;
+		min-width: 0;
+		width: 100%;
+	}
+
+	.sbx-tunnel-list-row .traffic-row-list--stack {
+		flex-direction: column;
+		align-items: stretch;
+		gap: 0.05rem;
+		border-radius: 4px;
+		cursor: pointer;
+		font-size: var(--sbx-card-note);
+		line-height: 1.1;
+		transition: background var(--t-fast) ease;
+	}
+
+	.sbx-tunnel-list-row .traffic-row-list--stack :global(svg.responsive) {
+		width: 100%;
+		min-width: 0;
+		max-width: 100%;
+		flex: 1 1 auto;
+	}
+
+	.sbx-tunnel-list-row .traffic-row-list--stack:hover {
+		background: rgba(96, 165, 250, 0.06);
+	}
+
+	.sbx-tunnel-list-row .traffic-row-list--stack:focus-visible {
+		outline: 1px solid var(--color-accent, #58a6ff);
+		outline-offset: 1px;
 	}
 	.badges-inline {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 0.25rem;
 	}
-	.server-line {
+
+	.sbx-tunnel-list-row .list-cell-badges {
 		display: flex;
 		align-items: center;
-		gap: 0.35rem;
-		font-size: 0.8125rem;
-		overflow: hidden;
+		justify-content: center;
+		align-self: stretch;
+	}
+
+	.sbx-tunnel-list-row .badges-inline {
+		display: inline-flex;
+		flex-direction: column;
+		flex-wrap: nowrap;
+		align-items: center;
+		justify-content: center;
+		gap: 0.25rem;
+		min-width: 0;
+	}
+
+	.sbx-tunnel-list-row .badges-inline .badge {
+		width: max-content;
+		max-width: 100%;
+		text-align: center;
 	}
 	.muted {
 		color: var(--text-muted);
 	}
-	.eye-inline {
-		display: inline-flex;
-		padding: 0.1rem;
-		border: none;
-		background: none;
-		color: var(--text-muted);
-		cursor: pointer;
-	}
 	.run-pill {
-		font-size: 0.68rem;
+		font-size: var(--sbx-card-badge);
 		font-weight: 600;
 		padding: 0.15rem 0.45rem;
 		border-radius: 999px;
@@ -908,21 +1136,15 @@
 		color: #10b981;
 	}
 	.traffic-mini {
-		font-size: 0.75rem;
-		color: var(--text-muted);
+		font-size: var(--sbx-card-note);
+		color: var(--color-text-muted);
 	}
 	.list-actions {
 		display: flex;
 		flex-wrap: nowrap;
-		gap: 0.5rem;
-		justify-content: flex-end;
+		gap: 0.375rem;
+		justify-content: center;
 		align-items: center;
 		white-space: nowrap;
-		margin-left: 0.5rem;
-	}
-	.action-danger:hover:not(:disabled),
-	.list-actions :global(.action-danger:hover:not(:disabled)) {
-		color: #ff6b6b;
-		background: rgba(239, 68, 68, 0.18);
 	}
 </style>

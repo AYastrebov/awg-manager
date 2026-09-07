@@ -2,12 +2,16 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"regexp"
+	"time"
 
 	"github.com/hoaxisr/awg-manager/internal/events"
+	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/managed"
 	"github.com/hoaxisr/awg-manager/internal/ndms"
+	ndmscommand "github.com/hoaxisr/awg-manager/internal/ndms/command"
 	"github.com/hoaxisr/awg-manager/internal/ndms/query"
 	"github.com/hoaxisr/awg-manager/internal/response"
 	"github.com/hoaxisr/awg-manager/internal/storage"
@@ -32,6 +36,7 @@ type WireguardServerPeerDTO struct {
 	LastHandshake string   `json:"lastHandshake" example:"2024-01-15T10:30:00Z"`
 	Online        bool     `json:"online" example:"true"`
 	Enabled       bool     `json:"enabled" example:"true"`
+	ConfAvailable bool     `json:"confAvailable,omitempty" example:"true"`
 }
 
 // WireguardServerDTO mirrors frontend WireguardServer.
@@ -47,6 +52,24 @@ type WireguardServerDTO struct {
 	PublicKey     string                   `json:"publicKey" example:"EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE="`
 	ListenPort    int                      `json:"listenPort" example:"51820"`
 	Peers         []WireguardServerPeerDTO `json:"peers"`
+	NATEnabled    bool                     `json:"natEnabled,omitempty" example:"true"`
+	NATMode       string                   `json:"natMode,omitempty" example:"full"`
+	Policy        string                   `json:"policy,omitempty" example:"Policy0"`
+	KeenDNSDomain string                   `json:"keenDnsDomain,omitempty" example:"home.keenetic.pro"`
+	// Endpoint is the user-configured connect host for client .conf files.
+	// Empty = WAN IP at generation time.
+	Endpoint string `json:"endpoint,omitempty" example:"203.0.113.42"`
+	BuiltIn  bool   `json:"builtIn,omitempty" example:"true"`
+	// NATModeKnown/PolicyKnown are false when the corresponding NDMS read
+	// failed (e.g. transient router error). The frontend must render an
+	// "unknown" state instead of trusting the zero-valued NATMode/Policy,
+	// which would otherwise read as a fabricated "none".
+	NATModeKnown bool `json:"natModeKnown" example:"true"`
+	PolicyKnown  bool `json:"policyKnown" example:"true"`
+	// Enabled reflects NDMS admin intent (summary.layer.conf == "running").
+	// Status/connected alone are unreliable for the on/off toggle.
+	Enabled      bool `json:"enabled" example:"true"`
+	EnabledKnown bool `json:"enabledKnown" example:"true"`
 }
 
 // ManagedPeerStatsDTO mirrors frontend ManagedPeerStats.
@@ -124,11 +147,14 @@ func isValidWireguardName(name string) bool {
 // resource:invalidated hints on mark/unmark and poller metrics ticks so
 // subscribers refetch immediately instead of waiting for the next poll.
 type ServersHandler struct {
-	queries  *query.Queries
-	settings *storage.SettingsStore
-	awgStore *storage.AWGTunnelStore
-	bus      *events.Bus
-	managed  *ManagedServerHandler
+	queries    *query.Queries
+	commands   *ndmscommand.Commands
+	settings   *storage.SettingsStore
+	awgStore   *storage.AWGTunnelStore
+	bus        *events.Bus
+	managed    *ManagedServerHandler
+	managedSvc *managed.Service
+	log        *logging.ScopedLogger
 }
 
 // SetEventBus sets the event bus used for SSE publishing.
@@ -139,23 +165,40 @@ func (h *ServersHandler) SetEventBus(bus *events.Bus) {
 // SetManagedHandler sets the managed server handler for shared publishing.
 func (h *ServersHandler) SetManagedHandler(m *ManagedServerHandler) { h.managed = m }
 
+// SetManagedService wires managed.Service for system-server NAT/policy RCI.
+func (h *ServersHandler) SetManagedService(svc *managed.Service) { h.managedSvc = svc }
+
+// SetCommands wires NDMS interface commands used by server up/down/restart
+// controls. Kept as a setter so tests using NewServersHandler do not need to
+// construct the full command registry.
+func (h *ServersHandler) SetCommands(commands *ndmscommand.Commands) { h.commands = commands }
+
 // PublishServerSnapshot broadcasts a resource:invalidated hint. Kept
 // as a method on *ServersHandler because ndms/metrics.Poller calls it
 // through the ServerSnapshotPublisher interface.
 func (h *ServersHandler) PublishServerSnapshot(ctx context.Context) {
-	publishInvalidated(h.bus, ResourceServers, "metrics-tick")
+	h.bus.PublishInvalidated(events.ResourceServers, "metrics-tick")
 }
 
 // publishServerInvalidated broadcasts a resource:invalidated hint for
 // servers. Used by ManagedServerHandler after managed CRUD so its
 // subscribers refetch immediately.
 func (h *ServersHandler) publishServerInvalidated(reason string) {
-	publishInvalidated(h.bus, ResourceServers, reason)
+	h.bus.PublishInvalidated(events.ResourceServers, reason)
 }
 
 // NewServersHandler creates a new servers handler.
-func NewServersHandler(queries *query.Queries, settings *storage.SettingsStore, awgStore *storage.AWGTunnelStore) *ServersHandler {
-	return &ServersHandler{queries: queries, settings: settings, awgStore: awgStore}
+func NewServersHandler(queries *query.Queries, settings *storage.SettingsStore, awgStore *storage.AWGTunnelStore, appLogger logging.AppLogger) *ServersHandler {
+	return &ServersHandler{
+		queries:  queries,
+		settings: settings,
+		awgStore: awgStore,
+		log:      logging.NewScopedLogger(appLogger, logging.GroupServer, logging.SubWan),
+	}
+}
+
+type serverEnabledRequest struct {
+	Enabled bool `json:"enabled"`
 }
 
 func (h *ServersHandler) validateName(w http.ResponseWriter, name string) bool {
@@ -168,6 +211,32 @@ func (h *ServersHandler) validateName(w http.ResponseWriter, name string) bool {
 		return false
 	}
 	return true
+}
+
+func (h *ServersHandler) getListedServer(ctx context.Context, name string) (*ndms.WireguardServer, error) {
+	servers, err := h.listServers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range servers {
+		server := servers[i]
+		if server.ID == name || server.InterfaceName == name {
+			return &server, nil
+		}
+	}
+
+	return nil, nil
+}
+
+func (h *ServersHandler) serverIsUp(ctx context.Context, server *ndms.WireguardServer) bool {
+	if server == nil {
+		return false
+	}
+	if enabled, known := h.readSystemServerEnabled(ctx, server.ID); known {
+		return enabled
+	}
+	return server.Status == "up"
 }
 
 // listServers builds the filtered server list for API response and SSE snapshots.
@@ -217,6 +286,39 @@ func (h *ServersHandler) listServers(ctx context.Context) ([]ndms.WireguardServe
 	return servers, nil
 }
 
+// ListServers exposes the filtered system WG-server list for cross-handler
+// reuse (sing-box connections peer-name enrichment, issue #435). It applies
+// the same stored-secret description fallback as enrichServerDTO, on copied
+// peer slices so the shared query-cache data is never mutated. Satisfies
+// api.WGServerPeersLister.
+func (h *ServersHandler) ListServers(ctx context.Context) ([]ndms.WireguardServer, error) {
+	servers, err := h.listServers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range servers {
+		srv := &servers[i]
+		var peers []ndms.WireguardServerPeer // copy-on-write
+		for j, p := range srv.Peers {
+			if p.Description != "" {
+				continue
+			}
+			sec, ok := h.settings.GetServerPeerSecret(srv.ID, p.PublicKey)
+			if !ok || sec.Description == "" {
+				continue
+			}
+			if peers == nil {
+				peers = append([]ndms.WireguardServerPeer(nil), srv.Peers...)
+			}
+			peers[j].Description = sec.Description
+		}
+		if peers != nil {
+			srv.Peers = peers
+		}
+	}
+	return servers, nil
+}
+
 // List returns all server WireGuard interfaces (built-in VPN Server + user-marked).
 // GET /api/servers
 func (h *ServersHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -248,14 +350,18 @@ func (h *ServersHandler) writeAll(w http.ResponseWriter, r *http.Request) {
 		response.Error(w, err.Error(), "LIST_FAILED")
 		return
 	}
+	enriched := make([]WireguardServerDTO, len(list))
+	for i, srv := range list {
+		enriched[i] = h.enrichServerDTO(ctx, srv)
+	}
 	managedList := []*managedServerResponse{}
 	managedStats := map[string]*managed.ManagedServerStats{}
 	if h.managed != nil {
-		managedList = h.managed.getManagedList()
+		managedList = h.managed.getManagedList(ctx)
 		managedStats = h.managed.getManagedStatsMap(ctx)
 	}
 	payload := map[string]any{
-		"servers":      list,
+		"servers":      enriched,
 		"managed":      managedList,
 		"managedStats": managedStats,
 	}
@@ -358,8 +464,143 @@ func (h *ServersHandler) Mark(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	publishInvalidated(h.bus, ResourceServers, "mark-changed")
+	h.bus.PublishInvalidated(events.ResourceServers, "mark-changed")
 	h.writeAll(w, r)
+}
+
+// SetEnabled enables or disables a built-in/marked WireGuard server interface.
+// POST /api/servers/enabled?name=Wireguard0
+//
+//	@Summary		Toggle WireGuard server enabled state
+//	@Description	Brings a built-in or marked WireGuard server interface up or down.
+//	@Tags			servers
+//	@Accept			json
+//	@Produce		json
+//	@Security		CookieAuth
+//	@Param			name	query	string				true	"Interface name"
+//	@Param			body	body	serverEnabledRequest	true	"Enabled flag"
+//	@Success		200		{object}	ServersAllResponse
+//	@Failure		400		{object}	APIErrorEnvelope
+//	@Failure		404		{object}	APIErrorEnvelope
+//	@Failure		405		{object}	APIErrorEnvelope
+//	@Router			/servers/enabled [post]
+func (h *ServersHandler) SetEnabled(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.MethodNotAllowed(w)
+		return
+	}
+	if h.commands == nil || h.commands.Interfaces == nil {
+		response.Error(w, "ndms commands not initialized", "INTERNAL_ERROR")
+		return
+	}
+
+	name := r.URL.Query().Get("name")
+	if !h.validateName(w, name) {
+		return
+	}
+
+	var req serverEnabledRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, "invalid request body", "INVALID_BODY")
+		return
+	}
+
+	server, err := h.getListedServer(r.Context(), name)
+	if err != nil {
+		response.Error(w, err.Error(), "GET_FAILED")
+		return
+	}
+	if server == nil {
+		response.Error(w, "server not found", "NOT_FOUND")
+		return
+	}
+
+	if req.Enabled {
+		if err := h.commands.Interfaces.InterfaceUp(r.Context(), name); err != nil {
+			response.Error(w, err.Error(), "INTERFACE_UP_FAILED")
+			return
+		}
+	} else {
+		if err := h.commands.Interfaces.InterfaceDown(r.Context(), name); err != nil {
+			response.Error(w, err.Error(), "INTERFACE_DOWN_FAILED")
+			return
+		}
+	}
+
+	if h.queries != nil && h.queries.WGServers != nil {
+		h.queries.WGServers.Invalidate(name)
+	}
+	h.bus.PublishInvalidated(events.ResourceServers, "server-enabled-changed")
+	h.writeAll(w, r)
+}
+
+// Restart accepts a restart/start command for a built-in/marked WireGuard server.
+// POST /api/servers/restart?name=Wireguard0
+//
+//	@Summary		Restart or start WireGuard server
+//	@Description	If the server interface is up, restarts it with down -> pause -> up. If it is down, starts it. The command is accepted quickly and executed in background so a client connected through this server does not cancel the operation.
+//	@Tags			servers
+//	@Produce		json
+//	@Security		CookieAuth
+//	@Param			name	query	string	true	"Interface name"
+//	@Success		200		{object}	APIEnvelope
+//	@Failure		400		{object}	APIErrorEnvelope
+//	@Failure		404		{object}	APIErrorEnvelope
+//	@Failure		405		{object}	APIErrorEnvelope
+//	@Router			/servers/restart [post]
+func (h *ServersHandler) Restart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.MethodNotAllowed(w)
+		return
+	}
+	if h.commands == nil || h.commands.Interfaces == nil {
+		response.Error(w, "ndms commands not initialized", "INTERNAL_ERROR")
+		return
+	}
+
+	name := r.URL.Query().Get("name")
+	if !h.validateName(w, name) {
+		return
+	}
+
+	server, err := h.getListedServer(r.Context(), name)
+	if err != nil {
+		response.Error(w, err.Error(), "GET_FAILED")
+		return
+	}
+	if server == nil {
+		response.Error(w, "server not found", "NOT_FOUND")
+		return
+	}
+
+	wasUp := h.serverIsUp(r.Context(), server)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 20*time.Second)
+
+	go func() {
+		defer cancel()
+
+		// Give the accepted response a chance to reach the browser before we
+		// drop the server interface.
+		time.Sleep(300 * time.Millisecond)
+
+		if wasUp {
+			if err := h.commands.Interfaces.InterfaceDown(ctx, name); err != nil {
+				return
+			}
+			time.Sleep(1200 * time.Millisecond)
+		}
+
+		if err := h.commands.Interfaces.InterfaceUp(ctx, name); err != nil {
+			return
+		}
+
+		h.bus.PublishInvalidated(events.ResourceServers, "server-restart")
+	}()
+
+	response.Success(w, map[string]any{
+		"id":       name,
+		"accepted": true,
+	})
 }
 
 // WANIP returns the external WAN IP for .conf generation.

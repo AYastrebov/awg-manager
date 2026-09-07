@@ -29,6 +29,20 @@ func Success(w http.ResponseWriter, data interface{}) {
 	enc.Encode(resp)
 }
 
+// Accepted writes a 202 success response with optional data. Used by
+// endpoints that start background work and return before it completes.
+func Accepted(w http.ResponseWriter, data interface{}) {
+	resp := APIResponse{Success: true}
+	if data != nil {
+		resp.Data = data
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	enc.Encode(resp)
+}
+
 // Error writes an error response with message and code.
 // Format: {error: true, message: "...", code: "..."}
 func Error(w http.ResponseWriter, message, code string) {
@@ -95,6 +109,27 @@ func ErrorWithStatus(w http.ResponseWriter, status int, message, code string) {
 		Error:   true,
 		Message: message,
 		Code:    code,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(resp)
+}
+
+// ErrorWithData — отказ, который обязан рассказать, что УЖЕ сделано.
+//
+// Конверт у успеха и отказа один (APIResponse), поле Data в нём было всегда и
+// у отказов просто опускалось — поэтому форма прежних ошибок не меняется, а
+// клиент кладёт всё тело в err.body и читает его без правок.
+//
+// Нужно там, где операция многошаговая и падение середины не отменяет
+// сделанного: сказать «не удалось» и умолчать о необратимой части — значит
+// оставить пользователя с расхождением, которое он объяснить не сможет.
+func ErrorWithData(w http.ResponseWriter, status int, message, code string, data any) {
+	resp := APIResponse{
+		Error:   true,
+		Message: message,
+		Code:    code,
+		Data:    data,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)

@@ -7,6 +7,7 @@ import type {
 	SingboxRouterRule,
 	SingboxRouterRuleSet,
 	SingboxRouterOutbound,
+	SingboxRouterTransitionData,
 } from '$lib/types';
 
 export interface LogEntryEvent {
@@ -18,6 +19,9 @@ export interface LogEntryEvent {
 	target: string;
 	message: string;
 	bucket: 'app' | 'singbox';
+	/** Повтор, свёрнутый в существующую запись: счётчик и время последнего. */
+	repeats?: number;
+	lastSeen?: string;
 }
 
 export interface SystemBootingEvent {
@@ -88,7 +92,7 @@ export interface ResourceInvalidatedEvent {
 
 export interface SSEEventHandlers {
 	// Connection lifecycle
-	onConnected?: () => void;
+	onConnected?: (data?: { ok?: boolean; instanceId?: string }) => void;
 	onDisconnected?: () => void;
 
 	// System events
@@ -103,10 +107,15 @@ export interface SSEEventHandlers {
 
 	// Sing-box streams (traffic + delay remain push-only)
 	onSingboxTraffic?: (data: SingboxTraffic[]) => void;
+	// Кумулятивные счётчики Clash за всю жизнь процесса (включая закрытые
+	// соединения) — монотонны до рестарта движка.
+	onSingboxTrafficTotals?: (data: { downloadTotal: number; uploadTotal: number }) => void;
 	onSingboxDelay?: (data: SingboxDelayEvent) => void;
+	onSingboxMemory?: (data: { memory: number }) => void;
 
 	// Sing-box Router push events (status + rules/rule-sets/outbounds snapshots)
 	onSingboxRouterStatus?: (data: SingboxRouterStatus) => void;
+	onSingboxRouterTransition?: (data: SingboxRouterTransitionData) => void;
 	onSingboxRouterRules?: (data: SingboxRouterRule[]) => void;
 	onSingboxRouterRuleSets?: (data: SingboxRouterRuleSet[]) => void;
 	onSingboxRouterOutbounds?: (data: SingboxRouterOutbound[]) => void;
@@ -133,14 +142,26 @@ export interface SSEEventHandlers {
 	onMonitoringMatrixUpdate?: (data: MonitoringSnapshot) => void;
 }
 
+export function parseConnectedEvent(data: string): { ok?: boolean; instanceId?: string } | undefined {
+	try {
+		const parsed: unknown = JSON.parse(data);
+		if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+		return parsed;
+	} catch {
+		return undefined;
+	}
+}
+
 export function connectSSE(handlers: SSEEventHandlers): () => void {
 	const es = new EventSource('/api/events');
 
-	const handle = (type: string, handler?: (data: any) => void) => {
+	const handle = <T>(type: string, handler?: (data: T) => void) => {
 		if (!handler) return;
 		es.addEventListener(type, ((e: MessageEvent) => {
 			try {
-				handler(JSON.parse(e.data));
+				// SSE payloads arrive as JSON strings; each handler declares its own
+				// data shape on SSEEventHandlers, so narrow at this trust boundary.
+				handler(JSON.parse(e.data) as T);
 			} catch {
 				/* ignore parse errors */
 			}
@@ -159,10 +180,13 @@ export function connectSSE(handlers: SSEEventHandlers): () => void {
 
 	// Sing-box streams
 	handle('singbox:traffic', handlers.onSingboxTraffic);
+	handle('singbox:traffic-totals', handlers.onSingboxTrafficTotals);
 	handle('singbox:delay', handlers.onSingboxDelay);
+	handle('singbox:memory', handlers.onSingboxMemory);
 
 	// Sing-box Router events
 	handle('singbox-router:status', handlers.onSingboxRouterStatus);
+	handle('singbox-router:transition', handlers.onSingboxRouterTransition);
 	handle('singbox-router:rules', handlers.onSingboxRouterRules);
 	handle('singbox-router:rulesets', handlers.onSingboxRouterRuleSets);
 	handle('singbox-router:outbounds', handlers.onSingboxRouterOutbounds);
@@ -188,9 +212,14 @@ export function connectSSE(handlers: SSEEventHandlers): () => void {
 	handle('monitoring:matrix-update', handlers.onMonitoringMatrixUpdate);
 
 	// Server sends "connected" event immediately on stream start
-	es.addEventListener('connected', () => {
-		handlers.onConnected?.();
-	});
+	es.addEventListener('connected', ((e: MessageEvent) => {
+		const data = parseConnectedEvent(e.data);
+		if (data) {
+			handlers.onConnected?.(data);
+		} else {
+			handlers.onConnected?.();
+		}
+	}) as EventListener);
 
 	es.onerror = () => {
 		if (es.readyState === EventSource.CLOSED) {

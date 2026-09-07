@@ -61,7 +61,7 @@ func (h *RoutingHandler) SetEventBus(bus *events.Bus) { h.bus = bus }
 //	@Tags			routing
 //	@Produce		json
 //	@Security		CookieAuth
-//	@Success		200	{array}	object
+//	@Success		200	{object}	RoutingTunnelsResponse
 //	@Failure		400	{object}	APIErrorEnvelope
 //	@Failure		500	{object}	APIErrorEnvelope
 //	@Router			/routing/tunnels [get]
@@ -112,52 +112,12 @@ func (h *RoutingHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 
 	snap := h.catalog.SnapshotAll(r.Context())
 	// Notify every routing polling store to refetch.
-	publishInvalidated(h.bus, ResourceRoutingDnsRoutes, "refresh")
-	publishInvalidated(h.bus, ResourceRoutingStaticRoutes, "refresh")
-	publishInvalidated(h.bus, ResourceRoutingAccessPolicies, "refresh")
-	publishInvalidated(h.bus, ResourceRoutingPolicyDevices, "refresh")
-	publishInvalidated(h.bus, ResourceRoutingPolicyInterfaces, "refresh")
-	publishInvalidated(h.bus, ResourceRoutingClientRoutes, "refresh")
-	publishInvalidated(h.bus, ResourceRoutingTunnels, "refresh")
+	h.bus.PublishInvalidated(events.ResourceRoutingDnsRoutes, "refresh")
+	h.bus.PublishInvalidated(events.ResourceRoutingStaticRoutes, "refresh")
+	h.bus.PublishInvalidated(events.ResourceRoutingAccessPolicies, "refresh")
+	h.bus.PublishInvalidated(events.ResourceRoutingPolicyDevices, "refresh")
+	h.bus.PublishInvalidated(events.ResourceRoutingPolicyInterfaces, "refresh")
+	h.bus.PublishInvalidated(events.ResourceRoutingClientRoutes, "refresh")
+	h.bus.PublishInvalidated(events.ResourceRoutingTunnels, "refresh")
 	response.Success(w, map[string]any{"missing": snap.Missing})
-}
-
-// ServeOS4EmptyAccessPolicies returns an empty access-policies list on OS4 (no NDMS policies API).
-//
-//	@Summary		OS4 access policies stub
-//	@Description	Always {"data":[]}. Real data on KeeneticOS 5 only.
-//	@Tags			routing
-//	@Produce		json
-//	@Security		CookieAuth
-//	@Success		200	{object}	AccessPoliciesListResponse
-//	@Failure		400	{object}	APIErrorEnvelope
-//	@Failure		500	{object}	APIErrorEnvelope
-//	@Router			/routing/access-policies [get]
-func ServeOS4EmptyAccessPolicies(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"data":[]}`))
-}
-
-// ServeOS4EmptyPolicyInterfaces returns an empty policy-interfaces list on OS4.
-//
-//	@Summary		OS4 policy interfaces stub
-//	@Description	Always {"data":[]}. Real data on KeeneticOS 5 only.
-//	@Tags			routing
-//	@Produce		json
-//	@Security		CookieAuth
-//	@Success		200	{object}	PolicyInterfacesListResponse
-//	@Failure		400	{object}	APIErrorEnvelope
-//	@Failure		500	{object}	APIErrorEnvelope
-//	@Router			/routing/policy-interfaces [get]
-func ServeOS4EmptyPolicyInterfaces(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(`{"data":[]}`))
 }

@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/hoaxisr/awg-manager/internal/logger"
+	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 )
 
@@ -17,18 +17,18 @@ const (
 type Scheduler struct {
 	svc         Service
 	settings    *storage.SettingsStore
-	log         *logger.Logger
+	appLog      *logging.ScopedLogger
 	stop        chan struct{}
 	done        chan struct{}
 	lastRefresh time.Time // tracks last successful refresh
 }
 
 // NewScheduler creates a new subscription refresh scheduler.
-func NewScheduler(svc Service, settings *storage.SettingsStore, log *logger.Logger) *Scheduler {
+func NewScheduler(svc Service, settings *storage.SettingsStore, appLogger logging.AppLogger) *Scheduler {
 	return &Scheduler{
 		svc:      svc,
 		settings: settings,
-		log:      log,
+		appLog:   logging.NewScopedLogger(appLogger, logging.GroupRouting, logging.SubDnsRoute),
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
 	}
@@ -57,8 +57,13 @@ func (s *Scheduler) run() {
 
 	for {
 		if s.shouldRefresh() {
-			s.doRefresh()
-			s.lastRefresh = time.Now()
+			// Stamp only successful runs: on cold boot the clock may still be
+			// at 1970 until NTP syncs, every TLS fetch fails "not yet valid",
+			// and stamping the failure would silently delay the retry by the
+			// full interval instead of the next tick.
+			if s.doRefresh() {
+				s.lastRefresh = time.Now()
+			}
 		}
 
 		select {
@@ -128,13 +133,24 @@ func (s *Scheduler) shouldRefreshDaily(targetTime string) bool {
 	return true
 }
 
-func (s *Scheduler) doRefresh() {
+func (s *Scheduler) doRefresh() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
+	// Abort the in-flight refresh on Stop(): a restart hook must not block
+	// behind a slow subscription fetch for up to the full timeout.
+	go func() {
+		select {
+		case <-s.stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	if err := s.svc.RefreshAllSubscriptions(ctx); err != nil {
-		s.log.Warn("dns-route auto-refresh failed", map[string]interface{}{"error": err.Error()})
-	} else {
-		s.log.Info("dns-route auto-refresh completed", nil)
+		s.appLog.Warn("auto-refresh", "", err.Error())
+		return false
 	}
+	s.appLog.Info("auto-refresh", "", "completed")
+	return true
 }

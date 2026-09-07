@@ -18,7 +18,7 @@
 		grid-template-columns: repeat(4, minmax(0, 1fr));
 		background: var(--color-bg-tertiary);
 		border: 1px solid var(--color-border);
-		border-radius: 12px;
+		border-radius: var(--radius);
 		overflow: hidden;
 	}
 
@@ -36,17 +36,6 @@
 		}
 
 		.strip > :global(:nth-child(-n + 2)) {
-			border-bottom: 1px solid var(--color-border);
-		}
-	}
-
-	@media (max-width: 560px) {
-		.strip {
-			grid-template-columns: minmax(0, 1fr);
-		}
-
-		.strip > :global(:not(:last-child)) {
-			border-right: none;
 			border-bottom: 1px solid var(--color-border);
 		}
 	}

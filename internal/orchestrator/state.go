@@ -14,36 +14,33 @@ type tunnelState struct {
 	Name         string
 	Backend      string // "kernel" | "nativewg"
 	Enabled      bool
-	Running      bool   // orchestrator's belief: tunnel is running
-	Monitoring   bool   // monitor goroutine is active
+	Running      bool // orchestrator's belief: tunnel is running
+	Monitoring   bool // monitor goroutine is active
 	ActiveWAN    string
 	NWGIndex     int
 	PingCheck    *storage.TunnelPingCheck
-	DefaultRoute bool
 	ISPInterface string
-	Endpoint             string    // peer endpoint (host:port)
-	ExternalRestartCount int       // consecutive external restarts within window
-	LastExternalRestart  time.Time // timestamp of last external restart
-}
+	// EndpointMayV6: peer endpoint — IPv6-литерал или hostname (может
+	// резолвиться в v6). Для nativewg на ASC-прошивке это значит, что реальный
+	// endpoint может жить только в ядре (wg set), а конфиг NDMS — нести
+	// заглушку: после ребута нужен полный Start (decideBoot).
+	EndpointMayV6 bool
 
-const (
-	externalRestartMaxCount = 3
-	externalRestartWindow   = 5 * time.Minute
-)
+	// ViaProxy: туннель идёт через awg_proxy.ko, а не через нативный ASC
+	// прошивки. Так бывает и на ASC-прошивке: её ASC знает AmneziaWG только до
+	// 2.0, а конфиг 3.0/3.1 обслуживает kmod (nwg.UsesProxyPath). От этого
+	// зависит, поднимать ли туннель после ребута роутера и снимать ли слот при
+	// падении WAN: NDMS сам умеет только свою половину, про слот он не знает.
+	ViaProxy bool
 
-func (t *tunnelState) canExternalRestart() bool {
-	if time.Since(t.LastExternalRestart) > externalRestartWindow {
-		return true
-	}
-	return t.ExternalRestartCount < externalRestartMaxCount
-}
+	// quiescentUntil: while now < this, a conf=disabled edge for this tunnel
+	// is treated as transient NDMS settling (do not stop). Set on (re)start.
+	quiescentUntil time.Time
 
-func (t *tunnelState) recordExternalRestart() {
-	if time.Since(t.LastExternalRestart) > externalRestartWindow {
-		t.ExternalRestartCount = 0
-	}
-	t.ExternalRestartCount++
-	t.LastExternalRestart = time.Now()
+	// lastConfRunningAt: when an external conf=running edge was last seen for
+	// this tunnel. settleConfDisabled uses it to tell an NDMS interface restart
+	// (disabled→running bounce) from a real disable. Runtime-only.
+	lastConfRunningAt time.Time
 }
 
 // ndmsName returns the NDMS interface name for this tunnel.
@@ -65,7 +62,7 @@ func (t *tunnelState) ifaceName() string {
 // State is the orchestrator's complete view of the system.
 type State struct {
 	tunnels     map[string]*tunnelState // tunnelID → state
-	anyWANUpFn  func() bool            // delegates to wanModel.AnyUp()
+	anyWANUpFn  func() bool             // delegates to wanModel.AnyUp()
 	supportsASC bool
 }
 
@@ -104,6 +101,12 @@ func (s *State) ensureTunnel(tunnelID string, store *storage.AWGTunnelStore) boo
 	if err != nil {
 		return false
 	}
+	// Тот же фильтр, что в loadFromStore, и по той же причине: зеркальная
+	// запись прокси-выхода оркестратору не принадлежит. Второй путь загрузки
+	// без этой проверки сводил бы первую на нет.
+	if stored.Backend == "wdtt-raw" {
+		return false
+	}
 	s.tunnels[tunnelID] = tunnelStateFromStored(stored)
 	return true
 }
@@ -111,16 +114,16 @@ func (s *State) ensureTunnel(tunnelID string, store *storage.AWGTunnelStore) boo
 // tunnelStateFromStored creates a tunnelState from stored data.
 func tunnelStateFromStored(t *storage.AWGTunnel) *tunnelState {
 	return &tunnelState{
-		ID:           t.ID,
-		Name:         t.Name,
-		Backend:      t.Backend,
-		Enabled:      t.Enabled,
-		NWGIndex:     t.NWGIndex,
-		PingCheck:    t.PingCheck,
-		DefaultRoute: t.DefaultRoute,
-		ISPInterface: t.ISPInterface,
-		Endpoint:     t.Peer.Endpoint,
-		ActiveWAN:    t.ActiveWAN,
+		ID:            t.ID,
+		Name:          t.Name,
+		Backend:       t.Backend,
+		Enabled:       t.Enabled,
+		NWGIndex:      t.NWGIndex,
+		PingCheck:     t.PingCheck,
+		ISPInterface:  t.ISPInterface,
+		ActiveWAN:     t.ActiveWAN,
+		EndpointMayV6: nwg.EndpointMayResolveIPv6(t.Peer.Endpoint),
+		ViaProxy:      t.Backend == "nativewg" && nwg.UsesProxyPath(&t.Interface),
 	}
 }
 
@@ -131,6 +134,14 @@ func (s *State) loadFromStore(store *storage.AWGTunnelStore) {
 		return
 	}
 	for _, t := range tunnels {
+		// Зеркальные записи raw-выходов — проекции прокси-инстансов, а не наши
+		// туннели: их жизненным циклом целиком ведает прокси-рантайм. Сегодня
+		// они безвредны лишь потому, что каждый switch по Backend перечисляет
+		// бэкенды поимённо и не имеет ветки default — первая же такая ветка
+		// начала бы стартовать и останавливать чужой ресурс. Не грузим вовсе.
+		if t.Backend == "wdtt-raw" {
+			continue
+		}
 		s.tunnels[t.ID] = tunnelStateFromStored(&t)
 	}
 }

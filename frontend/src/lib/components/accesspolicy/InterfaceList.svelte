@@ -1,30 +1,51 @@
 <script lang="ts">
 	import type { AccessPolicyInterface, PolicyGlobalInterface } from '$lib/types';
-	import { ConfirmModal } from '$lib/components/ui';
+	import { errorMessage } from '$lib/utils/errorMessage';
+	import { ConfirmModal, Badge, Button } from '$lib/components/ui';
+	import { Power, ChevronUp, ChevronDown, Check, Ban } from 'lucide-svelte';
 	import { api } from '$lib/api/client';
 	import { notifications } from '$lib/stores/notifications';
+	import {
+		filterPolicyGlobalInterfaces,
+		groupPolicyGlobalInterfaces,
+		policyInterfaceDisplayLabel,
+	} from '$lib/utils/routingTunnelOptions';
 
 	interface Props {
 		interfaces: AccessPolicyInterface[];
 		availableInterfaces: PolicyGlobalInterface[];
+		/** scroll: toggle + capped scroll. panel: toggle + full list без скролла (HR Neo, политики доступа). */
+		addPickerVariant?: 'scroll' | 'panel';
 		onpermit: (iface: string, order: number) => void;
 		ondeny: (iface: string) => void;
 		onreorder: (iface: string, newOrder: number) => void;
 		onupdate: () => void;
 	}
 
-	let { interfaces: rawInterfaces, availableInterfaces, onpermit, ondeny, onreorder, onupdate }: Props = $props();
+	let {
+		interfaces: rawInterfaces,
+		availableInterfaces,
+		addPickerVariant = 'scroll',
+		onpermit,
+		ondeny,
+		onreorder,
+		onupdate,
+	}: Props = $props();
+
+	const isPanelPicker = $derived(addPickerVariant === 'panel');
 
 	let interfaces = $derived(rawInterfaces ?? []);
 	let showAdd = $state(false);
 
 	let sorted = $derived([...interfaces].sort((a, b) => a.order - b.order));
 
+	let catalog = $derived(filterPolicyGlobalInterfaces(availableInterfaces));
+
 	let unassigned = $derived(
-		(availableInterfaces ?? []).filter(
-			(gi) => !interfaces.some((i) => i.name === gi.name)
-		)
+		catalog.filter((gi) => !interfaces.some((i) => i.name === gi.name)),
 	);
+
+	let unassignedGroups = $derived(groupPolicyGlobalInterfaces(unassigned));
 
 	function handleAdd(iface: string) {
 		onpermit(iface, interfaces.length);
@@ -32,12 +53,12 @@
 	}
 
 	function getLabel(name: string): string {
-		const gi = (availableInterfaces ?? []).find(g => g.name === name);
-		return gi?.label || name;
+		const gi = catalog.find((g) => g.name === name);
+		return gi ? policyInterfaceDisplayLabel(gi) : name;
 	}
 
 	function isUp(name: string): boolean {
-		return (availableInterfaces ?? []).find(gi => gi.name === name)?.up ?? false;
+		return catalog.find((gi) => gi.name === name)?.up ?? false;
 	}
 
 	let toggling = $state('');
@@ -59,8 +80,8 @@
 		try {
 			await api.setPolicyInterfaceUp(name, !currentlyUp);
 			onupdate();
-		} catch (e: any) {
-			notifications.error(`Ошибка: ${e.message}`);
+		} catch (e) {
+			notifications.error(`Ошибка: ${errorMessage(e)}`);
 		} finally {
 			toggling = '';
 		}
@@ -77,25 +98,28 @@
 	}
 </script>
 
-<div class="iface-section">
+<div class="iface-section" class:iface-section--panel={isPanelPicker}>
 	<div class="section-header">
 		<h4>Интерфейсы (приоритет)</h4>
 		{#if unassigned.length > 0}
-			<button class="link-btn" onclick={() => (showAdd = !showAdd)}>
+			<Button variant="secondary" size="sm" onclick={() => (showAdd = !showAdd)}>
 				{showAdd ? 'Отмена' : 'Добавить'}
-			</button>
+			</Button>
 		{/if}
 	</div>
 
 	{#if showAdd}
-		<div class="add-dropdown">
-			{#each unassigned as gi}
-				<button class="dropdown-item" onclick={() => handleAdd(gi.name)}>
-					<span class="iface-name">{gi.label || gi.name}</span>
-					{#if !gi.up}
-						<span class="iface-down">down</span>
-					{/if}
-				</button>
+		<div class="add-dropdown" class:add-dropdown--panel={isPanelPicker}>
+			{#each unassignedGroups as { group, items }}
+				<div class="group-label" role="presentation">{group}</div>
+				{#each items as gi (gi.name)}
+					<button class="dropdown-item in-group" onclick={() => handleAdd(gi.name)}>
+						<span class="iface-name">{policyInterfaceDisplayLabel(gi)}</span>
+						{#if !gi.up}
+							<span class="iface-down">down</span>
+						{/if}
+					</button>
+				{/each}
 			{/each}
 		</div>
 	{/if}
@@ -110,7 +134,7 @@
 					<span class="led" class:led-green={!iface.denied && isUp(iface.name)} class:led-gray={iface.denied || !isUp(iface.name)}></span>
 					<span class="iface-label" title={iface.name}>{getLabel(iface.name)}</span>
 					{#if iface.denied}
-						<span class="denied-badge">запрещён</span>
+						<Badge variant="error" size="xs">запрещён</Badge>
 					{/if}
 					<button
 						class="icon-btn"
@@ -119,10 +143,7 @@
 						disabled={toggling === iface.name}
 						onclick={() => requestToggle(iface.name)}
 					>
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-							<path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
-							<line x1="12" y1="2" x2="12" y2="12"/>
-						</svg>
+						<Power size={14} />
 					</button>
 					<div class="iface-actions">
 						<button
@@ -131,9 +152,7 @@
 							disabled={index === 0}
 							onclick={() => moveUp(index)}
 						>
-							<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-								<polyline points="18 15 12 9 6 15"/>
-							</svg>
+							<ChevronUp size={15} />
 						</button>
 						<button
 							class="icon-btn"
@@ -141,9 +160,7 @@
 							disabled={index === sorted.length - 1}
 							onclick={() => moveDown(index)}
 						>
-							<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-								<polyline points="6 9 12 15 18 9"/>
-							</svg>
+							<ChevronDown size={15} />
 						</button>
 						<button
 							class="icon-btn"
@@ -151,14 +168,9 @@
 							onclick={() => iface.denied ? onpermit(iface.name, interfaces.filter(i => !i.denied).length) : ondeny(iface.name)}
 						>
 							{#if iface.denied}
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-									<polyline points="20 6 9 17 4 12"/>
-								</svg>
+								<Check size={15} />
 							{:else}
-								<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-									<circle cx="12" cy="12" r="10"/>
-									<line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/>
-								</svg>
+								<Ban size={15} />
 							{/if}
 						</button>
 					</div>
@@ -196,6 +208,8 @@
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
+		width: 100%;
+		gap: 12px;
 	}
 
 	.section-header h4 {
@@ -205,25 +219,77 @@
 		color: var(--text-primary);
 	}
 
-	.link-btn {
-		background: none;
-		border: none;
-		color: var(--accent);
-		cursor: pointer;
-		font-size: 0.8125rem;
-		padding: 0;
-	}
+	@media (max-width: 640px) {
+		.section-header {
+			display: grid;
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+			align-items: center;
+		}
 
-	.link-btn:hover {
-		text-decoration: underline;
+		.section-header h4 {
+			min-width: 0;
+			text-align: left;
+		}
 	}
 
 	.add-dropdown {
 		display: flex;
 		flex-direction: column;
 		border: 1px solid var(--border);
-		border-radius: 6px;
+		border-radius: 8px;
 		overflow: hidden;
+		max-height: 280px;
+		overflow-y: auto;
+	}
+
+	.add-dropdown--panel {
+		max-height: none;
+		overflow: visible;
+		overflow-y: visible;
+		margin-bottom: 4px;
+	}
+
+	.add-dropdown--panel .dropdown-item:first-of-type,
+	.add-dropdown--panel .group-label:first-child + .dropdown-item {
+		border-top: none;
+	}
+
+	.add-dropdown--panel .group-label:first-child {
+		border-radius: 7px 7px 0 0;
+	}
+
+	.add-dropdown--panel .dropdown-item:last-child {
+		border-radius: 0 0 7px 7px;
+	}
+
+	.iface-section--panel {
+		gap: 10px;
+	}
+
+	.iface-section--panel .iface-list {
+		gap: 6px;
+	}
+
+	.group-label {
+		padding: 0.35rem 0.75rem 0.2rem;
+		font-size: 0.65rem;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--text-muted, var(--color-text-muted));
+		background: var(--bg-primary, var(--color-bg-primary));
+		position: sticky;
+		top: 0;
+		z-index: 1;
+	}
+
+	.add-dropdown--panel .group-label {
+		padding: 0.45rem 0.875rem 0.3rem;
+		position: static;
+	}
+
+	.add-dropdown--panel .dropdown-item {
+		padding: 10px 14px;
 	}
 
 	.dropdown-item {
@@ -243,7 +309,8 @@
 		background: var(--bg-hover);
 	}
 
-	.dropdown-item + .dropdown-item {
+	.dropdown-item.in-group + .dropdown-item.in-group,
+	.group-label + .dropdown-item {
 		border-top: 1px solid var(--border);
 	}
 
@@ -262,6 +329,11 @@
 		display: flex;
 		flex-direction: column;
 		gap: 4px;
+	}
+
+	.iface-section--panel .iface-row {
+		padding: 8px 12px;
+		gap: 10px;
 	}
 
 	.iface-row {
@@ -284,8 +356,12 @@
 
 	.iface-label {
 		flex: 1;
+		min-width: 0;
 		font-size: 0.8125rem;
 		font-weight: 500;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
 	}
 
 	.iface-actions {
@@ -319,16 +395,6 @@
 
 	.iface-row.denied {
 		opacity: 0.5;
-	}
-
-	.denied-badge {
-		font-size: 0.625rem;
-		padding: 1px 6px;
-		border-radius: 9999px;
-		background: rgba(239, 68, 68, 0.15);
-		color: var(--error);
-		font-weight: 500;
-		white-space: nowrap;
 	}
 
 	.led {

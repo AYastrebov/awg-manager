@@ -7,8 +7,6 @@ import (
 	"io"
 	"runtime"
 	"strings"
-
-	"github.com/hoaxisr/awg-manager/internal/sys/semver"
 )
 
 // PackageEntry is a single Debian-style package block from a Packages index,
@@ -16,13 +14,14 @@ import (
 type PackageEntry struct {
 	Version  string
 	Filename string
+	SHA256   string
 }
 
 // parsePackagesGz reads a gzipped Debian-style Packages index from r and
 // returns the entry with the highest Version field whose Package name matches
 // pkgName. Returns an error if the gzip stream is invalid or no matching
 // package is found.
-func parsePackagesGz(r io.Reader, pkgName string) (PackageEntry, error) {
+func parsePackagesGz(r io.Reader, pkgName string, cmp func(a, b string) int) (PackageEntry, error) {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return PackageEntry{}, fmt.Errorf("gunzip: %w", err)
@@ -31,15 +30,15 @@ func parsePackagesGz(r io.Reader, pkgName string) (PackageEntry, error) {
 
 	var best PackageEntry
 	var current struct {
-		pkg, ver, fn string
+		pkg, ver, fn, sum string
 	}
 	flush := func() {
 		if current.pkg == pkgName && current.ver != "" && current.fn != "" {
-			if best.Version == "" || semver.Compare(current.ver, best.Version) > 0 {
-				best = PackageEntry{Version: current.ver, Filename: current.fn}
+			if best.Version == "" || cmp(current.ver, best.Version) > 0 {
+				best = PackageEntry{Version: current.ver, Filename: current.fn, SHA256: current.sum}
 			}
 		}
-		current.pkg, current.ver, current.fn = "", "", ""
+		current.pkg, current.ver, current.fn, current.sum = "", "", "", ""
 	}
 
 	scanner := bufio.NewScanner(gz)
@@ -57,6 +56,8 @@ func parsePackagesGz(r io.Reader, pkgName string) (PackageEntry, error) {
 			current.ver = line[len("Version: "):]
 		case strings.HasPrefix(line, "Filename: "):
 			current.fn = line[len("Filename: "):]
+		case strings.HasPrefix(line, "SHA256sum: "):
+			current.sum = strings.TrimSpace(line[len("SHA256sum: "):])
 		}
 	}
 	flush()

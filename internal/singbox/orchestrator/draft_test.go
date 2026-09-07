@@ -202,6 +202,73 @@ func TestApplyDraft_HappyPath(t *testing.T) {
 	}
 }
 
+// snapshotRecordingValidator запоминает содержимое tmpdir-снапшота,
+// переданного в sing-box check.
+type snapshotRecordingValidator struct {
+	files map[string][]byte
+}
+
+func (v *snapshotRecordingValidator) Validate(_ context.Context, dir string) error {
+	v.files = map[string][]byte{}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return err
+		}
+		v.files[e.Name()] = data
+	}
+	return nil
+}
+
+// Черновик ВЫКЛЮЧЕННОГО целевого слота обязан попасть в снапшот sing-box
+// check — «валидируем как будто применён и включён» (контракт CheckMerged/
+// validateWithEnabled). Раньше цикл по o.enabled пропускал выключенную
+// цель: validateDraftLocked считал её включённой, а sing-box check её не
+// видел — внутренне противоречиво, и черновик уезжал в active/ мимо
+// проверки (дыра затрагивала и router ApplyStaging на выключенном слоте).
+func TestApplyDraft_DisabledTargetIncludedInSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	o := New(dir, nil)
+	if err := o.Register(SlotMeta{Slot: SlotRouter, Filename: "20-router.json"}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := o.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	// Слот НЕ включаем — цель выключена.
+	if o.enabled[SlotRouter] {
+		t.Fatal("precondition: router slot must be disabled")
+	}
+	draft := []byte(`{"outbounds":[{"tag":"draft-ob","type":"direct"}]}`)
+	if err := o.SaveDraft(SlotRouter, draft); err != nil {
+		t.Fatalf("SaveDraft: %v", err)
+	}
+	rv := &snapshotRecordingValidator{}
+	o.SetValidator(rv)
+
+	res, err := o.ApplyDraft(SlotRouter)
+	if err != nil {
+		t.Fatalf("ApplyDraft: %v", err)
+	}
+	if !res.Ok() {
+		t.Fatalf("ApplyDraft validation: %s", res.Error())
+	}
+	got, ok := rv.files["20-router.json"]
+	if !ok {
+		t.Fatalf("disabled target's draft missing from sing-box check snapshot; snapshot: %v", rv.files)
+	}
+	if string(got) != string(draft) {
+		t.Errorf("snapshot draft bytes mismatch: %s", got)
+	}
+}
+
 func TestApplyDraft_NoDraft(t *testing.T) {
 	o, _ := setupOrch(t)
 	res, err := o.ApplyDraft(SlotRouter)
@@ -354,5 +421,31 @@ func TestApplyDraft_ConcurrentSecondCallReturnsNoDraft(t *testing.T) {
 	r2, err := o.ApplyDraft(SlotRouter)
 	if !errors.Is(err, ErrNoDraft) {
 		t.Errorf("second call want ErrNoDraft, got %v (res=%v)", err, r2)
+	}
+}
+
+// F84: SaveAndValidate писал в active/ безусловно, а не выбирал путь по
+// enabled, как это делает saveLocked. Сегодня не стреляло — оба прод-слота
+// (10-tunnels, 16-awg3) AlwaysOn, — но первый же выключенный слот создал бы
+// файл в active/ при enabled=false, а Bootstrap считает «файл и там и там»
+// патологией.
+func TestSaveAndValidate_DisabledSlotWritesToDisabledDir(t *testing.T) {
+	o, dir := newTestOrch(t)
+	if err := o.Register(SlotMeta{Slot: SlotRouter, Filename: "20-router.json"}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := o.SetEnabled(SlotRouter, false); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+
+	if _, err := o.SaveAndValidate(SlotRouter, []byte(`{}`)); err != nil {
+		t.Fatalf("SaveAndValidate: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "disabled", "20-router.json")); err != nil {
+		t.Errorf("выключенный слот не попал в disabled/: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "20-router.json")); err == nil {
+		t.Error("выключенный слот записан в active/ — Bootstrap сочтёт это патологией")
 	}
 }

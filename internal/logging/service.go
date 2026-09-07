@@ -6,6 +6,12 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/events"
 )
 
+// repeatCoalesceWindow — окно схлопывания идентичных повторов: пока между
+// одинаковыми записями проходит меньше этого времени, они копятся в одной
+// строке журнала (LastSeen продлевает окно, так что непрерывный шум с любым
+// периодом короче окна остаётся одной записью).
+const repeatCoalesceWindow = 5 * time.Minute
+
 // SettingsGetter provides logging configuration.
 type SettingsGetter interface {
 	IsLoggingEnabled() bool
@@ -105,10 +111,16 @@ func (s *Service) AppLog(level Level, group, subgroup, action, target, message s
 		Target:    target,
 		Message:   message,
 	}
-	target_buf.Add(entry)
+	// Идентичный повтор в окне сворачивается в существующую запись (×N)
+	// вместо новой строки — источник рекуррентного шума (периодические
+	// проверки, зацикленные Warn) не может забить журнал.
+	entry, _ = target_buf.CoalesceOrAdd(entry, repeatCoalesceWindow)
 	if s.bus != nil {
-		s.bus.Publish("log:entry", events.LogEntryEvent{
-			Timestamp: entry.Timestamp.Format(time.RFC3339),
+		// Формат должен побайтно совпадать с REST-DTO (api.logEntryDTO):
+		// клиент сопоставляет SSE-повторы с загруженными строками по
+		// составному ключу, включающему timestamp как строку.
+		ev := events.LogEntryEvent{
+			Timestamp: entry.Timestamp.UTC().Format(time.RFC3339Nano),
 			Level:     entry.Level,
 			Group:     entry.Group,
 			Subgroup:  entry.Subgroup,
@@ -116,7 +128,12 @@ func (s *Service) AppLog(level Level, group, subgroup, action, target, message s
 			Target:    entry.Target,
 			Message:   entry.Message,
 			Bucket:    string(bucket),
-		})
+			Repeats:   entry.Repeats,
+		}
+		if entry.LastSeen != nil {
+			ev.LastSeen = entry.LastSeen.UTC().Format(time.RFC3339Nano)
+		}
+		s.bus.Publish("log:entry", ev)
 	}
 }
 
@@ -125,6 +142,20 @@ func (s *Service) AppLog(level Level, group, subgroup, action, target, message s
 // to entries strictly after that time (SSE catch-up after reconnect).
 // Returns the page slice and the total count of filtered entries.
 func (s *Service) GetLogs(bucket Bucket, group, subgroup, level string, since time.Time, limit, offset int) ([]LogEntry, int) {
+	var groups []string
+	var subgroups []string
+	if group != "" {
+		groups = []string{group}
+	}
+	if subgroup != "" {
+		subgroups = []string{subgroup}
+	}
+	return s.GetLogsMulti(bucket, groups, subgroups, level, since, limit, offset)
+}
+
+// GetLogsMulti returns entries from the specified bucket filtered by multiple
+// groups/subgroups and level with pagination.
+func (s *Service) GetLogsMulti(bucket Bucket, groups []string, subgroups []string, level string, since time.Time, limit, offset int) ([]LogEntry, int) {
 	if limit <= 0 {
 		limit = 200
 	}
@@ -132,7 +163,7 @@ func (s *Service) GetLogs(bucket Bucket, group, subgroup, level string, since ti
 	if buf == nil {
 		return nil, 0
 	}
-	return buf.GetPaginated(group, subgroup, level, since, limit, offset)
+	return buf.GetPaginatedMulti(groups, subgroups, level, since, limit, offset)
 }
 
 // Clear removes all entries from the specified bucket.

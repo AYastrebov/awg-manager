@@ -17,16 +17,18 @@ const neverHandshake int64 = types.NeverHandshake
 // NWGState holds parsed state from an RCI response for a single
 // Wireguard interface.
 type NWGState struct {
-	Exists        bool
-	ConfLayer     string // "running" | "disabled"
-	LinkUp        bool
-	WGStatus      string // "up" | "down"
-	PeerOnline    bool
-	LastHandshake int64  // unix timestamp, 2147483647 = never
-	RxBytes       int64
-	TxBytes       int64
-	PeerVia       string // NDMS WAN name from peer "via" field (e.g. "PPPoE0")
-	Connected     string // RFC3339 timestamp converted from NDMS "connected" field (unix ts or string)
+	Exists         bool
+	ConfLayer      string // "running" | "disabled"
+	LinkUp         bool
+	WGStatus       string // "up" | "down"
+	PeerOnline     bool
+	LastHandshake  int64 // unix timestamp, 2147483647 = never
+	RxBytes        int64
+	TxBytes        int64
+	PeerVia        string // NDMS WAN name from peer "via" field (e.g. "PPPoE0")
+	PeerRemoteAddr string // peer "remote-endpoint-address" (127.0.0.1 for proxy path)
+	PeerRemotePort int    // peer "remote-port" (kmod proxy listen port for proxy path)
+	Connected      string // RFC3339 timestamp converted from NDMS "connected" field (unix ts or string)
 }
 
 // parseRCIInterfaceResponse parses a raw RCI JSON response for a single
@@ -50,10 +52,11 @@ func parseRCIInterfaceResponse(data []byte) (NWGState, error) {
 	}
 
 	state := NWGState{
-		Exists:    true,
-		ConfLayer: iface.Summary.Layer.Conf,
-		LinkUp:    iface.Link == "up",
-		Connected: connectedAt,
+		Exists:        true,
+		ConfLayer:     iface.Summary.Layer.Conf,
+		LinkUp:        iface.Link == "up",
+		Connected:     connectedAt,
+		LastHandshake: neverHandshake, // нет peer-блока = хендшейка не было
 	}
 
 	if iface.WireGuard != nil {
@@ -66,6 +69,8 @@ func parseRCIInterfaceResponse(data []byte) (NWGState, error) {
 			state.RxBytes = peer.RxBytes
 			state.TxBytes = peer.TxBytes
 			state.PeerVia = peer.Via
+			state.PeerRemoteAddr = peer.RemoteEndpointAddress
+			state.PeerRemotePort = peer.RemotePort
 		}
 	}
 
@@ -107,22 +112,3 @@ func parseConnectedField(raw json.RawMessage) string {
 	}
 	return ""
 }
-
-// parseRCIInterfaceList parses the raw RCI JSON response from /show/interface/
-// which returns a map of interface objects keyed by interface ID.
-// It filters by type == "Wireguard" and returns matching interface names.
-func parseRCIInterfaceList(data []byte) ([]string, error) {
-	var allIfaces map[string]types.WGInterface
-	if err := json.Unmarshal(data, &allIfaces); err != nil {
-		return nil, fmt.Errorf("decode rci interface list: %w", err)
-	}
-
-	var names []string
-	for _, iface := range allIfaces {
-		if strings.EqualFold(iface.Type, "Wireguard") {
-			names = append(names, iface.ID)
-		}
-	}
-	return names, nil
-}
-

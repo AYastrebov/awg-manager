@@ -1,5 +1,7 @@
 <script lang="ts">
 	import type { PolicyDevice } from '$lib/types';
+	import { Badge } from '$lib/components/ui';
+	import { ArrowLeft } from 'lucide-svelte';
 
 	interface Props {
 		devices: PolicyDevice[];
@@ -10,22 +12,36 @@
 	let { devices, currentPolicy, onassign }: Props = $props();
 
 	let search = $state('');
+	let showOffline = $state(true);
+
+	function isDeviceOnline(d: PolicyDevice): boolean {
+		return d.active && d.link === 'up';
+	}
 
 	let filtered = $derived.by(() => {
-		const visible = devices.filter((d) => d.policy !== currentPolicy);
+		let visible = devices.filter((d) => d.policy !== currentPolicy);
+		if (!showOffline) {
+			visible = visible.filter(isDeviceOnline);
+		}
 		if (!search.trim()) return visible;
 		const q = search.trim().toLowerCase();
 		return visible.filter(
 			(d) =>
 				d.name.toLowerCase().includes(q) ||
 				d.hostname.toLowerCase().includes(q) ||
-				d.ip.toLowerCase().includes(q)
+				d.ip.toLowerCase().includes(q) ||
+				d.mac.toLowerCase().includes(q)
 		);
 	});
 </script>
 
 <div class="device-list-section">
 	<h4 class="section-title">Все устройства</h4>
+
+	<label class="offline-toggle">
+		<input type="checkbox" bind:checked={showOffline} />
+		<span>Отобразить offline устройства</span>
+	</label>
 
 	<input
 		type="text"
@@ -36,7 +52,7 @@
 
 	<div class="device-scroll">
 		{#each filtered as device}
-			{@const isActive = device.active && device.link === 'up'}
+			{@const isActive = isDeviceOnline(device)}
 			{@const isBusy = device.policy !== '' && device.policy !== currentPolicy}
 			<div
 				class="device-row"
@@ -51,12 +67,14 @@
 				<span class="led" class:led-green={isActive} class:led-gray={!isActive}></span>
 				<div class="device-info">
 					<span class="device-name">{device.name || device.hostname || device.mac}</span>
-					{#if device.ip}
+					{#if device.ip && device.ip !== '0.0.0.0'}
 						<span class="device-ip">{device.ip}</span>
+					{:else}
+						<span class="device-ip">IP адрес отсутствует</span>
 					{/if}
 				</div>
 				{#if isBusy}
-					<span class="badge-policy">{device.policy}</span>
+					<Badge variant="muted" size="xs">{device.policy}</Badge>
 				{/if}
 				<button
 					class="assign-btn"
@@ -64,10 +82,7 @@
 					disabled={isBusy}
 					onclick={() => { if (!isBusy) onassign(device.mac); }}
 				>
-					<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-						<line x1="19" y1="12" x2="5" y2="12"/>
-						<polyline points="12 19 5 12 12 5"/>
-					</svg>
+					<ArrowLeft size={15} />
 				</button>
 			</div>
 		{/each}
@@ -82,6 +97,9 @@
 		display: flex;
 		flex-direction: column;
 		gap: 8px;
+		flex: 1;
+		min-height: 0;
+		overflow: hidden;
 	}
 
 	.section-title {
@@ -89,6 +107,21 @@
 		font-weight: 600;
 		margin: 0;
 		color: var(--text-primary);
+	}
+
+	.offline-toggle {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 0.75rem;
+		color: var(--text-muted);
+		cursor: pointer;
+		user-select: none;
+	}
+
+	.offline-toggle input {
+		accent-color: var(--accent);
+		cursor: pointer;
 	}
 
 	.search-input {
@@ -108,7 +141,8 @@
 	}
 
 	.device-scroll {
-		max-height: 500px;
+		flex: 1;
+		min-height: 0;
 		overflow-y: auto;
 		display: flex;
 		flex-direction: column;
@@ -154,16 +188,6 @@
 	.device-ip {
 		font-size: 0.6875rem;
 		color: var(--text-muted);
-	}
-
-	.badge-policy {
-		font-size: 0.625rem;
-		padding: 1px 6px;
-		border-radius: 9999px;
-		background: var(--bg-hover);
-		color: var(--text-muted);
-		border: 1px solid var(--border);
-		white-space: nowrap;
 	}
 
 	.assign-btn {

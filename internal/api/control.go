@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/hoaxisr/awg-manager/internal/events"
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/orchestrator"
+	"github.com/hoaxisr/awg-manager/internal/proxyrt/instancestore"
 	"github.com/hoaxisr/awg-manager/internal/response"
-	"github.com/hoaxisr/awg-manager/internal/routing"
+	"github.com/hoaxisr/awg-manager/internal/storage"
 	"github.com/hoaxisr/awg-manager/internal/tunnel"
 )
 
@@ -32,17 +34,27 @@ type TunnelControlResponse struct {
 type ControlHandler struct {
 	svc            TunnelService
 	orch           *orchestrator.Orchestrator
+	store          *storage.AWGTunnelStore
+	proxyEnabler   ProxyInstanceEnabler
 	pingCheck      PingCheckService
 	tunnelsHandler *TunnelsHandler
 	bus            *events.Bus
 	log            *logging.ScopedLogger
 }
 
+// ProxyInstanceEnabler — тумблер намерения одного инстанса прокси-рантайма.
+// Узкий срез manager.Manager: карточке зеркальной записи wdtt-raw нужен ровно
+// он, а весь менеджер сюда тянуть незачем.
+type ProxyInstanceEnabler interface {
+	SetEnabled(ctx context.Context, key string, on bool) error
+}
+
 // NewControlHandler creates a new control handler.
-func NewControlHandler(svc TunnelService, appLogger logging.AppLogger) *ControlHandler {
+func NewControlHandler(svc TunnelService, store *storage.AWGTunnelStore, appLogger logging.AppLogger) *ControlHandler {
 	return &ControlHandler{
-		svc: svc,
-		log: logging.NewScopedLogger(appLogger, logging.GroupTunnel, logging.SubLifecycle),
+		svc:   svc,
+		store: store,
+		log:   logging.NewScopedLogger(appLogger, logging.GroupTunnel, logging.SubLifecycle),
 	}
 }
 
@@ -64,16 +76,57 @@ func (h *ControlHandler) SetTunnelsHandler(th *TunnelsHandler) {
 // SetEventBus sets the event bus for SSE publishing.
 func (h *ControlHandler) SetEventBus(bus *events.Bus) { h.bus = bus }
 
-// SetCatalog is a no-op retained for API compatibility. The control
-// handler no longer needs direct catalog access — it just emits a
-// resource:invalidated hint so the polling store refetches.
-func (h *ControlHandler) SetCatalog(_ routing.Catalog) {}
+// SetProxyControl wires the proxy-runtime intent switch so the wdtt-raw mirror
+// record's card toggles its instance, not the kernel lifecycle of a tunnel that
+// has no kernel lifecycle (store приходит конструктором).
+func (h *ControlHandler) SetProxyControl(en ProxyInstanceEnabler) { h.proxyEnabler = en }
+
+// controlWdttRaw — старт/стоп зеркальной записи wdtt-raw. Это НЕ kernel-туннель:
+// его поднимает и опускает воркер прокси-рантайма по намерению записи, поэтому
+// кнопка карточки переключает намерение инстанса, а не зовёт оркестратор (его
+// путь для такой записи означал бы побочные эффекты kernel-жизненного цикла).
+func (h *ControlHandler) controlWdttRaw(w http.ResponseWriter, r *http.Request, id string, start bool) bool {
+	if h.proxyEnabler == nil {
+		return false
+	}
+	stored, err := h.store.Get(id)
+	if err != nil || stored == nil || stored.Backend != backendWdttRaw {
+		return false
+	}
+	clientID := strings.TrimSpace(stored.WdttClientID)
+	if clientID == "" {
+		response.Error(w, "wdtt raw tunnel: client id missing", "INTERNAL")
+		return true
+	}
+	key := instancestore.Record{Kind: instancestore.KindWdttClient, ID: clientID}.Key()
+	if opErr := h.proxyEnabler.SetEnabled(r.Context(), key, start); opErr != nil {
+		code := "START_FAILED"
+		if !start {
+			code = "STOP_FAILED"
+		}
+		response.Error(w, opErr.Error(), code)
+		return true
+	}
+	if h.tunnelsHandler != nil {
+		h.tunnelsHandler.publishTunnelList(r.Context())
+	}
+	h.publishRoutingTunnels(r.Context())
+	status := "stopped"
+	if start {
+		status = "running"
+	}
+	response.Success(w, map[string]interface{}{
+		"id":     id,
+		"status": status,
+	})
+	return true
+}
 
 // publishRoutingTunnels posts a resource:invalidated hint so clients
 // refetch the routing tunnel list after a start/stop that changed
 // which tunnels are available for routing dropdowns.
 func (h *ControlHandler) publishRoutingTunnels(_ context.Context) {
-	publishInvalidated(h.bus, ResourceRoutingTunnels, "state-changed")
+	h.bus.PublishInvalidated(events.ResourceRoutingTunnels, "state-changed")
 }
 
 func (h *ControlHandler) getStatus(r *http.Request, id string) string {
@@ -90,6 +143,7 @@ func (h *ControlHandler) getStatus(r *http.Request, id string) string {
 //	@Param			id	query	string	true	"Tunnel id"
 //	@Success		200	{object}	TunnelControlResponse
 //	@Failure		400	{object}	APIErrorEnvelope
+//	@Failure		409	{object}	APIErrorEnvelope
 //	@Failure		500	{object}	APIErrorEnvelope
 //	@Router			/control/start [post]
 func (h *ControlHandler) Start(w http.ResponseWriter, r *http.Request) {
@@ -98,13 +152,15 @@ func (h *ControlHandler) Start(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		response.Error(w, "missing id parameter", "MISSING_ID")
+	id, ok := requireQueryID(w, r)
+	if !ok {
 		return
 	}
 	if !isValidTunnelID(id) {
 		response.Error(w, "invalid tunnel ID", "INVALID_ID")
+		return
+	}
+	if h.controlWdttRaw(w, r, id, true) {
 		return
 	}
 
@@ -114,6 +170,10 @@ func (h *ControlHandler) Start(w http.ResponseWriter, r *http.Request) {
 	})
 	if errors.Is(err, tunnel.ErrAlreadyRunning) {
 		err = nil // tunnel already running — user's intent fulfilled
+	}
+	if errors.Is(err, tunnel.ErrOperationInProgress) {
+		response.ErrorWithStatus(w, http.StatusConflict, err.Error(), "OPERATION_IN_PROGRESS")
+		return
 	}
 	if err != nil {
 		h.log.Warn("start", id, "Failed to start tunnel: "+err.Error())
@@ -143,6 +203,8 @@ func (h *ControlHandler) Start(w http.ResponseWriter, r *http.Request) {
 //	@Param			id	query	string	true	"Tunnel id"
 //	@Success		200	{object}	TunnelControlResponse
 //	@Failure		400	{object}	APIErrorEnvelope
+//	@Failure		403	{object}	APIErrorEnvelope
+//	@Failure		409	{object}	APIErrorEnvelope
 //	@Failure		500	{object}	APIErrorEnvelope
 //	@Router			/control/stop [post]
 func (h *ControlHandler) Stop(w http.ResponseWriter, r *http.Request) {
@@ -151,13 +213,19 @@ func (h *ControlHandler) Stop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		response.Error(w, "missing id parameter", "MISSING_ID")
+	id, ok := requireQueryID(w, r)
+	if !ok {
 		return
 	}
 	if !isValidTunnelID(id) {
 		response.Error(w, "invalid tunnel ID", "INVALID_ID")
+		return
+	}
+	if stored, _ := h.store.Get(id); stored != nil && stored.Locked {
+		response.ErrorWithStatus(w, http.StatusForbidden, tunnelLockedMessage, "TUNNEL_LOCKED")
+		return
+	}
+	if h.controlWdttRaw(w, r, id, false) {
 		return
 	}
 
@@ -165,6 +233,11 @@ func (h *ControlHandler) Stop(w http.ResponseWriter, r *http.Request) {
 		Type:   orchestrator.EventStop,
 		Tunnel: id,
 	}); err != nil {
+		if errors.Is(err, tunnel.ErrOperationInProgress) {
+			// Busy lock — nothing was attempted, do NOT flip Enabled.
+			response.ErrorWithStatus(w, http.StatusConflict, err.Error(), "OPERATION_IN_PROGRESS")
+			return
+		}
 		// Always sync Enabled=false — user's intent is "OFF" regardless of current state.
 		// ErrNotRunning means tunnel is already stopped/disabled, but we still want Enabled=false
 		// so it doesn't auto-start on boot.
@@ -196,6 +269,7 @@ func (h *ControlHandler) Stop(w http.ResponseWriter, r *http.Request) {
 //	@Param			id	query	string	true	"Tunnel id"
 //	@Success		200	{object}	TunnelControlResponse
 //	@Failure		400	{object}	APIErrorEnvelope
+//	@Failure		409	{object}	APIErrorEnvelope
 //	@Failure		500	{object}	APIErrorEnvelope
 //	@Router			/control/restart [post]
 func (h *ControlHandler) Restart(w http.ResponseWriter, r *http.Request) {
@@ -204,9 +278,8 @@ func (h *ControlHandler) Restart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		response.Error(w, "missing id parameter", "MISSING_ID")
+	id, ok := requireQueryID(w, r)
+	if !ok {
 		return
 	}
 	if !isValidTunnelID(id) {
@@ -218,6 +291,10 @@ func (h *ControlHandler) Restart(w http.ResponseWriter, r *http.Request) {
 		Type:   orchestrator.EventRestart,
 		Tunnel: id,
 	}); err != nil {
+		if errors.Is(err, tunnel.ErrOperationInProgress) {
+			response.ErrorWithStatus(w, http.StatusConflict, err.Error(), "OPERATION_IN_PROGRESS")
+			return
+		}
 		h.log.Warn("restart", id, "Failed to restart tunnel: "+err.Error())
 		response.Error(w, err.Error(), "RESTART_FAILED")
 		return
@@ -303,6 +380,7 @@ func (h *ControlHandler) RestartAll(w http.ResponseWriter, r *http.Request) {
 //	@Param			id	query	string	true	"Tunnel id"
 //	@Success		200	{object}	APIEnvelope
 //	@Failure		400	{object}	APIErrorEnvelope
+//	@Failure		403	{object}	APIErrorEnvelope
 //	@Failure		500	{object}	APIErrorEnvelope
 //	@Router			/control/toggle-enabled [post]
 func (h *ControlHandler) ToggleEnabled(w http.ResponseWriter, r *http.Request) {
@@ -311,13 +389,16 @@ func (h *ControlHandler) ToggleEnabled(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		response.Error(w, "missing id parameter", "MISSING_ID")
+	id, ok := requireQueryID(w, r)
+	if !ok {
 		return
 	}
 	if !isValidTunnelID(id) {
 		response.Error(w, "invalid tunnel ID", "INVALID_ID")
+		return
+	}
+	if stored, _ := h.store.Get(id); stored != nil && stored.Locked {
+		response.ErrorWithStatus(w, http.StatusForbidden, tunnelLockedMessage, "TUNNEL_LOCKED")
 		return
 	}
 
@@ -361,6 +442,7 @@ func (h *ControlHandler) ToggleEnabled(w http.ResponseWriter, r *http.Request) {
 //	@Param			id	query	string	true	"Tunnel id"
 //	@Success		200	{object}	APIEnvelope
 //	@Failure		400	{object}	APIErrorEnvelope
+//	@Failure		403	{object}	APIErrorEnvelope
 //	@Failure		500	{object}	APIErrorEnvelope
 //	@Router			/control/toggle-default-route [post]
 func (h *ControlHandler) ToggleDefaultRoute(w http.ResponseWriter, r *http.Request) {
@@ -369,13 +451,16 @@ func (h *ControlHandler) ToggleDefaultRoute(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	id := r.URL.Query().Get("id")
-	if id == "" {
-		response.Error(w, "missing id parameter", "MISSING_ID")
+	id, ok := requireQueryID(w, r)
+	if !ok {
 		return
 	}
 	if !isValidTunnelID(id) {
 		response.Error(w, "invalid tunnel ID", "INVALID_ID")
+		return
+	}
+	if stored, _ := h.store.Get(id); stored != nil && stored.Locked {
+		response.ErrorWithStatus(w, http.StatusForbidden, tunnelLockedMessage, "TUNNEL_LOCKED")
 		return
 	}
 
