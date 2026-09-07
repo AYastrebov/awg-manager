@@ -8,27 +8,20 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/tunnel/config"
 )
 
-// NDMS parses I1-I5 with the native AmneziaWG parser, which enforces the
-// per-tag ceiling on <r>/<rc>/<rd> that our own datapaths do not: awg_proxy.ko
-// accepts any size up to 100000 (kmod/awg-proxy/src/cps.c), and so do the
-// userspace and kernel AmneziaWG implementations. A config generated elsewhere
-// therefore works everywhere until it reaches the router, which refuses the
-// whole interface with `"WireguardN": invalid I1 value.` and creates nothing.
-//
-// The known source is the docker-amneziawg container, whose default I1 is a
-// QUIC Initial padded to the RFC 9000 §14.1 minimum of 1200 bytes — its
-// payload is a single <r 1178>. That default ships in every config the
-// container hands out, so the configs already in users' hands cannot be
-// regenerated. Splitting the token is wire-equivalent (same total random
-// bytes), so the peer sees no change and distributed configs stay valid.
+// NDMS parses I1-I5 with a strict AmneziaWG parser that enforces a per-tag
+// ceiling on <r>/<rc>/<rd> which none of our own datapaths do (see
+// signature.MaxTagBytes for the provenance). A config generated elsewhere —
+// notably the docker-amneziawg default I1 — therefore works everywhere until
+// it reaches the router, which refuses the whole interface with
+// `"WireguardN": invalid I1 value.` and creates nothing.
 //
 // Only what goes to NDMS is rewritten. The stored tunnel keeps the signature
 // exactly as imported, so a .conf downloaded from the UI is still the file the
 // user gave us.
 
-// splitSignatureTags returns iface with every oversized <r>/<rc>/<rd> token in
-// I1-I5 split, plus a description of what changed for the log ("" if nothing).
-// The input is not modified.
+// splitSignatureTags returns iface with every I1-I5 slot passed through
+// signature.SplitOversizedTags, plus a description of what changed for the log
+// ("" if nothing). The input is not modified.
 func splitSignatureTags(iface *storage.AWGInterface) (storage.AWGInterface, string) {
 	out := *iface
 	slots := []struct {
@@ -41,11 +34,12 @@ func splitSignatureTags(iface *storage.AWGInterface) (storage.AWGInterface, stri
 
 	var notes []string
 	for _, s := range slots {
-		if !signature.HasOversizedTag(*s.val) {
+		v, note := signature.SplitOversizedTags(*s.val)
+		if note == "" {
 			continue
 		}
-		notes = append(notes, s.name+": "+signature.DescribeOversizedTags(*s.val))
-		*s.val = signature.SplitOversizedTags(*s.val)
+		*s.val = v
+		notes = append(notes, s.name+": "+note)
 	}
 	return out, strings.Join(notes, "; ")
 }
@@ -55,9 +49,14 @@ func splitSignatureTags(iface *storage.AWGInterface) (storage.AWGInterface, stri
 // NDMS actually runs would differ from the stored one with nothing said —
 // precisely the diagnostic this fixup exists to provide.
 func (o *OperatorNativeWG) logSignatureSplit(stage, name string, iface *storage.AWGInterface) {
-	if _, note := splitSignatureTags(iface); note != "" {
-		o.appLog.Info(stage, name,
-			"сигнатуры разбиты под лимит NDMS в 1000 байт на тег — "+note)
+	_, note := splitSignatureTags(iface)
+	o.logSplitNote(stage, name, note)
+}
+
+// logSplitNote writes an already computed rewrite description, if any.
+func (o *OperatorNativeWG) logSplitNote(stage, name, note string) {
+	if note != "" {
+		o.appLog.Info(stage, name, signature.RewriteLogMessage(note))
 	}
 }
 

@@ -132,10 +132,7 @@ func (o *OperatorNativeWG) createViaImport(ctx context.Context, stored *storage.
 	// parser and rejects the whole import otherwise (see
 	// signature_normalize.go).
 	confData, splitNote := ndmsImportConf(stored)
-	if splitNote != "" {
-		o.appLog.Info("create", stored.Name,
-			"сигнатуры разбиты под лимит NDMS в 1000 байт на тег — "+splitNote)
-	}
+	o.logSplitNote("create", stored.Name, splitNote)
 
 	// NDMS RCI-импорт отвергает IPv6-endpoint в .conf («"WireguardN": invalid
 	// endpoint format») и создание падает целиком, а доменное имя он принимает,

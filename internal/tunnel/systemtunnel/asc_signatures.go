@@ -3,6 +3,7 @@ package systemtunnel
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 
 	"github.com/hoaxisr/awg-manager/internal/signature"
 )
@@ -11,7 +12,8 @@ import (
 var ascSignatureSlots = [...]string{"i1", "i2", "i3", "i4", "i5"}
 
 // splitASCSignatures rewrites oversized <r>/<rc>/<rd> tokens in the i1-i5
-// fields of an ASC params object.
+// fields of an ASC params object and describes what changed for the log
+// ("" if nothing).
 //
 // The /system-tunnels/asc form posts these straight through to the same NDMS
 // ASC endpoint the managed tunnels use, so a signature the router refuses
@@ -22,13 +24,13 @@ var ascSignatureSlots = [...]string{"i1", "i2", "i3", "i4", "i5"}
 // Anything that is not a JSON object, or has no signature fields to fix, comes
 // back byte-identical: this is a fixup, not a reformatter, and the caller's
 // payload is otherwise none of our business.
-func splitASCSignatures(params json.RawMessage) json.RawMessage {
+func splitASCSignatures(params json.RawMessage) (json.RawMessage, string) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(params, &obj); err != nil {
-		return params
+		return params, ""
 	}
 
-	changed := false
+	var notes []string
 	for _, slot := range ascSignatureSlots {
 		raw, ok := obj[slot]
 		if !ok {
@@ -38,8 +40,8 @@ func splitASCSignatures(params json.RawMessage) json.RawMessage {
 		if err := json.Unmarshal(raw, &val); err != nil {
 			continue
 		}
-		split := signature.SplitOversizedTags(val)
-		if split == val {
+		split, note := signature.SplitOversizedTags(val)
+		if note == "" {
 			continue
 		}
 		encoded, err := marshalNoEscape(split)
@@ -47,17 +49,17 @@ func splitASCSignatures(params json.RawMessage) json.RawMessage {
 			continue
 		}
 		obj[slot] = encoded
-		changed = true
+		notes = append(notes, strings.ToUpper(slot)+": "+note)
 	}
-	if !changed {
-		return params
+	if len(notes) == 0 {
+		return params, ""
 	}
 
 	out, err := marshalNoEscape(obj)
 	if err != nil {
-		return params
+		return params, ""
 	}
-	return out
+	return out, strings.Join(notes, "; ")
 }
 
 // marshalNoEscape marshals v without HTML escaping, so the <> in signature

@@ -105,3 +105,22 @@ func TestNDMSImportConf_SplitsOversizedSignatureTag(t *testing.T) {
 		t.Errorf("stored interface was mutated: %q", stored.Interface.I1)
 	}
 }
+
+// Canonicalisation must not depend on an oversized token sharing the slot:
+// "<r500>" alone is rejected by upstream's parser just the same, and the
+// systemtunnel path already rewrites it unconditionally.
+func TestSplitSignatureTags_CanonicalisesWithoutOversizedTag(t *testing.T) {
+	iface := oversizedIface()
+	iface.I1 = "<b 0xdead><r500>"
+	iface.I2 = "<r 32>"
+	out, note := splitSignatureTags(iface)
+	if out.I1 != "<b 0xdead><r 500>" || out.I2 != "<r 32>" {
+		t.Errorf("I1=%q I2=%q", out.I1, out.I2)
+	}
+	if note != "I1: <r500> → <r 500>" {
+		t.Errorf("note = %q", note)
+	}
+	if iface.I1 != "<b 0xdead><r500>" {
+		t.Errorf("input was mutated: %q", iface.I1)
+	}
+}

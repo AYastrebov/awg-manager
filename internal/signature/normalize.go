@@ -20,14 +20,17 @@ import (
 // So no current AmneziaWG implementation rejects an oversized token, and a
 // config carrying one is not malformed by today's upstream. Keenetic's NDMS
 // ASC nonetheless refuses such a value, which is consistent with its parser
-// having been derived from pre-PR-103 amneziawg-go. We keep our own generated
-// chains under the limit (splitPad) and split third-party ones at the NDMS
-// boundary purely for that compatibility.
+// having been derived from pre-PR-103 amneziawg-go. Measured on
+// 5.01.C.3.0-1 via RCI `wireguard asc`: <r 1000>, <rc 1000> accepted;
+// <r 1001>, <rc 1001>, <rd 1001> rejected with `invalid I1 value`. We keep our
+// own generated chains under the limit (splitPad) and split third-party ones
+// at the NDMS boundary purely for that compatibility.
 const MaxTagBytes = 1000
 
 // MaxSplittableTagBytes bounds what we are willing to rewrite. A size beyond
-// it is not a config we can rescue: awg_proxy.ko's own parser rejects anything
-// over 100000 (parse_int in kmod/awg-proxy/src/cps.c), so such a token is
+// it is not a config we can rescue: awg_proxy.ko's parse_int
+// (kmod/awg-proxy/src/cps.c) rejects a value once the digits read so far
+// exceed 100000 (so its true ceiling is 1000009), and such a token is
 // nonsense wherever it ends up.
 //
 // The bound is load-bearing, not cosmetic. Nothing validates I1-I5 on the way
@@ -46,9 +49,17 @@ const MaxSplittableTagBytes = 100000
 var randTagRe = regexp.MustCompile(`<\s*(rc|rd|r)\s*(\d+)\s*>`)
 
 // SplitOversizedTags rewrites any <r>/<rc>/<rd> token larger than MaxTagBytes
-// into a run of tokens of the same kind that sum to the original size, and
-// returns everything else — <b>, <t>, <c>, unknown tokens, stray text —
-// byte-identical.
+// into a run of tokens of the same kind that sum to the original size. Every
+// matched token is re-emitted in canonical "<kind N>" form: the regex tolerates
+// "<r500>" and "<r  500 >", which NDMS rejects just like an oversized token
+// (measured on 5.01.C.3.0-1), and fixing only the oversized tokens would leave
+// a differently malformed config behind. Everything else — <b>, <t>, <c>,
+// unknown tokens, stray text — comes back byte-identical.
+//
+// The second value lists every token that changed, e.g.
+// "<r 1178> → <r 1000><r 178>", and is "" when the spec was returned as is.
+// Callers log it rather than rewrite silently: a config that only imports
+// because we edited it should say so.
 //
 // The rewrite is wire-equivalent: N random bytes emitted as one token or as
 // several are the same N bytes on the wire, so a peer sees no difference and
@@ -62,56 +73,32 @@ var randTagRe = regexp.MustCompile(`<\s*(rc|rd|r)\s*(\d+)\s*>`)
 // splitting. Every current datapath accepts it, so it works everywhere until
 // the value reaches NDMS, which refuses the whole interface with
 // `"WireguardN": invalid I1 value.` — naming the slot but not the token.
-func SplitOversizedTags(spec string) string {
+func SplitOversizedTags(spec string) (out, note string) {
 	if !strings.Contains(spec, "<") {
-		return spec
+		return spec, ""
 	}
-	return randTagRe.ReplaceAllStringFunc(spec, func(tok string) string {
+	var changes []string
+	out = randTagRe.ReplaceAllStringFunc(spec, func(tok string) string {
 		m := randTagRe.FindStringSubmatch(tok)
-		if m == nil {
-			return tok
-		}
 		n, err := strconv.Atoi(m[2])
 		if err != nil || n > MaxSplittableTagBytes {
 			return tok
 		}
+		rep := fmt.Sprintf("<%s %d>", m[1], n)
 		if n > MaxTagBytes {
-			return splitPad(n, m[1])
+			rep = splitPad(n, m[1])
 		}
-		// Within the limit, but still re-emitted in canonical "<kind N>" form.
-		// The regex tolerates "<r500>" and "<r  500 >", which upstream's own
-		// parser does not accept — its parseTag regex,
-		// `([a-zA-Z]+)(?:\s+([^>]+))?>`, requires the whitespace. Rewriting
-		// only the oversized tokens would "fix" a config and leave a
-		// differently-malformed one in it, so every token we match is
-		// normalized.
-		return fmt.Sprintf("<%s %d>", m[1], n)
+		if rep != tok {
+			changes = append(changes, tok+" → "+rep)
+		}
+		return rep
 	})
+	return out, strings.Join(changes, ", ")
 }
 
-// HasOversizedTag reports whether spec contains a token SplitOversizedTags
-// would rewrite. Callers use it to log the fixup rather than perform it
-// silently — a config that only imports because we edited it should say so.
-func HasOversizedTag(spec string) bool {
-	for _, m := range randTagRe.FindAllStringSubmatch(spec, -1) {
-		n, err := strconv.Atoi(m[2])
-		if err == nil && n > MaxTagBytes && n <= MaxSplittableTagBytes {
-			return true
-		}
-	}
-	return false
-}
-
-// DescribeOversizedTags renders the offending tokens for a log line, e.g.
-// "<r 1178> → <r 1000><r 178>". Returns "" when nothing needs splitting.
-func DescribeOversizedTags(spec string) string {
-	var parts []string
-	for _, m := range randTagRe.FindAllStringSubmatch(spec, -1) {
-		n, err := strconv.Atoi(m[2])
-		if err != nil || n <= MaxTagBytes || n > MaxSplittableTagBytes {
-			continue
-		}
-		parts = append(parts, fmt.Sprintf("%s → %s", m[0], splitPad(n, m[1])))
-	}
-	return strings.Join(parts, ", ")
+// RewriteLogMessage renders the app-log line for a note returned by
+// SplitOversizedTags (prefixed by the caller with the slot names).
+func RewriteLogMessage(note string) string {
+	return fmt.Sprintf("сигнатуры переписаны под парсер NDMS (не более %d байт на тег) — %s",
+		MaxTagBytes, note)
 }

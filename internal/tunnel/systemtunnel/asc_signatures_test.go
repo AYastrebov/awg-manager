@@ -10,13 +10,17 @@ const containerI1 = "<b 0xc3><b 0x00000001><b 0x08><r 8><b 0x00><b 0x00><b 0x449
 
 func TestSplitASCSignatures_SplitsOversizedTag(t *testing.T) {
 	in := json.RawMessage(`{"jc":3,"s1":18,"i1":"` + containerI1 + `","i5":"<r 32>"}`)
-	got := string(splitASCSignatures(in))
+	raw, note := splitASCSignatures(in)
+	got := string(raw)
 
 	if strings.Contains(got, "<r 1178>") {
 		t.Errorf("oversized tag survived: %s", got)
 	}
 	if !strings.Contains(got, "<r 1000><r 178>") {
 		t.Errorf("expected split tag: %s", got)
+	}
+	if !strings.Contains(note, "I1: <r 1178> → <r 1000><r 178>") {
+		t.Errorf("rewrite must be described for the log, got %q", note)
 	}
 	// Angle brackets must not be HTML-escaped on the way back out: NDMS needs
 	// the literal <>, and encoding/json escapes them by default.
@@ -41,8 +45,8 @@ func TestSplitASCSignatures_PassesThroughUnchanged(t *testing.T) {
 		`[1,2,3]`,                               // not an object
 		`{"i1":42}`,                             // wrong type in slot
 	} {
-		if got := string(splitASCSignatures(json.RawMessage(in))); got != in {
-			t.Errorf("splitASCSignatures(%q)=%q, want unchanged", in, got)
+		if got, note := splitASCSignatures(json.RawMessage(in)); string(got) != in || note != "" {
+			t.Errorf("splitASCSignatures(%q)=%q, %q; want unchanged, empty note", in, got, note)
 		}
 	}
 }
