@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { protocols, calcByteSize, MAX_SIGNATURE_BYTES, type ProtocolKey, type SignaturePackets } from '$lib/utils/protocols';
+	import { protocols, MAX_SIGNATURE_CHARS, type ProtocolKey, type SignaturePackets } from '$lib/utils/protocols';
 	import { api } from '$lib/api/client';
 	import type { ASCParams, ASCParamsExtended } from '$lib/types';
 	import { isExtendedASCParams } from '$lib/utils/asc-validation';
@@ -76,19 +76,19 @@
 	let captureError = $state('');
 	let captureSource = $state('');
 
-	let totalBytes = $derived.by(() => {
+	let totalChars = $derived.by(() => {
 		if (!showExtended) return 0;
 		const ext = params as ASCParamsExtended;
 		return (
-			calcByteSize(String(ext.i1 || '')) +
-			calcByteSize(String(ext.i2 || '')) +
-			calcByteSize(String(ext.i3 || '')) +
-			calcByteSize(String(ext.i4 || '')) +
-			calcByteSize(String(ext.i5 || ''))
-		);
+			String(ext.i1 || '') +
+			String(ext.i2 || '') +
+			String(ext.i3 || '') +
+			String(ext.i4 || '') +
+			String(ext.i5 || '')
+		).length;
 	});
 
-	let overLimit = $derived(totalBytes > MAX_SIGNATURE_BYTES);
+	let overLimit = $derived(totalChars > MAX_SIGNATURE_CHARS);
 
 	function fieldId(name: string): string {
 		return `${idPrefix}${name}`;
@@ -313,7 +313,7 @@
 			</div>
 
 			<div class="size-indicator" class:over-limit={overLimit}>
-				{totalBytes} / {MAX_SIGNATURE_BYTES} байт
+				{totalChars} / {MAX_SIGNATURE_CHARS} символов
 				{#if overLimit}
 					<span class="size-error">— превышен лимит!</span>
 				{/if}

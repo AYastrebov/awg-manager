@@ -2,6 +2,7 @@ package signature
 
 import (
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
@@ -76,7 +77,7 @@ func TestGenerate_AllProfilesWithinLimitAndGrammar(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", p, err)
 		}
-		if res.Profile != p || res.ByteSize != TotalByteSize(res.Packets) || res.ByteSize > MaxSignatureBytes {
+		if res.Profile != p || res.ByteSize != TotalByteSize(res.Packets) || TotalChars(res.Packets) > MaxSignatureChars {
 			t.Fatalf("%s: %+v", p, res)
 		}
 		for _, pk := range []string{res.Packets.I1, res.Packets.I2, res.Packets.I3, res.Packets.I4, res.Packets.I5} {
@@ -94,20 +95,69 @@ func TestGenerate_AllProfilesWithinLimitAndGrammar(t *testing.T) {
 }
 
 func TestCheckSize(t *testing.T) {
-	ok := GeneratedPackets{I1: "<b 0x0102>", I2: "<r 4000>"}
-	if err := CheckSize(ok); err != nil {
-		t.Fatalf("4002 bytes must pass: %v", err)
+	// Форма из #888: 6060 байт полезной нагрузки при короткой строке. Стенд
+	// такое принимает и читает обратно — гейт обязан пропускать.
+	heavyPayload := GeneratedPackets{
+		I1: "<b 0x" + strings.Repeat("ab", 1200) + ">",
+		I2: "<r 1000>", I3: "<r 1000>", I4: "<r 1000>", I5: "<r 1860>",
 	}
-	over := GeneratedPackets{I1: "<r 1000><r 1000><r 1000><r 1000><r 97>"}
-	if !errors.Is(CheckSize(over), ErrPacketsTooLarge) {
-		t.Fatal("4097 token bytes must fail")
+	if err := CheckSize(heavyPayload); err != nil {
+		t.Fatalf("6060 байт нагрузки в 2438 символах должны проходить: %v", err)
 	}
-	raw := GeneratedPackets{I1: strings.Repeat("x", MaxSignatureRawChars+1)}
+	if n := TotalByteSize(heavyPayload); n != 6060 {
+		t.Fatalf("TotalByteSize = %d, want 6060", n)
+	}
+
+	// Обратный случай: 4096 байт одним <b> — это 8198 символов, стенд на таком
+	// теряет возможность прочитать интерфейс (`awg show`: Message too large).
+	fatString := GeneratedPackets{I1: "<b 0x" + strings.Repeat("ab", 4096) + ">"}
+	if !errors.Is(CheckSize(fatString), ErrPacketsTooLarge) {
+		t.Fatal("8198 символов в одном <b> обязаны отвергаться")
+	}
+
+	// Сырой текст без токенов — 0 байт по ByteSize, но строку занимает.
+	raw := GeneratedPackets{I1: strings.Repeat("x", MaxSignatureChars+1)}
 	if !errors.Is(CheckSize(raw), ErrPacketsTooLarge) {
-		t.Fatal("raw text over the char cap must fail even though it counts 0 token bytes")
+		t.Fatal("сырой текст сверх лимита обязан отвергаться")
 	}
-	edge := GeneratedPackets{I1: "<b 0x" + strings.Repeat("ab", MaxSignatureBytes) + ">"}
+
+	edge := GeneratedPackets{I1: strings.Repeat("x", MaxSignatureChars)}
 	if err := CheckSize(edge); err != nil {
-		t.Fatalf("a 4096-byte <b> (8198 chars) must pass: %v", err)
+		t.Fatalf("ровно лимит должен проходить: %v", err)
+	}
+}
+
+// F166: модуль ядра (junk.c, parse_r_tag и близнецы) проверяет только код
+// возврата kstrtoint, не значение. Одиночный отрицательный тег безвреден
+// (kzalloc проваливается), но в смеси с <b> сумма выходит положительной,
+// конфиг принимается, и в модуле остаётся модификатор с отрицательной длиной.
+func TestCheckTags(t *testing.T) {
+	bad := map[string]GeneratedPackets{
+		"отрицательный r":   {I1: "<r -1>"},
+		"отрицательный rc":  {I1: "<rc -5>"},
+		"отрицательный rd":  {I1: "<rd -1000>"},
+		"смесь с <b>":       {I1: "<b 0x0102><r -1>"},
+		"не в I1":           {I3: "<r -7>"},
+		"плюс перед числом": {I1: "<r +5>"},
+		"сверх потолка":     {I1: "<r 2000000000>"},
+		"не число":          {I1: "<r abc>"},
+	}
+	for name, p := range bad {
+		if !errors.Is(CheckTags(p), ErrInvalidPacketTag) {
+			t.Errorf("%s: должно отвергаться, CheckTags = %v", name, CheckTags(p))
+		}
+	}
+
+	ok := []GeneratedPackets{
+		{I1: "<r 1000>"},
+		{I1: "<r 0>"},            // ноль ядро принимает, вреда нет
+		{I1: "<b 0x0102><t><c>"}, // теги без числового аргумента
+		{I1: "<b 0x01>", I2: "<r 10>", I5: "<rd 4>"}, // все поля
+		{I1: fmt.Sprintf("<r %d>", MaxSplittableTagBytes)},
+	}
+	for _, p := range ok {
+		if err := CheckTags(p); err != nil {
+			t.Errorf("%+v: должно проходить, got %v", p, err)
+		}
 	}
 }

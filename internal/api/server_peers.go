@@ -289,6 +289,8 @@ func (h *ServersHandler) UpdateServerPeer(w http.ResponseWriter, r *http.Request
 				response.Error(w, err.Error(), "INVALID_SIGNATURE_PROFILE")
 			case errors.Is(err, signature.ErrPacketsTooLarge):
 				response.Error(w, err.Error(), "SIGNATURE_TOO_LARGE")
+			case errors.Is(err, signature.ErrInvalidPacketTag):
+				response.Error(w, err.Error(), "SIGNATURE_INVALID_TAG")
 			default:
 				response.Error(w, err.Error(), "UPDATE_PEER_FAILED")
 			}

@@ -65,13 +65,14 @@ func TestUpdatePeer_SignatureOptionalAndValidated(t *testing.T) {
 	if sv.Peers[0].SignatureProfile != "sip" {
 		t.Fatalf("profile must be canonical, got %q", sv.Peers[0].SignatureProfile)
 	}
-	// превышение лимита
+	// большая нагрузка в короткой строке лимит НЕ трогает: <r N> занимает
+	// 8 символов, байты генерирует модуль ядра при отправке
 	err = svc.UpdatePeer(context.Background(), "Wireguard1", testPeerPubKey, UpdatePeerRequest{Description: "d2", TunnelIP: "10.0.0.2/32",
 		Signature: &PeerSignature{I1: "<r 1000><r 1000><r 1000><r 1000><r 97>"}})
-	if !errors.Is(err, ErrSignatureTooLarge) {
+	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
-	// сырой текст без токенов: ByteSize видит 0, ловит лимит на длину строк
+	// превышение лимита — по ДЛИНЕ СТРОКИ
 	err = svc.UpdatePeer(context.Background(), "Wireguard1", testPeerPubKey, UpdatePeerRequest{Description: "d2", TunnelIP: "10.0.0.2/32",
 		Signature: &PeerSignature{I1: strings.Repeat("x", 9000)}})
 	if !errors.Is(err, ErrSignatureTooLarge) {

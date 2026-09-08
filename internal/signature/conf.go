@@ -3,10 +3,24 @@ package signature
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/hoaxisr/awg-manager/internal/ndms"
 )
+
+// HeaderOrDefault — значение H-параметра для .conf. Пустым его писать НЕЛЬЗЯ:
+// `awg setconf` на строке `H1 = ` отвергает ВЕСЬ файл (`Line unrecognized:
+// 'H1='` + `Configuration parsing error`, rc=1 — стенд 08.09, F167), то есть
+// туннель не стартует вовсе. Пустое поле означает «как в ванильном
+// WireGuard», а там H1..H4 — это номера типов сообщений 1..4: ровно то, что
+// показывает `awg showconf` на интерфейсе без header-параметров.
+func HeaderOrDefault(v string, msgType int) string {
+	if strings.TrimSpace(v) == "" {
+		return strconv.Itoa(msgType)
+	}
+	return v
+}
 
 // WriteASCConf пишет хвост [Interface] клиентского .conf: числовые и
 // header-параметры — из снимка ASC интерфейса (raw), сигнатуру I1–I5 — из
@@ -27,10 +41,10 @@ func WriteASCConf(b *strings.Builder, raw json.RawMessage, packets GeneratedPack
 	fmt.Fprintf(b, "Jmax = %d\n", ext.Jmax)
 	fmt.Fprintf(b, "S1 = %d\n", ext.S1)
 	fmt.Fprintf(b, "S2 = %d\n", ext.S2)
-	fmt.Fprintf(b, "H1 = %s\n", ext.H1)
-	fmt.Fprintf(b, "H2 = %s\n", ext.H2)
-	fmt.Fprintf(b, "H3 = %s\n", ext.H3)
-	fmt.Fprintf(b, "H4 = %s\n", ext.H4)
+	fmt.Fprintf(b, "H1 = %s\n", HeaderOrDefault(ext.H1, 1))
+	fmt.Fprintf(b, "H2 = %s\n", HeaderOrDefault(ext.H2, 2))
+	fmt.Fprintf(b, "H3 = %s\n", HeaderOrDefault(ext.H3, 3))
+	fmt.Fprintf(b, "H4 = %s\n", HeaderOrDefault(ext.H4, 4))
 
 	if ext.S3 > 0 || ext.S4 > 0 {
 		fmt.Fprintf(b, "S3 = %d\n", ext.S3)

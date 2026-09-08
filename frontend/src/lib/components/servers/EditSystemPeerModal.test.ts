@@ -83,7 +83,7 @@ describe('EditSystemPeerModal', () => {
 	});
 
 	it('блокирует сохранение при сигнатуре сверх лимита', () => {
-		const { getByText } = openModal(basePeer({ i1: '<r 4100>' }));
+		const { getByText } = openModal(basePeer({ i1: 'x'.repeat(3501) }));
 		expect((getByText('Сохранить').closest('button') as HTMLButtonElement).disabled).toBe(true);
 	});
 });

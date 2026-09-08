@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { WireguardServerPeer } from '$lib/types';
 	import { Modal, Button } from '$lib/components/ui';
-	import { protocols, calcTotalSize, MAX_SIGNATURE_BYTES, type ProtocolKey, type SignaturePackets } from '$lib/utils/protocols';
+	import { protocols, calcTotalChars, MAX_SIGNATURE_CHARS, type ProtocolKey, type SignaturePackets } from '$lib/utils/protocols';
 	import PeerSignatureEditor from './PeerSignatureEditor.svelte';
 	import { api } from '$lib/api/client';
 	import { notifications } from '$lib/stores/notifications';
@@ -64,7 +64,7 @@
 		);
 	});
 
-	const sigOver = $derived(calcTotalSize(sigPackets) > MAX_SIGNATURE_BYTES);
+	const sigOver = $derived(calcTotalChars(sigPackets) > MAX_SIGNATURE_CHARS);
 
 	async function handleSave() {
 		saving = true;

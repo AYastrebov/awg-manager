@@ -64,10 +64,39 @@ func TestValidateProfileAndSize(t *testing.T) {
 		t.Fatalf("неизвестный профиль дал %v", err)
 	}
 
-	if _, err := ValidateProfileAndSize("sip", GeneratedPackets{I1: strings.Repeat("a", MaxSignatureRawChars+1)}); !errors.Is(err, ErrPacketsTooLarge) {
-		t.Fatalf("сырой текст сверх лимита дал %v", err)
+	if _, err := ValidateProfileAndSize("sip", GeneratedPackets{I1: strings.Repeat("a", MaxSignatureChars+1)}); !errors.Is(err, ErrPacketsTooLarge) {
+		t.Fatalf("строка сверх лимита дала %v", err)
 	}
-	if _, err := ValidateProfileAndSize("sip", GeneratedPackets{I1: "<r " + strconv.Itoa(MaxSignatureBytes+1) + ">"}); !errors.Is(err, ErrPacketsTooLarge) {
-		t.Fatalf("байты сверх лимита дали %v", err)
+	if _, err := ValidateProfileAndSize("sip", GeneratedPackets{I1: "<r " + strconv.Itoa(MaxSignatureChars*2) + ">"}); err != nil {
+		t.Fatalf("большая нагрузка в короткой строке должна проходить: %v", err)
+	}
+}
+
+// F167: пустые H1..H4 в клиентском .conf роняют весь `awg setconf`
+// (`Line unrecognized: 'H1='`). Пусто = дефолт ядра: номера типов сообщений.
+func TestWriteASCConf_EmptyHeadersFallBackToMessageTypes(t *testing.T) {
+	var b strings.Builder
+	WriteASCConf(&b, json.RawMessage(`{"jc":4,"jmin":50,"jmax":1000,"s1":56,"s2":78}`), GeneratedPackets{I1: "<b 0x01>"})
+
+	out := b.String()
+	if strings.Contains(out, "H1 = \n") {
+		t.Fatalf("пустой H1 не должен попадать в .conf:\n%s", out)
+	}
+	for _, want := range []string{"H1 = 1", "H2 = 2", "H3 = 3", "H4 = 4"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("нет %q в:\n%s", want, out)
+		}
+	}
+}
+
+func TestHeaderOrDefault(t *testing.T) {
+	if got := HeaderOrDefault("", 3); got != "3" {
+		t.Fatalf("пусто → %q, want \"3\"", got)
+	}
+	if got := HeaderOrDefault("   ", 4); got != "4" {
+		t.Fatalf("пробелы → %q, want \"4\"", got)
+	}
+	if got := HeaderOrDefault("1635672874-1803270462", 1); got != "1635672874-1803270462" {
+		t.Fatalf("диапазон не должен подменяться, got %q", got)
 	}
 }

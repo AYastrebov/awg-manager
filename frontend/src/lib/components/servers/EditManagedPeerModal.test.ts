@@ -25,11 +25,11 @@ function basePeer(over: Partial<ManagedPeer> = {}): ManagedPeer {
 }
 
 describe('EditManagedPeerModal', () => {
-	it('disables Save when the signature exceeds MAX_SIGNATURE_BYTES', () => {
+	it('disables Save when the signature exceeds MAX_SIGNATURE_CHARS', () => {
 		const { getByText } = render(EditManagedPeerModal, {
 			open: true,
 			serverId: 'srv',
-			peer: basePeer({ i1: '<r 4100>' }),
+			peer: basePeer({ i1: 'x'.repeat(3501) }),
 			onclose: vi.fn(),
 			onUpdated: vi.fn(),
 		});

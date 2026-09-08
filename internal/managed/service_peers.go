@@ -117,6 +117,8 @@ func (s *Service) UpdatePeer(ctx context.Context, id, pubkey string, req UpdateP
 				return fmt.Errorf("%w: %s", ErrUnknownSignatureProfile, req.Signature.Profile)
 			case errors.Is(err, signature.ErrPacketsTooLarge):
 				return ErrSignatureTooLarge
+			case errors.Is(err, signature.ErrInvalidPacketTag):
+				return ErrInvalidSignatureTag
 			default:
 				// Чужую ошибку не переклеиваем в «слишком большая»: вызывающий
 				// не должен показывать пользователю неверную причину.

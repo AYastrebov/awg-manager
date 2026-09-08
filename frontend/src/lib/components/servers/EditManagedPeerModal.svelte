@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { ManagedPeer } from '$lib/types';
 	import { Modal, FormToggle, Button, FieldHint } from '$lib/components/ui';
-	import { protocols, calcTotalSize, MAX_SIGNATURE_BYTES, type ProtocolKey, type SignaturePackets } from '$lib/utils/protocols';
+	import { protocols, calcTotalChars, MAX_SIGNATURE_CHARS, type ProtocolKey, type SignaturePackets } from '$lib/utils/protocols';
 	import PeerSignatureEditor from './PeerSignatureEditor.svelte';
 	import { routerDnsHint } from './routerDnsHint';
 	import { validateTunnelIP, validateDNSList } from '$lib/utils/peerForm';
@@ -64,7 +64,7 @@
 		);
 	});
 
-	const sigOver = $derived(calcTotalSize(sigPackets) > MAX_SIGNATURE_BYTES);
+	const sigOver = $derived(calcTotalChars(sigPackets) > MAX_SIGNATURE_CHARS);
 	const ipError = $derived(validateTunnelIP(tunnelIP));
 	const dnsError = $derived(validateDNSList(dns));
 

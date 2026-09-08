@@ -87,9 +87,13 @@ func (p PeerSignature) packets() signature.GeneratedPackets {
 	return signature.GeneratedPackets{I1: p.I1, I2: p.I2, I3: p.I3, I4: p.I4, I5: p.I5}
 }
 
-// ErrSignatureTooLarge — сумма I1–I5 больше signature.MaxSignatureBytes либо
-// суммарная длина строк I1–I5 больше потолка их текстовой записи.
+// ErrSignatureTooLarge — суммарная длина строк I1–I5 больше
+// signature.MaxSignatureChars.
 var ErrSignatureTooLarge = errors.New("signature exceeds size limit")
+
+// ErrInvalidSignatureTag — тег <r>/<rc>/<rd> с аргументом, который нельзя
+// отдавать модулю ядра (см. signature.CheckTags).
+var ErrInvalidSignatureTag = errors.New("invalid signature packet tag")
 
 // ErrUnknownSignatureProfile — профиль имитации не из signature.Profiles.
 var ErrUnknownSignatureProfile = errors.New("unknown signature profile")

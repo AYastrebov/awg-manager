@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/hoaxisr/awg-manager/internal/signature"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 )
 
@@ -44,10 +45,10 @@ func writeAWGParams(b *strings.Builder, iface *storage.AWGInterface) {
 	b.WriteString(fmt.Sprintf("Jmax = %d\n", iface.Jmax))
 	b.WriteString(fmt.Sprintf("S1 = %d\n", iface.S1))
 	b.WriteString(fmt.Sprintf("S2 = %d\n", iface.S2))
-	b.WriteString(fmt.Sprintf("H1 = %s\n", iface.H1))
-	b.WriteString(fmt.Sprintf("H2 = %s\n", iface.H2))
-	b.WriteString(fmt.Sprintf("H3 = %s\n", iface.H3))
-	b.WriteString(fmt.Sprintf("H4 = %s\n", iface.H4))
+	b.WriteString(fmt.Sprintf("H1 = %s\n", signature.HeaderOrDefault(iface.H1, 1)))
+	b.WriteString(fmt.Sprintf("H2 = %s\n", signature.HeaderOrDefault(iface.H2, 2)))
+	b.WriteString(fmt.Sprintf("H3 = %s\n", signature.HeaderOrDefault(iface.H3, 3)))
+	b.WriteString(fmt.Sprintf("H4 = %s\n", signature.HeaderOrDefault(iface.H4, 4)))
 	// Extended params (S3, S4, I1-I5) - only if any extended param is set
 	if iface.S3 > 0 || iface.S4 > 0 || hasAnySignaturePacket(iface) {
 		b.WriteString(fmt.Sprintf("S3 = %d\n", iface.S3))

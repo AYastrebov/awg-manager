@@ -57,13 +57,13 @@ describe('PeerSignatureEditor', () => {
 		});
 	});
 
-	it('shows byte size against the 4096 limit', () => {
+	it('показывает длину строк против лимита в символах', () => {
 		const { getByText } = render(PeerSignatureEditor, {
 			profile: '',
 			packets: { i1: '<r 10>', i2: '', i3: '', i4: '', i5: '' },
 			onchange: vi.fn(),
 		});
-		expect(getByText(/10 \/ 4096 байт/)).toBeTruthy();
+		expect(getByText(/6 \/ 3500 символов/)).toBeTruthy();
 	});
 
 	// Профиль описывает байты: правка руками их меняет, значит профиль больше

@@ -197,13 +197,17 @@ func (h *TunnelsHandler) Get(w http.ResponseWriter, r *http.Request) {
 	response.Success(w, resp)
 }
 
-// awg3ErrorCode отделяет негабаритную сигнатуру от прочих отказов гейта
-// config.ValidateObfuscation: карточка показывает её на полях I1-I5.
+// awg3ErrorCode отделяет отказы по сигнатуре от прочих отказов гейта
+// config.ValidateObfuscation: карточка показывает их на полях I1-I5.
 func awg3ErrorCode(err error) string {
-	if errors.Is(err, signature.ErrPacketsTooLarge) {
+	switch {
+	case errors.Is(err, signature.ErrPacketsTooLarge):
 		return "SIGNATURE_TOO_LARGE"
+	case errors.Is(err, signature.ErrInvalidPacketTag):
+		return "SIGNATURE_INVALID_TAG"
+	default:
+		return "INVALID_AWG3"
 	}
-	return "INVALID_AWG3"
 }
 
 // checkExplicitIDFree проверяет присланный клиентом идентификатор той же

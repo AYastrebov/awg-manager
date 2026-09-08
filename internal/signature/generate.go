@@ -18,8 +18,19 @@ import (
 // Токены только b/t/r/rc/rd: пересечение kernel-модуля (нет d/ds/dz) и нашего
 // amneziawg-go (нет <c> — отвергает весь I1).
 
-// MaxSignatureBytes — потолок суммы I1–I5 (тот же в ASCEditor.svelte и schemas/tunnel.ts).
-const MaxSignatureBytes = 4096
+// MaxSignatureChars — потолок суммарной ДЛИНЫ СТРОК I1–I5 (тот же в
+// protocols.ts). Меряется в символах, а не в полезной нагрузке: `awg setconf`
+// кладёт device-атрибуты в netlink-буфер `malloc(pagesize≤8192)` = 4096 байт
+// (amneziawg-tools netlink.h, mnlg_socket_open) НЕпроверяемым
+// mnl_attr_put_strz — переполнение молча портит кучу, а не даёт ошибку.
+// `<r 1000>` при этом занимает 8 символов: тысячу байт генерирует модуль ядра
+// уже при отправке, в сообщение они не попадают.
+//
+// Стенд 5.01.C.3.0-1 / awg-tools v3.1.20260812 / mipsel, полный набор
+// параметров AWG 3.1 + пир: сумма 3710 символов применяется и читается
+// обратно, 3720 — `awg setconf` молча отдаёт rc=0, после чего `awg show` на
+// интерфейсе отвечает `Message too large`. 3500 — этот порог с запасом.
+const MaxSignatureChars = 3500
 
 // DefaultProfile — профиль новых пиров встроенного сервера и дефолт выпадашки.
 const DefaultProfile = "quic_initial"
@@ -29,6 +40,7 @@ var Profiles = []string{"quic_initial", "stun", "dns", "dtls", "sip"}
 
 var ErrUnknownProtocol = errors.New("unknown protocol")
 var ErrPacketsTooLarge = errors.New("signature packets exceed size limit")
+var ErrInvalidPacketTag = errors.New("invalid signature packet tag")
 
 type GeneratedPackets struct{ I1, I2, I3, I4, I5 string }
 
@@ -87,7 +99,9 @@ var cpsTagRe = regexp.MustCompile(`<(\w+)(?:\s+([^>]*))?>`)
 var hexArgRe = regexp.MustCompile(`0x([0-9a-fA-F]*)`)
 
 // ByteSize — размер полезной нагрузки одного паттерна (hex внутри <b>, N у
-// r/rc/rd, 4 байта у t/c). Совпадает с calcByteSize во фронте.
+// r/rc/rd, 4 байта у t/c), то есть размер имитируемого пакета на проводе.
+// Справочная величина для API и тестов: лимит считается НЕ по ней (см.
+// MaxSignatureChars).
 func ByteSize(pattern string) int {
 	if pattern == "" {
 		return 0
@@ -115,14 +129,10 @@ func TotalByteSize(p GeneratedPackets) int {
 	return ByteSize(p.I1) + ByteSize(p.I2) + ByteSize(p.I3) + ByteSize(p.I4) + ByteSize(p.I5)
 }
 
-// MaxSignatureRawChars — потолок суммарной ДЛИНЫ строк I1–I5. ByteSize считает
-// только распознанные токены, поэтому сырой текст оценивался в 0 байт и
-// проходил гейт; `<b>` на 4096 байт — 8198 символов, токены короче.
-const MaxSignatureRawChars = 2*MaxSignatureBytes + 80
-
 // ValidateProfileAndSize — единый гейт правки сигнатуры пира: профиль обязан
-// быть из Profiles (пустой допустим — сигнатура набрана руками), сумма I1–I5
-// обязана влезать в лимит. Возвращает КАНОНИЧЕСКИЙ ключ профиля: хранить
+// быть из Profiles (пустой допустим — сигнатура набрана руками), суммарная
+// длина строк I1–I5 обязана влезать в лимит. Возвращает КАНОНИЧЕСКИЙ ключ
+// профиля: хранить
 // присланное (" SIP ") нельзя. Ошибки — сентинелы ErrUnknownProtocol и
 // ErrPacketsTooLarge, вызывающий переводит их в свои коды.
 func ValidateProfileAndSize(profile string, p GeneratedPackets) (string, error) {
@@ -133,16 +143,68 @@ func ValidateProfileAndSize(profile string, p GeneratedPackets) (string, error) 
 	if err := CheckSize(p); err != nil {
 		return "", err
 	}
+	if err := CheckTags(p); err != nil {
+		return "", err
+	}
 	return canonical, nil
+}
+
+// CheckTags — проверка аргументов у <r>/<rc>/<rd>. Модуль ядра
+// (amneziawg-kernel src/junk.c, parse_r_tag:112 и два близнеца) смотрит только
+// код возврата kstrtoint, но НЕ само значение: отрицательный размер попадает в
+// tag->pkt_size, оттуда в mod->buf_len, а из него — в get_random_bytes(buf,
+// len) с приведением к size_t.
+//
+// Стенд 08.09: одиночный <r -1>/<rc -5>/<r 2000000000> безвреден — сумма
+// отрицательная или гигантская, kzalloc проваливается и setconf отвергается с
+// «Out of memory». Но в смеси сумма выходит маленькой положительной:
+// `<b 0x0102><r -1>` принимается с rc=0 и читается обратно, а в модуле
+// остаётся модификатор с отрицательной длиной.
+//
+// Строку I1–I5 мы берём из пользовательского .conf и отдаём ядру дословно,
+// поэтому режем здесь. Верх — MaxSplittableTagBytes: тот же потолок, за
+// которым тег и так считается неспасаемым (normalize.go).
+func CheckTags(p GeneratedPackets) error {
+	for _, pattern := range []string{p.I1, p.I2, p.I3, p.I4, p.I5} {
+		for _, m := range cpsTagRe.FindAllStringSubmatch(pattern, -1) {
+			tag := strings.ToLower(m[1])
+			if tag != "r" && tag != "rc" && tag != "rd" {
+				continue
+			}
+			arg := strings.TrimSpace(m[2])
+			n, err := strconv.Atoi(arg)
+			if err != nil || !isDecimal(arg) || n < 0 || n > MaxSplittableTagBytes {
+				return fmt.Errorf("%w: <%s %s>", ErrInvalidPacketTag, tag, arg)
+			}
+		}
+	}
+	return nil
+}
+
+// isDecimal — только цифры: strconv.Atoi берёт "+5" и "-5", а нам нужен отказ
+// на любом знаке.
+func isDecimal(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // CheckSize — единая проверка размера сигнатуры для туннелей и пиров.
 func CheckSize(p GeneratedPackets) error {
-	if n := TotalByteSize(p); n > MaxSignatureBytes {
-		return fmt.Errorf("%w: %d > %d bytes", ErrPacketsTooLarge, n, MaxSignatureBytes)
-	}
-	if n := len(p.I1) + len(p.I2) + len(p.I3) + len(p.I4) + len(p.I5); n > MaxSignatureRawChars {
-		return fmt.Errorf("%w: %d > %d chars", ErrPacketsTooLarge, n, MaxSignatureRawChars)
+	if n := TotalChars(p); n > MaxSignatureChars {
+		return fmt.Errorf("%w: %d > %d chars", ErrPacketsTooLarge, n, MaxSignatureChars)
 	}
 	return nil
+}
+
+// TotalChars — суммарная длина строк I1–I5, та величина, которую ограничивает
+// netlink-буфер awg-tools.
+func TotalChars(p GeneratedPackets) int {
+	return len(p.I1) + len(p.I2) + len(p.I3) + len(p.I4) + len(p.I5)
 }

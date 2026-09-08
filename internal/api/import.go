@@ -154,6 +154,10 @@ func (h *ImportHandler) ImportConf(w http.ResponseWriter, r *http.Request) {
 			response.Error(w, err.Error(), "SIGNATURE_TOO_LARGE")
 			return
 		}
+		if errors.Is(err, signature.ErrInvalidPacketTag) {
+			response.Error(w, err.Error(), "SIGNATURE_INVALID_TAG")
+			return
+		}
 		response.Error(w, err.Error(), "IMPORT_FAILED")
 		return
 	}

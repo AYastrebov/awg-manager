@@ -104,6 +104,8 @@ func (h *ManagedServerHandler) UpdatePeer(w http.ResponseWriter, r *http.Request
 			response.Error(w, err.Error(), "INVALID_SIGNATURE_PROFILE")
 		case errors.Is(err, managed.ErrSignatureTooLarge):
 			response.Error(w, err.Error(), "SIGNATURE_TOO_LARGE")
+		case errors.Is(err, managed.ErrInvalidSignatureTag):
+			response.Error(w, err.Error(), "SIGNATURE_INVALID_TAG")
 		default:
 			response.Error(w, err.Error(), "UPDATE_PEER_FAILED")
 		}

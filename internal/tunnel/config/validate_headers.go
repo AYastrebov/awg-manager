@@ -88,7 +88,11 @@ func ValidateObfuscation(o *storage.AWGObfuscation) error {
 	}
 	// Тот же потолок, что у пиров встроенного сервера: без него негабаритная
 	// или сырая сигнатура доезжала до .conf и модуля.
-	if err := signature.CheckSize(signature.GeneratedPackets{I1: o.I1, I2: o.I2, I3: o.I3, I4: o.I4, I5: o.I5}); err != nil {
+	packets := signature.GeneratedPackets{I1: o.I1, I2: o.I2, I3: o.I3, I4: o.I4, I5: o.I5}
+	if err := signature.CheckSize(packets); err != nil {
+		return fmt.Errorf("I1–I5: %w", err)
+	}
+	if err := signature.CheckTags(packets); err != nil {
 		return fmt.Errorf("I1–I5: %w", err)
 	}
 	return nil

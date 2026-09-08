@@ -2,7 +2,7 @@
 	import { api } from '$lib/api/client';
 	import { notifications } from '$lib/stores/notifications';
 	import { Button, Dropdown, type DropdownOption } from '$lib/components/ui';
-	import { protocols, calcTotalSize, MAX_SIGNATURE_BYTES, type ProtocolKey, type SignaturePackets } from '$lib/utils/protocols';
+	import { protocols, calcTotalChars, MAX_SIGNATURE_CHARS, type ProtocolKey, type SignaturePackets } from '$lib/utils/protocols';
 
 	const FIELDS = ['i1', 'i2', 'i3', 'i4', 'i5'] as const;
 
@@ -34,8 +34,8 @@
 		})),
 	]);
 
-	const totalBytes = $derived(calcTotalSize(packets));
-	const overLimit = $derived(totalBytes > MAX_SIGNATURE_BYTES);
+	const totalChars = $derived(calcTotalChars(packets));
+	const overLimit = $derived(totalChars > MAX_SIGNATURE_CHARS);
 
 	async function handleGenerate() {
 		const target: ProtocolKey = selected === '' ? 'quic_initial' : selected;
@@ -87,7 +87,7 @@
 	</div>
 
 	<div class="size-indicator" class:over-limit={overLimit}>
-		{totalBytes} / {MAX_SIGNATURE_BYTES} байт
+		{totalChars} / {MAX_SIGNATURE_CHARS} символов
 	</div>
 </section>
 
