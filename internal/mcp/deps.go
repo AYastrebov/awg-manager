@@ -47,6 +47,10 @@ type Deps interface {
 
 	ListClientRoutes(ctx context.Context) ([]ClientRoute, error)
 	SetClientRoute(ctx context.Context, in ClientRouteInput) (*ClientRoute, error) // nil when removed
+	// SetClientRouteEnabled switches one device's route without removing
+	// it. Addressed by client IP, as SetClientRoute is: that is what the
+	// device list gives an agent. The IP is already canonical here.
+	SetClientRouteEnabled(ctx context.Context, clientIP string, enabled bool) (ClientRoute, error)
 
 	ListAccessPolicies(ctx context.Context) ([]AccessPolicy, error)
 	ListDevices(ctx context.Context) ([]Device, error)

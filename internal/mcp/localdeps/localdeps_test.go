@@ -79,6 +79,18 @@ func (f *fakeClientRoutes) Update(_ context.Context, r clientroute.ClientRoute) 
 	}
 	return nil, errNotFound(r.ID)
 }
+
+// SetEnabled mirrors clientroute.ServiceImpl: the stored route is updated.
+func (f *fakeClientRoutes) SetEnabled(_ context.Context, id string, v bool) error {
+	for i := range f.routes {
+		if f.routes[i].ID == id {
+			f.routes[i].Enabled = v
+			return nil
+		}
+	}
+	return errNotFound(id)
+}
+
 func (f *fakeClientRoutes) Delete(_ context.Context, id string) error {
 	for i := range f.routes {
 		if f.routes[i].ID == id {
@@ -1294,5 +1306,32 @@ func TestLocal_SetStaticRouteEnabled(t *testing.T) {
 
 	if _, err := h.l.SetStaticRouteEnabled(ctx, "nope", true); err == nil {
 		t.Error("unknown id must be an error")
+	}
+}
+
+// TestLocal_SetClientRouteEnabled — переключатель ищет маршрут по IP
+// устройства, потому что это то, чем оперирует агент (list_devices), а
+// служба работает по внутреннему id.
+func TestLocal_SetClientRouteEnabled(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.client.routes = []clientroute.ClientRoute{{ID: "cr-1", ClientIP: "192.168.1.20", TunnelID: "tn-1", Fallback: "drop", Enabled: true}}
+
+	got, err := h.l.SetClientRouteEnabled(ctx, "192.168.1.20", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Enabled {
+		t.Error("the returned record must show the state AFTER the change")
+	}
+	if got.ID != "cr-1" || got.TunnelID != "tn-1" || got.Fallback != "drop" {
+		t.Errorf("a disabled route keeps its target and fallback: %+v", got)
+	}
+	if !h.bus.has(events.ResourceRoutingClientRoutes) {
+		t.Errorf("published %v, want a client-routes invalidation", h.bus.pub)
+	}
+
+	if _, err := h.l.SetClientRouteEnabled(ctx, "192.168.1.99", true); err == nil {
+		t.Error("an IP with no route must be an error, not a silent no-op")
 	}
 }

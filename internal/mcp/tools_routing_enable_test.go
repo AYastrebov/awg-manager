@@ -71,6 +71,63 @@ func TestTools_SetStaticRouteEnabled(t *testing.T) {
 	}
 }
 
+// TestTools_SetClientRouteEnabled — выключенный маршрут устройства
+// остаётся в списке: пользователь просил «пусти телевизор мимо VPN на
+// вечер», а не «забудь про него».
+func TestTools_SetClientRouteEnabled(t *testing.T) {
+	s, _ := newTestSession(t)
+	if res, _ := callTool(t, s, "set_client_route", map[string]any{"clientIp": "192.168.1.20", "tunnelId": "tn-1"}); res.IsError {
+		t.Fatal(toolText(res))
+	}
+
+	res, out := callTool(t, s, "set_client_route_enabled", map[string]any{"clientIp": "192.168.1.20", "enabled": false})
+	if res.IsError {
+		t.Fatal(toolText(res))
+	}
+	if out["enabled"] != false || out["clientIp"] != "192.168.1.20" {
+		t.Fatalf("out = %v", out)
+	}
+	if out["tunnelId"] != "tn-1" {
+		t.Fatalf("the route must keep its tunnel while disabled, got %v", out["tunnelId"])
+	}
+	_, listed := callTool(t, s, "list_client_routes", nil)
+	if n := len(listed["routes"].([]any)); n != 1 {
+		t.Fatalf("routes = %d, want the disabled route still listed", n)
+	}
+
+	_, out = callTool(t, s, "set_client_route_enabled", map[string]any{"clientIp": "192.168.1.20", "enabled": true})
+	if out["enabled"] != true {
+		t.Fatalf("re-enable = %v", out)
+	}
+
+	if res, _ = callTool(t, s, "set_client_route_enabled", map[string]any{"clientIp": "192.168.1.99", "enabled": true}); !res.IsError {
+		t.Error("an IP with no route must be a tool error")
+	}
+	if res, _ = callTool(t, s, "set_client_route_enabled", map[string]any{"clientIp": "999.1.1.1", "enabled": true}); !res.IsError {
+		t.Error("invalid IP must be a tool error")
+	}
+}
+
+// TestTools_SetClientRouteEnabledCanonicalisesIP — Deps ищет маршрут по
+// уже нормализованному IP, поэтому наружу должен уходить только
+// канонический вид: иначе " 192.168.1.20" не нашёл бы существующий
+// маршрут и инструмент отчитался бы об ошибке на живом маршруте.
+func TestTools_SetClientRouteEnabledCanonicalisesIP(t *testing.T) {
+	for _, spelling := range []string{" 192.168.1.20", "::ffff:192.168.1.20"} {
+		s, _ := newTestSession(t)
+		if res, _ := callTool(t, s, "set_client_route", map[string]any{"clientIp": "192.168.1.20", "tunnelId": "tn-1"}); res.IsError {
+			t.Fatal(toolText(res))
+		}
+		res, out := callTool(t, s, "set_client_route_enabled", map[string]any{"clientIp": spelling, "enabled": false})
+		if res.IsError {
+			t.Fatalf("%q: %s", spelling, toolText(res))
+		}
+		if out["clientIp"] != "192.168.1.20" || out["enabled"] != false {
+			t.Fatalf("%q: out = %v", spelling, out)
+		}
+	}
+}
+
 // TestTools_SetEnabledToolsAreReversibleWrites — хост решает, спрашивать
 // ли пользователя, по destructiveHint. Переключатель обратим, и пометить
 // его разрушающим значило бы приучать соглашаться на настоящие удаления.
@@ -83,7 +140,7 @@ func TestTools_SetEnabledToolsAreReversibleWrites(t *testing.T) {
 	seen := 0
 	for _, tool := range tools.Tools {
 		switch tool.Name {
-		case "set_dns_route_enabled", "set_static_route_enabled":
+		case "set_dns_route_enabled", "set_static_route_enabled", "set_client_route_enabled":
 			seen++
 			a := tool.Annotations
 			if a == nil || a.ReadOnlyHint || a.DestructiveHint == nil || *a.DestructiveHint || !a.IdempotentHint {
@@ -91,7 +148,7 @@ func TestTools_SetEnabledToolsAreReversibleWrites(t *testing.T) {
 			}
 		}
 	}
-	if seen != 2 {
+	if seen != 3 {
 		t.Fatalf("saw %d of the expected toggle tools", seen)
 	}
 	_ = mcpsrv.MaxDomainsInOutput

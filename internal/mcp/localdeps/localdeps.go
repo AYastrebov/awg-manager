@@ -948,6 +948,39 @@ func (l *Local) SetClientRoute(ctx context.Context, in mcpsrv.ClientRouteInput) 
 	return &out, nil
 }
 
+// SetClientRouteEnabled resolves the device IP to a route id and flips it.
+func (l *Local) SetClientRouteEnabled(ctx context.Context, clientIP string, enabled bool) (mcpsrv.ClientRoute, error) {
+	if l.c.ClientRoutes == nil {
+		return mcpsrv.ClientRoute{}, errUnavailable("client routes")
+	}
+	list, err := l.c.ClientRoutes.List()
+	if err != nil {
+		return mcpsrv.ClientRoute{}, err
+	}
+	var existing *clientroute.ClientRoute
+	for i := range list {
+		if list[i].ClientIP == clientIP {
+			existing = &list[i]
+		}
+	}
+	if existing == nil {
+		return mcpsrv.ClientRoute{}, fmt.Errorf("no client route for %q (use set_client_route to create one)", clientIP)
+	}
+	action := "disable"
+	if enabled {
+		action = "enable"
+	}
+	if err := l.c.ClientRoutes.SetEnabled(ctx, existing.ID, enabled); err != nil {
+		l.clientLog.Warn(action, clientIP, "Failed to switch client route (MCP): "+err.Error())
+		return mcpsrv.ClientRoute{}, err
+	}
+	l.clientLog.Info(action, clientIP, "Client route switched "+onOff(enabled)+" (MCP)")
+	l.publish(events.ResourceRoutingClientRoutes, "mcp-"+action)
+	out := mcpsrv.ClientRoute(*existing)
+	out.Enabled = enabled
+	return out, nil
+}
+
 func (l *Local) ListAccessPolicies(ctx context.Context) ([]mcpsrv.AccessPolicy, error) {
 	if l.c.Policies == nil {
 		return nil, errUnavailable("access policies")

@@ -87,7 +87,7 @@ func TestServer_ListsToolsWithAnnotations(t *testing.T) {
 		"list_tunnels", "get_tunnel", "control_tunnel", "create_tunnel", "replace_tunnel_config", "export_tunnel_config",
 		"list_dns_routes", "get_dns_route", "add_dns_route", "set_dns_route_enabled", "remove_dns_route",
 		"list_static_routes", "add_static_route", "set_static_route_enabled", "remove_static_route",
-		"list_client_routes", "set_client_route",
+		"list_client_routes", "set_client_route", "set_client_route_enabled",
 		"list_access_policies", "list_devices",
 		"list_managed_servers", "control_singbox",
 	}

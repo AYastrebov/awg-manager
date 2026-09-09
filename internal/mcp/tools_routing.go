@@ -43,6 +43,11 @@ type setRouteEnabledIn struct {
 	Enabled bool   `json:"enabled" jsonschema:"true turns the list on, false turns it off"`
 }
 
+type setClientRouteEnabledIn struct {
+	ClientIP string `json:"clientIp" jsonschema:"LAN client IPv4 from list_client_routes or list_devices"`
+	Enabled  bool   `json:"enabled" jsonschema:"true routes the device through its tunnel again, false suspends the route"`
+}
+
 type dnsRouteDetailIn struct {
 	RouteID       string `json:"routeId" jsonschema:"list id from list_dns_routes"`
 	DomainsOffset int    `json:"domainsOffset,omitempty" jsonschema:"index of the first domain to return; default 0"`
@@ -314,6 +319,22 @@ func registerRoutingTools(s *mcp.Server, d Deps) {
 			return nil, clientRouteOut{}, err
 		}
 		return nil, clientRouteOut{Route: route, Removed: route == nil}, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "set_client_route_enabled",
+		Description: "Switch one device's route off or on without removing it — the device falls back to normal routing while disabled, " +
+			"and the route keeps its tunnel and fallback for when it is switched back. To remove the route entirely, call set_client_route with an empty tunnelId.",
+		Annotations: safeWrite("Enable/disable client route", true),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in setClientRouteEnabledIn) (*mcp.CallToolResult, ClientRoute, error) {
+		ip := net.ParseIP(strings.TrimSpace(in.ClientIP))
+		if ip == nil || ip.To4() == nil {
+			return nil, ClientRoute{}, fmt.Errorf("clientIp %q is not a valid IPv4 address", in.ClientIP)
+		}
+		// Canonical spelling only, for the same reason as set_client_route:
+		// Deps matches this against the stored, already-canonical IP.
+		out, err := d.SetClientRouteEnabled(ctx, ip.To4().String(), in.Enabled)
+		return nil, out, err
 	})
 
 	mcp.AddTool(s, &mcp.Tool{

@@ -381,6 +381,21 @@ func (f *Fake) SetClientRoute(_ context.Context, in mcpsrv.ClientRouteInput) (*m
 	return &r, nil
 }
 
+func (f *Fake) SetClientRouteEnabled(_ context.Context, clientIP string, enabled bool) (mcpsrv.ClientRoute, error) {
+	if f.Err != nil {
+		return mcpsrv.ClientRoute{}, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.ClientRoutes {
+		if f.ClientRoutes[i].ClientIP == clientIP {
+			f.ClientRoutes[i].Enabled = enabled
+			return f.ClientRoutes[i], nil
+		}
+	}
+	return mcpsrv.ClientRoute{}, fmt.Errorf("no client route for %q", clientIP)
+}
+
 func (f *Fake) ListAccessPolicies(context.Context) ([]mcpsrv.AccessPolicy, error) {
 	if f.Err != nil {
 		return nil, f.Err
