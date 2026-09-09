@@ -269,6 +269,21 @@ type ConnectivityResult struct {
 	HTTPCode  *int   `json:"httpCode,omitempty"`
 }
 
+// IPCheckResult compares the external IP seen through a tunnel with the
+// one seen straight over the WAN. IPChanged is the answer to the question
+// users actually ask — "is my traffic really going through the VPN" —
+// which a reachability probe cannot give.
+type IPCheckResult struct {
+	TunnelID string `json:"tunnelId"`
+	// DirectIP is the address the router shows over the WAN, bypassing the
+	// tunnel. Empty when that leg of the check failed.
+	DirectIP string `json:"directIp,omitempty"`
+	// VpnIP is the address seen through the tunnel.
+	VpnIP      string `json:"vpnIp,omitempty"`
+	EndpointIP string `json:"endpointIp,omitempty" jsonschema:"the tunnel peer's address, for telling apart two tunnels landing in the same country"`
+	IPChanged  bool   `json:"ipChanged" jsonschema:"true means the tunnel really carries the traffic; FALSE means the external IP is the same with and without it — the traffic is NOT going through the tunnel"`
+}
+
 type MonitoringCell struct {
 	TargetID  string    `json:"targetId"`
 	TunnelID  string    `json:"tunnelId"`

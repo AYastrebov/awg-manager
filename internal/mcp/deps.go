@@ -62,6 +62,9 @@ type Deps interface {
 
 	GetLogs(ctx context.Context, q LogsQuery) ([]LogEntry, int, error) // entries, total matched
 	TestConnectivity(ctx context.Context, tunnelID string) (ConnectivityResult, error)
+	// CheckIP fetches the external IP through the tunnel and over the bare
+	// WAN. A tunnel that is not running is an error, not an empty result.
+	CheckIP(ctx context.Context, tunnelID string) (IPCheckResult, error)
 	MonitoringMatrix(ctx context.Context) (MonitoringMatrix, error)
 	// RunPingCheck starts a check of every monitored tunnel without
 	// waiting for it and returns the last completed statuses.

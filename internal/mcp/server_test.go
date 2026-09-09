@@ -83,7 +83,7 @@ func TestServer_ListsToolsWithAnnotations(t *testing.T) {
 	}
 	// Full tool catalogue across all five register* groups.
 	want := []string{
-		"get_system_status", "get_logs", "test_connectivity", "get_monitoring_matrix", "run_pingcheck",
+		"get_system_status", "get_logs", "test_connectivity", "check_ip", "get_monitoring_matrix", "run_pingcheck",
 		"list_tunnels", "get_tunnel", "control_tunnel", "create_tunnel", "replace_tunnel_config", "export_tunnel_config",
 		"list_dns_routes", "get_dns_route", "add_dns_route", "update_dns_route", "set_dns_route_enabled", "remove_dns_route",
 		"list_static_routes", "add_static_route", "set_static_route_enabled", "remove_static_route",

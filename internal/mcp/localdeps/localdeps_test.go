@@ -18,6 +18,7 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/orchestrator"
 	"github.com/hoaxisr/awg-manager/internal/pingcheck"
 	"github.com/hoaxisr/awg-manager/internal/storage"
+	awgtesting "github.com/hoaxisr/awg-manager/internal/testing"
 	"github.com/hoaxisr/awg-manager/internal/tunnel"
 	"github.com/hoaxisr/awg-manager/internal/tunnel/service"
 )
@@ -1438,5 +1439,72 @@ func TestLocal_UpdateDNSRouteWarnsAboutDroppedTargets(t *testing.T) {
 	}
 	if len(warnings) != 0 {
 		t.Fatalf("a rename touches no targets and must not warn: %v", warnings)
+	}
+}
+
+// fakeTester records the service URL it was asked for: MCP must not pin
+// one, or a single flaky IP-echo host reads as a broken tunnel.
+type fakeTester struct {
+	askedURL string
+	result   *awgtesting.IPResult
+	err      error
+}
+
+func (f *fakeTester) CheckConnectivity(context.Context, string) (*awgtesting.ConnectivityResult, error) {
+	return &awgtesting.ConnectivityResult{Connected: true}, nil
+}
+
+func (f *fakeTester) CheckIP(_ context.Context, _ string, serviceURL string) (*awgtesting.IPResult, error) {
+	f.askedURL = serviceURL
+	return f.result, f.err
+}
+
+func TestLocal_CheckIPMapsTheResultAndPinsNoProvider(t *testing.T) {
+	ctx := context.Background()
+	ft := &fakeTester{result: &awgtesting.IPResult{DirectIP: "203.0.113.7", VpnIP: "198.51.100.42", EndpointIP: "198.51.100.1", IPChanged: true}}
+	l := New(Config{Testing: ft})
+
+	got, err := l.CheckIP(ctx, "tn-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ft.askedURL != "" {
+		t.Errorf("serviceURL = %q, want empty so the service can fall back between providers", ft.askedURL)
+	}
+	want := mcpsrv.IPCheckResult{TunnelID: "tn-1", DirectIP: "203.0.113.7", VpnIP: "198.51.100.42", EndpointIP: "198.51.100.1", IPChanged: true}
+	if got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
+// TestLocal_CheckIPLeakIsReportedNotSwallowed — совпавшие адреса значат,
+// что трафик идёт мимо туннеля. Это результат проверки, и потерять его
+// нельзя.
+func TestLocal_CheckIPLeakIsReportedNotSwallowed(t *testing.T) {
+	ft := &fakeTester{result: &awgtesting.IPResult{DirectIP: "203.0.113.7", VpnIP: "203.0.113.7", IPChanged: false}}
+	l := New(Config{Testing: ft})
+
+	got, err := l.CheckIP(context.Background(), "tn-1")
+	if err != nil {
+		t.Fatalf("a leak is a result, not an error: %v", err)
+	}
+	if got.IPChanged || got.VpnIP != got.DirectIP {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestLocal_CheckIPWithoutATesterSaysSo(t *testing.T) {
+	l := New(Config{})
+	if _, err := l.CheckIP(context.Background(), "tn-1"); err == nil {
+		t.Fatal("a build without the testing service must report that, not return a blank result")
+	}
+}
+
+// TestLocal_CheckIPNilResultIsAnError — служба может вернуть (nil, nil);
+// пустая структура прочиталась бы как «оба адреса неизвестны, утечки нет».
+func TestLocal_CheckIPNilResultIsAnError(t *testing.T) {
+	l := New(Config{Testing: &fakeTester{result: nil}})
+	if _, err := l.CheckIP(context.Background(), "tn-1"); err == nil {
+		t.Fatal("a nil result must be an error")
 	}
 }

@@ -511,6 +511,26 @@ func (f *Fake) TestConnectivity(_ context.Context, tunnelID string) (mcpsrv.Conn
 	return mcpsrv.ConnectivityResult{TunnelID: tunnelID, Connected: true, LatencyMs: &lat, HTTPCode: &code}, nil
 }
 
+func (f *Fake) CheckIP(_ context.Context, tunnelID string) (mcpsrv.IPCheckResult, error) {
+	if f.Err != nil {
+		return mcpsrv.IPCheckResult{}, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t, err := f.findTunnel(tunnelID)
+	if err != nil {
+		return mcpsrv.IPCheckResult{}, err
+	}
+	if t.State != "running" {
+		// Same contract as testing.Service.CheckIP: no tunnel, no check.
+		return mcpsrv.IPCheckResult{}, fmt.Errorf("tunnel %q is not running", tunnelID)
+	}
+	return mcpsrv.IPCheckResult{
+		TunnelID: tunnelID, DirectIP: "203.0.113.7", VpnIP: "198.51.100.42",
+		EndpointIP: "198.51.100.1", IPChanged: true,
+	}, nil
+}
+
 func (f *Fake) MonitoringMatrix(context.Context) (mcpsrv.MonitoringMatrix, error) {
 	if f.Err != nil {
 		return mcpsrv.MonitoringMatrix{}, f.Err

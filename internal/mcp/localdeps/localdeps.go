@@ -53,6 +53,9 @@ type (
 	}
 	ConnectivityTester interface {
 		CheckConnectivity(ctx context.Context, tunnelID string) (*awgtesting.ConnectivityResult, error)
+		// CheckIP takes a service URL; MCP passes "" to let the service
+		// pick and fall back between its own providers.
+		CheckIP(ctx context.Context, tunnelID string, serviceURL string) (*awgtesting.IPResult, error)
 	}
 	Publisher interface {
 		PublishInvalidated(res events.Resource, reason string)
@@ -304,6 +307,27 @@ func (l *Local) TestConnectivity(ctx context.Context, id string) (mcpsrv.Connect
 		return mcpsrv.ConnectivityResult{}, fmt.Errorf("connectivity test returned no result for tunnel %q", id)
 	}
 	return mcpsrv.ConnectivityResult{TunnelID: id, Connected: r.Connected, LatencyMs: r.Latency, Reason: r.Reason, HTTPCode: r.HTTPCode}, nil
+}
+
+// CheckIP asks the testing service for both addresses. serviceURL is
+// empty on purpose: with no provider pinned the service falls back
+// between its own, so one flaky IP-echo host does not turn into "your
+// tunnel is broken".
+func (l *Local) CheckIP(ctx context.Context, id string) (mcpsrv.IPCheckResult, error) {
+	if l.c.Testing == nil {
+		return mcpsrv.IPCheckResult{}, errUnavailable("ip check")
+	}
+	r, err := l.c.Testing.CheckIP(ctx, id, "")
+	if err != nil {
+		return mcpsrv.IPCheckResult{}, err
+	}
+	if r == nil {
+		return mcpsrv.IPCheckResult{}, fmt.Errorf("ip check returned no result for tunnel %q", id)
+	}
+	return mcpsrv.IPCheckResult{
+		TunnelID: id, DirectIP: r.DirectIP, VpnIP: r.VpnIP,
+		EndpointIP: r.EndpointIP, IPChanged: r.IPChanged,
+	}, nil
 }
 
 func (l *Local) MonitoringMatrix(context.Context) (mcpsrv.MonitoringMatrix, error) {
