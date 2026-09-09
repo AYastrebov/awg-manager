@@ -54,8 +54,7 @@ describe('IntegrationsCard — удаление sing-box', () => {
 });
 
 describe('IntegrationsCard — HydraRoute', () => {
-	const hydra = (installed: boolean): HydraRouteStatus =>
-		({ installed, running: false }) as HydraRouteStatus;
+	const hydra = (installed: boolean): HydraRouteStatus => ({ installed, running: false });
 
 	// Своего установщика HydraRoute у нас нет — кнопка ведёт на инструкцию
 	// проекта. Подписывать её «Установить», как у остальных интеграций, значит
