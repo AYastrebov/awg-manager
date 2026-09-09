@@ -41,6 +41,9 @@ var readOnlyTools = map[string]bool{
 	// tool says so loudly — but that is a disclosure concern, not a write.
 	"get_server_peer_config": true,
 	"singbox_delay_check":    true,
+	"list_singbox_rules":     true,
+	"list_singbox_outbounds": true,
+	"get_singbox_staging":    true,
 }
 
 // IsReadOnlyTool reports whether name is known to change nothing. An

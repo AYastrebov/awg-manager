@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -30,6 +31,8 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/orchestrator"
 	"github.com/hoaxisr/awg-manager/internal/pingcheck"
 	"github.com/hoaxisr/awg-manager/internal/singbox"
+	singboxorch "github.com/hoaxisr/awg-manager/internal/singbox/orchestrator"
+	"github.com/hoaxisr/awg-manager/internal/singbox/router"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 	awgtesting "github.com/hoaxisr/awg-manager/internal/testing"
 	"github.com/hoaxisr/awg-manager/internal/traffic"
@@ -69,6 +72,17 @@ type (
 		Run(ctx context.Context) error
 		Status() diagnostics.RunStatus
 		Result() ([]byte, error)
+	}
+	// SingboxRouter is the subset of router.Service MCP uses. Rule writes
+	// land in the router's staging draft; nothing reaches traffic until
+	// ApplyStaging runs.
+	SingboxRouter interface {
+		ListRules(ctx context.Context) ([]router.Rule, error)
+		ListCompositeOutbounds(ctx context.Context) ([]router.CompositeOutboundView, error)
+		StagingStatus(ctx context.Context) router.StagingStatus
+		BulkSetRuleOutbound(ctx context.Context, indices []int, outbound string) error
+		ApplyStaging(ctx context.Context) (singboxorch.ValidationResult, error)
+		DiscardStaging(ctx context.Context) error
 	}
 	MonitoringSnapshotter interface {
 		Snapshot() monitoring.Snapshot
@@ -119,8 +133,10 @@ type Config struct {
 	// the matching tool report that it is unavailable on this build.
 	Connections ConnectionLister
 	Diagnostics DiagnosticsRunner
-	Singbox     SingboxOperator
-	SystemInfo  func() map[string]interface{}
+	// Router serves the sing-box routing-rule tools.
+	Router     SingboxRouter
+	Singbox    SingboxOperator
+	SystemInfo func() map[string]interface{}
 	// Resolve looks a hostname up. Injected rather than called directly so
 	// tests need no network; nil disables explain_route's subnet leg.
 	Resolve func(ctx context.Context, host string) ([]string, error)
@@ -158,11 +174,12 @@ type Local struct {
 	// api.DNSRouteHandler, ...). Messages end in "(MCP)" so the source is
 	// visible in a group-filtered view; the per-call line under system/mcp
 	// carries the key name.
-	tunnelLog *logging.ScopedLogger
-	dnsLog    *logging.ScopedLogger
-	staticLog *logging.ScopedLogger
-	clientLog *logging.ScopedLogger
-	serverLog *logging.ScopedLogger
+	tunnelLog  *logging.ScopedLogger
+	dnsLog     *logging.ScopedLogger
+	staticLog  *logging.ScopedLogger
+	clientLog  *logging.ScopedLogger
+	serverLog  *logging.ScopedLogger
+	singboxLog *logging.ScopedLogger
 }
 
 // New wires a Local. It does not validate cfg: nil fields are checked per
@@ -177,6 +194,7 @@ func New(cfg Config) *Local {
 		staticLog:        logging.NewScopedLogger(cfg.AppLog, logging.GroupRouting, logging.SubStaticRoute),
 		clientLog:        logging.NewScopedLogger(cfg.AppLog, logging.GroupRouting, logging.SubClientRoute),
 		serverLog:        logging.NewScopedLogger(cfg.AppLog, logging.GroupServer, logging.SubManaged),
+		singboxLog:       logging.NewScopedLogger(cfg.AppLog, logging.GroupSingbox, logging.SubSBRouter),
 	}
 }
 
@@ -1421,6 +1439,179 @@ func (l *Local) ServerPeerConfig(ctx context.Context, serverID, publicKey string
 		return "", err
 	}
 	return l.c.Managed.GenerateConf(ctx, serverID, publicKey, "")
+}
+
+// ruleMatchSummary renders a rule's matchers in words. A model picks a
+// rule by meaning ("the YouTube rule"), and reconstructing that from raw
+// matcher arrays is exactly the step it gets wrong.
+func ruleMatchSummary(r router.Rule) string {
+	var parts []string
+	add := func(label string, values []string) {
+		if len(values) > 0 {
+			parts = append(parts, label+" "+strings.Join(values, ", "))
+		}
+	}
+	add("domain_suffix", r.DomainSuffix)
+	add("domain", r.Domain)
+	add("ip_cidr", r.IPCIDR)
+	add("source_ip_cidr", r.SourceIPCIDR)
+	add("source_mac", r.SourceMACAddress)
+	add("rule_set", r.RuleSet)
+	add("inbound", r.Inbound)
+	if r.Protocol != "" {
+		parts = append(parts, "protocol "+r.Protocol)
+	}
+	if r.Network != "" {
+		parts = append(parts, "network "+r.Network)
+	}
+	if len(r.Port) > 0 {
+		ports := make([]string, 0, len(r.Port))
+		for _, p := range r.Port {
+			ports = append(ports, strconv.Itoa(p))
+		}
+		parts = append(parts, "port "+strings.Join(ports, ", "))
+	}
+	if r.IPIsPrivate != nil && *r.IPIsPrivate {
+		parts = append(parts, "destination is private")
+	}
+	if r.Type == "logical" && len(r.Rules) > 0 {
+		nested := make([]string, 0, len(r.Rules))
+		for _, sub := range r.Rules {
+			nested = append(nested, ruleMatchSummary(sub))
+		}
+		mode := r.Mode
+		if mode == "" {
+			mode = "or"
+		}
+		parts = append(parts, "("+strings.Join(nested, " "+mode+" ")+")")
+	}
+	if len(parts) == 0 {
+		// A rule with no matchers matches everything; saying nothing here
+		// would read as "this rule is empty".
+		return "everything"
+	}
+	return strings.Join(parts, "; ")
+}
+
+func singboxRule(i int, r router.Rule) mcpsrv.SingboxRule {
+	action := r.Action
+	if action == "" {
+		// sing-box defaults an omitted action to route; reporting it blank
+		// reads as "this rule does nothing".
+		action = "route"
+	}
+	return mcpsrv.SingboxRule{
+		Index: i, Match: ruleMatchSummary(r), Action: action,
+		Outbound: r.Outbound, Managed: r.AwgmManaged != "",
+	}
+}
+
+// ListSingboxRules reads through the staging slot, as the service does,
+// so an edit is visible at once — and reports hasDraft, because the rules
+// returned are then NOT what traffic is following.
+func (l *Local) ListSingboxRules(ctx context.Context) ([]mcpsrv.SingboxRule, bool, error) {
+	if l.c.Router == nil {
+		return nil, false, errUnavailable("sing-box router")
+	}
+	rules, err := l.c.Router.ListRules(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	out := make([]mcpsrv.SingboxRule, 0, len(rules))
+	for i, r := range rules {
+		out = append(out, singboxRule(i, r))
+	}
+	return out, l.c.Router.StagingStatus(ctx).HasDraft, nil
+}
+
+func (l *Local) ListSingboxOutbounds(ctx context.Context) ([]mcpsrv.SingboxOutbound, error) {
+	if l.c.Router == nil {
+		return nil, errUnavailable("sing-box router")
+	}
+	list, err := l.c.Router.ListCompositeOutbounds(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]mcpsrv.SingboxOutbound, 0, len(list))
+	for _, o := range list {
+		out = append(out, mcpsrv.SingboxOutbound{Tag: o.Tag, Type: o.Type, Source: o.Source})
+	}
+	return out, nil
+}
+
+func (l *Local) SingboxStaging(ctx context.Context) (mcpsrv.SingboxStaging, error) {
+	if l.c.Router == nil {
+		return mcpsrv.SingboxStaging{}, errUnavailable("sing-box router")
+	}
+	st := l.c.Router.StagingStatus(ctx)
+	out := mcpsrv.SingboxStaging{HasDraft: st.HasDraft}
+	if !st.HasDraft {
+		return out, nil
+	}
+	out.DraftedAt = st.DraftedAt.UTC().Format(time.RFC3339)
+	if st.Validation != nil && !st.Validation.Ok() {
+		out.ValidationError = "the staged draft would be rejected on apply"
+	}
+	return out, nil
+}
+
+// SetSingboxRuleOutbound retargets one rule through the bulk path, which
+// validates the outbound tag and the rule kind before writing anything.
+// The managed check is ours: such a rule is regenerated on the next
+// reconcile, so the edit would apply and then silently vanish.
+func (l *Local) SetSingboxRuleOutbound(ctx context.Context, index int, outbound string) error {
+	if l.c.Router == nil {
+		return errUnavailable("sing-box router")
+	}
+	rules, err := l.c.Router.ListRules(ctx)
+	if err != nil {
+		return err
+	}
+	if index < 0 || index >= len(rules) {
+		return fmt.Errorf("rule index %d is out of range (the router has %d rules)", index, len(rules))
+	}
+	if rules[index].AwgmManaged != "" {
+		return fmt.Errorf("rule %d is generated by awg-manager and would be rewritten on the next reconcile; change it in the web interface instead", index)
+	}
+	if err := l.c.Router.BulkSetRuleOutbound(ctx, []int{index}, outbound); err != nil {
+		l.singboxLog.Warn("rule-outbound", strconv.Itoa(index), "Failed to retarget sing-box rule (MCP): "+err.Error())
+		return err
+	}
+	l.singboxLog.Info("rule-outbound", strconv.Itoa(index), "Sing-box rule retargeted to "+outbound+" (MCP, staged)")
+	return nil
+}
+
+// ApplySingboxStaging publishes the draft. Both a hard error and a failed
+// validation are reported as errors: "applied" on a rejected draft would
+// misdescribe the router's state.
+func (l *Local) ApplySingboxStaging(ctx context.Context) error {
+	if l.c.Router == nil {
+		return errUnavailable("sing-box router")
+	}
+	res, err := l.c.Router.ApplyStaging(ctx)
+	if err != nil {
+		l.singboxLog.Warn("staging-apply", "", "Failed to apply sing-box draft (MCP): "+err.Error())
+		return err
+	}
+	if !res.Ok() {
+		l.singboxLog.Warn("staging-apply", "", "Sing-box draft rejected by validation (MCP)")
+		return fmt.Errorf("the draft did not pass validation and was not applied; open the sing-box router page to see what is wrong")
+	}
+	l.singboxLog.Info("staging-apply", "", "Sing-box draft applied (MCP)")
+	l.publish(events.ResourceSingboxStatus, "mcp-staging-apply")
+	return nil
+}
+
+func (l *Local) DiscardSingboxStaging(ctx context.Context) error {
+	if l.c.Router == nil {
+		return errUnavailable("sing-box router")
+	}
+	if err := l.c.Router.DiscardStaging(ctx); err != nil {
+		return err
+	}
+	l.singboxLog.Info("staging-discard", "", "Sing-box draft discarded (MCP)")
+	l.publish(events.ResourceSingboxStatus, "mcp-staging-discard")
+	return nil
 }
 
 func (l *Local) ControlSingbox(ctx context.Context, action string) (mcpsrv.SingboxStatus, error) {

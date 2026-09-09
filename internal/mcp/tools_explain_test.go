@@ -3,6 +3,7 @@ package mcp_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
@@ -184,5 +185,23 @@ func TestTools_ExplainRouteRejectsBadInput(t *testing.T) {
 	}
 	if res, _ := callTool(t, s, "explain_route", map[string]any{"target": "youtube.com", "clientIp": "999.1.1.1"}); !res.IsError {
 		t.Error("an invalid clientIp must be a tool error")
+	}
+}
+
+// TestTools_ExplainRouteMentionsSingboxRules — на установке, где
+// маршрутизацией занимается sing-box, разбор по спискам NDMS — это
+// половина ответа. Промолчать о второй половине значит уверенно назвать
+// не тот туннель.
+func TestTools_ExplainRouteMentionsSingboxRules(t *testing.T) {
+	deps, _ := explainFake(t)
+	s := connectDeps(t, deps)
+
+	_, out := callTool(t, s, "explain_route", map[string]any{"target": "www.youtube.com"})
+	note, _ := out["note"].(string)
+	if !strings.Contains(strings.ToLower(note), "sing-box") {
+		t.Fatalf("note = %q, want it to point at the sing-box rules as well", note)
+	}
+	if !strings.Contains(note, "list_singbox_rules") {
+		t.Fatalf("note = %q, want it to name the tool that shows them", note)
 	}
 }

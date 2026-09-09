@@ -1107,6 +1107,14 @@ func (s *Server) registerMcpRoutes(mux *http.ServeMux, h *routeHandlers) {
 	}
 	// Конкретные типы, а не интерфейсы: интерфейс с nil-указателем внутри
 	// сравнение с nil проходит, и первый же вызов уронил бы демон.
+	// Тот же экземпляр службы, что и у HTTP-обработчиков: у второго был бы
+	// свой взгляд на черновик, и «применить» применяло бы не то.
+	var routerForMcp localdeps.SingboxRouter
+	if s.singboxRouterHandler != nil {
+		if svc := s.singboxRouterHandler.Service(); svc != nil {
+			routerForMcp = svc
+		}
+	}
 	var connsForMcp localdeps.ConnectionLister
 	if h.connectionsService != nil {
 		connsForMcp = h.connectionsService
@@ -1164,6 +1172,7 @@ func (s *Server) registerMcpRoutes(mux *http.ServeMux, h *routeHandlers) {
 		ListServers:    h.serverHandler.ListServers,
 		Managed:        managedForMcp,
 		Connections:    connsForMcp,
+		Router:         routerForMcp,
 		Diagnostics:    diagForMcp,
 		Singbox:        singboxOp,
 		SystemInfo:     h.systemHandler.InfoData,

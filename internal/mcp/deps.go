@@ -96,6 +96,16 @@ type Deps interface {
 	ServerPeerConfig(ctx context.Context, serverID, publicKey string) (string, error)
 	ControlSingbox(ctx context.Context, action string) (SingboxStatus, error)
 	ListSingboxTunnels(ctx context.Context) ([]SingboxTunnel, error)
+	// ListSingboxRules returns the router's rules in evaluation order.
+	// hasDraft reports whether they come from an unapplied draft.
+	ListSingboxRules(ctx context.Context) (rules []SingboxRule, hasDraft bool, err error)
+	ListSingboxOutbounds(ctx context.Context) ([]SingboxOutbound, error)
+	SingboxStaging(ctx context.Context) (SingboxStaging, error)
+	// SetSingboxRuleOutbound retargets one rule. The write lands in the
+	// draft; nothing changes for traffic until ApplySingboxStaging.
+	SetSingboxRuleOutbound(ctx context.Context, index int, outbound string) error
+	ApplySingboxStaging(ctx context.Context) error
+	DiscardSingboxStaging(ctx context.Context) error
 	// CheckSingboxDelay probes one proxy. An unknown tag is an error;
 	// a proxy that stays silent is a result with Reachable false.
 	CheckSingboxDelay(ctx context.Context, tag string) (SingboxDelay, error)

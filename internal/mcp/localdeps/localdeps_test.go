@@ -21,6 +21,8 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/orchestrator"
 	"github.com/hoaxisr/awg-manager/internal/pingcheck"
 	"github.com/hoaxisr/awg-manager/internal/singbox"
+	singboxorch "github.com/hoaxisr/awg-manager/internal/singbox/orchestrator"
+	"github.com/hoaxisr/awg-manager/internal/singbox/router"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 	awgtesting "github.com/hoaxisr/awg-manager/internal/testing"
 	"github.com/hoaxisr/awg-manager/internal/tunnel"
@@ -2071,5 +2073,224 @@ func TestLocal_RunDiagnosticsStarts(t *testing.T) {
 	}
 	if !got.Started || fd.runs != 1 {
 		t.Fatalf("got %+v after %d runs", got, fd.runs)
+	}
+}
+
+// fakeRouter implements the router surface MCP uses.
+type fakeRouter struct {
+	router.Service
+	rules     []router.Rule
+	outbounds []router.CompositeOutboundView
+	staging   router.StagingStatus
+	bulkIdx   []int
+	bulkTag   string
+	bulkErr   error
+	applied   int
+	discarded int
+	applyErr  error
+	applyRes  singboxorch.ValidationResult
+}
+
+func (f *fakeRouter) ListRules(context.Context) ([]router.Rule, error) { return f.rules, nil }
+func (f *fakeRouter) ListCompositeOutbounds(context.Context) ([]router.CompositeOutboundView, error) {
+	return f.outbounds, nil
+}
+func (f *fakeRouter) StagingStatus(context.Context) router.StagingStatus { return f.staging }
+func (f *fakeRouter) BulkSetRuleOutbound(_ context.Context, idx []int, tag string) error {
+	f.bulkIdx, f.bulkTag = idx, tag
+	return f.bulkErr
+}
+func (f *fakeRouter) ApplyStaging(context.Context) (singboxorch.ValidationResult, error) {
+	f.applied++
+	return f.applyRes, f.applyErr
+}
+func (f *fakeRouter) DiscardStaging(context.Context) error { f.discarded++; return nil }
+
+func routerHarness() *fakeRouter {
+	yes := true
+	return &fakeRouter{
+		rules: []router.Rule{
+			{DomainSuffix: []string{"youtube.com", "googlevideo.com"}, Action: "route", Outbound: "vless-nl"},
+			{RuleSet: []string{"geosite-ru"}, Outbound: "direct"},
+			{Protocol: "dns", Action: "hijack-dns", IPIsPrivate: &yes, AwgmManaged: "selective-ip"},
+		},
+		outbounds: []router.CompositeOutboundView{
+			{Outbound: router.Outbound{Tag: "auto", Type: "urltest"}, Source: "user"},
+		},
+	}
+}
+
+// TestLocal_ListSingboxRulesRendersAMatchSummary — модель выбирает
+// правило по смыслу («правило про ютуб»), а не по сырым полям матчера.
+func TestLocal_ListSingboxRulesRendersAMatchSummary(t *testing.T) {
+	fr := routerHarness()
+	l := New(Config{Router: fr})
+
+	got, hasDraft, err := l.ListSingboxRules(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasDraft {
+		t.Error("no draft was staged")
+	}
+	if len(got) != 3 {
+		t.Fatalf("rules = %d", len(got))
+	}
+	if got[0].Index != 0 || got[1].Index != 1 {
+		t.Fatalf("indices must be the positions: %+v", got)
+	}
+	if !strings.Contains(got[0].Match, "youtube.com") {
+		t.Fatalf("match = %q", got[0].Match)
+	}
+	if !strings.Contains(got[1].Match, "geosite-ru") {
+		t.Fatalf("a rule-set rule must name the set: %q", got[1].Match)
+	}
+	// An empty action is "route" in sing-box; reporting it blank would
+	// read as "this rule does nothing".
+	if got[1].Action != "route" {
+		t.Fatalf("action = %q, want route for an omitted action", got[1].Action)
+	}
+	if !got[2].Managed {
+		t.Error("a rule carrying awgm_managed must be marked")
+	}
+	if got[0].Managed {
+		t.Error("a user rule must not be marked managed")
+	}
+}
+
+// TestLocal_ListSingboxRulesReportsTheDraft — правила читаются из
+// черновика, и агент, принявший их за действующие, отчитается «сделано»
+// там, где ничего не применено.
+func TestLocal_ListSingboxRulesReportsTheDraft(t *testing.T) {
+	fr := routerHarness()
+	fr.staging = router.StagingStatus{HasDraft: true, DraftedAt: time.Date(2026, 9, 2, 10, 4, 0, 0, time.UTC)}
+	l := New(Config{Router: fr})
+
+	_, hasDraft, err := l.ListSingboxRules(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasDraft {
+		t.Fatal("with a draft staged the caller must be told the rules are not live")
+	}
+}
+
+func TestLocal_SingboxStaging(t *testing.T) {
+	ctx := context.Background()
+	fr := routerHarness()
+	l := New(Config{Router: fr})
+
+	got, err := l.SingboxStaging(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HasDraft {
+		t.Fatalf("got %+v", got)
+	}
+
+	fr.staging = router.StagingStatus{HasDraft: true, DraftedAt: time.Date(2026, 9, 2, 10, 4, 0, 0, time.UTC)}
+	got, err = l.SingboxStaging(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.HasDraft || got.DraftedAt != "2026-09-02T10:04:00Z" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+// TestLocal_SetSingboxRuleOutboundRefusesManagedRules — правило,
+// созданное демоном, будет переписано ближайшим reconcile: правка
+// «применится» и молча исчезнет.
+func TestLocal_SetSingboxRuleOutboundRefusesManagedRules(t *testing.T) {
+	ctx := context.Background()
+	fr := routerHarness()
+	l := New(Config{Router: fr})
+
+	if err := l.SetSingboxRuleOutbound(ctx, 2, "auto"); err == nil {
+		t.Fatal("editing a managed rule must be refused")
+	}
+	if fr.bulkTag != "" {
+		t.Fatalf("the refused edit still reached the service: %v %q", fr.bulkIdx, fr.bulkTag)
+	}
+
+	if err := l.SetSingboxRuleOutbound(ctx, 5, "auto"); err == nil {
+		t.Error("an out-of-range index must be refused")
+	}
+
+	if err := l.SetSingboxRuleOutbound(ctx, 0, "auto"); err != nil {
+		t.Fatal(err)
+	}
+	if len(fr.bulkIdx) != 1 || fr.bulkIdx[0] != 0 || fr.bulkTag != "auto" {
+		t.Fatalf("service got %v %q", fr.bulkIdx, fr.bulkTag)
+	}
+}
+
+// TestLocal_ApplySingboxStagingSurfacesValidationFailure — sing-box может
+// отвергнуть черновик. Сказать «применено» в этом случае значит соврать о
+// состоянии роутера.
+func TestLocal_ApplySingboxStagingSurfacesValidationFailure(t *testing.T) {
+	ctx := context.Background()
+	fr := routerHarness()
+	fr.applyErr = errors.New("sing-box check failed: unknown outbound")
+	l := New(Config{Router: fr})
+
+	if err := l.ApplySingboxStaging(ctx); err == nil {
+		t.Fatal("a rejected draft must be an error")
+	}
+
+	// A draft can also come back without an error but with blocking
+	// validation errors. Reporting that as applied is the same lie.
+	fr.applyErr = nil
+	fr.applyRes = singboxorch.ValidationResult{Errors: []singboxorch.ValidationError{
+		{Kind: "unknown-outbound", Tag: "gone", Message: "outbound not found"},
+	}}
+	if err := l.ApplySingboxStaging(ctx); err == nil {
+		t.Fatal("a draft that fails validation must be an error, not a silent success")
+	}
+
+	// An advisory warning does not block a reload, so it must not block
+	// this call either.
+	fr.applyRes = singboxorch.ValidationResult{Errors: []singboxorch.ValidationError{
+		{Kind: "dns-final-conflict", Severity: singboxorch.SeverityWarning, Message: "advisory"},
+	}}
+	if err := l.ApplySingboxStaging(ctx); err != nil {
+		t.Fatalf("an advisory warning must not block the apply: %v", err)
+	}
+	if fr.applied != 3 {
+		t.Fatalf("applied %d times", fr.applied)
+	}
+}
+
+func TestLocal_DiscardSingboxStaging(t *testing.T) {
+	fr := routerHarness()
+	l := New(Config{Router: fr})
+	if err := l.DiscardSingboxStaging(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fr.discarded != 1 {
+		t.Fatalf("discarded %d times", fr.discarded)
+	}
+}
+
+func TestLocal_RouterToolsWithoutTheServiceSaySo(t *testing.T) {
+	ctx := context.Background()
+	l := New(Config{})
+	if _, _, err := l.ListSingboxRules(ctx); err == nil {
+		t.Error("listing rules must report the missing service")
+	}
+	if _, err := l.ListSingboxOutbounds(ctx); err == nil {
+		t.Error("listing outbounds must report the missing service")
+	}
+	if _, err := l.SingboxStaging(ctx); err == nil {
+		t.Error("staging status must report the missing service")
+	}
+	if err := l.SetSingboxRuleOutbound(ctx, 0, "auto"); err == nil {
+		t.Error("the edit must report the missing service")
+	}
+	if err := l.ApplySingboxStaging(ctx); err == nil {
+		t.Error("apply must report the missing service")
+	}
+	if err := l.DiscardSingboxStaging(ctx); err == nil {
+		t.Error("discard must report the missing service")
 	}
 }
