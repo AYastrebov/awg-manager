@@ -90,3 +90,49 @@ describe('IntegrationsCard — HydraRoute', () => {
 		expect(open?.getAttribute('href')).toBe('/routing?tab=hrneo');
 	});
 });
+
+describe('IntegrationsCard — ширина кнопок установки', () => {
+	// Пол ширины (min-width: 7.5rem) вешается на прямого ребёнка .setting-row
+	// и на ОДИНОЧНУЮ кнопку в .integration-actions. У sing-box кнопка — прямой
+	// ребёнок строки, у прокси-бинарей она обёрнута в группу, и пока пол не
+	// доставал до вложенных, «Установить» у sing-box был шире остальных.
+	// Тест держит структуру, на которую опирается селектор :only-child:
+	// появится вторая кнопка в ветке «не установлен» — пол молча отвалится.
+	const binary = (key: string, label: string) => ({
+		key,
+		label,
+		present: false,
+		installAvailable: true,
+		updateAvailable: false,
+		busy: false,
+		instances: 0,
+		oninstall: vi.fn(),
+		onuninstall: vi.fn(),
+	});
+
+	it('у неустановленного прокси-бинаря «Установить» — единственная кнопка в группе', () => {
+		render(IntegrationsCard, {
+			...baseProps,
+			singboxStatus: status(false),
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			proxyBinaries: [binary('wdtt', 'WDTT'), binary('freeturn', 'FreeTurn')] as any,
+		});
+
+		const groups = document.querySelectorAll('.integration-actions');
+		expect(groups.length).toBe(2);
+		for (const g of groups) {
+			const buttons = g.querySelectorAll('.btn');
+			expect(buttons.length).toBe(1);
+			expect(buttons[0].textContent?.trim()).toBe('Установить');
+		}
+	});
+
+	it('sing-box без установки держит кнопку прямым ребёнком строки', () => {
+		render(IntegrationsCard, { ...baseProps, singboxStatus: status(false) });
+
+		const row = document.querySelector('.setting-row');
+		expect(row).not.toBeNull();
+		const direct = row?.querySelector(':scope > .btn');
+		expect(direct?.textContent?.trim()).toBe('Установить');
+	});
+});

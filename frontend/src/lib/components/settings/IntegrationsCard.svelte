@@ -637,12 +637,22 @@
 		grid-column: 1 / -1;
 	}
 
-	/* Same action-button floor as settings actions-card (fits «Обновление…»). */
+	/* Same action-button floor as settings actions-card (fits «Обновление…»):
+	   ширина не прыгает, когда подпись уезжает в «Установка…»/«Обновление…».
+	   Одиночная кнопка в .integration-actions получает тот же пол — иначе
+	   «Установить» у sing-box (прямой ребёнок строки) шире, чем у прокси-
+	   бинарей (обёрнуты в группу), хотя это одно и то же действие. Пары
+	   кнопок («Открыть» + «Удалить») пол не получают: там ширину задаёт
+	   содержимое, а 7.5rem на каждую распирало бы строку. */
 	@media (min-width: 641px) {
+		.setting-row > :global(.btn),
+		.integration-actions > :global(.btn:only-child) {
+			min-width: 7.5rem;
+		}
+
 		.setting-row > :global(.btn) {
 			justify-self: end;
 			align-self: center;
-			min-width: 7.5rem;
 		}
 	}
 
@@ -688,10 +698,14 @@
 				gap: 0.625rem;
 			}
 
+			.setting-row > :global(.btn),
+			.integration-actions > :global(.btn:only-child) {
+				min-width: 7.5rem;
+			}
+
 			.setting-row > :global(.btn) {
 				justify-self: end;
 				align-self: center;
-				min-width: 7.5rem;
 			}
 		}
 	}
