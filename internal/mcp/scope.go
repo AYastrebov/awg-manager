@@ -32,7 +32,12 @@ var readOnlyTools = map[string]bool{
 	"explain_route":         true,
 	"list_managed_servers":  true,
 	"list_singbox_tunnels":  true,
-	"singbox_delay_check":   true,
+	"list_server_peers":     true,
+	// The peer config is a read: it renders what already exists and
+	// changes nothing. It does hand out a private key, which is why the
+	// tool says so loudly — but that is a disclosure concern, not a write.
+	"get_server_peer_config": true,
+	"singbox_delay_check":    true,
 }
 
 // IsReadOnlyTool reports whether name is known to change nothing. An

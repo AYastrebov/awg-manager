@@ -19,6 +19,7 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/dnsroute"
 	"github.com/hoaxisr/awg-manager/internal/events"
 	"github.com/hoaxisr/awg-manager/internal/logging"
+	"github.com/hoaxisr/awg-manager/internal/managed"
 	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
 	"github.com/hoaxisr/awg-manager/internal/monitoring"
 	"github.com/hoaxisr/awg-manager/internal/ndms"
@@ -46,6 +47,14 @@ type (
 		// that stayed silent, which is why the caller keeps Reachable
 		// separate. Wired to singbox.DelayChecker.CheckOne.
 		CheckDelay(ctx context.Context, tag string) (int, error)
+	}
+	// ManagedServers is the subset of *managed.Service the peer tools use.
+	ManagedServers interface {
+		List() []storage.ManagedServer
+		Get(id string) (*storage.ManagedServer, error)
+		AddPeer(ctx context.Context, id string, req managed.AddPeerRequest) (*storage.ManagedPeer, error)
+		TogglePeer(ctx context.Context, id, pubkey string, enabled bool) error
+		GenerateConf(ctx context.Context, id, pubkey, endpointHost string) (string, error)
 	}
 	MonitoringSnapshotter interface {
 		Snapshot() monitoring.Snapshot
@@ -89,8 +98,11 @@ type Config struct {
 	Monitoring   MonitoringSnapshotter
 	PingCheck    api.PingCheckService
 	ListServers  func(ctx context.Context) ([]ndms.WireguardServer, error)
-	Singbox      SingboxOperator
-	SystemInfo   func() map[string]interface{}
+	// Managed serves the peer tools. Servers this service does not know
+	// about cannot have peers managed through MCP, and the tools say so.
+	Managed    ManagedServers
+	Singbox    SingboxOperator
+	SystemInfo func() map[string]interface{}
 	// Resolve looks a hostname up. Injected rather than called directly so
 	// tests need no network; nil disables explain_route's subnet leg.
 	Resolve func(ctx context.Context, host string) ([]string, error)
@@ -132,6 +144,7 @@ type Local struct {
 	dnsLog    *logging.ScopedLogger
 	staticLog *logging.ScopedLogger
 	clientLog *logging.ScopedLogger
+	serverLog *logging.ScopedLogger
 }
 
 // New wires a Local. It does not validate cfg: nil fields are checked per
@@ -145,6 +158,7 @@ func New(cfg Config) *Local {
 		dnsLog:           logging.NewScopedLogger(cfg.AppLog, logging.GroupRouting, logging.SubDnsRoute),
 		staticLog:        logging.NewScopedLogger(cfg.AppLog, logging.GroupRouting, logging.SubStaticRoute),
 		clientLog:        logging.NewScopedLogger(cfg.AppLog, logging.GroupRouting, logging.SubClientRoute),
+		serverLog:        logging.NewScopedLogger(cfg.AppLog, logging.GroupServer, logging.SubManaged),
 	}
 }
 
@@ -1143,6 +1157,117 @@ func (l *Local) ListManagedServers(ctx context.Context) ([]mcpsrv.ManagedServer,
 		out = append(out, mcpsrv.ManagedServer{ID: s.ID, InterfaceName: s.InterfaceName, Description: s.Description, Status: s.Status, Connected: s.Connected, ListenPort: s.ListenPort, PeerCount: len(s.Peers)})
 	}
 	return out, nil
+}
+
+// serverPeer maps a stored peer, dropping the private key and PSK: they
+// live in storage only so GenerateConf can render a client config, and
+// that config is what get_server_peer_config returns on request.
+func serverPeer(p storage.ManagedPeer) mcpsrv.ServerPeer {
+	return mcpsrv.ServerPeer{
+		PublicKey: p.PublicKey, Description: p.Description,
+		TunnelIP: p.TunnelIP, DNS: p.DNS, Enabled: p.Enabled,
+	}
+}
+
+func (l *Local) managedServer(id string) (*storage.ManagedServer, error) {
+	if l.c.Managed == nil {
+		return nil, errUnavailable("managed servers")
+	}
+	server, err := l.c.Managed.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	if server == nil {
+		return nil, fmt.Errorf("managed server %q not found", id)
+	}
+	return server, nil
+}
+
+func (l *Local) ListServerPeers(_ context.Context, serverID string) ([]mcpsrv.ServerPeer, error) {
+	server, err := l.managedServer(serverID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]mcpsrv.ServerPeer, 0, len(server.Peers))
+	for _, p := range server.Peers {
+		out = append(out, serverPeer(p))
+	}
+	return out, nil
+}
+
+// AddServerPeer creates a client. When the caller named no address, one
+// is allocated from the server's own subnet here rather than left to the
+// model: an invented address either collides or lands outside the subnet,
+// and the second kind produces a peer that looks fine and never connects.
+func (l *Local) AddServerPeer(ctx context.Context, in mcpsrv.AddPeerInput) (mcpsrv.ServerPeer, error) {
+	server, err := l.managedServer(in.ServerID)
+	if err != nil {
+		return mcpsrv.ServerPeer{}, err
+	}
+	tunnelIP := in.TunnelIP
+	if tunnelIP == "" {
+		used := make([]string, 0, len(server.Peers))
+		for _, p := range server.Peers {
+			used = append(used, p.TunnelIP)
+		}
+		tunnelIP = mcpsrv.NextFreePeerIP(server.Address, used)
+		if tunnelIP == "" {
+			return mcpsrv.ServerPeer{}, fmt.Errorf("no free address left in the subnet of server %q — ask the user which address to use", in.ServerID)
+		}
+	}
+	created, err := l.c.Managed.AddPeer(ctx, in.ServerID, managed.AddPeerRequest{
+		Description: in.Description, TunnelIP: tunnelIP, DNS: in.DNS,
+	})
+	if err != nil {
+		l.serverLog.Warn("add-peer", in.Description, "Failed to add server peer (MCP): "+err.Error())
+		return mcpsrv.ServerPeer{}, err
+	}
+	if created == nil {
+		return mcpsrv.ServerPeer{}, fmt.Errorf("add peer returned no peer")
+	}
+	l.serverLog.Info("add-peer", created.Description, "Server peer added (MCP)")
+	l.publish(events.ResourceServers, "mcp-add-peer")
+	return serverPeer(*created), nil
+}
+
+func (l *Local) SetServerPeerEnabled(ctx context.Context, serverID, publicKey string, enabled bool) (mcpsrv.ServerPeer, error) {
+	server, err := l.managedServer(serverID)
+	if err != nil {
+		return mcpsrv.ServerPeer{}, err
+	}
+	var existing *storage.ManagedPeer
+	for i := range server.Peers {
+		if server.Peers[i].PublicKey == publicKey {
+			existing = &server.Peers[i]
+			break
+		}
+	}
+	if existing == nil {
+		return mcpsrv.ServerPeer{}, fmt.Errorf("peer %q not found on server %q (use list_server_peers)", publicKey, serverID)
+	}
+	action := "disable-peer"
+	if enabled {
+		action = "enable-peer"
+	}
+	if err := l.c.Managed.TogglePeer(ctx, serverID, publicKey, enabled); err != nil {
+		l.serverLog.Warn(action, existing.Description, "Failed to switch server peer (MCP): "+err.Error())
+		return mcpsrv.ServerPeer{}, err
+	}
+	l.serverLog.Info(action, existing.Description, "Server peer switched "+onOff(enabled)+" (MCP)")
+	l.publish(events.ResourceServers, "mcp-"+action)
+	out := serverPeer(*existing)
+	out.Enabled = enabled
+	return out, nil
+}
+
+// ServerPeerConfig renders the client .conf. The endpoint host is left
+// empty so the service falls back to the server's configured endpoint or
+// the WAN IP, as the web UI does.
+func (l *Local) ServerPeerConfig(ctx context.Context, serverID, publicKey string) (string, error) {
+	if _, err := l.managedServer(serverID); err != nil {
+		return "", err
+	}
+	return l.c.Managed.GenerateConf(ctx, serverID, publicKey, "")
 }
 
 func (l *Local) ControlSingbox(ctx context.Context, action string) (mcpsrv.SingboxStatus, error) {

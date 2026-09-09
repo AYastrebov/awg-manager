@@ -23,7 +23,9 @@ func NewServer(deps Deps, version string) *mcp.Server {
 			"Tunnel ids come from list_tunnels. Writes are reversible except remove_dns_route and remove_static_route, which delete a routing list permanently — MCP cannot restore it. " +
 			"To stop a routing list from applying, use set_dns_route_enabled / set_static_route_enabled / set_client_route_enabled; to change one, use update_dns_route. Removal is for lists the user wants gone for good. " +
 			"list_dns_routes truncates long domain lists: use get_dns_route or explain_route before telling the user a domain is not routed. " +
-			"Other destructive operations (delete tunnel, backup restore, system update) are not exposed.",
+			"add_server_peer creates working VPN credentials and get_server_peer_config returns a client's private key: call them only when the user asked, and hand the config to them rather than repeating it elsewhere. " +
+			"A key may be read-only, in which case every tool that changes the router is refused with nothing applied. " +
+			"Other destructive operations (delete tunnel, delete peer, backup restore, system update) are not exposed.",
 	})
 	registerSystemTools(s, deps)
 	registerTunnelTools(s, deps)
@@ -31,6 +33,7 @@ func NewServer(deps Deps, version string) *mcp.Server {
 	registerExplainTools(s, deps)
 	registerSingboxTools(s, deps)
 	registerServerTools(s, deps)
+	registerPeerTools(s, deps)
 	s.AddResource(&mcp.Resource{
 		URI:         ResourceOpenAPI,
 		Name:        "openapi",

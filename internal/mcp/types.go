@@ -357,6 +357,29 @@ type ManagedServer struct {
 // no way to cancel it — so Tunnels is the status as of the LAST completed
 // check, and Triggered says whether this call started a new one (false
 // when one was already in flight).
+// ServerPeer is one client of a WireGuard server hosted on this router.
+// The peer's private key and preshared key are NOT here: they exist in
+// storage only to render the client's .conf, which get_server_peer_config
+// returns on an explicit call.
+type ServerPeer struct {
+	PublicKey   string `json:"publicKey" jsonschema:"identifies the peer for the other peer tools"`
+	Description string `json:"description" jsonschema:"whose device this is"`
+	TunnelIP    string `json:"tunnelIp" jsonschema:"the peer's address inside the tunnel, e.g. 10.0.0.2/32"`
+	DNS         string `json:"dns,omitempty"`
+	Enabled     bool   `json:"enabled" jsonschema:"a disabled peer keeps its keys and address but cannot connect"`
+}
+
+// AddPeerInput creates a client on a hosted server. TunnelIP is optional:
+// left empty, the daemon allocates the first free address in the server's
+// subnet. Asking the model to invent one produces either a collision or a
+// peer outside the subnet, which simply never connects.
+type AddPeerInput struct {
+	ServerID    string `json:"serverId" jsonschema:"server id from list_managed_servers"`
+	Description string `json:"description" jsonschema:"whose device this is, e.g. \"phone\" — required, it is how the peer is recognised later"`
+	TunnelIP    string `json:"tunnelIp,omitempty" jsonschema:"optional address inside the tunnel (10.0.0.5/32); omit to let the router pick the first free one"`
+	DNS         string `json:"dns,omitempty" jsonschema:"optional DNS server for the client config"`
+}
+
 type PingCheckRun struct {
 	Triggered bool              `json:"triggered" jsonschema:"true if this call started a new check; false if monitoring is disabled, a check is already running, or one started less than ~10 s ago"`
 	Tunnels   []PingCheckStatus `json:"tunnels" jsonschema:"status as of the last COMPLETED check — call again in ~10 s for the result of the one just triggered"`

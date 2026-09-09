@@ -76,6 +76,14 @@ type Deps interface {
 	ResolveDomain(ctx context.Context, domain string) ([]string, error)
 
 	ListManagedServers(ctx context.Context) ([]ManagedServer, error)
+	ListServerPeers(ctx context.Context, serverID string) ([]ServerPeer, error)
+	// AddServerPeer creates a client and returns it. An empty TunnelIP
+	// means "allocate one"; the implementation must not leave that choice
+	// to the caller.
+	AddServerPeer(ctx context.Context, in AddPeerInput) (ServerPeer, error)
+	SetServerPeerEnabled(ctx context.Context, serverID, publicKey string, enabled bool) (ServerPeer, error)
+	// ServerPeerConfig renders the client .conf, private key included.
+	ServerPeerConfig(ctx context.Context, serverID, publicKey string) (string, error)
 	ControlSingbox(ctx context.Context, action string) (SingboxStatus, error)
 	ListSingboxTunnels(ctx context.Context) ([]SingboxTunnel, error)
 	// CheckSingboxDelay probes one proxy. An unknown tag is an error;

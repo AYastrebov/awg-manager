@@ -31,6 +31,10 @@ type Fake struct {
 	SingboxTunnels []mcpsrv.SingboxTunnel
 	Delays         map[string]int
 	Servers        []mcpsrv.ManagedServer
+	// Peers maps a server id to its clients; ServerAddresses maps it to
+	// the server's own tunnel address, which the allocator counts from.
+	Peers           map[string][]mcpsrv.ServerPeer
+	ServerAddresses map[string]string
 	// Resolver backs ResolveDomain: domain -> IPv4 addresses.
 	Resolver map[string][]string
 	Spec     []byte
@@ -70,9 +74,16 @@ func New() *Fake {
 			{Tag: "vless-nl", Protocol: "vless", Server: "nl.example.net", Port: 443, Security: "reality", Transport: "tcp", ListenPort: 2081, ProxyInterface: "Proxy0", SNI: "www.example.com", Running: true},
 			{Tag: "hy2-de", Protocol: "hysteria2", Server: "de.example.net", Port: 8443, Security: "tls", Transport: "quic", ListenPort: 2082, Running: false},
 		},
-		Delays:  map[string]int{"vless-nl": 120, "hy2-de": 0},
-		Servers: []mcpsrv.ManagedServer{{ID: "Wireguard0", InterfaceName: "nwg3", Description: "Home", Status: "up", Connected: true, ListenPort: 51820, PeerCount: 2}},
-		Spec:    []byte("swagger: \"2.0\"\ninfo:\n  title: AWG Manager API (mcptest stub)\n"),
+		Delays: map[string]int{"vless-nl": 120, "hy2-de": 0},
+		Peers: map[string][]mcpsrv.ServerPeer{
+			"Wireguard0": {
+				{PublicKey: "pub-laptop=", Description: "laptop", TunnelIP: "10.0.0.2/32", Enabled: true},
+				{PublicKey: "pub-tv=", Description: "tv", TunnelIP: "10.0.0.3/32", Enabled: true},
+			},
+		},
+		ServerAddresses: map[string]string{"Wireguard0": "10.0.0.1/24"},
+		Servers:         []mcpsrv.ManagedServer{{ID: "Wireguard0", InterfaceName: "nwg3", Description: "Home", Status: "up", Connected: true, ListenPort: 51820, PeerCount: 2}},
+		Spec:            []byte("swagger: \"2.0\"\ninfo:\n  title: AWG Manager API (mcptest stub)\n"),
 	}
 }
 
@@ -596,6 +607,91 @@ func (f *Fake) ListManagedServers(context.Context) ([]mcpsrv.ManagedServer, erro
 		return nil, f.Err
 	}
 	return append([]mcpsrv.ManagedServer(nil), f.Servers...), nil
+}
+
+func (f *Fake) serverExists(id string) bool {
+	for _, s := range f.Servers {
+		if s.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *Fake) ListServerPeers(_ context.Context, serverID string) ([]mcpsrv.ServerPeer, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.serverExists(serverID) {
+		return nil, fmt.Errorf("managed server %q not found", serverID)
+	}
+	return append([]mcpsrv.ServerPeer(nil), f.Peers[serverID]...), nil
+}
+
+func (f *Fake) AddServerPeer(_ context.Context, in mcpsrv.AddPeerInput) (mcpsrv.ServerPeer, error) {
+	if f.Err != nil {
+		return mcpsrv.ServerPeer{}, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.serverExists(in.ServerID) {
+		return mcpsrv.ServerPeer{}, fmt.Errorf("managed server %q not found", in.ServerID)
+	}
+	peers := f.Peers[in.ServerID]
+	ip := in.TunnelIP
+	if ip == "" {
+		used := make([]string, 0, len(peers))
+		for _, p := range peers {
+			used = append(used, p.TunnelIP)
+		}
+		ip = mcpsrv.NextFreePeerIP(f.ServerAddresses[in.ServerID], used)
+		if ip == "" {
+			return mcpsrv.ServerPeer{}, fmt.Errorf("no free address left in the server subnet")
+		}
+	}
+	for _, p := range peers {
+		if p.TunnelIP == ip {
+			return mcpsrv.ServerPeer{}, fmt.Errorf("tunnel IP %s already in use", ip)
+		}
+	}
+	peer := mcpsrv.ServerPeer{
+		PublicKey:   f.nextID("pub") + "=",
+		Description: in.Description, TunnelIP: ip, DNS: in.DNS, Enabled: true,
+	}
+	f.Peers[in.ServerID] = append(peers, peer)
+	return peer, nil
+}
+
+func (f *Fake) SetServerPeerEnabled(_ context.Context, serverID, publicKey string, enabled bool) (mcpsrv.ServerPeer, error) {
+	if f.Err != nil {
+		return mcpsrv.ServerPeer{}, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	peers := f.Peers[serverID]
+	for i := range peers {
+		if peers[i].PublicKey == publicKey {
+			peers[i].Enabled = enabled
+			return peers[i], nil
+		}
+	}
+	return mcpsrv.ServerPeer{}, fmt.Errorf("peer %q not found on server %q", publicKey, serverID)
+}
+
+func (f *Fake) ServerPeerConfig(_ context.Context, serverID, publicKey string) (string, error) {
+	if f.Err != nil {
+		return "", f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, p := range f.Peers[serverID] {
+		if p.PublicKey == publicKey {
+			return fmt.Sprintf("[Interface]\nPrivateKey = secret-private\nAddress = %s\n\n[Peer]\nPublicKey = server-pub=\nPresharedKey = secret-psk\nEndpoint = router.example:51820\nAllowedIPs = 0.0.0.0/0\n", p.TunnelIP), nil
+		}
+	}
+	return "", fmt.Errorf("peer %q not found on server %q", publicKey, serverID)
 }
 
 func (f *Fake) ListSingboxTunnels(context.Context) ([]mcpsrv.SingboxTunnel, error) {

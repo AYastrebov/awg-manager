@@ -14,6 +14,7 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/dnsroute"
 	"github.com/hoaxisr/awg-manager/internal/events"
 	"github.com/hoaxisr/awg-manager/internal/logging"
+	"github.com/hoaxisr/awg-manager/internal/managed"
 	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
 	"github.com/hoaxisr/awg-manager/internal/orchestrator"
 	"github.com/hoaxisr/awg-manager/internal/pingcheck"
@@ -1661,5 +1662,220 @@ func TestLocal_SingboxToolsWithoutTheEngineSaySo(t *testing.T) {
 	}
 	if _, err := l.CheckSingboxDelay(context.Background(), "x"); err == nil {
 		t.Error("a build without sing-box must report that")
+	}
+}
+
+// fakeManaged implements the managed-server surface MCP needs.
+type fakeManaged struct {
+	servers  []storage.ManagedServer
+	added    managed.AddPeerRequest
+	addedTo  string
+	toggled  []string
+	confFor  string
+	confErr  error
+	addErr   error
+	confText string
+}
+
+func (f *fakeManaged) List() []storage.ManagedServer { return f.servers }
+
+func (f *fakeManaged) Get(id string) (*storage.ManagedServer, error) {
+	for i := range f.servers {
+		if f.servers[i].InterfaceName == id {
+			cp := f.servers[i]
+			return &cp, nil
+		}
+	}
+	return nil, errNotFound(id)
+}
+
+func (f *fakeManaged) AddPeer(_ context.Context, id string, req managed.AddPeerRequest) (*storage.ManagedPeer, error) {
+	if f.addErr != nil {
+		return nil, f.addErr
+	}
+	f.addedTo, f.added = id, req
+	peer := storage.ManagedPeer{
+		PublicKey: "pub-new=", PrivateKey: "secret-private", PresharedKey: "secret-psk",
+		Description: req.Description, TunnelIP: req.TunnelIP, DNS: req.DNS, Enabled: true,
+	}
+	for i := range f.servers {
+		if f.servers[i].InterfaceName == id {
+			f.servers[i].Peers = append(f.servers[i].Peers, peer)
+		}
+	}
+	return &peer, nil
+}
+
+func (f *fakeManaged) TogglePeer(_ context.Context, id, pubkey string, enabled bool) error {
+	for i := range f.servers {
+		if f.servers[i].InterfaceName != id {
+			continue
+		}
+		for j := range f.servers[i].Peers {
+			if f.servers[i].Peers[j].PublicKey == pubkey {
+				f.servers[i].Peers[j].Enabled = enabled
+				f.toggled = append(f.toggled, pubkey)
+				return nil
+			}
+		}
+	}
+	return errNotFound(pubkey)
+}
+
+func (f *fakeManaged) GenerateConf(_ context.Context, id, pubkey, _ string) (string, error) {
+	f.confFor = pubkey
+	return f.confText, f.confErr
+}
+
+func managedHarness() *fakeManaged {
+	return &fakeManaged{
+		servers: []storage.ManagedServer{{
+			InterfaceName: "Wireguard3", Description: "Home", Address: "10.0.0.1", Mask: "255.255.255.0",
+			Peers: []storage.ManagedPeer{
+				{PublicKey: "pub-laptop=", PrivateKey: "secret-private", PresharedKey: "secret-psk", Description: "laptop", TunnelIP: "10.0.0.2/32", Enabled: true},
+				{PublicKey: "pub-tv=", PrivateKey: "secret-private2", PresharedKey: "secret-psk2", Description: "tv", TunnelIP: "10.0.0.3/32", Enabled: false},
+			},
+		}},
+		confText: "[Interface]\nPrivateKey = secret-private\n\n[Peer]\nPublicKey = server=\n",
+	}
+}
+
+// TestLocal_ListServerPeersCarriesNoKeys — приватный ключ и PSK клиента
+// лежат в хранилище ради генерации .conf. В списке пиров им делать
+// нечего: конфиг выдаётся отдельным инструментом.
+func TestLocal_ListServerPeersCarriesNoKeys(t *testing.T) {
+	m := managedHarness()
+	l := New(Config{Managed: m})
+
+	got, err := l.ListServerPeers(context.Background(), "Wireguard3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("peers = %d", len(got))
+	}
+	want := mcpsrv.ServerPeer{PublicKey: "pub-laptop=", Description: "laptop", TunnelIP: "10.0.0.2/32", Enabled: true}
+	if got[0] != want {
+		t.Fatalf("got %+v, want %+v", got[0], want)
+	}
+	if !got[1].Enabled == false && got[1].Description != "tv" {
+		t.Fatalf("a disabled peer must still be listed: %+v", got[1])
+	}
+	blob := fmt.Sprintf("%+v", got)
+	for _, secret := range []string{"secret-private", "secret-psk"} {
+		if strings.Contains(blob, secret) {
+			t.Fatalf("the peer listing leaked %q: %s", secret, blob)
+		}
+	}
+
+	if _, err := l.ListServerPeers(context.Background(), "nope"); err == nil {
+		t.Error("an unknown server must be an error")
+	}
+}
+
+// TestLocal_AddServerPeerAllocatesFromTheServerSubnet — адрес считается
+// от адреса самого сервера, а не от произвольной сети: пир в чужой
+// подсети создастся и просто не будет работать.
+func TestLocal_AddServerPeerAllocatesFromTheServerSubnet(t *testing.T) {
+	ctx := context.Background()
+	m := managedHarness()
+	l := New(Config{Managed: m})
+
+	got, err := l.AddServerPeer(ctx, mcpsrv.AddPeerInput{ServerID: "Wireguard3", Description: "phone"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.added.TunnelIP != "10.0.0.4/32" {
+		t.Fatalf("allocated %q, want the first free address in the server subnet", m.added.TunnelIP)
+	}
+	if m.addedTo != "Wireguard3" || m.added.Description != "phone" {
+		t.Fatalf("request = %+v to %q", m.added, m.addedTo)
+	}
+	if got.TunnelIP != "10.0.0.4/32" || got.Description != "phone" || !got.Enabled {
+		t.Fatalf("returned peer = %+v", got)
+	}
+	if got.PublicKey == "" {
+		t.Error("the caller needs the public key to address the peer later")
+	}
+
+	// An explicit address is passed through untouched.
+	if _, err := l.AddServerPeer(ctx, mcpsrv.AddPeerInput{ServerID: "Wireguard3", Description: "x", TunnelIP: "10.0.0.9/32"}); err != nil {
+		t.Fatal(err)
+	}
+	if m.added.TunnelIP != "10.0.0.9/32" {
+		t.Fatalf("explicit address was rewritten to %q", m.added.TunnelIP)
+	}
+}
+
+// TestLocal_AddServerPeerReturnsNoSecrets — созданный пир возвращается
+// вызывающему, а AddPeer отдаёт запись с приватным ключом.
+func TestLocal_AddServerPeerReturnsNoSecrets(t *testing.T) {
+	m := managedHarness()
+	l := New(Config{Managed: m})
+
+	got, err := l.AddServerPeer(context.Background(), mcpsrv.AddPeerInput{ServerID: "Wireguard3", Description: "phone"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blob := fmt.Sprintf("%+v", got); strings.Contains(blob, "secret-private") || strings.Contains(blob, "secret-psk") {
+		t.Fatalf("the created peer leaked key material: %s", blob)
+	}
+}
+
+func TestLocal_SetServerPeerEnabled(t *testing.T) {
+	ctx := context.Background()
+	m := managedHarness()
+	l := New(Config{Managed: m})
+
+	got, err := l.SetServerPeerEnabled(ctx, "Wireguard3", "pub-laptop=", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Enabled {
+		t.Error("the returned peer must show the state AFTER the change")
+	}
+	if got.PublicKey != "pub-laptop=" || got.Description != "laptop" {
+		t.Fatalf("peer = %+v", got)
+	}
+	if len(m.toggled) != 1 {
+		t.Fatalf("toggled = %v", m.toggled)
+	}
+	if _, err := l.SetServerPeerEnabled(ctx, "Wireguard3", "nope", true); err == nil {
+		t.Error("an unknown peer must be an error")
+	}
+}
+
+func TestLocal_ServerPeerConfig(t *testing.T) {
+	m := managedHarness()
+	l := New(Config{Managed: m})
+
+	conf, err := l.ServerPeerConfig(context.Background(), "Wireguard3", "pub-laptop=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(conf, "[Interface]") {
+		t.Fatalf("conf = %q", conf)
+	}
+	if m.confFor != "pub-laptop=" {
+		t.Fatalf("asked for %q", m.confFor)
+	}
+}
+
+// TestLocal_PeerToolsWithoutTheManagedServiceSaySo — на сборке без службы
+// пустой список читался бы как «клиентов нет».
+func TestLocal_PeerToolsWithoutTheManagedServiceSaySo(t *testing.T) {
+	ctx := context.Background()
+	l := New(Config{})
+	if _, err := l.ListServerPeers(ctx, "Wireguard3"); err == nil {
+		t.Error("listing must report the missing service")
+	}
+	if _, err := l.AddServerPeer(ctx, mcpsrv.AddPeerInput{ServerID: "Wireguard3", Description: "x"}); err == nil {
+		t.Error("adding must report the missing service")
+	}
+	if _, err := l.SetServerPeerEnabled(ctx, "Wireguard3", "k", true); err == nil {
+		t.Error("toggling must report the missing service")
+	}
+	if _, err := l.ServerPeerConfig(ctx, "Wireguard3", "k"); err == nil {
+		t.Error("the config must report the missing service")
 	}
 }
