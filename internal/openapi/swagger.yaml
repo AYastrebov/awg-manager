@@ -2488,6 +2488,13 @@ definitions:
       name:
         example: laptop
         type: string
+      readOnly:
+        description: |-
+          ReadOnly mints a key restricted to tools that change nothing.
+          Omitted means full access, matching the behaviour before scopes
+          existed — clients that do not know the field keep working.
+        example: false
+        type: boolean
     type: object
   api.McpKeyCreatedData:
     properties:
@@ -2502,6 +2509,9 @@ definitions:
       name:
         example: laptop
         type: string
+      readOnly:
+        example: false
+        type: boolean
     type: object
   api.McpKeyCreatedResponse:
     properties:
@@ -2523,6 +2533,13 @@ definitions:
       name:
         example: laptop
         type: string
+      readOnly:
+        description: |-
+          ReadOnly is always present, unlike the stored field: the UI has to
+          distinguish a restricted key from a full one, and an omitted false
+          would render the same as "unknown".
+        example: false
+        type: boolean
     type: object
   api.McpKeyRevokeRequest:
     properties:
