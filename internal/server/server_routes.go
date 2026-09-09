@@ -1157,6 +1157,10 @@ func (s *Server) registerMcpRoutes(mux *http.ServeMux, h *routeHandlers) {
 	// а не в конструкторе Server: до регистрации маршрутов MCP нет.
 	s.mcpCalls, s.mcpCallsCancel = context.WithCancel(context.Background())
 	mcpServer.AddReceivingMiddleware(mcp.CallDeadline(mcpToolTimeout, s.mcpCalls))
+	// Ключ только для чтения не должен доходить до записи. Проверка стоит
+	// перед обработчиком инструмента: «нельзя» после применения изменения
+	// было бы худшим из исходов.
+	mcpServer.AddReceivingMiddleware(mcp.RequireWriteScope())
 	// Один info-лог на вызов инструмента: имя инструмента + имя ключа
 	// (никогда сам ключ), длительность и исход — спека §8.
 	mcpServer.AddReceivingMiddleware(func(next sdk.MethodHandler) sdk.MethodHandler {
@@ -1180,7 +1184,11 @@ func (s *Server) registerMcpRoutes(mux *http.ServeMux, h *routeHandlers) {
 			} else if r, ok := res.(*sdk.CallToolResult); ok && r.IsError {
 				outcome = "tool-error"
 			}
-			mcpLog.Info("call", toolName, fmt.Sprintf("key=%s %s %dms", keyName, outcome, time.Since(start).Milliseconds()))
+			scope := ""
+			if k, ok := mcp.KeyFromContext(ctx); ok && k.ReadOnly {
+				scope = " scope=read-only"
+			}
+			mcpLog.Info("call", toolName, fmt.Sprintf("key=%s%s %s %dms", keyName, scope, outcome, time.Since(start).Milliseconds()))
 			return res, err
 		}
 	})
@@ -1192,7 +1200,7 @@ func (s *Server) registerMcpRoutes(mux *http.ServeMux, h *routeHandlers) {
 		Enabled: s.settings.IsMcpEnabled,
 		Verify: func(tok string) (mcp.KeyInfo, bool) {
 			k, ok := s.mcpKeys.Verify(tok)
-			return mcp.KeyInfo{ID: k.ID, Name: k.Name}, ok
+			return mcp.KeyInfo{ID: k.ID, Name: k.Name, ReadOnly: k.ReadOnly}, ok
 		},
 		Touch:    s.mcpKeys.Touch,
 		Throttle: throttle,

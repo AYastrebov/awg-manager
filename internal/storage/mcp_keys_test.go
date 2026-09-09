@@ -41,7 +41,7 @@ func newKeyStoreIn(t *testing.T, dataDir string) *McpKeyStore {
 
 func TestMcpKeyStore_CreateVerifyRevoke(t *testing.T) {
 	s := newKeyStore(t)
-	key, plain, err := s.Create("laptop")
+	key, plain, err := s.Create("laptop", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,10 +73,10 @@ func TestMcpKeyStore_CreateVerifyRevoke(t *testing.T) {
 
 func TestMcpKeyStore_ListHidesHashAndPersists(t *testing.T) {
 	s := newKeyStore(t)
-	if _, _, err := s.Create("a"); err != nil {
+	if _, _, err := s.Create("a", false); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := s.Create("b"); err != nil {
+	if _, _, err := s.Create("b", false); err != nil {
 		t.Fatal(err)
 	}
 	list := s.List()
@@ -107,34 +107,34 @@ func TestMcpKeyStore_ListHidesHashAndPersists(t *testing.T) {
 
 func TestMcpKeyStore_CreateRejectsBadName(t *testing.T) {
 	s := newKeyStore(t)
-	if _, _, err := s.Create("   "); err == nil {
+	if _, _, err := s.Create("   ", false); err == nil {
 		t.Fatal("empty name accepted")
 	}
-	if _, _, err := s.Create(strings.Repeat("x", 65)); err == nil {
+	if _, _, err := s.Create(strings.Repeat("x", 65), false); err == nil {
 		t.Fatal("65 ASCII char name accepted")
 	}
-	if _, _, err := s.Create(strings.Repeat("x", 64)); err != nil {
+	if _, _, err := s.Create(strings.Repeat("x", 64), false); err != nil {
 		t.Fatalf("64 ASCII char name rejected: %v", err)
 	}
 	// Name length must be measured in runes, not bytes: each "я" is two
 	// UTF-8 bytes, so a byte-based check would wrongly reject a 64-rune
 	// Cyrillic name (128 bytes) and wrongly accept some multi-byte names
 	// short of the character limit.
-	if _, _, err := s.Create(strings.Repeat("я", 64)); err != nil {
+	if _, _, err := s.Create(strings.Repeat("я", 64), false); err != nil {
 		t.Fatalf("64 Cyrillic char name rejected: %v", err)
 	}
-	if _, _, err := s.Create(strings.Repeat("я", 65)); err == nil {
+	if _, _, err := s.Create(strings.Repeat("я", 65), false); err == nil {
 		t.Fatal("65 Cyrillic char name accepted")
 	}
 }
 
 func TestMcpKeyStore_CreateBadNameWrapsSentinel(t *testing.T) {
 	s := newKeyStore(t)
-	_, _, err := s.Create("   ")
+	_, _, err := s.Create("   ", false)
 	if err == nil || !errors.Is(err, ErrMcpKeyInvalidName) {
 		t.Fatalf("empty name error does not wrap ErrMcpKeyInvalidName: %v", err)
 	}
-	_, _, err = s.Create(strings.Repeat("x", 65))
+	_, _, err = s.Create(strings.Repeat("x", 65), false)
 	if err == nil || !errors.Is(err, ErrMcpKeyInvalidName) {
 		t.Fatalf("too-long name error does not wrap ErrMcpKeyInvalidName: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestMcpKeyStore_CreateSaveFailureDoesNotWrapInvalidName(t *testing.T) {
 	s := newKeyStore(t)
 	blockWrites(t, s)
 
-	_, _, err := s.Create("laptop")
+	_, _, err := s.Create("laptop", false)
 	if err == nil {
 		t.Fatal("Create succeeded despite unwritable data dir")
 	}
@@ -155,7 +155,7 @@ func TestMcpKeyStore_CreateSaveFailureDoesNotWrapInvalidName(t *testing.T) {
 
 func TestMcpKeyStore_PlaintextNeverPersisted(t *testing.T) {
 	s := newKeyStore(t)
-	key, plain, err := s.Create("laptop")
+	key, plain, err := s.Create("laptop", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestMcpKeyStore_CreateRollsBackOnSaveFailure(t *testing.T) {
 	s := newKeyStore(t)
 	blockWrites(t, s)
 
-	_, plain, err := s.Create("laptop")
+	_, plain, err := s.Create("laptop", false)
 	if err == nil {
 		t.Fatal("Create succeeded despite unwritable data dir")
 	}
@@ -189,7 +189,7 @@ func TestMcpKeyStore_CreateRollsBackOnSaveFailure(t *testing.T) {
 
 func TestMcpKeyStore_RevokeRollsBackOnSaveFailure(t *testing.T) {
 	s := newKeyStore(t)
-	key, plain, err := s.Create("laptop")
+	key, plain, err := s.Create("laptop", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,7 @@ func TestMcpKeyStore_TouchThrottled(t *testing.T) {
 	s := newKeyStore(t)
 	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
 	s.now = func() time.Time { return now }
-	key, _, _ := s.Create("k")
+	key, _, _ := s.Create("k", false)
 	s.Touch(key.ID)
 	first := s.List()[0].LastUsedAt
 	if !first.Equal(now) {
@@ -243,7 +243,7 @@ func TestMcpKeyStore_NewerFileVersionIsReadOnly(t *testing.T) {
 	if !errors.Is(err, ErrMcpKeysFileVersion) {
 		t.Fatalf("Load = %v, want ErrMcpKeysFileVersion", err)
 	}
-	if _, _, err := s.Create("x"); !errors.Is(err, ErrMcpKeyStoreReadOnly) {
+	if _, _, err := s.Create("x", false); !errors.Is(err, ErrMcpKeyStoreReadOnly) {
 		t.Fatalf("Create = %v, want ErrMcpKeyStoreReadOnly", err)
 	}
 	if err := s.Revoke("abc"); !errors.Is(err, ErrMcpKeyStoreReadOnly) {
@@ -272,11 +272,11 @@ func TestMcpKeyStore_CorruptFileRestoresFromBackup(t *testing.T) {
 	if err := seed.Load(); err != nil {
 		t.Fatal(err)
 	}
-	first, firstPlain, err := seed.Create("laptop")
+	first, firstPlain, err := seed.Create("laptop", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	phone, phonePlain, err := seed.Create("phone")
+	phone, phonePlain, err := seed.Create("phone", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestMcpKeyStore_CorruptFileRestoresFromBackup(t *testing.T) {
 		t.Fatal("restore was not persisted; next boot would start empty")
 	}
 	// And the store is writable — the on-disk state is known again.
-	if _, _, err := again.Create("tablet"); err != nil {
+	if _, _, err := again.Create("tablet", false); err != nil {
 		t.Fatalf("Create after restore = %v", err)
 	}
 }
@@ -329,7 +329,7 @@ func TestMcpKeyStore_CorruptFileWithoutBackupIsEmptyAndWritable(t *testing.T) {
 	if len(s.List()) != 0 {
 		t.Fatal("expected no keys")
 	}
-	if _, _, err := s.Create("x"); err != nil {
+	if _, _, err := s.Create("x", false); err != nil {
 		t.Fatalf("Create = %v", err)
 	}
 }
@@ -340,7 +340,7 @@ func TestMcpKeyStore_CorruptFileWithoutBackupIsEmptyAndWritable(t *testing.T) {
 func TestMcpKeyStore_UnloadedStoreRefusesWrites(t *testing.T) {
 	dataDir := t.TempDir()
 	seed := newKeyStoreIn(t, dataDir)
-	key, plain, err := seed.Create("laptop")
+	key, plain, err := seed.Create("laptop", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +350,7 @@ func TestMcpKeyStore_UnloadedStoreRefusesWrites(t *testing.T) {
 	}
 
 	s := NewMcpKeyStore(dataDir) // no Load
-	if _, _, err := s.Create("phone"); !errors.Is(err, ErrMcpKeyStoreReadOnly) {
+	if _, _, err := s.Create("phone", false); !errors.Is(err, ErrMcpKeyStoreReadOnly) {
 		t.Fatalf("Create on an unloaded store = %v, want ErrMcpKeyStoreReadOnly", err)
 	}
 	if err := s.Revoke(key.ID); !errors.Is(err, ErrMcpKeyStoreReadOnly) {
@@ -374,17 +374,17 @@ func TestMcpKeyStore_UnloadedStoreRefusesWrites(t *testing.T) {
 // (оно уходит в каждую строку журнала) отклоняются.
 func TestMcpKeyStore_NameValidationRunsBeforeReadOnlyCheck(t *testing.T) {
 	s := NewMcpKeyStore(t.TempDir()) // unloaded → read-only
-	if _, _, err := s.Create("   "); !errors.Is(err, ErrMcpKeyInvalidName) {
+	if _, _, err := s.Create("   ", false); !errors.Is(err, ErrMcpKeyInvalidName) {
 		t.Fatalf("blank name on a read-only store = %v, want ErrMcpKeyInvalidName", err)
 	}
 	loaded := newKeyStore(t)
 	for _, bad := range []string{"lap\ntop", "lap\ttop", "lap\x00top", "\x1b[31mred"} {
-		if _, _, err := loaded.Create(bad); !errors.Is(err, ErrMcpKeyInvalidName) {
+		if _, _, err := loaded.Create(bad, false); !errors.Is(err, ErrMcpKeyInvalidName) {
 			t.Errorf("Create(%q) = %v, want ErrMcpKeyInvalidName", bad, err)
 		}
 	}
 	for _, ok := range []string{"Ноутбук Андрея — дом", "MacBook\u00a0Pro", "wide\u3000space"} {
-		if _, _, err := loaded.Create(ok); err != nil {
+		if _, _, err := loaded.Create(ok, false); err != nil {
 			t.Errorf("Create(%q) rejected: %v", ok, err)
 		}
 	}
@@ -404,7 +404,7 @@ func TestMcpKeyStore_LoadMissingFileIsEmpty(t *testing.T) {
 func TestMcpKeyStore_UnreadableFileMakesStoreReadOnly(t *testing.T) {
 	dataDir := t.TempDir()
 	seed := newKeyStoreIn(t, dataDir)
-	key, plain, err := seed.Create("laptop")
+	key, plain, err := seed.Create("laptop", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +431,7 @@ func TestMcpKeyStore_UnreadableFileMakesStoreReadOnly(t *testing.T) {
 		t.Fatal("Load of an unreadable file returned nil")
 	}
 
-	_, _, err = s.Create("phone")
+	_, _, err = s.Create("phone", false)
 	if !errors.Is(err, ErrMcpKeyStoreReadOnly) {
 		t.Fatalf("Create = %v, want ErrMcpKeyStoreReadOnly", err)
 	}
@@ -469,10 +469,10 @@ func TestMcpKeyStore_BackupIsTheCurrentMembership(t *testing.T) {
 	path := filepath.Join(dataDir, mcpKeysFile)
 	bak := path + ".bak"
 
-	if _, _, err := s.Create("first"); err != nil {
+	if _, _, err := s.Create("first", false); err != nil {
 		t.Fatal(err)
 	}
-	second, _, err := s.Create("second")
+	second, _, err := s.Create("second", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -511,11 +511,11 @@ func TestMcpKeyStore_BackupIsTheCurrentMembership(t *testing.T) {
 func TestMcpKeyStore_RestoreDoesNotResurrectRevokedKey(t *testing.T) {
 	dataDir := t.TempDir()
 	seed := newKeyStoreIn(t, dataDir)
-	_, keepPlain, err := seed.Create("keep")
+	_, keepPlain, err := seed.Create("keep", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	leaked, leakedPlain, err := seed.Create("leaked")
+	leaked, leakedPlain, err := seed.Create("leaked", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -541,7 +541,7 @@ func TestMcpKeyStore_RestoreDoesNotResurrectRevokedKey(t *testing.T) {
 func TestMcpKeyStore_MissingMainWithBackupRestores(t *testing.T) {
 	dataDir := t.TempDir()
 	seed := newKeyStoreIn(t, dataDir)
-	_, plain, err := seed.Create("laptop")
+	_, plain, err := seed.Create("laptop", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -563,7 +563,7 @@ func TestMcpKeyStore_MissingMainWithBackupRestores(t *testing.T) {
 // Verify для всех параллельных запросов.
 func TestMcpKeyStore_TouchDoesNotHoldTheLockAcrossTheWrite(t *testing.T) {
 	s := newKeyStore(t)
-	key, plain, err := s.Create("k")
+	key, plain, err := s.Create("k", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -647,11 +647,11 @@ func touchRacesWith(t *testing.T, s *McpKeyStore, touchID string, mutate func())
 // снова рабочий.
 func TestMcpKeyStore_TouchDoesNotResurrectRevokedKey(t *testing.T) {
 	s := newKeyStore(t)
-	keep, _, err := s.Create("keep")
+	keep, _, err := s.Create("keep", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	doomed, doomedPlain, err := s.Create("doomed")
+	doomed, doomedPlain, err := s.Create("doomed", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -690,7 +690,7 @@ func TestMcpKeyStore_TouchDoesNotResurrectRevokedKey(t *testing.T) {
 // новый ключ с диска.
 func TestMcpKeyStore_TouchDoesNotEraseNewKey(t *testing.T) {
 	s := newKeyStore(t)
-	old, _, err := s.Create("old")
+	old, _, err := s.Create("old", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -698,7 +698,7 @@ func TestMcpKeyStore_TouchDoesNotEraseNewKey(t *testing.T) {
 	var fresh McpKey
 	var freshPlain string
 	var createErr error
-	onDisk := touchRacesWith(t, s, old.ID, func() { fresh, freshPlain, createErr = s.Create("fresh") })
+	onDisk := touchRacesWith(t, s, old.ID, func() { fresh, freshPlain, createErr = s.Create("fresh", false) })
 	if createErr != nil {
 		t.Fatalf("Create = %v", createErr)
 	}
@@ -722,5 +722,83 @@ func TestMcpKeyStore_TouchDoesNotEraseNewKey(t *testing.T) {
 	}
 	if _, ok := reloaded.Verify(freshPlain); !ok {
 		t.Fatal("a freshly issued key does not verify after a restart")
+	}
+}
+
+// TestMcpKeyStore_ReadOnlyScopeSurvivesAReload — область ключа решает,
+// пустят ли его к записи, поэтому она обязана лежать на диске: ключ,
+// перечитанный после перезапуска как полноправный, — это тихое повышение
+// прав.
+func TestMcpKeyStore_ReadOnlyScopeSurvivesAReload(t *testing.T) {
+	dir := t.TempDir()
+	s := NewMcpKeyStore(dir)
+	if err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+
+	ro, roPlain, err := s.Create("reader", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ro.ReadOnly {
+		t.Fatal("the created key must carry its scope")
+	}
+	rw, rwPlain, err := s.Create("writer", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rw.ReadOnly {
+		t.Fatal("a full key must not be read-only")
+	}
+
+	reloaded := NewMcpKeyStore(dir)
+	if err := reloaded.Load(); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := reloaded.Verify(roPlain)
+	if !ok {
+		t.Fatal("the read-only key must still verify after a reload")
+	}
+	if !got.ReadOnly {
+		t.Fatal("the scope was lost across the reload — the key would silently gain write access")
+	}
+	got, ok = reloaded.Verify(rwPlain)
+	if !ok || got.ReadOnly {
+		t.Fatalf("full key after reload: %+v ok=%v", got, ok)
+	}
+
+	// The listing has to show the scope, or the UI cannot tell them apart.
+	listed := reloaded.List()
+	if len(listed) != 2 {
+		t.Fatalf("keys = %d", len(listed))
+	}
+	byName := map[string]McpKey{}
+	for _, k := range listed {
+		byName[k.Name] = k
+	}
+	if !byName["reader"].ReadOnly || byName["writer"].ReadOnly {
+		t.Fatalf("listed scopes are wrong: %+v", byName)
+	}
+}
+
+// TestMcpKeyStore_KeysWrittenBeforeScopesStayFull — в файлах прежних
+// версий поля нет. Прочитать его отсутствие как «только чтение» значило бы
+// молча сломать все выданные ключи.
+func TestMcpKeyStore_KeysWrittenBeforeScopesStayFull(t *testing.T) {
+	dir := t.TempDir()
+	old := `{"version":1,"keys":[{"id":"aabbccdd","name":"legacy","hash":"deadbeef","createdAt":"2026-01-01T00:00:00Z"}]}`
+	if err := os.WriteFile(filepath.Join(dir, "mcp_keys.json"), []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := NewMcpKeyStore(dir)
+	if err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+	keys := s.List()
+	if len(keys) != 1 {
+		t.Fatalf("keys = %d", len(keys))
+	}
+	if keys[0].ReadOnly {
+		t.Fatal("a key stored before scopes existed must keep full access, not silently lose it")
 	}
 }

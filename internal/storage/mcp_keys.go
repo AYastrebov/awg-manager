@@ -44,10 +44,15 @@ var ErrMcpKeyInvalidName = errors.New("invalid mcp key name")
 // McpKey is one named bearer key for the /mcp endpoint. Only the SHA-256
 // of the plaintext is stored; the plaintext is shown once at creation.
 type McpKey struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name"`
-	Hash       string    `json:"hash"`
-	CreatedAt  time.Time `json:"createdAt"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Hash      string    `json:"hash"`
+	CreatedAt time.Time `json:"createdAt"`
+	// ReadOnly limits the key to tools that change nothing. Absent in
+	// files written before scopes existed, and absent must mean FULL
+	// access: reading it as read-only would silently break every key
+	// already handed out. New restricted keys always write the field.
+	ReadOnly   bool      `json:"readOnly,omitempty"`
 	LastUsedAt time.Time `json:"lastUsedAt,omitzero"`
 }
 
@@ -313,7 +318,8 @@ func hashMcpKey(plaintext string) string {
 }
 
 // Create mints a new key. The returned plaintext is never stored.
-func (s *McpKeyStore) Create(name string) (McpKey, string, error) {
+// readOnly restricts it to tools that change nothing.
+func (s *McpKeyStore) Create(name string, readOnly bool) (McpKey, string, error) {
 	name, err := validateKeyName(name)
 	if err != nil {
 		return McpKey{}, "", err
@@ -340,6 +346,7 @@ func (s *McpKeyStore) Create(name string) (McpKey, string, error) {
 		Name:      name,
 		Hash:      hashMcpKey(plaintext),
 		CreatedAt: s.now().UTC(),
+		ReadOnly:  readOnly,
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
