@@ -721,6 +721,42 @@ func (l *Local) AddDNSRoute(ctx context.Context, in mcpsrv.DNSRouteInput) (mcpsr
 	return dnsRoute(created), nil
 }
 
+// SetDNSRouteEnabled flips one list and reads it back, so the caller
+// sees the state the change produced rather than the one it asked for.
+func (l *Local) SetDNSRouteEnabled(ctx context.Context, id string, enabled bool) (mcpsrv.DNSRoute, error) {
+	if l.c.DNSRoutes == nil {
+		return mcpsrv.DNSRoute{}, errUnavailable("dns routes")
+	}
+	// Read first: SetEnabled on a missing id is a no-op in some backends,
+	// and reporting success for a list that does not exist is worse than
+	// an error the agent can act on.
+	existing, err := l.c.DNSRoutes.Get(ctx, id)
+	if err != nil {
+		return mcpsrv.DNSRoute{}, err
+	}
+	if existing == nil {
+		return mcpsrv.DNSRoute{}, fmt.Errorf("dns route %q not found", id)
+	}
+	action := "disable"
+	if enabled {
+		action = "enable"
+	}
+	if err := l.c.DNSRoutes.SetEnabled(ctx, id, enabled); err != nil {
+		l.dnsLog.Warn(action, existing.Name, "Failed to switch DNS route list (MCP): "+err.Error())
+		return mcpsrv.DNSRoute{}, err
+	}
+	l.dnsLog.Info(action, existing.Name, "DNS route list switched "+onOff(enabled)+" (MCP)")
+	l.publish(events.ResourceRoutingDnsRoutes, "mcp-"+action)
+	updated, err := l.c.DNSRoutes.Get(ctx, id)
+	if err != nil || updated == nil {
+		// The switch itself succeeded; fall back to the pre-change record
+		// with the flag we know was applied rather than failing the call.
+		existing.Enabled = enabled
+		return dnsRoute(existing), nil
+	}
+	return dnsRoute(updated), nil
+}
+
 func (l *Local) RemoveDNSRoute(ctx context.Context, id string) (mcpsrv.DNSRoute, error) {
 	if l.c.DNSRoutes == nil {
 		return mcpsrv.DNSRoute{}, errUnavailable("dns routes")
@@ -949,6 +985,14 @@ func (l *Local) ControlSingbox(ctx context.Context, action string) (mcpsrv.Singb
 	}
 	l.publish(events.ResourceSingboxStatus, "mcp-control")
 	return singboxStatus(l.c.Singbox.GetStatus(ctx)), nil
+}
+
+// onOff renders a flag for the journal, matching the REST handlers.
+func onOff(v bool) string {
+	if v {
+		return "on"
+	}
+	return "off"
 }
 
 func (l *Local) OpenAPISpec() []byte { return openapi.RawSpec }

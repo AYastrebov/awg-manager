@@ -30,6 +30,9 @@ type Deps interface {
 	// Domains; implementations must not truncate them here.
 	GetDNSRoute(ctx context.Context, id string) (DNSRouteDetail, error)
 	AddDNSRoute(ctx context.Context, in DNSRouteInput) (DNSRoute, error)
+	// SetDNSRouteEnabled toggles a list on or off and returns it as it
+	// stands afterwards. Reversible: the record survives either way.
+	SetDNSRouteEnabled(ctx context.Context, id string, enabled bool) (DNSRoute, error)
 	// RemoveDNSRoute deletes the list and returns it as it was; the
 	// deletion is permanent, so the record is the only thing left to show
 	// the user. See tools_routing.go removedDNSOut.

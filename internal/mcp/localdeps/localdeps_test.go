@@ -139,6 +139,13 @@ func (f *fakeDNSRoutes) Get(_ context.Context, id string) (*dnsroute.DomainList,
 
 func (f *fakeDNSRoutes) SetEnabled(_ context.Context, id string, v bool) error {
 	f.enabled[id] = v
+	// Mirrors dnsroute.ServiceImpl.SetEnabled: the stored list is updated,
+	// so a read-back sees the new flag.
+	for i := range f.lists {
+		if f.lists[i].ID == id {
+			f.lists[i].Enabled = v
+		}
+	}
 	return nil
 }
 
@@ -1212,6 +1219,37 @@ func TestLocal_GetDNSRouteIsUncappedAndCarriesTheDroppedFields(t *testing.T) {
 	}
 
 	if _, err := h.l.GetDNSRoute(context.Background(), "nope"); err == nil {
+		t.Error("unknown id must be an error")
+	}
+}
+
+// TestLocal_SetDNSRouteEnabled — переключатель должен возвращать запись
+// уже в новом состоянии и публиковать инвалидацию: MCP пишет мимо HTTP-
+// обработчиков, которые этим занимаются, и открытая вкладка иначе покажет
+// список включённым после выключения.
+func TestLocal_SetDNSRouteEnabled(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.dns.lists = []dnsroute.DomainList{{ID: "dl-1", Name: "Video", Enabled: true, Domains: []string{"youtube.com"}}}
+
+	got, err := h.l.SetDNSRouteEnabled(ctx, "dl-1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := h.dns.enabled["dl-1"]; !ok || v {
+		t.Fatalf("service SetEnabled was called with %v (present=%v), want false", v, ok)
+	}
+	if got.Enabled {
+		t.Error("the returned record must show the state AFTER the change")
+	}
+	if got.ID != "dl-1" || got.Name != "Video" {
+		t.Errorf("record = %+v", got)
+	}
+	if !h.bus.has(events.ResourceRoutingDnsRoutes) {
+		t.Errorf("published %v, want a dns-routes invalidation", h.bus.pub)
+	}
+
+	if _, err := h.l.SetDNSRouteEnabled(ctx, "nope", true); err == nil {
 		t.Error("unknown id must be an error")
 	}
 }

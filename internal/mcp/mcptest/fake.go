@@ -245,6 +245,21 @@ func (f *Fake) AddDNSRoute(_ context.Context, in mcpsrv.DNSRouteInput) (mcpsrv.D
 	return r.Summary(), nil
 }
 
+func (f *Fake) SetDNSRouteEnabled(_ context.Context, id string, enabled bool) (mcpsrv.DNSRoute, error) {
+	if f.Err != nil {
+		return mcpsrv.DNSRoute{}, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.DNSRoutes {
+		if f.DNSRoutes[i].ID == id {
+			f.DNSRoutes[i].Enabled = enabled
+			return f.DNSRoutes[i].Summary(), nil
+		}
+	}
+	return mcpsrv.DNSRoute{}, fmt.Errorf("dns route %q not found", id)
+}
+
 func (f *Fake) RemoveDNSRoute(_ context.Context, id string) (mcpsrv.DNSRoute, error) {
 	if f.Err != nil {
 		return mcpsrv.DNSRoute{}, f.Err

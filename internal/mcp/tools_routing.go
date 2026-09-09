@@ -35,6 +35,14 @@ type dnsRoutesOut struct {
 	Routes []DNSRoute `json:"routes"`
 }
 
+// setRouteEnabledIn carries an explicit enabled flag: there is no toggle
+// semantics on purpose, so an agent retrying after a timeout cannot flip
+// a list back to where it started.
+type setRouteEnabledIn struct {
+	RouteID string `json:"routeId" jsonschema:"list id from the corresponding list_* tool"`
+	Enabled bool   `json:"enabled" jsonschema:"true turns the list on, false turns it off"`
+}
+
 type dnsRouteDetailIn struct {
 	RouteID       string `json:"routeId" jsonschema:"list id from list_dns_routes"`
 	DomainsOffset int    `json:"domainsOffset,omitempty" jsonschema:"index of the first domain to return; default 0"`
@@ -173,6 +181,19 @@ func registerRoutingTools(s *mcp.Server, d Deps) {
 			return nil, DNSRoute{}, err
 		}
 		out, err := d.AddDNSRoute(ctx, in)
+		return nil, out, err
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "set_dns_route_enabled",
+		Description: "Turn a domain routing list on or off. The list itself is kept, so this is the reversible way to stop routing a set of domains — " +
+			"prefer it to remove_dns_route, which destroys the list for good. Takes effect immediately.",
+		Annotations: safeWrite("Enable/disable DNS route", true),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in setRouteEnabledIn) (*mcp.CallToolResult, DNSRoute, error) {
+		if in.RouteID == "" {
+			return nil, DNSRoute{}, fmt.Errorf("routeId is required")
+		}
+		out, err := d.SetDNSRouteEnabled(ctx, in.RouteID, in.Enabled)
 		return nil, out, err
 	})
 
