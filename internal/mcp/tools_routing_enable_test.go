@@ -41,6 +41,36 @@ func TestTools_SetDNSRouteEnabled(t *testing.T) {
 	}
 }
 
+// TestTools_SetStaticRouteEnabled — статический список тоже должен
+// выключаться обратимо, а не только удаляться навсегда.
+func TestTools_SetStaticRouteEnabled(t *testing.T) {
+	s, fake := newTestSession(t)
+
+	res, out := callTool(t, s, "set_static_route_enabled", map[string]any{"routeId": "sr-1", "enabled": false})
+	if res.IsError {
+		t.Fatal(toolText(res))
+	}
+	if out["enabled"] != false || out["id"] != "sr-1" {
+		t.Fatalf("out = %v", out)
+	}
+	list, _ := fake.ListStaticRoutes(t.Context())
+	if len(list) != 1 || list[0].Enabled {
+		t.Fatalf("list after disable = %+v", list)
+	}
+
+	_, out = callTool(t, s, "set_static_route_enabled", map[string]any{"routeId": "sr-1", "enabled": true})
+	if out["enabled"] != true {
+		t.Fatalf("re-enable = %v", out)
+	}
+
+	if res, _ = callTool(t, s, "set_static_route_enabled", map[string]any{"routeId": "nope", "enabled": true}); !res.IsError {
+		t.Error("unknown routeId must be a tool error")
+	}
+	if res, _ = callTool(t, s, "set_static_route_enabled", map[string]any{"enabled": true}); !res.IsError {
+		t.Error("missing routeId must be a tool error")
+	}
+}
+
 // TestTools_SetEnabledToolsAreReversibleWrites — хост решает, спрашивать
 // ли пользователя, по destructiveHint. Переключатель обратим, и пометить
 // его разрушающим значило бы приучать соглашаться на настоящие удаления.
@@ -53,7 +83,7 @@ func TestTools_SetEnabledToolsAreReversibleWrites(t *testing.T) {
 	seen := 0
 	for _, tool := range tools.Tools {
 		switch tool.Name {
-		case "set_dns_route_enabled":
+		case "set_dns_route_enabled", "set_static_route_enabled":
 			seen++
 			a := tool.Annotations
 			if a == nil || a.ReadOnlyHint || a.DestructiveHint == nil || *a.DestructiveHint || !a.IdempotentHint {
@@ -61,7 +91,7 @@ func TestTools_SetEnabledToolsAreReversibleWrites(t *testing.T) {
 			}
 		}
 	}
-	if seen != 1 {
+	if seen != 2 {
 		t.Fatalf("saw %d of the expected toggle tools", seen)
 	}
 	_ = mcpsrv.MaxDomainsInOutput

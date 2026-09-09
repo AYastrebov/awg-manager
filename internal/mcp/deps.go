@@ -40,6 +40,8 @@ type Deps interface {
 
 	ListStaticRoutes(ctx context.Context) ([]StaticRoute, error)
 	AddStaticRoute(ctx context.Context, in StaticRouteInput) (StaticRoute, error)
+	// SetStaticRouteEnabled is SetDNSRouteEnabled for subnet lists.
+	SetStaticRouteEnabled(ctx context.Context, id string, enabled bool) (StaticRoute, error)
 	// RemoveStaticRoute deletes the list and returns it as it was.
 	RemoveStaticRoute(ctx context.Context, id string) (StaticRoute, error)
 

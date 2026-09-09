@@ -818,6 +818,36 @@ func (l *Local) AddStaticRoute(ctx context.Context, in mcpsrv.StaticRouteInput) 
 	return staticRoute(created), nil
 }
 
+// SetStaticRouteEnabled flips one subnet list and reads it back.
+func (l *Local) SetStaticRouteEnabled(ctx context.Context, id string, enabled bool) (mcpsrv.StaticRoute, error) {
+	if l.c.StaticRoutes == nil {
+		return mcpsrv.StaticRoute{}, errUnavailable("static routes")
+	}
+	existing, err := l.c.StaticRoutes.Get(id)
+	if err != nil {
+		return mcpsrv.StaticRoute{}, err
+	}
+	if existing == nil {
+		return mcpsrv.StaticRoute{}, fmt.Errorf("static route %q not found", id)
+	}
+	action := "disable"
+	if enabled {
+		action = "enable"
+	}
+	if err := l.c.StaticRoutes.SetEnabled(ctx, id, enabled); err != nil {
+		l.staticLog.Warn(action, existing.Name, "Failed to switch static route list (MCP): "+err.Error())
+		return mcpsrv.StaticRoute{}, err
+	}
+	l.staticLog.Info(action, existing.Name, "Static route list switched "+onOff(enabled)+" (MCP)")
+	l.publish(events.ResourceRoutingStaticRoutes, "mcp-"+action)
+	updated, err := l.c.StaticRoutes.Get(id)
+	if err != nil || updated == nil {
+		existing.Enabled = enabled
+		return staticRoute(existing), nil
+	}
+	return staticRoute(updated), nil
+}
+
 func (l *Local) RemoveStaticRoute(ctx context.Context, id string) (mcpsrv.StaticRoute, error) {
 	if l.c.StaticRoutes == nil {
 		return mcpsrv.StaticRoute{}, errUnavailable("static routes")

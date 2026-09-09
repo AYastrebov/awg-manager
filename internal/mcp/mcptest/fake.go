@@ -299,6 +299,21 @@ func (f *Fake) AddStaticRoute(_ context.Context, in mcpsrv.StaticRouteInput) (mc
 	return r, nil
 }
 
+func (f *Fake) SetStaticRouteEnabled(_ context.Context, id string, enabled bool) (mcpsrv.StaticRoute, error) {
+	if f.Err != nil {
+		return mcpsrv.StaticRoute{}, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.StaticRoutes {
+		if f.StaticRoutes[i].ID == id {
+			f.StaticRoutes[i].Enabled = enabled
+			return f.StaticRoutes[i], nil
+		}
+	}
+	return mcpsrv.StaticRoute{}, fmt.Errorf("static route %q not found", id)
+}
+
 func (f *Fake) RemoveStaticRoute(_ context.Context, id string) (mcpsrv.StaticRoute, error) {
 	if f.Err != nil {
 		return mcpsrv.StaticRoute{}, f.Err

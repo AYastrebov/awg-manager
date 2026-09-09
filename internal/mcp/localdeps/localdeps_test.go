@@ -162,7 +162,24 @@ func (f *fakeDNSRoutes) Delete(_ context.Context, id string) error {
 
 type fakeStaticRoutes struct {
 	api.StaticRouteService
-	lists []storage.StaticRouteList
+	lists   []storage.StaticRouteList
+	enabled map[string]bool
+}
+
+// SetEnabled mirrors staticroute.ServiceImpl: the stored list is updated,
+// so a read-back sees the new flag.
+func (f *fakeStaticRoutes) SetEnabled(_ context.Context, id string, v bool) error {
+	for i := range f.lists {
+		if f.lists[i].ID == id {
+			f.lists[i].Enabled = v
+			if f.enabled == nil {
+				f.enabled = map[string]bool{}
+			}
+			f.enabled[id] = v
+			return nil
+		}
+	}
+	return errNotFound(id)
 }
 
 func (f *fakeStaticRoutes) Get(id string) (*storage.StaticRouteList, error) {
@@ -1250,6 +1267,32 @@ func TestLocal_SetDNSRouteEnabled(t *testing.T) {
 	}
 
 	if _, err := h.l.SetDNSRouteEnabled(ctx, "nope", true); err == nil {
+		t.Error("unknown id must be an error")
+	}
+}
+
+// TestLocal_SetStaticRouteEnabled — как и у доменных списков, ответ
+// обязан отражать состояние после применения, а веб-интерфейс — узнать
+// об изменении.
+func TestLocal_SetStaticRouteEnabled(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+
+	got, err := h.l.SetStaticRouteEnabled(ctx, "sr-1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Enabled {
+		t.Error("the returned record must show the state AFTER the change")
+	}
+	if got.ID != "sr-1" || got.Name != "Office" || got.TunnelID != "tn-1" {
+		t.Errorf("record = %+v", got)
+	}
+	if !h.bus.has(events.ResourceRoutingStaticRoutes) {
+		t.Errorf("published %v, want a static-routes invalidation", h.bus.pub)
+	}
+
+	if _, err := h.l.SetStaticRouteEnabled(ctx, "nope", true); err == nil {
 		t.Error("unknown id must be an error")
 	}
 }

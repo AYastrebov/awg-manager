@@ -245,6 +245,19 @@ func registerRoutingTools(s *mcp.Server, d Deps) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
+		Name: "set_static_route_enabled",
+		Description: "Turn a static (CIDR) routing list on or off, keeping the list itself. The reversible alternative to remove_static_route, " +
+			"which destroys the list and every subnet in it. Takes effect immediately.",
+		Annotations: safeWrite("Enable/disable static route", true),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in setRouteEnabledIn) (*mcp.CallToolResult, StaticRoute, error) {
+		if in.RouteID == "" {
+			return nil, StaticRoute{}, fmt.Errorf("routeId is required")
+		}
+		out, err := d.SetStaticRouteEnabled(ctx, in.RouteID, in.Enabled)
+		return nil, out, err
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
 		Name: "remove_static_route",
 		Description: "Delete a static routing list by id. DESTRUCTIVE: the list and every subnet in it are deleted permanently and cannot be restored through MCP. " +
 			"Confirm with the user first; the deleted record is returned so you can show what was destroyed.",
