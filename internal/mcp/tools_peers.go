@@ -10,16 +10,16 @@ import (
 )
 
 type serverIDIn struct {
-	ServerID string `json:"serverId" jsonschema:"server id from list_managed_servers"`
+	ServerID string `json:"serverId" jsonschema:"id of a server with managed=true in list_managed_servers"`
 }
 
 type peerRefIn struct {
-	ServerID  string `json:"serverId" jsonschema:"server id from list_managed_servers"`
+	ServerID  string `json:"serverId" jsonschema:"id of a server with managed=true in list_managed_servers"`
 	PublicKey string `json:"publicKey" jsonschema:"peer public key from list_server_peers"`
 }
 
 type setPeerEnabledIn struct {
-	ServerID  string `json:"serverId" jsonschema:"server id from list_managed_servers"`
+	ServerID  string `json:"serverId" jsonschema:"id of a server with managed=true in list_managed_servers"`
 	PublicKey string `json:"publicKey" jsonschema:"peer public key from list_server_peers"`
 	Enabled   bool   `json:"enabled" jsonschema:"false suspends the client without deleting it"`
 }

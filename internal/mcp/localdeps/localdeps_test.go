@@ -18,6 +18,7 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/managed"
 	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
+	"github.com/hoaxisr/awg-manager/internal/ndms"
 	"github.com/hoaxisr/awg-manager/internal/orchestrator"
 	"github.com/hoaxisr/awg-manager/internal/pingcheck"
 	"github.com/hoaxisr/awg-manager/internal/singbox"
@@ -2292,5 +2293,63 @@ func TestLocal_RouterToolsWithoutTheServiceSaySo(t *testing.T) {
 	}
 	if err := l.DiscardSingboxStaging(ctx); err == nil {
 		t.Error("discard must report the missing service")
+	}
+}
+
+// TestLocal_ListManagedServersUnitesBothIdSpaces — список NDMS-серверов
+// (api.ServersHandler.ListServers) намеренно исключает серверы,
+// заведённые awg-manager, а инструменты пиров знают только их. Без
+// объединения агенту показывали id, которые пиры не принимали, и прятали
+// те, которые принимали.
+func TestLocal_ListManagedServersUnitesBothIdSpaces(t *testing.T) {
+	m := managedHarness()
+	l := New(Config{
+		Managed: m,
+		ListServers: func(context.Context) ([]ndms.WireguardServer, error) {
+			return []ndms.WireguardServer{{ID: "Wireguard0", InterfaceName: "nwg0", Description: "Built-in", Status: "up", ListenPort: 51820}}, nil
+		},
+	})
+
+	got, err := l.ListManagedServers(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("servers = %+v, want the NDMS one and the managed one", got)
+	}
+	byID := map[string]mcpsrv.ManagedServer{}
+	for _, s := range got {
+		byID[s.ID] = s
+	}
+	builtIn, ok := byID["Wireguard0"]
+	if !ok || builtIn.Managed || builtIn.Status != "up" {
+		t.Fatalf("built-in = %+v", builtIn)
+	}
+	managed, ok := byID["Wireguard3"]
+	if !ok || !managed.Managed {
+		t.Fatalf("managed = %+v, want the awg-manager server flagged", managed)
+	}
+	if managed.PeerCount != 2 || managed.Description != "Home" {
+		t.Fatalf("managed = %+v", managed)
+	}
+}
+
+// TestLocal_PeerToolsRefuseAnUnmanagedServerWithTheReason — «не найден»
+// отправил бы агента искать опечатку в id, который он только что получил
+// из list_managed_servers.
+func TestLocal_PeerToolsRefuseAnUnmanagedServerWithTheReason(t *testing.T) {
+	m := managedHarness()
+	l := New(Config{
+		Managed: m,
+		ListServers: func(context.Context) ([]ndms.WireguardServer, error) {
+			return []ndms.WireguardServer{{ID: "Wireguard0", InterfaceName: "nwg0"}}, nil
+		},
+	})
+	_, err := l.ListServerPeers(context.Background(), "Wireguard0")
+	if err == nil {
+		t.Fatal("an unmanaged server must be refused")
+	}
+	if !strings.Contains(err.Error(), "not managed") {
+		t.Fatalf("error = %q, want the reason", err)
 	}
 }

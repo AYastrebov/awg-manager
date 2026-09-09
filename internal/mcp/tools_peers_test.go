@@ -192,3 +192,40 @@ func toolJSON(t *testing.T, out map[string]any) string {
 	}
 	return string(b)
 }
+
+// TestTools_ManagedServersSayWhichAcceptPeerTools — list_managed_servers
+// показывает и встроенные WG-серверы NDMS, и серверы, заведённые
+// awg-manager. Пиры через MCP ведутся только у вторых, и агент обязан
+// видеть, к какому серверу инструменты пиров применимы: раньше оба
+// пространства id были разными, и ни один инструмент пиров нельзя было
+// довести до конца.
+func TestTools_ManagedServersSayWhichAcceptPeerTools(t *testing.T) {
+	s, _ := newTestSession(t)
+
+	_, out := callTool(t, s, "list_managed_servers", nil)
+	servers := out["servers"].([]any)
+	if len(servers) != 2 {
+		t.Fatalf("servers = %v, want the managed one and the built-in one", servers)
+	}
+	byID := map[string]map[string]any{}
+	for _, sv := range servers {
+		m := sv.(map[string]any)
+		byID[m["id"].(string)] = m
+	}
+	if byID["Wireguard0"]["managed"] != true {
+		t.Fatalf("the awg-manager server must be flagged managed: %v", byID["Wireguard0"])
+	}
+	if byID["Wireguard1"]["managed"] != false {
+		t.Fatalf("the built-in server must not be flagged managed: %v", byID["Wireguard1"])
+	}
+
+	// A built-in server is listed, but the peer tools cannot serve it and
+	// must say why rather than "not found".
+	res, _ := callTool(t, s, "list_server_peers", map[string]any{"serverId": "Wireguard1"})
+	if !res.IsError {
+		t.Fatal("peer tools on a non-managed server must be refused")
+	}
+	if txt := toolText(res); !strings.Contains(strings.ToLower(txt), "managed") {
+		t.Fatalf("the refusal must explain the server is not managed by awg-manager: %q", txt)
+	}
+}

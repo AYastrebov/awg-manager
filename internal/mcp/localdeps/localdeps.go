@@ -1315,17 +1315,42 @@ func (l *Local) DiagnosticsResult(context.Context) (mcpsrv.DiagnosticsResult, er
 	return out, nil
 }
 
+// ListManagedServers unites two id spaces on purpose. The NDMS listing
+// (api.ServersHandler.ListServers) deliberately drops the servers
+// awg-manager created, while the peer tools accept ONLY those — shown
+// separately, the agent was handed ids the peer tools rejected and never
+// saw the ones they took. Managed says which kind each entry is.
 func (l *Local) ListManagedServers(ctx context.Context) ([]mcpsrv.ManagedServer, error) {
-	if l.c.ListServers == nil {
+	if l.c.ListServers == nil && l.c.Managed == nil {
 		return nil, errUnavailable("managed servers")
 	}
-	list, err := l.c.ListServers(ctx)
-	if err != nil {
-		return nil, err
+	var out []mcpsrv.ManagedServer
+	if l.c.ListServers != nil {
+		list, err := l.c.ListServers(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, s := range list {
+			out = append(out, mcpsrv.ManagedServer{ID: s.ID, InterfaceName: s.InterfaceName, Description: s.Description, Status: s.Status, Connected: s.Connected, ListenPort: s.ListenPort, PeerCount: len(s.Peers)})
+		}
 	}
-	out := make([]mcpsrv.ManagedServer, 0, len(list))
-	for _, s := range list {
-		out = append(out, mcpsrv.ManagedServer{ID: s.ID, InterfaceName: s.InterfaceName, Description: s.Description, Status: s.Status, Connected: s.Connected, ListenPort: s.ListenPort, PeerCount: len(s.Peers)})
+	if l.c.Managed != nil {
+		for _, s := range l.c.Managed.List() {
+			connected := false
+			for _, p := range s.Peers {
+				if p.Enabled {
+					connected = true
+					break
+				}
+			}
+			out = append(out, mcpsrv.ManagedServer{
+				ID: s.InterfaceName, InterfaceName: s.InterfaceName, Description: s.Description,
+				Connected: connected, ListenPort: s.ListenPort, PeerCount: len(s.Peers), Managed: true,
+			})
+		}
+	}
+	if out == nil {
+		out = []mcpsrv.ManagedServer{}
 	}
 	return out, nil
 }
@@ -1340,22 +1365,34 @@ func serverPeer(p storage.ManagedPeer) mcpsrv.ServerPeer {
 	}
 }
 
-func (l *Local) managedServer(id string) (*storage.ManagedServer, error) {
+func (l *Local) managedServer(ctx context.Context, id string) (*storage.ManagedServer, error) {
 	if l.c.Managed == nil {
 		return nil, errUnavailable("managed servers")
 	}
 	server, err := l.c.Managed.Get(id)
+	if err == nil && server != nil {
+		return server, nil
+	}
+	// Not one of ours. If NDMS knows the id, say WHY it is refused: "not
+	// found" would send the agent looking for a typo in an id it just got
+	// from list_managed_servers.
+	if l.c.ListServers != nil {
+		if list, lerr := l.c.ListServers(ctx); lerr == nil {
+			for _, s := range list {
+				if s.ID == id {
+					return nil, fmt.Errorf("server %q is not managed by awg-manager; its peers cannot be managed through MCP (only servers with managed=true accept the peer tools)", id)
+				}
+			}
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-	if server == nil {
-		return nil, fmt.Errorf("managed server %q not found", id)
-	}
-	return server, nil
+	return nil, fmt.Errorf("managed server %q not found", id)
 }
 
-func (l *Local) ListServerPeers(_ context.Context, serverID string) ([]mcpsrv.ServerPeer, error) {
-	server, err := l.managedServer(serverID)
+func (l *Local) ListServerPeers(ctx context.Context, serverID string) ([]mcpsrv.ServerPeer, error) {
+	server, err := l.managedServer(ctx, serverID)
 	if err != nil {
 		return nil, err
 	}
@@ -1371,7 +1408,7 @@ func (l *Local) ListServerPeers(_ context.Context, serverID string) ([]mcpsrv.Se
 // model: an invented address either collides or lands outside the subnet,
 // and the second kind produces a peer that looks fine and never connects.
 func (l *Local) AddServerPeer(ctx context.Context, in mcpsrv.AddPeerInput) (mcpsrv.ServerPeer, error) {
-	server, err := l.managedServer(in.ServerID)
+	server, err := l.managedServer(ctx, in.ServerID)
 	if err != nil {
 		return mcpsrv.ServerPeer{}, err
 	}
@@ -1402,7 +1439,7 @@ func (l *Local) AddServerPeer(ctx context.Context, in mcpsrv.AddPeerInput) (mcps
 }
 
 func (l *Local) SetServerPeerEnabled(ctx context.Context, serverID, publicKey string, enabled bool) (mcpsrv.ServerPeer, error) {
-	server, err := l.managedServer(serverID)
+	server, err := l.managedServer(ctx, serverID)
 	if err != nil {
 		return mcpsrv.ServerPeer{}, err
 	}
@@ -1435,7 +1472,7 @@ func (l *Local) SetServerPeerEnabled(ctx context.Context, serverID, publicKey st
 // empty so the service falls back to the server's configured endpoint or
 // the WAN IP, as the web UI does.
 func (l *Local) ServerPeerConfig(ctx context.Context, serverID, publicKey string) (string, error) {
-	if _, err := l.managedServer(serverID); err != nil {
+	if _, err := l.managedServer(ctx, serverID); err != nil {
 		return "", err
 	}
 	return l.c.Managed.GenerateConf(ctx, serverID, publicKey, "")

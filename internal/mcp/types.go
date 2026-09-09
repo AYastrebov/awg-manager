@@ -443,14 +443,22 @@ type DiagnosticsResult struct {
 	Problems    []DiagnosticsProblem `json:"problems" jsonschema:"checks that did not pass, failures before warnings"`
 }
 
+// ManagedServer is a WireGuard server hosted on this router. Two kinds
+// appear in one list: servers awg-manager created and fully manages, and
+// built-in or marked NDMS servers it only observes. Only the first kind
+// accepts the peer tools, hence Managed — the two id spaces were once
+// presented as one, and no peer tool could be completed end to end.
 type ManagedServer struct {
 	ID            string `json:"id"`
 	InterfaceName string `json:"interfaceName"`
 	Description   string `json:"description"`
-	Status        string `json:"status"`
+	Status        string `json:"status,omitempty" jsonschema:"up|down; empty for servers awg-manager manages itself"`
 	Connected     bool   `json:"connected"`
 	ListenPort    int    `json:"listenPort"`
 	PeerCount     int    `json:"peerCount"`
+	// Managed is true for servers created by awg-manager. The peer tools
+	// (list_server_peers, add_server_peer, …) work only on these.
+	Managed bool `json:"managed" jsonschema:"true means the peer tools accept this server's id"`
 }
 
 // PingCheckRun is what run_pingcheck returns. The sweep itself runs in
@@ -476,7 +484,7 @@ type ServerPeer struct {
 // subnet. Asking the model to invent one produces either a collision or a
 // peer outside the subnet, which simply never connects.
 type AddPeerInput struct {
-	ServerID    string `json:"serverId" jsonschema:"server id from list_managed_servers"`
+	ServerID    string `json:"serverId" jsonschema:"id of a server with managed=true in list_managed_servers"`
 	Description string `json:"description" jsonschema:"whose device this is, e.g. \"phone\" — required, it is how the peer is recognised later"`
 	TunnelIP    string `json:"tunnelIp,omitempty" jsonschema:"optional address inside the tunnel (10.0.0.5/32); omit to let the router pick the first free one"`
 	DNS         string `json:"dns,omitempty" jsonschema:"optional DNS server for the client config"`

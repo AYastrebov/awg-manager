@@ -112,8 +112,11 @@ func New() *Fake {
 			{Timestamp: "2026-09-02T10:02:00Z", TunnelID: "tn-2", TunnelName: "Frankfurt", Success: false, Error: "timeout"},
 			{Timestamp: "2026-09-02T10:01:00Z", TunnelID: "tn-1", TunnelName: "Amsterdam", Success: true, LatencyMs: 32},
 		},
-		Servers: []mcpsrv.ManagedServer{{ID: "Wireguard0", InterfaceName: "nwg3", Description: "Home", Status: "up", Connected: true, ListenPort: 51820, PeerCount: 2}},
-		Spec:    []byte("swagger: \"2.0\"\ninfo:\n  title: AWG Manager API (mcptest stub)\n"),
+		Servers: []mcpsrv.ManagedServer{
+			{ID: "Wireguard0", InterfaceName: "Wireguard0", Description: "Home", Connected: true, ListenPort: 51820, PeerCount: 2, Managed: true},
+			{ID: "Wireguard1", InterfaceName: "nwg3", Description: "Built-in", Status: "up", Connected: false, ListenPort: 51821, PeerCount: 0},
+		},
+		Spec: []byte("swagger: \"2.0\"\ninfo:\n  title: AWG Manager API (mcptest stub)\n"),
 	}
 }
 
@@ -714,13 +717,20 @@ func (f *Fake) ListManagedServers(context.Context) ([]mcpsrv.ManagedServer, erro
 	return append([]mcpsrv.ManagedServer(nil), f.Servers...), nil
 }
 
-func (f *Fake) serverExists(id string) bool {
+// managedServer reports whether id names a server the peer tools accept.
+// A listed but unmanaged server is refused with the reason, as the real
+// adapter does: "not found" would send the agent looking for a typo.
+func (f *Fake) managedServer(id string) error {
 	for _, s := range f.Servers {
-		if s.ID == id {
-			return true
+		if s.ID != id {
+			continue
 		}
+		if !s.Managed {
+			return fmt.Errorf("server %q is not managed by awg-manager; its peers cannot be managed through MCP", id)
+		}
+		return nil
 	}
-	return false
+	return fmt.Errorf("managed server %q not found", id)
 }
 
 func (f *Fake) ListServerPeers(_ context.Context, serverID string) ([]mcpsrv.ServerPeer, error) {
@@ -729,8 +739,8 @@ func (f *Fake) ListServerPeers(_ context.Context, serverID string) ([]mcpsrv.Ser
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if !f.serverExists(serverID) {
-		return nil, fmt.Errorf("managed server %q not found", serverID)
+	if err := f.managedServer(serverID); err != nil {
+		return nil, err
 	}
 	return append([]mcpsrv.ServerPeer(nil), f.Peers[serverID]...), nil
 }
@@ -741,8 +751,8 @@ func (f *Fake) AddServerPeer(_ context.Context, in mcpsrv.AddPeerInput) (mcpsrv.
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if !f.serverExists(in.ServerID) {
-		return mcpsrv.ServerPeer{}, fmt.Errorf("managed server %q not found", in.ServerID)
+	if err := f.managedServer(in.ServerID); err != nil {
+		return mcpsrv.ServerPeer{}, err
 	}
 	peers := f.Peers[in.ServerID]
 	ip := in.TunnelIP
