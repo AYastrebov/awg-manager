@@ -27,7 +27,9 @@ type Fake struct {
 	Logs         []mcpsrv.LogEntry
 	Singbox      mcpsrv.SingboxStatus
 	Servers      []mcpsrv.ManagedServer
-	Spec         []byte
+	// Resolver backs ResolveDomain: domain -> IPv4 addresses.
+	Resolver map[string][]string
+	Spec     []byte
 	// Err, when set, is returned by every method — for error-path tests.
 	Err error
 }
@@ -567,6 +569,17 @@ func (f *Fake) RunPingCheck(context.Context) (mcpsrv.PingCheckRun, error) {
 		out.Tunnels = append(out.Tunnels, mcpsrv.PingCheckStatus{TunnelID: t.ID, TunnelName: t.Name, Enabled: t.Enabled, Status: st, Method: "http", LastLatency: 30})
 	}
 	return out, nil
+}
+
+// ResolveDomain answers from Resolver when set, so a test can decide
+// what a name resolves to; otherwise nothing resolves.
+func (f *Fake) ResolveDomain(_ context.Context, domain string) ([]string, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.Resolver[domain], nil
 }
 
 func (f *Fake) ListManagedServers(context.Context) ([]mcpsrv.ManagedServer, error) {

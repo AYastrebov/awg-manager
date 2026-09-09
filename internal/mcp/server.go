@@ -26,6 +26,7 @@ func NewServer(deps Deps, version string) *mcp.Server {
 	registerSystemTools(s, deps)
 	registerTunnelTools(s, deps)
 	registerRoutingTools(s, deps)
+	registerExplainTools(s, deps)
 	registerSingboxTools(s, deps)
 	registerServerTools(s, deps)
 	s.AddResource(&mcp.Resource{

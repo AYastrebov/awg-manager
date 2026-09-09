@@ -70,6 +70,11 @@ type Deps interface {
 	// waiting for it and returns the last completed statuses.
 	RunPingCheck(ctx context.Context) (PingCheckRun, error)
 
+	// ResolveDomain looks a domain up (IPv4 only), for explain_route's
+	// subnet comparison. A lookup failure is returned as an error; the
+	// tool degrades rather than failing the whole call.
+	ResolveDomain(ctx context.Context, domain string) ([]string, error)
+
 	ListManagedServers(ctx context.Context) ([]ManagedServer, error)
 	ControlSingbox(ctx context.Context, action string) (SingboxStatus, error)
 

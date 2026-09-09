@@ -1,0 +1,188 @@
+package mcp_test
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
+	"github.com/hoaxisr/awg-manager/internal/mcp/mcptest"
+)
+
+// resolvingFake answers DNS from a table instead of the network.
+type resolvingFake struct {
+	*mcptest.Fake
+	table map[string][]string
+	err   error
+}
+
+func (f resolvingFake) ResolveDomain(_ context.Context, domain string) ([]string, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.table[domain], nil
+}
+
+func explainFake(t *testing.T) (resolvingFake, *mcptest.Fake) {
+	t.Helper()
+	fake := mcptest.New()
+	return resolvingFake{Fake: fake, table: map[string][]string{
+		"www.youtube.com": {"142.250.1.1"},
+		"lab.corp.local":  {"10.20.5.7"},
+	}}, fake
+}
+
+// TestTools_ExplainRouteFindsTheDomainList — «почему ютуб идёт не туда»
+// — самый частый вопрос к маршрутизации, и до сих пор агенту пришлось бы
+// вручную сверять списки, каждый из которых list_dns_routes к тому же
+// обрезает.
+func TestTools_ExplainRouteFindsTheDomainList(t *testing.T) {
+	deps, _ := explainFake(t)
+	s := connectDeps(t, deps)
+
+	res, out := callTool(t, s, "explain_route", map[string]any{"target": "www.youtube.com"})
+	if res.IsError {
+		t.Fatal(toolText(res))
+	}
+	matches := out["dnsMatches"].([]any)
+	if len(matches) != 1 {
+		t.Fatalf("dnsMatches = %v, want the Video list", matches)
+	}
+	m := matches[0].(map[string]any)
+	if m["routeId"] != "dl-1" || m["tunnelId"] != "tn-1" || m["matchedEntry"] != "youtube.com" {
+		t.Fatalf("match = %v — a subdomain must match its parent entry", m)
+	}
+	if m["tunnelName"] != "Amsterdam" {
+		t.Fatalf("the tunnel must be named, not just numbered: %v", m)
+	}
+	if out["defaultRouteTunnelId"] != "tn-1" {
+		t.Fatalf("defaultRouteTunnelId = %v", out["defaultRouteTunnelId"])
+	}
+	if ips := out["resolvedIps"].([]any); len(ips) != 1 || ips[0] != "142.250.1.1" {
+		t.Fatalf("resolvedIps = %v", ips)
+	}
+}
+
+// TestTools_ExplainRouteMatchesAgainstTheWholeList — list_dns_routes
+// отдаёт лишь первые 50 доменов. Сопоставление по обрезанному списку
+// ответило бы «нет такого правила» на живое правило.
+func TestTools_ExplainRouteMatchesAgainstTheWholeList(t *testing.T) {
+	deps, fake := explainFake(t)
+	big := bigDNSList("dl-big", 300)
+	big.Domains[299] = "late.example.com"
+	fake.DNSRoutes = append(fake.DNSRoutes, big)
+	deps.table["late.example.com"] = []string{"203.0.113.9"}
+	s := connectDeps(t, deps)
+
+	_, out := callTool(t, s, "explain_route", map[string]any{"target": "late.example.com"})
+	matches := out["dnsMatches"].([]any)
+	if len(matches) != 1 {
+		t.Fatalf("a domain past the list cap must still match, got %v", matches)
+	}
+	if matches[0].(map[string]any)["routeId"] != "dl-big" {
+		t.Fatalf("match = %v", matches[0])
+	}
+}
+
+// TestTools_ExplainRouteReportsWhatItCannotEvaluate — geosite:/geoip:
+// раскрываются на роутере, а не здесь. Промолчать о таком списке значит
+// сказать «правил нет» там, где они могут быть.
+func TestTools_ExplainRouteReportsWhatItCannotEvaluate(t *testing.T) {
+	deps, fake := explainFake(t)
+	fake.DNSRoutes = append(fake.DNSRoutes, mcpsrv.DNSRouteDetail{
+		ID: "dl-geo", Name: "Geo", Enabled: true,
+		Domains: []string{"geosite:google"}, ManualDomains: []string{"geosite:google"},
+		Routes: []mcpsrv.RouteTarget{{TunnelID: "tn-2"}},
+	})
+	s := connectDeps(t, deps)
+
+	_, out := callTool(t, s, "explain_route", map[string]any{"target": "www.youtube.com"})
+	un := out["unevaluatedLists"].([]any)
+	if len(un) != 1 {
+		t.Fatalf("unevaluatedLists = %v, want the geosite list named", un)
+	}
+	if u := un[0].(map[string]any); u["routeId"] != "dl-geo" || u["reason"] == "" {
+		t.Fatalf("entry = %v, want a routeId and a reason", u)
+	}
+}
+
+// TestTools_ExplainRouteCoversSubnetsAndDevices — статический список
+// сверяется по разрешённым адресам, а маршрут устройства перекрывает весь
+// его трафик, независимо от адресата.
+func TestTools_ExplainRouteCoversSubnetsAndDevices(t *testing.T) {
+	deps, _ := explainFake(t)
+	s := connectDeps(t, deps)
+	if res, _ := callTool(t, s, "set_client_route", map[string]any{"clientIp": "192.168.1.20", "tunnelId": "tn-2"}); res.IsError {
+		t.Fatal("setup")
+	}
+
+	_, out := callTool(t, s, "explain_route", map[string]any{"target": "lab.corp.local", "clientIp": "192.168.1.20"})
+	static := out["staticMatches"].([]any)
+	if len(static) != 1 {
+		t.Fatalf("staticMatches = %v, want the 10.20.0.0/16 list", static)
+	}
+	sm := static[0].(map[string]any)
+	if sm["routeId"] != "sr-1" || sm["matchedEntry"] != "10.20.0.0/16" || sm["matchedIp"] != "10.20.5.7" {
+		t.Fatalf("static match = %v", sm)
+	}
+	cr, _ := out["clientRoute"].(map[string]any)
+	if cr == nil || cr["tunnelId"] != "tn-2" {
+		t.Fatalf("clientRoute = %v", out["clientRoute"])
+	}
+	if out["note"] == "" {
+		t.Fatal("a device route and a list both matched; the tool must say how they relate")
+	}
+}
+
+// TestTools_ExplainRouteWithALiteralIP — цель может быть адресом: тогда
+// резолвить нечего, а доменные записи сверять не с чем.
+func TestTools_ExplainRouteWithALiteralIP(t *testing.T) {
+	deps, _ := explainFake(t)
+	s := connectDeps(t, deps)
+
+	res, out := callTool(t, s, "explain_route", map[string]any{"target": "10.20.5.7"})
+	if res.IsError {
+		t.Fatal(toolText(res))
+	}
+	if len(out["staticMatches"].([]any)) != 1 {
+		t.Fatalf("staticMatches = %v", out["staticMatches"])
+	}
+	if n := len(out["dnsMatches"].([]any)); n != 0 {
+		t.Fatalf("dnsMatches = %d, want none for a literal IP", n)
+	}
+	if err, ok := out["resolveError"]; ok {
+		t.Fatalf("resolveError = %v, want none — nothing needed resolving", err)
+	}
+}
+
+// TestTools_ExplainRouteSurvivesAFailedLookup — без резолва подсети
+// сверить нельзя, но доменные списки — можно. Ошибка резолва не должна
+// топить весь ответ.
+func TestTools_ExplainRouteSurvivesAFailedLookup(t *testing.T) {
+	deps, _ := explainFake(t)
+	deps.err = fmt.Errorf("no such host")
+	s := connectDeps(t, deps)
+
+	res, out := callTool(t, s, "explain_route", map[string]any{"target": "www.youtube.com"})
+	if res.IsError {
+		t.Fatalf("a failed lookup must not fail the whole call: %s", toolText(res))
+	}
+	if out["resolveError"] == nil || out["resolveError"] == "" {
+		t.Fatal("the failure must be reported, not hidden")
+	}
+	if len(out["dnsMatches"].([]any)) != 1 {
+		t.Fatalf("domain matching does not need DNS: %v", out["dnsMatches"])
+	}
+}
+
+func TestTools_ExplainRouteRejectsBadInput(t *testing.T) {
+	deps, _ := explainFake(t)
+	s := connectDeps(t, deps)
+
+	if res, _ := callTool(t, s, "explain_route", map[string]any{"target": "  "}); !res.IsError {
+		t.Error("a blank target must be a tool error")
+	}
+	if res, _ := callTool(t, s, "explain_route", map[string]any{"target": "youtube.com", "clientIp": "999.1.1.1"}); !res.IsError {
+		t.Error("an invalid clientIp must be a tool error")
+	}
+}

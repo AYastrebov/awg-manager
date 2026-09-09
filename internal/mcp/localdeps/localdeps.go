@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -85,7 +86,10 @@ type Config struct {
 	ListServers  func(ctx context.Context) ([]ndms.WireguardServer, error)
 	Singbox      SingboxOperator
 	SystemInfo   func() map[string]interface{}
-	Bus          Publisher
+	// Resolve looks a hostname up. Injected rather than called directly so
+	// tests need no network; nil disables explain_route's subnet leg.
+	Resolve func(ctx context.Context, host string) ([]string, error)
+	Bus     Publisher
 	// PingCheckSnapshot rebroadcasts the monitoring snapshot after the
 	// tunnel list changes (api.TunnelsHandler.SetPingCheckSnapshot). Without
 	// it a tunnel created through MCP is invisible to the monitoring page
@@ -98,6 +102,10 @@ type Config struct {
 	// here and it is not (see registerMcpRoutes).
 	AppLog logging.AppLogger
 }
+
+// resolveTimeout bounds one explain_route lookup. The daemon's own
+// /routing/resolve uses the same 5 s.
+const resolveTimeout = 5 * time.Second
 
 // Local is the production Deps.
 type Local struct {
@@ -1092,6 +1100,30 @@ func (l *Local) ListDevices(ctx context.Context) ([]mcpsrv.Device, error) {
 }
 
 // ---- servers / sing-box ---------------------------------------------------
+
+// ResolveDomain looks the target up for explain_route and keeps only
+// IPv4: the routing lists this is compared against are IPv4 CIDRs, so an
+// AAAA answer could never match and would quietly read as "no list
+// covers this". An IPv4-mapped IPv6 answer is unwrapped rather than
+// dropped.
+func (l *Local) ResolveDomain(ctx context.Context, domain string) ([]string, error) {
+	if l.c.Resolve == nil {
+		return nil, errUnavailable("dns resolution")
+	}
+	ctx, cancel := context.WithTimeout(ctx, resolveTimeout)
+	defer cancel()
+	addrs, err := l.c.Resolve(ctx, domain)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		if ip := net.ParseIP(strings.TrimSpace(a)); ip != nil && ip.To4() != nil {
+			out = append(out, ip.To4().String())
+		}
+	}
+	return out, nil
+}
 
 func (l *Local) ListManagedServers(ctx context.Context) ([]mcpsrv.ManagedServer, error) {
 	if l.c.ListServers == nil {

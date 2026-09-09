@@ -1508,3 +1508,39 @@ func TestLocal_CheckIPNilResultIsAnError(t *testing.T) {
 		t.Fatal("a nil result must be an error")
 	}
 }
+
+// TestLocal_ResolveDomainReturnsIPv4Only — explain_route сверяет адреса с
+// CIDR-списками, а те у нас IPv4. Пропущенный AAAA сравнивался бы всегда
+// мимо и молча превращался в «ни один список не подходит».
+func TestLocal_ResolveDomainReturnsIPv4Only(t *testing.T) {
+	l := New(Config{Resolve: func(context.Context, string) ([]string, error) {
+		return []string{"2001:db8::1", "203.0.113.9", "not-an-ip", "::ffff:198.51.100.7"}, nil
+	}})
+
+	got, err := l.ResolveDomain(context.Background(), "example.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"203.0.113.9", "198.51.100.7"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func TestLocal_ResolveDomainReportsFailure(t *testing.T) {
+	l := New(Config{Resolve: func(context.Context, string) ([]string, error) {
+		return nil, errors.New("no such host")
+	}})
+	if _, err := l.ResolveDomain(context.Background(), "nope.invalid"); err == nil {
+		t.Fatal("a failed lookup must be reported, so explain_route can say the subnets went unchecked")
+	}
+}
+
+// TestLocal_ResolveDomainWithoutAResolverSaysSo — пустой список читался бы
+// как «домен никуда не резолвится».
+func TestLocal_ResolveDomainWithoutAResolverSaysSo(t *testing.T) {
+	l := New(Config{})
+	if _, err := l.ResolveDomain(context.Background(), "example.invalid"); err == nil {
+		t.Fatal("a build without a resolver must report that")
+	}
+}

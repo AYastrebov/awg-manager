@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -1074,6 +1075,11 @@ func (s *Server) registerMcpRoutes(mux *http.ServeMux, h *routeHandlers) {
 	if s.loggingService != nil {
 		logs = s.loggingService
 	}
+	// explain_route sweeps the routing lists for a domain, so it needs the
+	// domain's addresses; the same IPv4-only lookup /routing/resolve does.
+	resolveHost := func(ctx context.Context, host string) ([]string, error) {
+		return (&net.Resolver{}).LookupHost(ctx, host)
+	}
 	var connTester localdeps.ConnectivityTester
 	if s.testingService != nil {
 		connTester = s.testingService
@@ -1115,6 +1121,7 @@ func (s *Server) registerMcpRoutes(mux *http.ServeMux, h *routeHandlers) {
 		ListServers:    h.serverHandler.ListServers,
 		Singbox:        singboxOp,
 		SystemInfo:     h.systemHandler.InfoData,
+		Resolve:        resolveHost,
 		Bus:            bus,
 
 		PingCheckSnapshot: pingSnapshot,
