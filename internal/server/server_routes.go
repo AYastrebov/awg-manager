@@ -16,11 +16,28 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/mcp/localdeps"
 	"github.com/hoaxisr/awg-manager/internal/openapi"
 	"github.com/hoaxisr/awg-manager/internal/response"
+	"github.com/hoaxisr/awg-manager/internal/singbox"
 	sysports "github.com/hoaxisr/awg-manager/internal/sys/ports"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/hoaxisr/awg-manager/internal/logging"
 )
+
+// singboxOperatorWithDelay joins the operator with the latency prober so
+// together they satisfy localdeps.SingboxOperator.
+type singboxOperatorWithDelay struct {
+	*singbox.Operator
+	delay *singbox.DelayChecker
+}
+
+// CheckDelay probes one proxy. Without a checker wired there is nothing to
+// measure with, and saying so beats reporting every proxy as silent.
+func (s singboxOperatorWithDelay) CheckDelay(ctx context.Context, tag string) (int, error) {
+	if s.delay == nil {
+		return 0, fmt.Errorf("sing-box delay checker is not available on this build")
+	}
+	return s.delay.CheckOne(ctx, tag)
+}
 
 // routeHandlers держит handlers, разделяемые секциями registerRoutes.
 // Конструирование и перекрёстная проводка — в buildRouteHandlers; секционные
@@ -1090,7 +1107,14 @@ func (s *Server) registerMcpRoutes(mux *http.ServeMux, h *routeHandlers) {
 	}
 	var singboxOp localdeps.SingboxOperator
 	if s.singboxOp != nil {
-		singboxOp = s.singboxOp
+		// The operator alone cannot probe latency; the delay checker owns
+		// that, and it lives on the sing-box handler. Compose the two so
+		// MCP reuses the running checker instead of starting its own.
+		var delay *singbox.DelayChecker
+		if s.singboxHandler != nil {
+			delay = s.singboxHandler.DelayChecker()
+		}
+		singboxOp = singboxOperatorWithDelay{Operator: s.singboxOp, delay: delay}
 	}
 	var bus localdeps.Publisher
 	if s.bus != nil {

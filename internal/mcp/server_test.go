@@ -89,7 +89,7 @@ func TestServer_ListsToolsWithAnnotations(t *testing.T) {
 		"list_static_routes", "add_static_route", "set_static_route_enabled", "remove_static_route",
 		"list_client_routes", "set_client_route", "set_client_route_enabled",
 		"list_access_policies", "list_devices", "explain_route",
-		"list_managed_servers", "control_singbox",
+		"list_managed_servers", "control_singbox", "list_singbox_tunnels", "singbox_delay_check",
 	}
 	for _, n := range want {
 		if byName[n] == nil {

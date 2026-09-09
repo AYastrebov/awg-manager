@@ -17,6 +17,7 @@ import (
 	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
 	"github.com/hoaxisr/awg-manager/internal/orchestrator"
 	"github.com/hoaxisr/awg-manager/internal/pingcheck"
+	"github.com/hoaxisr/awg-manager/internal/singbox"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 	awgtesting "github.com/hoaxisr/awg-manager/internal/testing"
 	"github.com/hoaxisr/awg-manager/internal/tunnel"
@@ -1542,5 +1543,123 @@ func TestLocal_ResolveDomainWithoutAResolverSaysSo(t *testing.T) {
 	l := New(Config{})
 	if _, err := l.ResolveDomain(context.Background(), "example.invalid"); err == nil {
 		t.Fatal("a build without a resolver must report that")
+	}
+}
+
+// fakeSingboxOp implements the operator surface MCP needs.
+type fakeSingboxOp struct {
+	tunnels []singbox.TunnelInfo
+	delays  map[string]int
+	asked   []string
+	err     error
+}
+
+func (f *fakeSingboxOp) GetStatus(context.Context) singbox.Status {
+	return singbox.Status{Installed: true, Running: true, TunnelCount: len(f.tunnels)}
+}
+func (f *fakeSingboxOp) Control(context.Context, string) error { return nil }
+func (f *fakeSingboxOp) ListTunnels(context.Context) ([]singbox.TunnelInfo, error) {
+	return f.tunnels, f.err
+}
+func (f *fakeSingboxOp) CheckDelay(_ context.Context, tag string) (int, error) {
+	f.asked = append(f.asked, tag)
+	return f.delays[tag], nil
+}
+
+func singboxHarness() *fakeSingboxOp {
+	return &fakeSingboxOp{
+		tunnels: []singbox.TunnelInfo{
+			{Tag: "vless-nl", Protocol: "vless", Server: "nl.example.net", Port: 443, Security: "reality", Transport: "tcp", ListenPort: 2081, ProxyInterface: "Proxy0", SNI: "www.example.com", Username: "secret-user", Running: true},
+			{Tag: "hy2-de", Protocol: "hysteria2", Server: "de.example.net", Port: 8443, Running: false},
+		},
+		delays: map[string]int{"vless-nl": 120, "hy2-de": 0},
+	}
+}
+
+func TestLocal_ListSingboxTunnelsMapsTheProxy(t *testing.T) {
+	op := singboxHarness()
+	l := New(Config{Singbox: op})
+
+	got, err := l.ListSingboxTunnels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("tunnels = %d", len(got))
+	}
+	want := mcpsrv.SingboxTunnel{
+		Tag: "vless-nl", Protocol: "vless", Server: "nl.example.net", Port: 443,
+		Security: "reality", Transport: "tcp", ListenPort: 2081, ProxyInterface: "Proxy0",
+		SNI: "www.example.com", Running: true,
+	}
+	if got[0] != want {
+		t.Fatalf("got %+v, want %+v", got[0], want)
+	}
+	if !got[1].Running == false && got[1].Tag != "hy2-de" {
+		t.Fatalf("a configured but dead proxy must still be listed: %+v", got[1])
+	}
+}
+
+// TestLocal_ListSingboxTunnelsCarriesNoCredentials — у naive-прокси в
+// TunnelInfo лежит имя пользователя. Учётные данные через MCP не отдаём.
+func TestLocal_ListSingboxTunnelsCarriesNoCredentials(t *testing.T) {
+	op := singboxHarness()
+	l := New(Config{Singbox: op})
+
+	got, err := l.ListSingboxTunnels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := fmt.Sprintf("%+v", got)
+	if strings.Contains(blob, "secret-user") {
+		t.Fatalf("the proxy username must not cross the MCP boundary: %s", blob)
+	}
+}
+
+// TestLocal_CheckSingboxDelaySeparatesSilenceFromZero — CheckOne отвечает
+// нулём и на таймаут; ноль сам по себе читается как «0 мс, отлично».
+func TestLocal_CheckSingboxDelaySeparatesSilenceFromZero(t *testing.T) {
+	ctx := context.Background()
+	op := singboxHarness()
+	l := New(Config{Singbox: op})
+
+	got, err := l.CheckSingboxDelay(ctx, "vless-nl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Reachable || got.DelayMs != 120 {
+		t.Fatalf("got %+v", got)
+	}
+
+	got, err = l.CheckSingboxDelay(ctx, "hy2-de")
+	if err != nil {
+		t.Fatalf("silence is a result, not an error: %v", err)
+	}
+	if got.Reachable || got.DelayMs != 0 {
+		t.Fatalf("got %+v, want an explicit unreachable", got)
+	}
+}
+
+// TestLocal_CheckSingboxDelayRejectsUnknownTag — по чужому тегу проба
+// просто не ответит, и опечатка выглядела бы как упавший прокси.
+func TestLocal_CheckSingboxDelayRejectsUnknownTag(t *testing.T) {
+	op := singboxHarness()
+	l := New(Config{Singbox: op})
+
+	if _, err := l.CheckSingboxDelay(context.Background(), "nope"); err == nil {
+		t.Fatal("an unknown tag must be an error")
+	}
+	if len(op.asked) != 0 {
+		t.Fatalf("an unknown tag must not reach the delay checker, asked %v", op.asked)
+	}
+}
+
+func TestLocal_SingboxToolsWithoutTheEngineSaySo(t *testing.T) {
+	l := New(Config{})
+	if _, err := l.ListSingboxTunnels(context.Background()); err == nil {
+		t.Error("a build without sing-box must report that, not an empty list")
+	}
+	if _, err := l.CheckSingboxDelay(context.Background(), "x"); err == nil {
+		t.Error("a build without sing-box must report that")
 	}
 }

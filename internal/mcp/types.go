@@ -21,6 +21,37 @@ type SingboxStatus struct {
 	LastError   string `json:"lastError,omitempty"`
 }
 
+// SingboxTunnel is one proxy configured inside sing-box. Credentials
+// (passwords, uuids, the naive username) are deliberately left out: an
+// agent needs to tell proxies apart and see whether they work, not to
+// reproduce them. Use the web UI to read a proxy's secrets.
+type SingboxTunnel struct {
+	Tag      string `json:"tag" jsonschema:"unique name of the proxy; the id every other sing-box tool takes"`
+	Protocol string `json:"protocol" jsonschema:"vless|hysteria2|naive"`
+	Server   string `json:"server,omitempty"`
+	Port     int    `json:"port,omitempty"`
+	Security string `json:"security,omitempty" jsonschema:"reality|tls|none"`
+	// Transport is the stream the protocol runs over: tcp|grpc|quic|https.
+	Transport      string `json:"transport,omitempty"`
+	ListenPort     int    `json:"listenPort,omitempty" jsonschema:"local SOCKS5 port this proxy listens on"`
+	ProxyInterface string `json:"proxyInterface,omitempty" jsonschema:"Keenetic Proxy0/Proxy1… interface, when NDMS proxy mode is on"`
+	SNI            string `json:"sni,omitempty"`
+	// Running means the sing-box process is alive AND this proxy is
+	// actually up (its TUN exists, or Clash reports the outbound). A
+	// configured proxy that is down is listed with running=false rather
+	// than omitted.
+	Running bool `json:"running"`
+}
+
+// SingboxDelay is one latency probe. Reachable exists because the delay
+// test answers 0 both for "did not respond" and for a real zero, and 0 ms
+// reads as an excellent result.
+type SingboxDelay struct {
+	Tag       string `json:"tag"`
+	Reachable bool   `json:"reachable" jsonschema:"false means the proxy did not answer in time; delayMs carries no information then"`
+	DelayMs   int    `json:"delayMs" jsonschema:"round-trip in milliseconds, meaningless when reachable is false"`
+}
+
 type SystemStatus struct {
 	Version     string         `json:"version"`
 	InstanceID  string         `json:"instanceId"`

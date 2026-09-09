@@ -26,7 +26,11 @@ type Fake struct {
 	Devices      []mcpsrv.Device
 	Logs         []mcpsrv.LogEntry
 	Singbox      mcpsrv.SingboxStatus
-	Servers      []mcpsrv.ManagedServer
+	// SingboxTunnels are the proxies inside sing-box; Delays maps a tag to
+	// the latency a probe answers with (0 = the proxy stayed silent).
+	SingboxTunnels []mcpsrv.SingboxTunnel
+	Delays         map[string]int
+	Servers        []mcpsrv.ManagedServer
 	// Resolver backs ResolveDomain: domain -> IPv4 addresses.
 	Resolver map[string][]string
 	Spec     []byte
@@ -62,6 +66,11 @@ func New() *Fake {
 			{Timestamp: "2026-09-02T10:02:00Z", Level: "error", Group: "singbox", Subgroup: "ops", Message: "sing-box exited"},
 		},
 		Singbox: mcpsrv.SingboxStatus{Installed: true, Running: true, Version: "1.14.0", TunnelCount: 1},
+		SingboxTunnels: []mcpsrv.SingboxTunnel{
+			{Tag: "vless-nl", Protocol: "vless", Server: "nl.example.net", Port: 443, Security: "reality", Transport: "tcp", ListenPort: 2081, ProxyInterface: "Proxy0", SNI: "www.example.com", Running: true},
+			{Tag: "hy2-de", Protocol: "hysteria2", Server: "de.example.net", Port: 8443, Security: "tls", Transport: "quic", ListenPort: 2082, Running: false},
+		},
+		Delays:  map[string]int{"vless-nl": 120, "hy2-de": 0},
 		Servers: []mcpsrv.ManagedServer{{ID: "Wireguard0", InterfaceName: "nwg3", Description: "Home", Status: "up", Connected: true, ListenPort: 51820, PeerCount: 2}},
 		Spec:    []byte("swagger: \"2.0\"\ninfo:\n  title: AWG Manager API (mcptest stub)\n"),
 	}
@@ -587,6 +596,33 @@ func (f *Fake) ListManagedServers(context.Context) ([]mcpsrv.ManagedServer, erro
 		return nil, f.Err
 	}
 	return append([]mcpsrv.ManagedServer(nil), f.Servers...), nil
+}
+
+func (f *Fake) ListSingboxTunnels(context.Context) ([]mcpsrv.SingboxTunnel, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]mcpsrv.SingboxTunnel(nil), f.SingboxTunnels...), nil
+}
+
+func (f *Fake) CheckSingboxDelay(_ context.Context, tag string) (mcpsrv.SingboxDelay, error) {
+	if f.Err != nil {
+		return mcpsrv.SingboxDelay{}, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, t := range f.SingboxTunnels {
+		if t.Tag != tag {
+			continue
+		}
+		// Mirrors DelayChecker.CheckOne: a silent proxy answers 0, which
+		// is why Reachable is carried separately.
+		ms := f.Delays[tag]
+		return mcpsrv.SingboxDelay{Tag: tag, Reachable: ms > 0, DelayMs: ms}, nil
+	}
+	return mcpsrv.SingboxDelay{}, fmt.Errorf("sing-box proxy %q not found", tag)
 }
 
 func (f *Fake) ControlSingbox(_ context.Context, action string) (mcpsrv.SingboxStatus, error) {

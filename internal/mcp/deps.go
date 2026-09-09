@@ -77,6 +77,10 @@ type Deps interface {
 
 	ListManagedServers(ctx context.Context) ([]ManagedServer, error)
 	ControlSingbox(ctx context.Context, action string) (SingboxStatus, error)
+	ListSingboxTunnels(ctx context.Context) ([]SingboxTunnel, error)
+	// CheckSingboxDelay probes one proxy. An unknown tag is an error;
+	// a proxy that stays silent is a result with Reachable false.
+	CheckSingboxDelay(ctx context.Context, tag string) (SingboxDelay, error)
 
 	OpenAPISpec() []byte
 }
