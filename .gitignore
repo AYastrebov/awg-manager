@@ -49,12 +49,8 @@ coverage.out
 coverage.txt
 coverage.html
 
-# Claude (all internal) — except project skills, which ship with the repo.
-# A parent directory that is ignored cannot have children re-included, so
-# the rule is on its contents; the eval workspace beside a skill stays out.
-.claude/*
-!.claude/skills/
-.claude/skills/*-workspace/
+# Claude (all internal)
+.claude/
 CLAUDE.md
 screenshots/
 

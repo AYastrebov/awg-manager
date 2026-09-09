@@ -103,7 +103,7 @@ func registerObservabilityTools(s *mcp.Server, d Deps) {
 		Name: "run_diagnostics",
 		Description: "Start a full diagnostic sweep of the router in the background: interfaces, routes, firewall, kernel module, per-tunnel checks. " +
 			"It takes tens of seconds; call get_diagnostics afterwards for the outcome. Changes nothing.",
-		Annotations: safeWrite("Run diagnostics", true),
+		Annotations: readOnly("Run diagnostics"),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, DiagnosticsRun, error) {
 		out, err := d.RunDiagnostics(ctx)
 		return nil, out, err

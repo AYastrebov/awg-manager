@@ -251,11 +251,16 @@ type DNSRouteInput struct {
 // itself treats a zero value as "not sent", and inventing a clear here
 // would mean a payload that empties Name or the domains on any caller who
 // simply forgot a field. Deleting is remove_dns_route's job.
+//
+// The entries field is named manualDomains, not domains, on purpose: the
+// `domains` of get_dns_route is the EXPANDED list (subscriptions included),
+// and a model that read it and handed it back under the same name would
+// turn every subscription domain into a manual copy.
 type DNSRouteUpdate struct {
-	RouteID  string   `json:"routeId" jsonschema:"list id from list_dns_routes"`
-	Name     string   `json:"name,omitempty" jsonschema:"new list name; omit to keep the current one"`
-	Domains  []string `json:"domains,omitempty" jsonschema:"replaces the list's own (manual) domains; omit to keep them. Domains pulled in by subscriptions are unaffected"`
-	TunnelID string   `json:"tunnelId,omitempty" jsonschema:"send the list through this tunnel instead; omit to keep the current target"`
+	RouteID       string   `json:"routeId" jsonschema:"list id from list_dns_routes"`
+	Name          string   `json:"name,omitempty" jsonschema:"new list name; omit to keep the current one"`
+	ManualDomains []string `json:"manualDomains,omitempty" jsonschema:"replaces ALL of the list's own entries — domains and CIDR subnets alike — so read the current ones from get_dns_route's manualDomains (NOT domains, which includes subscription entries) and pass back everything you want to keep; omit to leave them untouched"`
+	TunnelID      string   `json:"tunnelId,omitempty" jsonschema:"send the list through this tunnel instead; omit to keep the current target"`
 }
 
 type StaticRoute struct {
@@ -465,12 +470,6 @@ type ManagedServer struct {
 	Managed bool `json:"managed" jsonschema:"true means the peer tools accept this server's id"`
 }
 
-// PingCheckRun is what run_pingcheck returns. The sweep itself runs in
-// the background — on a router with several tunnels and a 5 s probe
-// timeout a synchronous sweep would hold the call for half a minute with
-// no way to cancel it — so Tunnels is the status as of the LAST completed
-// check, and Triggered says whether this call started a new one (false
-// when one was already in flight).
 // ServerPeer is one client of a WireGuard server hosted on this router.
 // The peer's private key and preshared key are NOT here: they exist in
 // storage only to render the client's .conf, which get_server_peer_config
@@ -494,6 +493,12 @@ type AddPeerInput struct {
 	DNS         string `json:"dns,omitempty" jsonschema:"optional DNS server for the client config"`
 }
 
+// PingCheckRun is what run_pingcheck returns. The sweep itself runs in
+// the background — on a router with several tunnels and a 5 s probe
+// timeout a synchronous sweep would hold the call for half a minute with
+// no way to cancel it — so Tunnels is the status as of the LAST completed
+// check, and Triggered says whether this call started a new one (false
+// when one was already in flight).
 type PingCheckRun struct {
 	Triggered bool              `json:"triggered" jsonschema:"true if this call started a new check; false if monitoring is disabled, a check is already running, or one started less than ~10 s ago"`
 	Tunnels   []PingCheckStatus `json:"tunnels" jsonschema:"status as of the last COMPLETED check — call again in ~10 s for the result of the one just triggered"`

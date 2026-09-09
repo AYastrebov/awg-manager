@@ -1,8 +1,3 @@
----
-name: mcp-tool
-description: How to add or change a tool of awg-manager's MCP server (internal/mcp). Use this whenever a task touches internal/mcp, internal/mcp/localdeps, internal/mcp/mcptest, mentions "MCP tool", "expose … via MCP", "let the agent see/do …", or asks to give Claude Code / Cursor access to a router feature — even if the word "tool" is never used. Also use it when reviewing a change under internal/mcp. It lists the six places a tool must touch, the traps that a code review found in the first 40 tools, and how to test the Linux-only adapter from macOS.
----
-
 # Adding an MCP tool to awg-manager
 
 An MCP tool is a thin, well-described door from an AI agent into the daemon. The
@@ -209,6 +204,12 @@ docker run --rm -v "$PWD":/src -w /src golang:1.27rc1 go test ./internal/mcp/...
 
 Do not report the adapter tests as passing if the container did not run. Say
 they were typechecked only.
+
+A helper the fake shares with the adapter (the peer address allocator, for
+one) has to live in a package that builds on macOS, or the fake stops
+building there and takes every tool test with it. `internal/managed` does
+not (it pulls in `syscall.Uname`); the leaf `internal/managed/peerip` does.
+Check with `GOOS=darwin go build ./internal/mcp/... ` before importing.
 
 ## Tell the model about the tool
 

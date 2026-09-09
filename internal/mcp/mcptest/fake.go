@@ -5,10 +5,13 @@ package mcptest
 import (
 	"context"
 	"fmt"
+	"net"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/hoaxisr/awg-manager/internal/managed/peerip"
 	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
 )
 
@@ -329,11 +332,28 @@ func (f *Fake) UpdateDNSRoute(_ context.Context, in mcpsrv.DNSRouteUpdate) (mcps
 		if in.Name != "" {
 			r.Name = in.Name
 		}
-		if in.Domains != nil {
-			// Mirrors dnsroute.Update: the manual entries are replaced and
-			// the expanded list is recomputed from them.
-			r.ManualDomains = in.Domains
-			r.Domains = in.Domains
+		if in.ManualDomains != nil {
+			// Mirrors dnsroute.Update ("Merge domains" in impl.go): the manual
+			// entries are replaced and Domains/Subnets are split out of them
+			// again, so a CIDR the caller did not repeat is gone — and said so.
+			var dropped []string
+			for _, e := range r.ManualDomains {
+				if _, _, err := net.ParseCIDR(e); err == nil && !slices.Contains(in.ManualDomains, e) {
+					dropped = append(dropped, e)
+				}
+			}
+			if len(dropped) > 0 {
+				warnings = append(warnings, fmt.Sprintf("manualDomains replaced every manual entry, so the list's manual subnets %s are gone", strings.Join(dropped, ", ")))
+			}
+			r.ManualDomains = in.ManualDomains
+			r.Domains, r.Subnets = nil, nil
+			for _, e := range in.ManualDomains {
+				if _, _, err := net.ParseCIDR(e); err == nil {
+					r.Subnets = append(r.Subnets, e)
+				} else {
+					r.Domains = append(r.Domains, e)
+				}
+			}
 		}
 		if in.TunnelID != "" {
 			if _, err := f.findTunnel(in.TunnelID); err != nil {
@@ -778,7 +798,7 @@ func (f *Fake) AddServerPeer(_ context.Context, in mcpsrv.AddPeerInput) (mcpsrv.
 		for _, p := range peers {
 			used = append(used, p.TunnelIP)
 		}
-		ip = mcpsrv.NextFreePeerIP(f.ServerAddresses[in.ServerID], used)
+		ip = peerip.NextFree(f.ServerAddresses[in.ServerID], used)
 		if ip == "" {
 			return mcpsrv.ServerPeer{}, fmt.Errorf("no free address left in the server subnet")
 		}

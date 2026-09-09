@@ -1427,12 +1427,12 @@ func TestLocal_UpdateDNSRouteSendsOnlyWhatChanged(t *testing.T) {
 		t.Fatalf("a rename must send nothing but the name; the service preserves the rest: %+v", sent)
 	}
 
-	if _, _, err := h.l.UpdateDNSRoute(ctx, mcpsrv.DNSRouteUpdate{RouteID: "dl-1", Domains: []string{"a.example"}}); err != nil {
+	if _, _, err := h.l.UpdateDNSRoute(ctx, mcpsrv.DNSRouteUpdate{RouteID: "dl-1", ManualDomains: []string{"a.example"}}); err != nil {
 		t.Fatal(err)
 	}
 	sent = h.dns.updated
 	if len(sent.ManualDomains) != 1 || sent.ManualDomains[0] != "a.example" {
-		t.Fatalf("domains must go into ManualDomains, got %+v", sent)
+		t.Fatalf("manualDomains must go into ManualDomains, got %+v", sent)
 	}
 	if sent.Domains != nil {
 		t.Errorf("Domains is derived by the service and must not be sent: %v", sent.Domains)
@@ -1476,6 +1476,39 @@ func TestLocal_UpdateDNSRouteWarnsAboutDroppedTargets(t *testing.T) {
 	}
 	if len(warnings) != 0 {
 		t.Fatalf("a rename touches no targets and must not warn: %v", warnings)
+	}
+}
+
+// TestLocal_UpdateDNSRouteWarnsAboutDroppedManualSubnets — dnsroute.Update
+// пересобирает Domains и Subnets из ManualDomains (impl.go, «Merge
+// domains»), поэтому CIDR среди ручных записей живёт ровно до первой
+// замены manualDomains, в которой его не повторили. Молча — нельзя.
+func TestLocal_UpdateDNSRouteWarnsAboutDroppedManualSubnets(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.dns.lists = []dnsroute.DomainList{{
+		ID: "dl-mixed", Name: "Mixed", Enabled: true,
+		Domains:       []string{"a.example"},
+		ManualDomains: []string{"a.example", "10.0.0.0/8", "192.168.0.0/16"},
+		Subnets:       []string{"10.0.0.0/8", "192.168.0.0/16"},
+		Routes:        []dnsroute.RouteTarget{{TunnelID: "tn-1"}},
+	}}
+
+	_, warnings, err := h.l.UpdateDNSRoute(ctx, mcpsrv.DNSRouteUpdate{RouteID: "dl-mixed", ManualDomains: []string{"b.example", "10.0.0.0/8"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "192.168.0.0/16") || strings.Contains(warnings[0], "10.0.0.0/8") {
+		t.Fatalf("warnings = %v, want exactly the dropped subnet named", warnings)
+	}
+
+	// The subnets are sent back whole: nothing was lost, nothing to say.
+	_, warnings, err = h.l.UpdateDNSRoute(ctx, mcpsrv.DNSRouteUpdate{RouteID: "dl-mixed", ManualDomains: []string{"c.example", "10.0.0.0/8"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("re-sending every subnet must not warn: %v", warnings)
 	}
 }
 

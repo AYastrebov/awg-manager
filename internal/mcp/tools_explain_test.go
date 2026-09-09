@@ -242,6 +242,66 @@ func TestTools_ExplainRouteHonoursExcludes(t *testing.T) {
 	}
 }
 
+// TestTools_ExplainRouteHonoursExcludeSubnets — ревью нашло: исключения
+// сверялись только по имени. CIDR в excludes не срабатывал никогда (адреса
+// в сверку не передавались), excludeSubnets не читались вовсе, а для
+// запроса по литеральному адресу проверка была выключена целиком. Адрес,
+// вычеркнутый из списка подсетью, показывался как маршрутизируемый.
+func TestTools_ExplainRouteHonoursExcludeSubnets(t *testing.T) {
+	deps, fake := explainFake(t)
+	fake.DNSRoutes = []mcpsrv.DNSRouteDetail{
+		{
+			// A CIDR among the plain excludes: the service stores it there
+			// until it splits it out, so both spellings must work.
+			ID: "dl-cidr-in-excludes", Name: "Corp", Enabled: true,
+			Domains: []string{"corp.local"}, ManualDomains: []string{"corp.local"},
+			Excludes: []string{"10.20.0.0/16"},
+			Routes:   []mcpsrv.RouteTarget{{TunnelID: "tn-1"}},
+		},
+		{
+			ID: "dl-exclude-subnets", Name: "Lab", Enabled: true,
+			Domains: []string{"corp.local"}, ManualDomains: []string{"corp.local"},
+			ExcludeSubnets: []string{"10.20.5.0/24"},
+			Routes:         []mcpsrv.RouteTarget{{TunnelID: "tn-2"}},
+		},
+		{
+			// Matched by subnet, excluded by subnet: the only way a literal
+			// address can be carved out, and the case the old guard skipped.
+			ID: "dl-ip-only", Name: "Range", Enabled: true,
+			Subnets:        []string{"10.20.0.0/16"},
+			ExcludeSubnets: []string{"10.20.5.7/32"},
+			Routes:         []mcpsrv.RouteTarget{{TunnelID: "tn-1"}},
+		},
+	}
+	s := connectDeps(t, deps)
+
+	for _, target := range []string{"lab.corp.local", "10.20.5.7"} {
+		_, out := callTool(t, s, "explain_route", map[string]any{"target": target})
+		if n := len(out["dnsMatches"].([]any)); n != 0 {
+			t.Fatalf("%s: dnsMatches = %v, want none — every list excludes this address", target, out["dnsMatches"])
+		}
+		excluded, _ := out["excludedFrom"].([]any)
+		byList := map[string]string{}
+		for _, e := range excluded {
+			m := e.(map[string]any)
+			byList[m["routeId"].(string)] = m["excludedBy"].(string)
+		}
+		if target == "lab.corp.local" {
+			if byList["dl-cidr-in-excludes"] != "10.20.0.0/16" || byList["dl-exclude-subnets"] != "10.20.5.0/24" {
+				t.Fatalf("%s: excludedFrom = %v, want both domain lists carved out by their subnets", target, excluded)
+			}
+		} else if byList["dl-ip-only"] != "10.20.5.7/32" {
+			t.Fatalf("%s: excludedFrom = %v, want the subnet list carved out by excludeSubnets", target, excluded)
+		}
+	}
+
+	// A sibling address outside the excluded ranges still matches.
+	_, out := callTool(t, s, "explain_route", map[string]any{"target": "10.20.9.9"})
+	if n := len(out["dnsMatches"].([]any)); n != 1 {
+		t.Fatalf("dnsMatches = %v, want the Range list", out["dnsMatches"])
+	}
+}
+
 // TestTools_ExplainRouteFlagsGeoIPSubnets — ревью нашло: теги geoip:
 // хранятся в subnets списка, а сверка подсетей молча пропускала всё, что
 // не CIDR. Список из одних geoip-тегов не попадал ни в совпадения, ни в

@@ -1839,6 +1839,7 @@ const api_SingboxRouterQoSClassDTO: v.GenericSchema = v.looseObject({
 
 const api_SingboxRouterRuleDTO: v.GenericSchema = v.looseObject({
 	action: v.optional(v.nullable(v.string())),
+	awgm_managed: v.optional(v.nullable(v.string())),
 	domain_suffix: v.optional(v.nullable(v.array(v.string()))),
 	inbound: v.optional(v.nullable(v.array(v.string()))),
 	ip_cidr: v.optional(v.nullable(v.array(v.string()))),

@@ -25,6 +25,7 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/events"
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/managed"
+	"github.com/hoaxisr/awg-manager/internal/managed/peerip"
 	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
 	"github.com/hoaxisr/awg-manager/internal/monitoring"
 	"github.com/hoaxisr/awg-manager/internal/ndms"
@@ -873,12 +874,16 @@ func (l *Local) UpdateDNSRoute(ctx context.Context, in mcpsrv.DNSRouteUpdate) (m
 	}
 
 	patch := dnsroute.DomainList{ID: in.RouteID, Name: in.Name}
-	if in.Domains != nil {
+	var warnings []string
+	if in.ManualDomains != nil {
 		// ManualDomains only: the service recomputes Domains (and Subnets)
 		// from it and merges in whatever the subscriptions resolved to.
-		patch.ManualDomains = in.Domains
+		patch.ManualDomains = in.ManualDomains
+		if dropped := droppedManualSubnets(existing.ManualDomains, in.ManualDomains); len(dropped) > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"manualDomains replaced every manual entry, so the list's manual subnets %s are gone — include them in manualDomains as well to keep them", strings.Join(dropped, ", ")))
+		}
 	}
-	var warnings []string
 	if in.TunnelID != "" {
 		if n := len(existing.Routes); n > 1 {
 			warnings = append(warnings, fmt.Sprintf(
@@ -898,6 +903,26 @@ func (l *Local) UpdateDNSRoute(ctx context.Context, in mcpsrv.DNSRouteUpdate) (m
 	l.dnsLog.Info("update", updated.Name, "DNS route list updated (MCP)")
 	l.publish(events.ResourceRoutingDnsRoutes, "mcp-update")
 	return dnsRoute(updated), warnings, nil
+}
+
+// droppedManualSubnets lists the CIDR entries of before that after no
+// longer carries. dnsroute.Update rebuilds Subnets from ManualDomains
+// ("Merge domains" in impl.go), so a manual subnet the caller did not
+// repeat is gone after the write — unlike excludes or subscriptions, which
+// the sparse payload leaves alone.
+func droppedManualSubnets(before, after []string) []string {
+	kept := make(map[string]bool, len(after))
+	for _, e := range after {
+		kept[strings.TrimSpace(e)] = true
+	}
+	var dropped []string
+	for _, e := range before {
+		e = strings.TrimSpace(e)
+		if _, _, err := net.ParseCIDR(e); err == nil && !kept[e] {
+			dropped = append(dropped, e)
+		}
+	}
+	return dropped
 }
 
 // SetDNSRouteEnabled flips one list and reads it back, so the caller
@@ -1494,7 +1519,7 @@ func (l *Local) AddServerPeer(ctx context.Context, in mcpsrv.AddPeerInput) (mcps
 		for _, p := range server.Peers {
 			used = append(used, p.TunnelIP)
 		}
-		tunnelIP = mcpsrv.NextFreePeerIP(server.Address, used)
+		tunnelIP = peerip.NextFree(server.Address, used)
 		if tunnelIP == "" {
 			return mcpsrv.ServerPeer{}, fmt.Errorf("no free address left in the subnet of server %q — ask the user which address to use", in.ServerID)
 		}

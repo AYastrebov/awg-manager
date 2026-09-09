@@ -1,14 +1,14 @@
-package mcp
+package peerip
 
 import (
 	"fmt"
 	"testing"
 )
 
-// TestNextFreePeerIP — адрес выдаётся вместо модели, поэтому ошибка здесь
+// TestNextFree — адрес выдаётся вместо модели, поэтому ошибка здесь
 // тихая: пир создастся и просто не будет работать. Повторяет
 // suggestNextPeerIP из веб-интерфейса.
-func TestNextFreePeerIP(t *testing.T) {
+func TestNextFree(t *testing.T) {
 	cases := []struct {
 		name    string
 		address string
@@ -29,22 +29,20 @@ func TestNextFreePeerIP(t *testing.T) {
 		{"refuses an IPv6 server address", "fd00::1/64", nil, ""},
 	}
 	for _, c := range cases {
-		if got := NextFreePeerIP(c.address, c.used); got != c.want {
-			t.Errorf("%s: NextFreePeerIP(%q, %v) = %q, want %q", c.name, c.address, c.used, got, c.want)
+		if got := NextFree(c.address, c.used); got != c.want {
+			t.Errorf("%s: NextFree(%q, %v) = %q, want %q", c.name, c.address, c.used, got, c.want)
 		}
 	}
 }
 
-// TestNextFreePeerIPExhausted — когда свободных нет, пустая строка
-// заставляет вызывающего сказать об этом, а не выдать .255 или .0.
-func TestNextFreePeerIPExhausted(t *testing.T) {
+// TestNextFreeExhausted — когда свободных нет, пустая строка заставляет
+// вызывающего сказать об этом, а не выдать .255 или .0.
+func TestNextFreeExhausted(t *testing.T) {
 	used := make([]string, 0, 253)
 	for n := 2; n < 255; n++ {
-		used = append(used, itoaIP(n))
+		used = append(used, fmt.Sprintf("10.0.0.%d/32", n))
 	}
-	if got := NextFreePeerIP("10.0.0.1/24", used); got != "" {
+	if got := NextFree("10.0.0.1/24", used); got != "" {
 		t.Fatalf("a full subnet returned %q, want an empty result", got)
 	}
 }
-
-func itoaIP(n int) string { return fmt.Sprintf("10.0.0.%d/32", n) }

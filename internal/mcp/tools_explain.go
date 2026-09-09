@@ -276,9 +276,16 @@ func registerExplainTools(s *mcp.Server, d Deps) {
 			// pushes excludes to NDMS as real exceptions, so a match here
 			// would report a tunnel the traffic never takes. Reported
 			// separately rather than dropped — "no rule" and "explicitly
-			// carved out" are different answers.
-			if entry != "" && target != "" {
-				if ex, _ := matchDNSList(detail.Excludes, target, nil); ex != "" {
+			// carved out" are different answers. Checked by name AND by
+			// address: a CIDR may sit among Excludes (before the service
+			// splits it out) or under ExcludeSubnets, and a literal-IP
+			// target has only its address to be carved out by.
+			if entry != "" {
+				ex, _ := matchDNSList(detail.Excludes, target, ips)
+				if ex == "" {
+					ex, _, _ = matchSubnets(detail.ExcludeSubnets, ips)
+				}
+				if ex != "" {
 					out.ExcludedFrom = append(out.ExcludedFrom, explainExcluded{RouteID: detail.ID, Name: detail.Name, MatchedEntry: entry, ExcludedBy: ex})
 					continue
 				}

@@ -22,6 +22,7 @@ var readOnlyTools = map[string]bool{
 	"get_monitoring_matrix":  true,
 	"list_connections":       true,
 	"get_pingcheck_logs":     true,
+	"run_diagnostics":        true,
 	"get_diagnostics":        true,
 	"list_tunnels":           true,
 	"get_tunnel":             true,

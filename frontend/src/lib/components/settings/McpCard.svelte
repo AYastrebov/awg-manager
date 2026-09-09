@@ -229,10 +229,7 @@
 				maxlength="64"
 				onkeydown={(e) => e.key === 'Enter' && submitCreate()}
 			/>
-			<label class="flex items-center gap-2 cursor-pointer">
-				<input type="checkbox" bind:checked={readOnlyDraft} />
-				<span class="setting-description">Только чтение</span>
-			</label>
+			<Toggle checked={readOnlyDraft} onchange={(v) => (readOnlyDraft = v)} label="Только чтение" size="sm" />
 			<span class="setting-description text-xs">
 				Такой ключ читает состояние, логи и маршруты, но не может ничего изменить на роутере и не выдаёт конфиги с приватными ключами.
 			</span>
