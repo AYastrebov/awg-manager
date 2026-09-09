@@ -39,6 +39,36 @@ func TestTools_ListConnections(t *testing.T) {
 	if res, _ := callTool(t, s, "list_connections", map[string]any{"tunnelId": "../etc"}); !res.IsError {
 		t.Error("a malformed tunnelId must be rejected before Deps")
 	}
+	// clientIp used to be forwarded as free text; it is an address.
+	if res, _ := callTool(t, s, "list_connections", map[string]any{"clientIp": "laptop"}); !res.IsError {
+		t.Error("a non-IP clientIp must be rejected before Deps")
+	}
+	res, out = callTool(t, s, "list_connections", map[string]any{"clientIp": " 192.168.1.20"})
+	if res.IsError {
+		t.Fatal(toolText(res))
+	}
+	if n := len(out["connections"].([]any)); n != 1 {
+		t.Fatalf("filtered by device = %d, want the canonical spelling to match", n)
+	}
+}
+
+// TestTools_GetDiagnosticsWhileRunning — пока прогон идёт, ответ обязан
+// быть «идёт», а не «отчёта нет, запустите»: иначе агент запускает снова
+// и получает «уже идёт».
+func TestTools_GetDiagnosticsWhileRunning(t *testing.T) {
+	s, fake := newTestSession(t)
+	fake.DiagnosticsRunning = true
+
+	res, out := callTool(t, s, "get_diagnostics", nil)
+	if res.IsError {
+		t.Fatalf("a running sweep is not an error: %s", toolText(res))
+	}
+	if out["status"] != "running" {
+		t.Fatalf("status = %v", out["status"])
+	}
+	if txt := strings.ToLower(toolText(res)); !strings.Contains(txt, "running") || strings.Contains(txt, "run_diagnostics") {
+		t.Fatalf("the text must say the sweep is still running and not send the model back to run_diagnostics: %q", txt)
+	}
 }
 
 // TestTools_GetPingcheckLogs — матрица мониторинга показывает только

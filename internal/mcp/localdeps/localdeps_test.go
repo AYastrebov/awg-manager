@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -940,12 +941,21 @@ func (f *fakePingCheck) CheckAllNow() {
 }
 func (f *fakePingCheck) GetStatus() []pingcheck.TunnelStatus { return f.statuses }
 
-// GetLogs hands entries out oldest first, as the real ring buffer does.
-func (f *fakePingCheck) GetLogs() []pingcheck.LogEntry { return f.logs }
+// GetLogs hands entries out NEWEST first, as logbuf.Buffer.GetAll does
+// (buffer.go: "returns all entries, newest first"). The earlier version
+// of this fake claimed the opposite, and the adapter reversed a list
+// that was already in the right order.
+func (f *fakePingCheck) GetLogs() []pingcheck.LogEntry {
+	out := make([]pingcheck.LogEntry, 0, len(f.logs))
+	for i := len(f.logs) - 1; i >= 0; i-- {
+		out = append(out, f.logs[i])
+	}
+	return out
+}
 
 func (f *fakePingCheck) GetTunnelLogs(tunnelID string) []pingcheck.LogEntry {
 	var out []pingcheck.LogEntry
-	for _, e := range f.logs {
+	for _, e := range f.GetLogs() {
 		if e.TunnelID == tunnelID {
 			out = append(out, e)
 		}
@@ -1911,9 +1921,24 @@ type fakeConns struct {
 	err   error
 }
 
+// List applies the service's real Search semantics — a substring match
+// over "src:port dst:port clientName" — so a test can show what an
+// exact-IP filter must add on top.
 func (f *fakeConns) List(_ context.Context, p connections.ListParams) (*connections.ListResponse, error) {
 	f.asked = p
-	return f.resp, f.err
+	if f.resp == nil || p.Search == "" {
+		return f.resp, f.err
+	}
+	needle := strings.ToLower(p.Search)
+	out := &connections.ListResponse{}
+	for _, c := range f.resp.Connections {
+		hay := strings.ToLower(c.Src + ":" + strconv.Itoa(c.SrcPort) + " " + c.Dst + ":" + strconv.Itoa(c.DstPort) + " " + c.ClientName)
+		if strings.Contains(hay, needle) {
+			out.Connections = append(out.Connections, c)
+		}
+	}
+	out.Pagination.Total = len(out.Connections)
+	return out, f.err
 }
 
 // TestLocal_ListConnectionsKeepsTheRealTotal — страница и общее число
@@ -1961,8 +1986,11 @@ func TestLocal_ListConnectionsWithoutTheServiceSaysSo(t *testing.T) {
 	}
 }
 
-// TestLocal_PingCheckLogsAreNewestFirst — буфер отдаёт записи от старых к
-// новым, а на вопрос «когда начало падать» смотрят в начало списка.
+// TestLocal_PingCheckLogsAreNewestFirst — ревью нашло: буфер и так отдаёт
+// записи от новых к старым, а адаптер их переворачивал и обрезал. С
+// лимитом 100 из 800 записей агент получал сотню САМЫХ СТАРЫХ проверок и
+// отвечал на «когда начало падать» по данным двухчасовой давности. Здесь
+// логи заданы от старых к новым, а фейк отдаёт их как настоящий буфер.
 func TestLocal_PingCheckLogsAreNewestFirst(t *testing.T) {
 	pc := &fakePingCheck{logs: []pingcheck.LogEntry{
 		{Timestamp: time.Date(2026, 9, 2, 10, 0, 0, 0, time.UTC), TunnelID: "tn-1", TunnelName: "A", Success: true, Latency: 30},
@@ -2397,5 +2425,53 @@ func TestLocal_DNSRouteReadsResolveHydraRouteIDs(t *testing.T) {
 
 	if _, err := h.l.GetDNSRoute(ctx, "nope"); err == nil {
 		t.Error("an unknown id must still be an error")
+	}
+}
+
+// TestLocal_ListConnectionsFiltersByExactSourceIP — ревью нашло: clientIp
+// уходил в службу как подстрочный поиск по «src dst clientName». Фильтр
+// «только потоки этого устройства» захватывал соседей по подсети,
+// потоки К этому адресу и совпадения по имени клиента, и общее число
+// считалось по той же рыхлой выборке.
+func TestLocal_ListConnectionsFiltersByExactSourceIP(t *testing.T) {
+	fc := &fakeConns{resp: &connections.ListResponse{Connections: []connections.Connection{
+		{Protocol: "tcp", Src: "192.168.1.1", SrcPort: 1, Dst: "1.1.1.1", DstPort: 443, ClientName: "router"},
+		{Protocol: "tcp", Src: "192.168.1.10", SrcPort: 2, Dst: "1.1.1.1", DstPort: 443, ClientName: "laptop"},
+		{Protocol: "tcp", Src: "192.168.1.100", SrcPort: 3, Dst: "1.1.1.1", DstPort: 443, ClientName: "tv"},
+		{Protocol: "udp", Src: "192.168.1.20", SrcPort: 4, Dst: "192.168.1.1", DstPort: 53, ClientName: "phone"},
+		{Protocol: "tcp", Src: "10.0.0.5", SrcPort: 5, Dst: "1.1.1.1", DstPort: 443, ClientName: "host-192.168.1.1-x"},
+	}}}
+	l := New(Config{Connections: fc})
+
+	got, total, err := l.ListConnections(context.Background(), mcpsrv.ConnectionsQuery{ClientIP: "192.168.1.1", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Src != "192.168.1.1" {
+		t.Fatalf("got %+v, want only the flow FROM 192.168.1.1", got)
+	}
+	if total != 1 {
+		t.Fatalf("total = %d, want it to count the exact matches, not the substring ones", total)
+	}
+}
+
+// TestLocal_DiagnosticsResultWhileRunningSaysSo — ревью нашло: Run
+// обнуляет прошлый отчёт на старте, и на протяжении всего прогона
+// get_diagnostics отвечал «отчёта нет, вызовите run_diagnostics», а тот —
+// «уже идёт, вызовите get_diagnostics». Агент ходил по кругу или решал,
+// что диагностика не запускалась.
+func TestLocal_DiagnosticsResultWhileRunningSaysSo(t *testing.T) {
+	fd := &fakeDiag{status: diagnostics.RunStatus{Status: "running", Progress: "checking tunnels"}, repErr: errors.New("no report available")}
+	l := New(Config{Diagnostics: fd})
+
+	got, err := l.DiagnosticsResult(context.Background())
+	if err != nil {
+		t.Fatalf("a sweep in progress is a state, not a missing report: %v", err)
+	}
+	if got.Status != "running" {
+		t.Fatalf("status = %q, want running", got.Status)
+	}
+	if got.Problems == nil {
+		t.Fatal("problems must be an empty list, not null, so the shape stays stable")
 	}
 }

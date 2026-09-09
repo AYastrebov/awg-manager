@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"net"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -49,13 +51,24 @@ func registerObservabilityTools(s *mcp.Server, d Deps) {
 				return nil, connectionsOut{}, err
 			}
 		}
+		clientIP := ""
+		if strings.TrimSpace(in.ClientIP) != "" {
+			// An address, not free text: the adapter matches it exactly
+			// against the flow source, so only the canonical spelling
+			// may cross the boundary.
+			ip := net.ParseIP(strings.TrimSpace(in.ClientIP))
+			if ip == nil || ip.To4() == nil {
+				return nil, connectionsOut{}, fmt.Errorf("clientIp %q is not a valid IPv4 address", in.ClientIP)
+			}
+			clientIP = ip.To4().String()
+		}
 		if in.Limit <= 0 {
 			in.Limit = 50
 		}
 		if in.Limit > MaxConnectionsInOutput {
 			in.Limit = MaxConnectionsInOutput
 		}
-		list, total, err := d.ListConnections(ctx, ConnectionsQuery{TunnelID: in.TunnelID, ClientIP: in.ClientIP, Limit: in.Limit})
+		list, total, err := d.ListConnections(ctx, ConnectionsQuery{TunnelID: in.TunnelID, ClientIP: clientIP, Limit: in.Limit})
 		if list == nil {
 			list = []Connection{}
 		}
@@ -108,6 +121,13 @@ func registerObservabilityTools(s *mcp.Server, d Deps) {
 		}
 		if out.Problems == nil {
 			out.Problems = []DiagnosticsProblem{}
+		}
+		if out.Status == "running" {
+			// Said in text as well: a zero-count result with status
+			// "running" is easy to read as a clean sweep.
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{
+				Text: "The diagnostic sweep is still running; the counts above are not a result. Call get_diagnostics again in about half a minute.",
+			}}}, out, nil
 		}
 		return nil, out, nil
 	})

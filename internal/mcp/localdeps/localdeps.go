@@ -1195,9 +1195,19 @@ func (l *Local) ListConnections(ctx context.Context, q mcpsrv.ConnectionsQuery) 
 	if l.c.Connections == nil {
 		return nil, 0, errUnavailable("connections")
 	}
-	params := connections.ListParams{Tunnel: q.TunnelID, Search: q.ClientIP, Limit: q.Limit}
+	params := connections.ListParams{Tunnel: q.TunnelID, Limit: q.Limit}
 	if params.Tunnel == "" {
 		params.Tunnel = "all"
+	}
+	if q.ClientIP != "" {
+		// The service has no exact source filter, only a substring search
+		// over "src:port dst:port clientName" — which also catches
+		// 192.168.1.10 for 192.168.1.1, flows TO the address, and client
+		// names containing it. Use the search to narrow, then keep only
+		// exact source matches and count those; the total is capped by
+		// the service's own page limit.
+		params.Search = q.ClientIP
+		params.Limit = maxConnectionsScan
 	}
 	resp, err := l.c.Connections.List(ctx, params)
 	if err != nil {
@@ -1206,8 +1216,22 @@ func (l *Local) ListConnections(ctx context.Context, q mcpsrv.ConnectionsQuery) 
 	if resp == nil {
 		return nil, 0, fmt.Errorf("connections list returned no result")
 	}
-	out := make([]mcpsrv.Connection, 0, len(resp.Connections))
-	for _, c := range resp.Connections {
+	total := resp.Pagination.Total
+	rows := resp.Connections
+	if q.ClientIP != "" {
+		exact := rows[:0:0]
+		for _, c := range rows {
+			if c.Src == q.ClientIP {
+				exact = append(exact, c)
+			}
+		}
+		rows, total = exact, len(exact)
+		if q.Limit > 0 && len(rows) > q.Limit {
+			rows = rows[:q.Limit]
+		}
+	}
+	out := make([]mcpsrv.Connection, 0, len(rows))
+	for _, c := range rows {
 		out = append(out, mcpsrv.Connection{
 			Protocol: c.Protocol, Src: c.Src, SrcPort: c.SrcPort,
 			Dst: c.Dst, DstPort: c.DstPort, State: c.State,
@@ -1215,12 +1239,17 @@ func (l *Local) ListConnections(ctx context.Context, q mcpsrv.ConnectionsQuery) 
 			ClientName: c.ClientName,
 		})
 	}
-	return out, resp.Pagination.Total, nil
+	return out, total, nil
 }
 
-// PingCheckLogs returns the health-check journal newest first. The buffer
-// hands entries out oldest first, and an agent asked "when did this start
-// failing" reads the head of the list.
+// maxConnectionsScan is the service's own page cap; when filtering by
+// device the adapter asks for that many and keeps the exact matches.
+const maxConnectionsScan = 500
+
+// PingCheckLogs returns the health-check journal newest first. The ring
+// buffer already hands entries out newest first (logbuf.Buffer.GetAll),
+// so the page is a prefix — reversing it would return the OLDEST entries
+// and answer "since when is it failing" from hours-old data.
 func (l *Local) PingCheckLogs(_ context.Context, tunnelID string, limit int) ([]mcpsrv.PingCheckLogEntry, error) {
 	if l.c.PingCheck == nil {
 		return nil, errUnavailable("ping check")
@@ -1231,16 +1260,15 @@ func (l *Local) PingCheckLogs(_ context.Context, tunnelID string, limit int) ([]
 	} else {
 		raw = l.c.PingCheck.GetLogs()
 	}
+	if limit > 0 && len(raw) > limit {
+		raw = raw[:limit]
+	}
 	out := make([]mcpsrv.PingCheckLogEntry, 0, len(raw))
-	for i := len(raw) - 1; i >= 0; i-- {
-		e := raw[i]
+	for _, e := range raw {
 		out = append(out, mcpsrv.PingCheckLogEntry{
 			Timestamp: e.Timestamp.UTC().Format(time.RFC3339), TunnelID: e.TunnelID, TunnelName: e.TunnelName,
 			Success: e.Success, LatencyMs: e.Latency, Error: e.Error, StateChange: e.StateChange,
 		})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
 	}
 	return out, nil
 }
@@ -1286,8 +1314,15 @@ func (l *Local) DiagnosticsResult(context.Context) (mcpsrv.DiagnosticsResult, er
 	}
 	raw, err := l.c.Diagnostics.Result()
 	if err != nil || len(raw) == 0 {
-		// A missing report is not a failure of this call; it means nobody
-		// has run one. Saying "no report" alone would read as "all clear".
+		// Run clears the previous report the moment a sweep starts, so
+		// "no report" also covers the whole of a sweep in progress. That
+		// is a state to report, not a missing run: telling the model to
+		// call run_diagnostics here sends it round in a circle.
+		if l.c.Diagnostics.Status().Status == "running" {
+			return mcpsrv.DiagnosticsResult{Status: "running", Problems: []mcpsrv.DiagnosticsProblem{}}, nil
+		}
+		// Otherwise nobody has run one. Saying "no report" alone would
+		// read as "all clear".
 		return mcpsrv.DiagnosticsResult{}, mcpsrv.ErrNoDiagnostics
 	}
 	var report diagnosticsReport

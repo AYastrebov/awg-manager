@@ -49,6 +49,9 @@ type Fake struct {
 	ConnTotal   int
 	PingLogs    []mcpsrv.PingCheckLogEntry
 	Diagnostics *mcpsrv.DiagnosticsResult
+	// DiagnosticsRunning makes DiagnosticsResult answer as the real
+	// runner does mid-sweep: no report yet, status running.
+	DiagnosticsRunning bool
 	// Err, when set, is returned by every method — for error-path tests.
 	Err error
 }
@@ -655,6 +658,9 @@ func (f *Fake) DiagnosticsResult(context.Context) (mcpsrv.DiagnosticsResult, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.DiagnosticsRunning {
+		return mcpsrv.DiagnosticsResult{Status: "running", Problems: []mcpsrv.DiagnosticsProblem{}}, nil
+	}
 	if f.Diagnostics == nil {
 		return mcpsrv.DiagnosticsResult{}, mcpsrv.ErrNoDiagnostics
 	}
