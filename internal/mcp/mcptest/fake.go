@@ -38,6 +38,11 @@ type Fake struct {
 	// Resolver backs ResolveDomain: domain -> IPv4 addresses.
 	Resolver map[string][]string
 	Spec     []byte
+	// Conns, PingLogs and Diagnostics back the observability tools.
+	Conns       []mcpsrv.Connection
+	ConnTotal   int
+	PingLogs    []mcpsrv.PingCheckLogEntry
+	Diagnostics *mcpsrv.DiagnosticsResult
 	// Err, when set, is returned by every method — for error-path tests.
 	Err error
 }
@@ -82,8 +87,18 @@ func New() *Fake {
 			},
 		},
 		ServerAddresses: map[string]string{"Wireguard0": "10.0.0.1/24"},
-		Servers:         []mcpsrv.ManagedServer{{ID: "Wireguard0", InterfaceName: "nwg3", Description: "Home", Status: "up", Connected: true, ListenPort: 51820, PeerCount: 2}},
-		Spec:            []byte("swagger: \"2.0\"\ninfo:\n  title: AWG Manager API (mcptest stub)\n"),
+		Conns: []mcpsrv.Connection{
+			{Protocol: "tcp", Src: "192.168.1.10", SrcPort: 51234, Dst: "142.250.1.1", DstPort: 443, State: "ESTABLISHED", Interface: "nwg0", TunnelID: "tn-1", TunnelName: "Amsterdam", ClientName: "laptop"},
+			{Protocol: "udp", Src: "192.168.1.20", SrcPort: 5353, Dst: "8.8.8.8", DstPort: 53, Interface: "opkgtun1", TunnelID: "tn-2", TunnelName: "Frankfurt", ClientName: "tv"},
+		},
+		ConnTotal: 7,
+		PingLogs: []mcpsrv.PingCheckLogEntry{
+			{Timestamp: "2026-09-02T10:03:00Z", TunnelID: "tn-2", TunnelName: "Frankfurt", Success: false, Error: "timeout", StateChange: "link_toggle"},
+			{Timestamp: "2026-09-02T10:02:00Z", TunnelID: "tn-2", TunnelName: "Frankfurt", Success: false, Error: "timeout"},
+			{Timestamp: "2026-09-02T10:01:00Z", TunnelID: "tn-1", TunnelName: "Amsterdam", Success: true, LatencyMs: 32},
+		},
+		Servers: []mcpsrv.ManagedServer{{ID: "Wireguard0", InterfaceName: "nwg3", Description: "Home", Status: "up", Connected: true, ListenPort: 51820, PeerCount: 2}},
+		Spec:    []byte("swagger: \"2.0\"\ninfo:\n  title: AWG Manager API (mcptest stub)\n"),
 	}
 }
 
@@ -551,6 +566,81 @@ func (f *Fake) CheckIP(_ context.Context, tunnelID string) (mcpsrv.IPCheckResult
 		TunnelID: tunnelID, DirectIP: "203.0.113.7", VpnIP: "198.51.100.42",
 		EndpointIP: "198.51.100.1", IPChanged: true,
 	}, nil
+}
+
+func (f *Fake) ListConnections(_ context.Context, q mcpsrv.ConnectionsQuery) ([]mcpsrv.Connection, int, error) {
+	if f.Err != nil {
+		return nil, 0, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]mcpsrv.Connection, 0, len(f.Conns))
+	for _, c := range f.Conns {
+		if q.TunnelID != "" && c.TunnelID != q.TunnelID {
+			continue
+		}
+		if q.ClientIP != "" && c.Src != q.ClientIP {
+			continue
+		}
+		out = append(out, c)
+	}
+	total := f.ConnTotal
+	if q.TunnelID != "" || q.ClientIP != "" {
+		total = len(out)
+	}
+	if q.Limit > 0 && len(out) > q.Limit {
+		out = out[:q.Limit]
+	}
+	return out, total, nil
+}
+
+func (f *Fake) PingCheckLogs(_ context.Context, tunnelID string, limit int) ([]mcpsrv.PingCheckLogEntry, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]mcpsrv.PingCheckLogEntry, 0, len(f.PingLogs))
+	for _, e := range f.PingLogs {
+		if tunnelID != "" && e.TunnelID != tunnelID {
+			continue
+		}
+		out = append(out, e)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (f *Fake) RunDiagnostics(context.Context) (mcpsrv.DiagnosticsRun, error) {
+	if f.Err != nil {
+		return mcpsrv.DiagnosticsRun{}, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// The fake completes instantly; the real runner takes tens of seconds.
+	f.Diagnostics = &mcpsrv.DiagnosticsResult{
+		Status: "done", GeneratedAt: "2026-09-02T10:05:00Z",
+		Passed: 2, Failed: 1, Warnings: 1,
+		Problems: []mcpsrv.DiagnosticsProblem{
+			{Name: "Kernel module", Status: "fail", Detail: "awg-proxy is not loaded"},
+			{Name: "Handshake", Status: "warn", Detail: "no handshake in the last 5 minutes", TunnelID: "tn-2", TunnelName: "Frankfurt"},
+		},
+	}
+	return mcpsrv.DiagnosticsRun{Started: true, Status: "running"}, nil
+}
+
+func (f *Fake) DiagnosticsResult(context.Context) (mcpsrv.DiagnosticsResult, error) {
+	if f.Err != nil {
+		return mcpsrv.DiagnosticsResult{}, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Diagnostics == nil {
+		return mcpsrv.DiagnosticsResult{}, mcpsrv.ErrNoDiagnostics
+	}
+	return *f.Diagnostics, nil
 }
 
 func (f *Fake) MonitoringMatrix(context.Context) (mcpsrv.MonitoringMatrix, error) {

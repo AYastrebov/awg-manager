@@ -1105,6 +1105,16 @@ func (s *Server) registerMcpRoutes(mux *http.ServeMux, h *routeHandlers) {
 	if s.monitoringService != nil {
 		mon = s.monitoringService
 	}
+	// Конкретные типы, а не интерфейсы: интерфейс с nil-указателем внутри
+	// сравнение с nil проходит, и первый же вызов уронил бы демон.
+	var connsForMcp localdeps.ConnectionLister
+	if h.connectionsService != nil {
+		connsForMcp = h.connectionsService
+	}
+	var diagForMcp localdeps.DiagnosticsRunner
+	if h.diagRunner != nil {
+		diagForMcp = h.diagRunner
+	}
 	// Пиры через MCP ведёт служба управляемых серверов: только её серверы
 	// заведены целиком нами, и только у них есть подсеть, из которой можно
 	// выдать адрес.
@@ -1153,6 +1163,8 @@ func (s *Server) registerMcpRoutes(mux *http.ServeMux, h *routeHandlers) {
 		PingCheck:      s.pingCheckService,
 		ListServers:    h.serverHandler.ListServers,
 		Managed:        managedForMcp,
+		Connections:    connsForMcp,
+		Diagnostics:    diagForMcp,
 		Singbox:        singboxOp,
 		SystemInfo:     h.systemHandler.InfoData,
 		Resolve:        resolveHost,

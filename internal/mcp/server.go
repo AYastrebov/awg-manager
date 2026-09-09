@@ -28,6 +28,7 @@ func NewServer(deps Deps, version string) *mcp.Server {
 			"Other destructive operations (delete tunnel, delete peer, backup restore, system update) are not exposed.",
 	})
 	registerSystemTools(s, deps)
+	registerObservabilityTools(s, deps)
 	registerTunnelTools(s, deps)
 	registerRoutingTools(s, deps)
 	registerExplainTools(s, deps)

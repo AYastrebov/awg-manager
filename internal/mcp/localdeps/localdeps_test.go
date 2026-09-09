@@ -11,6 +11,8 @@ import (
 
 	"github.com/hoaxisr/awg-manager/internal/api"
 	"github.com/hoaxisr/awg-manager/internal/clientroute"
+	"github.com/hoaxisr/awg-manager/internal/connections"
+	"github.com/hoaxisr/awg-manager/internal/diagnostics"
 	"github.com/hoaxisr/awg-manager/internal/dnsroute"
 	"github.com/hoaxisr/awg-manager/internal/events"
 	"github.com/hoaxisr/awg-manager/internal/logging"
@@ -911,6 +913,7 @@ func TestLocal_ReplaceTunnelConfigStopsAndStarts(t *testing.T) {
 type fakePingCheck struct {
 	api.PingCheckService
 	statuses []pingcheck.TunnelStatus
+	logs     []pingcheck.LogEntry
 	started  chan struct{} // receives once per CheckAllNow (optional)
 	release  chan struct{} // CheckAllNow blocks until it is closed (optional)
 	disabled bool          // IsEnabled reports the inverse (zero value: enabled)
@@ -927,6 +930,19 @@ func (f *fakePingCheck) CheckAllNow() {
 	}
 }
 func (f *fakePingCheck) GetStatus() []pingcheck.TunnelStatus { return f.statuses }
+
+// GetLogs hands entries out oldest first, as the real ring buffer does.
+func (f *fakePingCheck) GetLogs() []pingcheck.LogEntry { return f.logs }
+
+func (f *fakePingCheck) GetTunnelLogs(tunnelID string) []pingcheck.LogEntry {
+	var out []pingcheck.LogEntry
+	for _, e := range f.logs {
+		if e.TunnelID == tunnelID {
+			out = append(out, e)
+		}
+	}
+	return out
+}
 
 // TestLocal_RunPingCheckDoesNotBlockOnTheSweep — CheckAllNow пробует все
 // туннели синхронно и без контекста запроса; вызов возвращается сразу со
@@ -1877,5 +1893,183 @@ func TestLocal_PeerToolsWithoutTheManagedServiceSaySo(t *testing.T) {
 	}
 	if _, err := l.ServerPeerConfig(ctx, "Wireguard3", "k"); err == nil {
 		t.Error("the config must report the missing service")
+	}
+}
+
+type fakeConns struct {
+	asked connections.ListParams
+	resp  *connections.ListResponse
+	err   error
+}
+
+func (f *fakeConns) List(_ context.Context, p connections.ListParams) (*connections.ListResponse, error) {
+	f.asked = p
+	return f.resp, f.err
+}
+
+// TestLocal_ListConnectionsKeepsTheRealTotal — страница и общее число
+// разные вещи: короткая страница, прочитанная как «всего два соединения»,
+// это неверный ответ на «что делает устройство».
+func TestLocal_ListConnectionsKeepsTheRealTotal(t *testing.T) {
+	fc := &fakeConns{resp: &connections.ListResponse{
+		Connections: []connections.Connection{{
+			Protocol: "tcp", Src: "192.168.1.10", SrcPort: 5123, Dst: "142.250.1.1", DstPort: 443,
+			State: "ESTABLISHED", Interface: "nwg0", TunnelID: "tn-1", TunnelName: "Amsterdam",
+			ClientName: "laptop", Bytes: 999, TTL: 42,
+		}},
+		Pagination: connections.PaginationInfo{Total: 37, Returned: 1},
+	}}
+	l := New(Config{Connections: fc})
+
+	got, total, err := l.ListConnections(context.Background(), mcpsrv.ConnectionsQuery{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 37 {
+		t.Fatalf("total = %d, want the count before paging", total)
+	}
+	want := mcpsrv.Connection{
+		Protocol: "tcp", Src: "192.168.1.10", SrcPort: 5123, Dst: "142.250.1.1", DstPort: 443,
+		State: "ESTABLISHED", Interface: "nwg0", TunnelID: "tn-1", TunnelName: "Amsterdam", ClientName: "laptop",
+	}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	// An empty tunnel filter must reach the service as "all", not as an
+	// empty string it would treat as a tunnel named "".
+	if fc.asked.Tunnel != "all" {
+		t.Errorf("Tunnel = %q, want \"all\"", fc.asked.Tunnel)
+	}
+	if fc.asked.Limit != 10 {
+		t.Errorf("Limit = %d", fc.asked.Limit)
+	}
+}
+
+func TestLocal_ListConnectionsWithoutTheServiceSaysSo(t *testing.T) {
+	l := New(Config{})
+	if _, _, err := l.ListConnections(context.Background(), mcpsrv.ConnectionsQuery{}); err == nil {
+		t.Fatal("a build without the connections service must report that, not an empty table")
+	}
+}
+
+// TestLocal_PingCheckLogsAreNewestFirst — буфер отдаёт записи от старых к
+// новым, а на вопрос «когда начало падать» смотрят в начало списка.
+func TestLocal_PingCheckLogsAreNewestFirst(t *testing.T) {
+	pc := &fakePingCheck{logs: []pingcheck.LogEntry{
+		{Timestamp: time.Date(2026, 9, 2, 10, 0, 0, 0, time.UTC), TunnelID: "tn-1", TunnelName: "A", Success: true, Latency: 30},
+		{Timestamp: time.Date(2026, 9, 2, 10, 1, 0, 0, time.UTC), TunnelID: "tn-1", TunnelName: "A", Success: false, Error: "timeout"},
+		{Timestamp: time.Date(2026, 9, 2, 10, 2, 0, 0, time.UTC), TunnelID: "tn-1", TunnelName: "A", Success: false, Error: "timeout", StateChange: "link_toggle"},
+	}}
+	l := New(Config{PingCheck: pc})
+
+	got, err := l.PingCheckLogs(context.Background(), "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("entries = %d", len(got))
+	}
+	if got[0].StateChange != "link_toggle" {
+		t.Fatalf("first entry = %+v, want the newest", got[0])
+	}
+	if got[0].Timestamp != "2026-09-02T10:02:00Z" {
+		t.Fatalf("timestamp = %q", got[0].Timestamp)
+	}
+
+	// The limit must keep the newest entries, not the oldest.
+	got, err = l.PingCheckLogs(context.Background(), "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].StateChange != "link_toggle" {
+		t.Fatalf("limited = %+v", got)
+	}
+}
+
+type fakeDiag struct {
+	runErr error
+	status diagnostics.RunStatus
+	report []byte
+	repErr error
+	runs   int
+}
+
+func (f *fakeDiag) Run(context.Context) error     { f.runs++; return f.runErr }
+func (f *fakeDiag) Status() diagnostics.RunStatus { return f.status }
+func (f *fakeDiag) Result() ([]byte, error)       { return f.report, f.repErr }
+
+// TestLocal_DiagnosticsResultPutsFailuresFirst — агент читает начало
+// списка, поэтому там должно быть худшее, а не то, что проверилось первым.
+func TestLocal_DiagnosticsResultPutsFailuresFirst(t *testing.T) {
+	report := `{"generatedAt":"2026-09-02T10:05:00Z","tests":[
+		{"name":"Handshake","status":"warn","detail":"stale","tunnelId":"tn-2","tunnelName":"F"},
+		{"name":"Interface","status":"pass","detail":"up"},
+		{"name":"Kernel module","status":"fail","detail":"not loaded"},
+		{"name":"Speed","status":"skip","detail":"iperf3 missing"},
+		{"name":"Routes","status":"error","detail":"ip route failed"}
+	]}`
+	fd := &fakeDiag{status: diagnostics.RunStatus{Status: "done"}, report: []byte(report)}
+	l := New(Config{Diagnostics: fd})
+
+	got, err := l.DiagnosticsResult(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Passed != 1 || got.Failed != 2 || got.Warnings != 1 || got.Skipped != 1 {
+		t.Fatalf("counts = %+v", got)
+	}
+	if len(got.Problems) != 3 {
+		t.Fatalf("problems = %+v", got.Problems)
+	}
+	if got.Problems[0].Status == "warn" {
+		t.Fatalf("a warning came before the failures: %+v", got.Problems)
+	}
+	if got.Problems[2].Status != "warn" {
+		t.Fatalf("the warning must come last: %+v", got.Problems)
+	}
+	if got.GeneratedAt != "2026-09-02T10:05:00Z" || got.Status != "done" {
+		t.Fatalf("result = %+v", got)
+	}
+}
+
+// TestLocal_DiagnosticsResultWithoutAReportIsExplicit — пустой отчёт
+// читался бы как «всё в порядке».
+func TestLocal_DiagnosticsResultWithoutAReportIsExplicit(t *testing.T) {
+	fd := &fakeDiag{repErr: errors.New("no report available")}
+	l := New(Config{Diagnostics: fd})
+
+	if _, err := l.DiagnosticsResult(context.Background()); err == nil {
+		t.Fatal("with no report the call must fail loudly, not return an all-clear")
+	}
+}
+
+// TestLocal_RunDiagnosticsAlreadyRunningIsNotAnError — но и «запустил» в
+// этом случае говорить нельзя.
+func TestLocal_RunDiagnosticsAlreadyRunning(t *testing.T) {
+	fd := &fakeDiag{runErr: errors.New("diagnostics already running"), status: diagnostics.RunStatus{Status: "running"}}
+	l := New(Config{Diagnostics: fd})
+
+	got, err := l.RunDiagnostics(context.Background())
+	if err != nil {
+		t.Fatalf("a sweep already in progress is not a failure: %v", err)
+	}
+	if got.Started {
+		t.Fatal("started must be false — this call started nothing")
+	}
+	if got.Status != "running" {
+		t.Fatalf("status = %q", got.Status)
+	}
+}
+
+func TestLocal_RunDiagnosticsStarts(t *testing.T) {
+	fd := &fakeDiag{}
+	l := New(Config{Diagnostics: fd})
+
+	got, err := l.RunDiagnostics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Started || fd.runs != 1 {
+		t.Fatalf("got %+v after %d runs", got, fd.runs)
 	}
 }

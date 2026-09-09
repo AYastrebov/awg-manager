@@ -66,6 +66,16 @@ type Deps interface {
 	// WAN. A tunnel that is not running is an error, not an empty result.
 	CheckIP(ctx context.Context, tunnelID string) (IPCheckResult, error)
 	MonitoringMatrix(ctx context.Context) (MonitoringMatrix, error)
+	// ListConnections returns one page of open flows and the total that
+	// matched, so a short page cannot be read as a quiet network.
+	ListConnections(ctx context.Context, q ConnectionsQuery) (page []Connection, total int, err error)
+	// PingCheckLogs returns the health-check journal, newest first.
+	PingCheckLogs(ctx context.Context, tunnelID string, limit int) ([]PingCheckLogEntry, error)
+	// RunDiagnostics starts a sweep without waiting for it.
+	RunDiagnostics(ctx context.Context) (DiagnosticsRun, error)
+	// DiagnosticsResult summarises the last completed sweep. With none, it
+	// returns ErrNoDiagnostics rather than an empty, reassuring report.
+	DiagnosticsResult(ctx context.Context) (DiagnosticsResult, error)
 	// RunPingCheck starts a check of every monitored tunnel without
 	// waiting for it and returns the last completed statuses.
 	RunPingCheck(ctx context.Context) (PingCheckRun, error)

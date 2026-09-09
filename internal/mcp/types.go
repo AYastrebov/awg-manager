@@ -341,6 +341,75 @@ type MonitoringMatrix struct {
 	UpdatedAt time.Time          `json:"updatedAt"`
 }
 
+// Connection is one open flow, trimmed to what identifies it: who, where
+// and through which tunnel. Byte counters and conntrack internals are
+// left out — an agent answering "what is this device doing" needs the
+// destination, not the TTL.
+type Connection struct {
+	Protocol   string `json:"protocol"`
+	Src        string `json:"src"`
+	SrcPort    int    `json:"srcPort,omitempty"`
+	Dst        string `json:"dst"`
+	DstPort    int    `json:"dstPort,omitempty"`
+	State      string `json:"state,omitempty"`
+	Interface  string `json:"interface,omitempty"`
+	TunnelID   string `json:"tunnelId,omitempty" jsonschema:"empty means the flow does not go through a tunnel"`
+	TunnelName string `json:"tunnelName,omitempty"`
+	ClientName string `json:"clientName,omitempty" jsonschema:"LAN device the flow came from, when known"`
+}
+
+// ConnectionsQuery filters the flow table. Limit is already clamped by
+// the tool.
+type ConnectionsQuery struct {
+	TunnelID string
+	ClientIP string
+	Limit    int
+}
+
+// PingCheckLogEntry is one automatic health check of one tunnel.
+type PingCheckLogEntry struct {
+	Timestamp  string `json:"timestamp"`
+	TunnelID   string `json:"tunnelId"`
+	TunnelName string `json:"tunnelName,omitempty"`
+	Success    bool   `json:"success"`
+	LatencyMs  int    `json:"latencyMs,omitempty" jsonschema:"meaningless when success is false"`
+	Error      string `json:"error,omitempty"`
+	// StateChange marks the entries that matter most: the moment a tunnel
+	// was switched off after repeated failures, or came back.
+	StateChange string `json:"stateChange,omitempty" jsonschema:"link_toggle or recovered on the checks that changed the tunnel's state"`
+}
+
+// DiagnosticsRun is the answer to starting a sweep. Started is false when
+// one was already running — the call is not an error, but the caller must
+// not report a fresh run either.
+type DiagnosticsRun struct {
+	Started bool   `json:"started" jsonschema:"false when a sweep was already in progress"`
+	Status  string `json:"status" jsonschema:"running|done|error|idle"`
+	Message string `json:"message,omitempty"`
+}
+
+// DiagnosticsProblem is one check that did not pass.
+type DiagnosticsProblem struct {
+	Name       string `json:"name"`
+	Status     string `json:"status" jsonschema:"fail|warn|error"`
+	Detail     string `json:"detail"`
+	TunnelID   string `json:"tunnelId,omitempty"`
+	TunnelName string `json:"tunnelName,omitempty"`
+}
+
+// DiagnosticsResult is the sweep's outcome. The counts describe every
+// check; Problems lists only the ones that did not pass, worst first, so
+// a short list never means a clean run on its own.
+type DiagnosticsResult struct {
+	Status      string               `json:"status" jsonschema:"done when the report is complete; running means these numbers are from an EARLIER sweep"`
+	GeneratedAt string               `json:"generatedAt,omitempty"`
+	Passed      int                  `json:"passed"`
+	Failed      int                  `json:"failed"`
+	Warnings    int                  `json:"warnings"`
+	Skipped     int                  `json:"skipped"`
+	Problems    []DiagnosticsProblem `json:"problems" jsonschema:"checks that did not pass, failures before warnings"`
+}
+
 type ManagedServer struct {
 	ID            string `json:"id"`
 	InterfaceName string `json:"interfaceName"`

@@ -5,6 +5,7 @@ package localdeps
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -16,6 +17,8 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/accesspolicy"
 	"github.com/hoaxisr/awg-manager/internal/api"
 	"github.com/hoaxisr/awg-manager/internal/clientroute"
+	"github.com/hoaxisr/awg-manager/internal/connections"
+	"github.com/hoaxisr/awg-manager/internal/diagnostics"
 	"github.com/hoaxisr/awg-manager/internal/dnsroute"
 	"github.com/hoaxisr/awg-manager/internal/events"
 	"github.com/hoaxisr/awg-manager/internal/logging"
@@ -25,6 +28,7 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/ndms"
 	"github.com/hoaxisr/awg-manager/internal/openapi"
 	"github.com/hoaxisr/awg-manager/internal/orchestrator"
+	"github.com/hoaxisr/awg-manager/internal/pingcheck"
 	"github.com/hoaxisr/awg-manager/internal/singbox"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 	awgtesting "github.com/hoaxisr/awg-manager/internal/testing"
@@ -55,6 +59,16 @@ type (
 		AddPeer(ctx context.Context, id string, req managed.AddPeerRequest) (*storage.ManagedPeer, error)
 		TogglePeer(ctx context.Context, id, pubkey string, enabled bool) error
 		GenerateConf(ctx context.Context, id, pubkey, endpointHost string) (string, error)
+	}
+	// ConnectionLister is the subset of *connections.Service MCP uses.
+	ConnectionLister interface {
+		List(ctx context.Context, params connections.ListParams) (*connections.ListResponse, error)
+	}
+	// DiagnosticsRunner is the subset of *diagnostics.Runner MCP uses.
+	DiagnosticsRunner interface {
+		Run(ctx context.Context) error
+		Status() diagnostics.RunStatus
+		Result() ([]byte, error)
 	}
 	MonitoringSnapshotter interface {
 		Snapshot() monitoring.Snapshot
@@ -100,9 +114,13 @@ type Config struct {
 	ListServers  func(ctx context.Context) ([]ndms.WireguardServer, error)
 	// Managed serves the peer tools. Servers this service does not know
 	// about cannot have peers managed through MCP, and the tools say so.
-	Managed    ManagedServers
-	Singbox    SingboxOperator
-	SystemInfo func() map[string]interface{}
+	Managed ManagedServers
+	// Connections and Diagnostics back the observability tools; nil makes
+	// the matching tool report that it is unavailable on this build.
+	Connections ConnectionLister
+	Diagnostics DiagnosticsRunner
+	Singbox     SingboxOperator
+	SystemInfo  func() map[string]interface{}
 	// Resolve looks a hostname up. Injected rather than called directly so
 	// tests need no network; nil disables explain_route's subnet leg.
 	Resolve func(ctx context.Context, host string) ([]string, error)
@@ -1141,6 +1159,141 @@ func (l *Local) ResolveDomain(ctx context.Context, domain string) ([]string, err
 			out = append(out, ip.To4().String())
 		}
 	}
+	return out, nil
+}
+
+// ListConnections maps one page of the flow table. Byte counters and
+// conntrack internals stay behind: the tool answers "what is this device
+// doing", and a model reading a TTL learns nothing from it.
+func (l *Local) ListConnections(ctx context.Context, q mcpsrv.ConnectionsQuery) ([]mcpsrv.Connection, int, error) {
+	if l.c.Connections == nil {
+		return nil, 0, errUnavailable("connections")
+	}
+	params := connections.ListParams{Tunnel: q.TunnelID, Search: q.ClientIP, Limit: q.Limit}
+	if params.Tunnel == "" {
+		params.Tunnel = "all"
+	}
+	resp, err := l.c.Connections.List(ctx, params)
+	if err != nil {
+		return nil, 0, err
+	}
+	if resp == nil {
+		return nil, 0, fmt.Errorf("connections list returned no result")
+	}
+	out := make([]mcpsrv.Connection, 0, len(resp.Connections))
+	for _, c := range resp.Connections {
+		out = append(out, mcpsrv.Connection{
+			Protocol: c.Protocol, Src: c.Src, SrcPort: c.SrcPort,
+			Dst: c.Dst, DstPort: c.DstPort, State: c.State,
+			Interface: c.Interface, TunnelID: c.TunnelID, TunnelName: c.TunnelName,
+			ClientName: c.ClientName,
+		})
+	}
+	return out, resp.Pagination.Total, nil
+}
+
+// PingCheckLogs returns the health-check journal newest first. The buffer
+// hands entries out oldest first, and an agent asked "when did this start
+// failing" reads the head of the list.
+func (l *Local) PingCheckLogs(_ context.Context, tunnelID string, limit int) ([]mcpsrv.PingCheckLogEntry, error) {
+	if l.c.PingCheck == nil {
+		return nil, errUnavailable("ping check")
+	}
+	var raw []pingcheck.LogEntry
+	if tunnelID != "" {
+		raw = l.c.PingCheck.GetTunnelLogs(tunnelID)
+	} else {
+		raw = l.c.PingCheck.GetLogs()
+	}
+	out := make([]mcpsrv.PingCheckLogEntry, 0, len(raw))
+	for i := len(raw) - 1; i >= 0; i-- {
+		e := raw[i]
+		out = append(out, mcpsrv.PingCheckLogEntry{
+			Timestamp: e.Timestamp.UTC().Format(time.RFC3339), TunnelID: e.TunnelID, TunnelName: e.TunnelName,
+			Success: e.Success, LatencyMs: e.Latency, Error: e.Error, StateChange: e.StateChange,
+		})
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// RunDiagnostics starts a sweep. A sweep already in progress is not an
+// error — the caller simply must not report a fresh run, hence Started.
+func (l *Local) RunDiagnostics(ctx context.Context) (mcpsrv.DiagnosticsRun, error) {
+	if l.c.Diagnostics == nil {
+		return mcpsrv.DiagnosticsRun{}, errUnavailable("diagnostics")
+	}
+	if err := l.c.Diagnostics.Run(ctx); err != nil {
+		st := l.c.Diagnostics.Status()
+		if st.Status == "running" {
+			return mcpsrv.DiagnosticsRun{Started: false, Status: "running", Message: "a diagnostic sweep was already running; call get_diagnostics for its outcome"}, nil
+		}
+		return mcpsrv.DiagnosticsRun{}, err
+	}
+	return mcpsrv.DiagnosticsRun{Started: true, Status: "running", Message: "started; call get_diagnostics in about half a minute"}, nil
+}
+
+// diagnosticsReport is the slice of the report MCP reads. The full
+// structure is far larger; decoding into this shape keeps the adapter
+// from breaking every time an unrelated section changes.
+type diagnosticsReport struct {
+	GeneratedAt string `json:"generatedAt"`
+	Tests       []struct {
+		Name       string `json:"name"`
+		TunnelID   string `json:"tunnelId"`
+		TunnelName string `json:"tunnelName"`
+		Status     string `json:"status"`
+		Detail     string `json:"detail"`
+	} `json:"tests"`
+}
+
+// DiagnosticsResult summarises the last completed sweep: the counts cover
+// every check, the list holds only the ones that did not pass, failures
+// first. Returning the whole report is not an option — it carries the
+// merged sing-box config and journal excerpts, orders of magnitude more
+// than a tool result should ever hold.
+func (l *Local) DiagnosticsResult(context.Context) (mcpsrv.DiagnosticsResult, error) {
+	if l.c.Diagnostics == nil {
+		return mcpsrv.DiagnosticsResult{}, errUnavailable("diagnostics")
+	}
+	raw, err := l.c.Diagnostics.Result()
+	if err != nil || len(raw) == 0 {
+		// A missing report is not a failure of this call; it means nobody
+		// has run one. Saying "no report" alone would read as "all clear".
+		return mcpsrv.DiagnosticsResult{}, mcpsrv.ErrNoDiagnostics
+	}
+	var report diagnosticsReport
+	if err := json.Unmarshal(raw, &report); err != nil {
+		return mcpsrv.DiagnosticsResult{}, fmt.Errorf("diagnostics report could not be read: %w", err)
+	}
+	out := mcpsrv.DiagnosticsResult{
+		Status: l.c.Diagnostics.Status().Status, GeneratedAt: report.GeneratedAt,
+		Problems: []mcpsrv.DiagnosticsProblem{},
+	}
+	var warnings []mcpsrv.DiagnosticsProblem
+	for _, t := range report.Tests {
+		switch t.Status {
+		case diagnostics.StatusPass:
+			out.Passed++
+			continue
+		case diagnostics.StatusSkip:
+			out.Skipped++
+			continue
+		case diagnostics.StatusWarn:
+			out.Warnings++
+			warnings = append(warnings, mcpsrv.DiagnosticsProblem{Name: t.Name, Status: t.Status, Detail: t.Detail, TunnelID: t.TunnelID, TunnelName: t.TunnelName})
+			continue
+		default:
+			// fail and error both mean "this check did not pass".
+			out.Failed++
+			out.Problems = append(out.Problems, mcpsrv.DiagnosticsProblem{Name: t.Name, Status: t.Status, Detail: t.Detail, TunnelID: t.TunnelID, TunnelName: t.TunnelName})
+		}
+	}
+	// Failures first: an agent that reads only the head of the list must
+	// see the worst thing, not whichever check happened to run first.
+	out.Problems = append(out.Problems, warnings...)
 	return out, nil
 }
 
