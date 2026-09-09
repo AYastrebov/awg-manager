@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 
+	"github.com/hoaxisr/awg-manager/internal/managed/peerip"
 	"github.com/hoaxisr/awg-manager/internal/signature"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 )
@@ -53,9 +54,9 @@ func (s *Service) AddPeer(ctx context.Context, id string, req AddPeerRequest) (*
 		for _, p := range server.Peers {
 			used = append(used, p.TunnelIP)
 		}
-		req.TunnelIP = NextFreePeerIP(server.Address, used)
+		req.TunnelIP = peerip.NextFree(server.Address, used)
 		if req.TunnelIP == "" {
-			return nil, ErrNoFreePeerIP
+			return nil, peerip.ErrNoFree
 		}
 	}
 

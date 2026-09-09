@@ -18,6 +18,7 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/events"
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/managed"
+	"github.com/hoaxisr/awg-manager/internal/managed/peerip"
 	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
 	"github.com/hoaxisr/awg-manager/internal/ndms"
 	"github.com/hoaxisr/awg-manager/internal/orchestrator"
@@ -1778,10 +1779,10 @@ func (f *fakeManaged) AddPeer(_ context.Context, id string, req managed.AddPeerR
 			for _, p := range f.servers[i].Peers {
 				used = append(used, p.TunnelIP)
 			}
-			tunnelIP = managed.NextFreePeerIP(f.servers[i].Address, used)
+			tunnelIP = peerip.NextFree(f.servers[i].Address, used)
 		}
 		if tunnelIP == "" {
-			return nil, managed.ErrNoFreePeerIP
+			return nil, peerip.ErrNoFree
 		}
 	}
 	peer := storage.ManagedPeer{
@@ -1897,7 +1898,7 @@ func TestLocal_AddServerPeerLeavesAllocationToTheService(t *testing.T) {
 		t.Fatalf("explicit address was rewritten to %q", m.added.TunnelIP)
 	}
 
-	m.addErr = managed.ErrNoFreePeerIP
+	m.addErr = peerip.ErrNoFree
 	_, err = l.AddServerPeer(ctx, mcpsrv.AddPeerInput{ServerID: "Wireguard3", Description: "y"})
 	if err == nil || !strings.Contains(err.Error(), "ask the user") {
 		t.Fatalf("err = %v, want the model told to ask the user for an address", err)

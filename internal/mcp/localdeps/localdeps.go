@@ -25,6 +25,7 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/events"
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/managed"
+	"github.com/hoaxisr/awg-manager/internal/managed/peerip"
 	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
 	"github.com/hoaxisr/awg-manager/internal/monitoring"
 	"github.com/hoaxisr/awg-manager/internal/ndms"
@@ -1517,7 +1518,7 @@ func (l *Local) AddServerPeer(ctx context.Context, in mcpsrv.AddPeerInput) (mcps
 	})
 	if err != nil {
 		l.serverLog.Warn("add-peer", in.Description, "Failed to add server peer (MCP): "+err.Error())
-		if errors.Is(err, managed.ErrNoFreePeerIP) {
+		if errors.Is(err, peerip.ErrNoFree) {
 			return mcpsrv.ServerPeer{}, fmt.Errorf("%w of %q — ask the user which address to use", err, in.ServerID)
 		}
 		return mcpsrv.ServerPeer{}, err

@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hoaxisr/awg-manager/internal/managed"
+	"github.com/hoaxisr/awg-manager/internal/managed/peerip"
 	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
 )
 
@@ -799,10 +799,12 @@ func (f *Fake) AddServerPeer(_ context.Context, in mcpsrv.AddPeerInput) (mcpsrv.
 			used = append(used, p.TunnelIP)
 		}
 		// Mirrors managed.Service.AddPeer: the same allocator, the same
-		// typed error when the subnet is exhausted.
-		ip = managed.NextFreePeerIP(f.ServerAddresses[in.ServerID], used)
+		// typed error when the subnet is exhausted. Only the leaf package
+		// is imported — internal/managed itself does not build on darwin,
+		// and CI cross-builds cmd/mcp-dev there.
+		ip = peerip.NextFree(f.ServerAddresses[in.ServerID], used)
 		if ip == "" {
-			return mcpsrv.ServerPeer{}, managed.ErrNoFreePeerIP
+			return mcpsrv.ServerPeer{}, peerip.ErrNoFree
 		}
 	}
 	for _, p := range peers {
