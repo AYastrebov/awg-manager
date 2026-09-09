@@ -131,7 +131,10 @@ type fakeDNSRoutes struct {
 	created dnsroute.DomainList
 	updated dnsroute.DomainList
 	enabled map[string]bool
-	deleted []string
+	// getKnowsHR mirrors the real service: dnsroute.Get scans only the
+	// JSON store and never finds an "hr:" list, while List merges them in.
+	getKnowsHR bool
+	deleted    []string
 }
 
 func (f *fakeDNSRoutes) Create(_ context.Context, l dnsroute.DomainList) (*dnsroute.DomainList, error) {
@@ -177,6 +180,9 @@ func (f *fakeDNSRoutes) List(context.Context) ([]dnsroute.DomainList, error) {
 func (f *fakeDNSRoutes) Get(_ context.Context, id string) (*dnsroute.DomainList, error) {
 	for i := range f.lists {
 		if f.lists[i].ID == id {
+			if strings.HasPrefix(id, "hr:") && !f.getKnowsHR {
+				return nil, errNotFound(id)
+			}
 			return &f.lists[i], nil
 		}
 	}
@@ -2351,5 +2357,45 @@ func TestLocal_PeerToolsRefuseAnUnmanagedServerWithTheReason(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not managed") {
 		t.Fatalf("error = %q, want the reason", err)
+	}
+}
+
+// TestLocal_DNSRouteReadsResolveHydraRouteIDs — ревью нашло: списки
+// HydraRoute приходят из List с id «hr:…», а Get их не знает. Получить,
+// переключить или поправить такой список через MCP было нельзя, а
+// explain_route помечал каждый как «не удалось прочитать».
+func TestLocal_DNSRouteReadsResolveHydraRouteIDs(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.dns.lists = []dnsroute.DomainList{
+		{ID: "dl-1", Name: "Video", Enabled: true, Domains: []string{"youtube.com"}},
+		{ID: "hr:youtube", Name: "YouTube (HR)", Enabled: true, Backend: "hydraroute", Domains: []string{"youtube.com"}, Routes: []dnsroute.RouteTarget{{TunnelID: "tn-1"}}},
+	}
+	h.dns.getKnowsHR = false
+
+	got, err := h.l.GetDNSRoute(ctx, "hr:youtube")
+	if err != nil {
+		t.Fatalf("GetDNSRoute(hr:…) = %v; the list is in List and must be readable", err)
+	}
+	if got.Name != "YouTube (HR)" || got.Backend != "hydraroute" {
+		t.Fatalf("got %+v", got)
+	}
+
+	if _, err := h.l.SetDNSRouteEnabled(ctx, "hr:youtube", false); err != nil {
+		t.Fatalf("SetDNSRouteEnabled(hr:…) = %v", err)
+	}
+	if v, ok := h.dns.enabled["hr:youtube"]; !ok || v {
+		t.Fatalf("SetEnabled was not called for the HR list: %v %v", v, ok)
+	}
+
+	if _, _, err := h.l.UpdateDNSRoute(ctx, mcpsrv.DNSRouteUpdate{RouteID: "hr:youtube", Name: "YT"}); err != nil {
+		t.Fatalf("UpdateDNSRoute(hr:…) = %v", err)
+	}
+	if h.dns.updated.ID != "hr:youtube" {
+		t.Fatalf("update went to %q", h.dns.updated.ID)
+	}
+
+	if _, err := h.l.GetDNSRoute(ctx, "nope"); err == nil {
+		t.Error("an unknown id must still be an error")
 	}
 }

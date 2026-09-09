@@ -33,13 +33,17 @@ func TestDomainCovers(t *testing.T) {
 }
 
 func TestUnevaluatableEntry(t *testing.T) {
+	// Only the two tag prefixes the daemon itself recognises count
+	// (dnsroute/impl.go): a bare IPv6 literal also contains colons and
+	// must not be mistaken for a tag.
 	cases := map[string]bool{
 		"geosite:google":  true,
 		"geoip:ru":        true,
 		"youtube.com":     false,
 		"10.0.0.0/8":      false,
-		"2001:db8::/32":   false, // a CIDR, not a tag: it has a slash
-		"example.com:443": true,  // not a domain this tool can judge
+		"2001:db8::/32":   false,
+		"2001:db8::1":     false,
+		"example.com:443": false,
 	}
 	for entry, want := range cases {
 		if got := unevaluatableEntry(entry); got != want {
@@ -81,16 +85,20 @@ func TestMatchDNSList(t *testing.T) {
 func TestMatchSubnets(t *testing.T) {
 	ips := []net.IP{net.ParseIP("192.0.2.9").To4(), net.ParseIP("10.20.5.7").To4()}
 
-	cidr, hit := matchSubnets([]string{"172.16.0.0/12", " 10.20.0.0/16 "}, ips)
+	cidr, hit, _ := matchSubnets([]string{"172.16.0.0/12", " 10.20.0.0/16 "}, ips)
 	if cidr != "10.20.0.0/16" || hit != "10.20.5.7" {
 		t.Errorf("cidr=%q hit=%q, want the containing subnet and the address inside it", cidr, hit)
 	}
 
-	if cidr, _ := matchSubnets([]string{"not-a-cidr"}, ips); cidr != "" {
+	if cidr, _, _ := matchSubnets([]string{"not-a-cidr"}, ips); cidr != "" {
 		t.Errorf("a malformed entry must be skipped, got %q", cidr)
 	}
-	if cidr, _ := matchSubnets([]string{"10.20.0.0/16"}, nil); cidr != "" {
+	if cidr, _, _ := matchSubnets([]string{"10.20.0.0/16"}, nil); cidr != "" {
 		t.Errorf("with nothing resolved there is nothing to match, got %q", cidr)
+	}
+	// geoip: tags live in Subnets; a list of only those is not a miss.
+	if cidr, _, unevaluated := matchSubnets([]string{"geoip:ru"}, ips); cidr != "" || !unevaluated {
+		t.Errorf("cidr=%q unevaluated=%v, want no match and the flag", cidr, unevaluated)
 	}
 }
 

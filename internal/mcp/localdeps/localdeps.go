@@ -766,17 +766,34 @@ func dnsRoute(dl *dnsroute.DomainList) mcpsrv.DNSRoute {
 	return dnsRouteDetail(dl).Summary()
 }
 
+// findDNSList resolves an id the way List does, not the way Get does:
+// dnsroute.Get scans only the JSON store and never sees a HydraRoute
+// list ("hr:…"), while List merges them in. Every MCP read goes through
+// here so an id the agent got from list_dns_routes is always readable.
+func (l *Local) findDNSList(ctx context.Context, id string) (*dnsroute.DomainList, error) {
+	if l.c.DNSRoutes == nil {
+		return nil, errUnavailable("dns routes")
+	}
+	if existing, err := l.c.DNSRoutes.Get(ctx, id); err == nil && existing != nil {
+		return existing, nil
+	}
+	lists, err := l.c.DNSRoutes.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range lists {
+		if lists[i].ID == id {
+			return &lists[i], nil
+		}
+	}
+	return nil, fmt.Errorf("dns route %q not found", id)
+}
+
 // GetDNSRoute reads one list in full for get_dns_route.
 func (l *Local) GetDNSRoute(ctx context.Context, id string) (mcpsrv.DNSRouteDetail, error) {
-	if l.c.DNSRoutes == nil {
-		return mcpsrv.DNSRouteDetail{}, errUnavailable("dns routes")
-	}
-	existing, err := l.c.DNSRoutes.Get(ctx, id)
+	existing, err := l.findDNSList(ctx, id)
 	if err != nil {
 		return mcpsrv.DNSRouteDetail{}, err
-	}
-	if existing == nil {
-		return mcpsrv.DNSRouteDetail{}, fmt.Errorf("dns route %q not found", id)
 	}
 	return dnsRouteDetail(existing), nil
 }
@@ -817,12 +834,9 @@ func (l *Local) UpdateDNSRoute(ctx context.Context, in mcpsrv.DNSRouteUpdate) (m
 	if l.c.DNSRoutes == nil {
 		return mcpsrv.DNSRoute{}, nil, errUnavailable("dns routes")
 	}
-	existing, err := l.c.DNSRoutes.Get(ctx, in.RouteID)
+	existing, err := l.findDNSList(ctx, in.RouteID)
 	if err != nil {
 		return mcpsrv.DNSRoute{}, nil, err
-	}
-	if existing == nil {
-		return mcpsrv.DNSRoute{}, nil, fmt.Errorf("dns route %q not found", in.RouteID)
 	}
 
 	patch := dnsroute.DomainList{ID: in.RouteID, Name: in.Name}
@@ -862,12 +876,9 @@ func (l *Local) SetDNSRouteEnabled(ctx context.Context, id string, enabled bool)
 	// Read first: SetEnabled on a missing id is a no-op in some backends,
 	// and reporting success for a list that does not exist is worse than
 	// an error the agent can act on.
-	existing, err := l.c.DNSRoutes.Get(ctx, id)
+	existing, err := l.findDNSList(ctx, id)
 	if err != nil {
 		return mcpsrv.DNSRoute{}, err
-	}
-	if existing == nil {
-		return mcpsrv.DNSRoute{}, fmt.Errorf("dns route %q not found", id)
 	}
 	action := "disable"
 	if enabled {
@@ -879,8 +890,8 @@ func (l *Local) SetDNSRouteEnabled(ctx context.Context, id string, enabled bool)
 	}
 	l.dnsLog.Info(action, existing.Name, "DNS route list switched "+onOff(enabled)+" (MCP)")
 	l.publish(events.ResourceRoutingDnsRoutes, "mcp-"+action)
-	updated, err := l.c.DNSRoutes.Get(ctx, id)
-	if err != nil || updated == nil {
+	updated, err := l.findDNSList(ctx, id)
+	if err != nil {
 		// The switch itself succeeded; fall back to the pre-change record
 		// with the flag we know was applied rather than failing the call.
 		existing.Enabled = enabled
@@ -895,12 +906,9 @@ func (l *Local) RemoveDNSRoute(ctx context.Context, id string) (mcpsrv.DNSRoute,
 	}
 	// Read the record before destroying it: the tool returns it so the
 	// agent can show the user what it deleted.
-	existing, err := l.c.DNSRoutes.Get(ctx, id)
+	existing, err := l.findDNSList(ctx, id)
 	if err != nil {
 		return mcpsrv.DNSRoute{}, err
-	}
-	if existing == nil {
-		return mcpsrv.DNSRoute{}, fmt.Errorf("dns route %q not found", id)
 	}
 	out := dnsRoute(existing)
 	if err := l.c.DNSRoutes.Delete(ctx, id); err != nil {

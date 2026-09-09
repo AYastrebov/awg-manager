@@ -205,3 +205,62 @@ func TestTools_ExplainRouteMentionsSingboxRules(t *testing.T) {
 		t.Fatalf("note = %q, want it to name the tool that shows them", note)
 	}
 }
+
+// TestTools_ExplainRouteHonoursExcludes — ревью нашло: домен, явно
+// вырезанный из списка через excludes, показывался как идущий через
+// туннель этого списка. Роутер его так не маршрутизирует.
+func TestTools_ExplainRouteHonoursExcludes(t *testing.T) {
+	deps, fake := explainFake(t)
+	fake.DNSRoutes = append(fake.DNSRoutes, mcpsrv.DNSRouteDetail{
+		ID: "dl-google", Name: "Google", Enabled: true,
+		Domains: []string{"google.com"}, ManualDomains: []string{"google.com"},
+		Excludes: []string{"mail.google.com"},
+		Routes:   []mcpsrv.RouteTarget{{TunnelID: "tn-1"}},
+	})
+	deps.table["mail.google.com"] = []string{"142.250.9.9"}
+	s := connectDeps(t, deps)
+
+	_, out := callTool(t, s, "explain_route", map[string]any{"target": "mail.google.com"})
+	for _, m := range out["dnsMatches"].([]any) {
+		if m.(map[string]any)["routeId"] == "dl-google" {
+			t.Fatalf("an excluded domain must not count as covered: %v", m)
+		}
+	}
+	excluded, _ := out["excludedFrom"].([]any)
+	if len(excluded) != 1 {
+		t.Fatalf("excludedFrom = %v, want the exclusion reported, not silently dropped", out["excludedFrom"])
+	}
+	e := excluded[0].(map[string]any)
+	if e["routeId"] != "dl-google" || e["excludedBy"] != "mail.google.com" {
+		t.Fatalf("exclusion = %v", e)
+	}
+
+	// A sibling that is not excluded still matches.
+	_, out = callTool(t, s, "explain_route", map[string]any{"target": "www.google.com"})
+	if n := len(out["dnsMatches"].([]any)); n != 1 {
+		t.Fatalf("dnsMatches = %v", out["dnsMatches"])
+	}
+}
+
+// TestTools_ExplainRouteFlagsGeoIPSubnets — ревью нашло: теги geoip:
+// хранятся в subnets списка, а сверка подсетей молча пропускала всё, что
+// не CIDR. Список из одних geoip-тегов не попадал ни в совпадения, ни в
+// непроверенные, и ответ был «маршрута нет».
+func TestTools_ExplainRouteFlagsGeoIPSubnets(t *testing.T) {
+	deps, fake := explainFake(t)
+	fake.DNSRoutes = []mcpsrv.DNSRouteDetail{{
+		ID: "dl-ru", Name: "RU", Enabled: true,
+		Subnets: []string{"geoip:ru"},
+		Routes:  []mcpsrv.RouteTarget{{TunnelID: "tn-2"}},
+	}}
+	s := connectDeps(t, deps)
+
+	_, out := callTool(t, s, "explain_route", map[string]any{"target": "10.20.5.7"})
+	un, _ := out["unevaluatedLists"].([]any)
+	if len(un) != 1 || un[0].(map[string]any)["routeId"] != "dl-ru" {
+		t.Fatalf("a geoip-only list must be reported as unevaluated, got %v", out["unevaluatedLists"])
+	}
+	if note, _ := out["note"].(string); strings.Contains(note, "no routing list covers") {
+		t.Fatalf("the note must not claim nothing matches: %q", note)
+	}
+}

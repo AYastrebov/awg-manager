@@ -48,6 +48,15 @@ type explainUnevaluated struct {
 	Reason  string `json:"reason"`
 }
 
+// explainExcluded is a list that matched the target and then carved it
+// out again through its excludes. The list does not route it.
+type explainExcluded struct {
+	RouteID      string `json:"routeId"`
+	Name         string `json:"name"`
+	MatchedEntry string `json:"matchedEntry"`
+	ExcludedBy   string `json:"excludedBy" jsonschema:"the exclude entry that removes the target from this list"`
+}
+
 type explainOut struct {
 	Target      string   `json:"target"`
 	IsIP        bool     `json:"isIp" jsonschema:"true when the target was given as a literal address"`
@@ -58,6 +67,7 @@ type explainOut struct {
 	DNSMatches           []explainDNSMatch    `json:"dnsMatches"`
 	StaticMatches        []explainStaticMatch `json:"staticMatches"`
 	ClientRoute          *ClientRoute         `json:"clientRoute,omitempty" jsonschema:"the device's own route, when clientIp was given"`
+	ExcludedFrom         []explainExcluded    `json:"excludedFrom,omitempty" jsonschema:"lists that would match but explicitly exclude the target — they do NOT route it"`
 	UnevaluatedLists     []explainUnevaluated `json:"unevaluatedLists,omitempty" jsonschema:"lists this tool could not decide about — check them before telling the user nothing matches"`
 	DefaultRouteTunnelID string               `json:"defaultRouteTunnelId,omitempty" jsonschema:"tunnel carrying the default route; traffic matching no rule goes here, or straight out the WAN when empty"`
 	DefaultRouteTunnel   string               `json:"defaultRouteTunnelName,omitempty"`
@@ -84,10 +94,10 @@ func domainCovers(entry, target string) bool {
 
 // unevaluatableEntry reports whether an entry is one this tool cannot
 // decide locally: geosite:/geoip: tags expand from data files on the
-// router. A CIDR entry is not unevaluatable — it is compared against the
-// resolved addresses instead.
+// router. Only those two prefixes count — the ones dnsroute itself
+// recognises — because a bare IPv6 literal also contains colons.
 func unevaluatableEntry(entry string) bool {
-	return strings.Contains(entry, ":") && !strings.Contains(entry, "/")
+	return strings.HasPrefix(entry, "geosite:") || strings.HasPrefix(entry, "geoip:")
 }
 
 // matchDNSList decides one list against a target. It returns the matching
@@ -118,20 +128,28 @@ func matchDNSList(entries []string, target string, ips []net.IP) (matched string
 	return "", unevaluated
 }
 
-// matchSubnets returns the first CIDR in list containing one of ips.
-func matchSubnets(subnets []string, ips []net.IP) (cidr string, hit string) {
+// matchSubnets returns the first CIDR in list containing one of ips, and
+// separately whether the list held geoip: tags — dnsroute stores those
+// under Subnets, and a list made only of them must surface as
+// unevaluated rather than as a clean miss.
+func matchSubnets(subnets []string, ips []net.IP) (cidr string, hit string, unevaluated bool) {
 	for _, s := range subnets {
-		_, subnet, err := net.ParseCIDR(strings.TrimSpace(s))
+		s = strings.TrimSpace(s)
+		if unevaluatableEntry(s) {
+			unevaluated = true
+			continue
+		}
+		_, subnet, err := net.ParseCIDR(s)
 		if err != nil {
 			continue
 		}
 		for _, ip := range ips {
 			if subnet.Contains(ip) {
-				return strings.TrimSpace(s), ip.String()
+				return s, ip.String(), unevaluated
 			}
 		}
 	}
-	return "", ""
+	return "", "", unevaluated
 }
 
 // explainNote states in words how the matches relate. It deliberately
@@ -244,8 +262,19 @@ func registerExplainTools(s *mcp.Server, d Deps) {
 			}
 			entry, unevaluated := matchDNSList(detail.Domains, target, ips)
 			if entry == "" {
-				if sub, hit := matchSubnets(detail.Subnets, ips); sub != "" {
-					entry, _ = sub, hit
+				sub, _, subUnevaluated := matchSubnets(detail.Subnets, ips)
+				entry = sub
+				unevaluated = unevaluated || subUnevaluated
+			}
+			// An exclude carves the target back out of the list: the router
+			// pushes excludes to NDMS as real exceptions, so a match here
+			// would report a tunnel the traffic never takes. Reported
+			// separately rather than dropped — "no rule" and "explicitly
+			// carved out" are different answers.
+			if entry != "" && target != "" {
+				if ex, _ := matchDNSList(detail.Excludes, target, nil); ex != "" {
+					out.ExcludedFrom = append(out.ExcludedFrom, explainExcluded{RouteID: detail.ID, Name: detail.Name, MatchedEntry: entry, ExcludedBy: ex})
+					continue
 				}
 			}
 			if entry != "" {
@@ -270,7 +299,7 @@ func registerExplainTools(s *mcp.Server, d Deps) {
 			return nil, explainOut{}, err
 		}
 		for _, sr := range statics {
-			cidr, hit := matchSubnets(sr.Subnets, ips)
+			cidr, hit, _ := matchSubnets(sr.Subnets, ips)
 			if cidr == "" {
 				continue
 			}
