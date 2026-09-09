@@ -56,6 +56,24 @@ type McpKey struct {
 	LastUsedAt time.Time `json:"lastUsedAt,omitzero"`
 }
 
+// fileVersionFor picks the lowest format version that carries every field
+// in snapshot. An older build refuses a newer version outright (Load), so
+// stamping every save with the newest number would lock all keys out on a
+// downgrade even when no key uses the newer field. The bump is applied
+// only when it protects something: a read-only key an older build would
+// silently rewrite as full-access.
+func fileVersionFor(keys []McpKey) int {
+	for _, k := range keys {
+		if k.ReadOnly {
+			return mcpKeysFileVersion
+		}
+	}
+	return mcpKeysFileVersionLegacy
+}
+
+// mcpKeysFileVersionLegacy is the format before scoped keys existed.
+const mcpKeysFileVersionLegacy = 1
+
 // mcpKeysFileVersion is bumped whenever a field is added that an older
 // build would silently drop on its next save. Version 2 added readOnly:
 // an older build reading it as version 1 would rewrite the file without
@@ -277,7 +295,7 @@ func (s *McpKeyStore) persist(snapshot []McpKey) error {
 // but LastUsedAt, and doubling the hourly flash write for that would be
 // waste.
 func (s *McpKeyStore) persistFileLocked(snapshot []McpKey, withBackup bool) error {
-	data, err := json.MarshalIndent(mcpKeysFileV1{Version: mcpKeysFileVersion, Keys: snapshot}, "", "  ")
+	data, err := json.MarshalIndent(mcpKeysFileV1{Version: fileVersionFor(snapshot), Keys: snapshot}, "", "  ")
 	if err != nil {
 		return err
 	}

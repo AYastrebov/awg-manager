@@ -264,3 +264,51 @@ func TestTools_ExplainRouteFlagsGeoIPSubnets(t *testing.T) {
 		t.Fatalf("the note must not claim nothing matches: %q", note)
 	}
 }
+
+// TestTools_ExplainRouteReadsListsOnce — ревью нашло: инструмент дёргал
+// GetDNSRoute на каждый список, а для HydraRoute-id это перечитывание
+// конфигов HR под замком на каждый вызов — O(N²) от валидного ключа.
+// Полные записи читаются одним вызовом.
+func TestTools_ExplainRouteReadsListsOnce(t *testing.T) {
+	deps, fake := explainFake(t)
+	counting := &countingDeps{resolvingFake: deps}
+	fake.DNSRoutes = append(fake.DNSRoutes, bigDNSList("dl-a", 3), bigDNSList("dl-b", 3))
+	s := connectDeps(t, counting)
+
+	if res, _ := callTool(t, s, "explain_route", map[string]any{"target": "www.youtube.com"}); res.IsError {
+		t.Fatal(toolText(res))
+	}
+	if counting.getCalls != 0 {
+		t.Fatalf("GetDNSRoute was called %d times; explain_route must read all lists in one call", counting.getCalls)
+	}
+	if counting.listDetailCalls != 1 {
+		t.Fatalf("ListDNSRouteDetails called %d times, want 1", counting.listDetailCalls)
+	}
+}
+
+type countingDeps struct {
+	resolvingFake
+	getCalls        int
+	listDetailCalls int
+}
+
+func (c *countingDeps) GetDNSRoute(ctx context.Context, id string) (mcpsrv.DNSRouteDetail, error) {
+	c.getCalls++
+	return c.resolvingFake.GetDNSRoute(ctx, id)
+}
+
+func (c *countingDeps) ListDNSRouteDetails(ctx context.Context) ([]mcpsrv.DNSRouteDetail, error) {
+	c.listDetailCalls++
+	return c.resolvingFake.ListDNSRouteDetails(ctx)
+}
+
+// TestTools_ExplainRouteCapsTheTarget — цель уходит в резолвер роутера.
+// Имя длиннее допустимого для DNS нечего резолвить.
+func TestTools_ExplainRouteCapsTheTarget(t *testing.T) {
+	deps, _ := explainFake(t)
+	s := connectDeps(t, deps)
+	long := strings.Repeat("a", 254) + ".example"
+	if res, _ := callTool(t, s, "explain_route", map[string]any{"target": long}); !res.IsError {
+		t.Fatal("a target longer than a DNS name must be refused before resolving")
+	}
+}

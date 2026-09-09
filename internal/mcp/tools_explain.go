@@ -9,6 +9,10 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// maxTargetLen is the longest DNS name (RFC 1035), the upper bound on
+// what explain_route hands to the resolver.
+const maxTargetLen = 253
+
 type explainIn struct {
 	Target   string `json:"target" jsonschema:"a domain (e.g. \"www.youtube.com\") or a literal IPv4 address to explain"`
 	ClientIP string `json:"clientIp,omitempty" jsonschema:"optional LAN device IPv4: include the device's own route in the answer"`
@@ -193,6 +197,11 @@ func registerExplainTools(s *mcp.Server, d Deps) {
 		if target == "" {
 			return nil, explainOut{}, fmt.Errorf("target is required (a domain or an IPv4 address)")
 		}
+		// A DNS name is at most 253 octets; anything longer is not a name
+		// the router's resolver should be asked about.
+		if len(target) > maxTargetLen {
+			return nil, explainOut{}, fmt.Errorf("target is longer than %d characters", maxTargetLen)
+		}
 		out := explainOut{Target: target, ResolvedIPs: []string{}, DNSMatches: []explainDNSMatch{}, StaticMatches: []explainStaticMatch{}}
 
 		var ips []net.IP
@@ -248,18 +257,15 @@ func registerExplainTools(s *mcp.Server, d Deps) {
 			}
 		}
 
-		lists, err := d.ListDNSRoutes(ctx)
+		// Full records in one call: the list view caps Domains, and matching
+		// against a truncated list would answer "no rule covers this" for a
+		// rule that does; per-id reads would re-read HydraRoute's files
+		// once per list.
+		details, err := d.ListDNSRouteDetails(ctx)
 		if err != nil {
 			return nil, explainOut{}, err
 		}
-		for _, l := range lists {
-			// The list view caps Domains, and matching against a truncated
-			// list would answer "no rule covers this" for a rule that does.
-			detail, err := d.GetDNSRoute(ctx, l.ID)
-			if err != nil {
-				out.UnevaluatedLists = append(out.UnevaluatedLists, explainUnevaluated{RouteID: l.ID, Name: l.Name, Reason: "could not be read: " + err.Error()})
-				continue
-			}
+		for _, detail := range details {
 			entry, unevaluated := matchDNSList(detail.Domains, target, ips)
 			if entry == "" {
 				sub, _, subUnevaluated := matchSubnets(detail.Subnets, ips)

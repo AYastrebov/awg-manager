@@ -29,6 +29,11 @@ type Deps interface {
 	// excludes and subscriptions the list view drops. The tool pages
 	// Domains; implementations must not truncate them here.
 	GetDNSRoute(ctx context.Context, id string) (DNSRouteDetail, error)
+	// ListDNSRouteDetails returns every list in full in one call, for
+	// tools that must match against whole lists (explain_route). One call
+	// because per-id reads of HydraRoute lists re-read its config files
+	// each time.
+	ListDNSRouteDetails(ctx context.Context) ([]DNSRouteDetail, error)
 	AddDNSRoute(ctx context.Context, in DNSRouteInput) (DNSRoute, error)
 	// UpdateDNSRoute applies a partial edit and returns the list as it
 	// stands afterwards. warnings carries losses the edit caused that the

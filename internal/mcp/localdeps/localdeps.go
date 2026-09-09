@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -755,7 +756,7 @@ func dnsRouteDetail(dl *dnsroute.DomainList) mcpsrv.DNSRouteDetail {
 	}
 	for _, sub := range dl.Subscriptions {
 		out.Subscriptions = append(out.Subscriptions, mcpsrv.DNSSubscription{
-			URL: sub.URL, Name: sub.Name, LastFetched: sub.LastFetched, LastCount: sub.LastCount, LastError: sub.LastError,
+			URL: redactURL(sub.URL), Name: sub.Name, LastFetched: sub.LastFetched, LastCount: sub.LastCount, LastError: sub.LastError,
 		})
 	}
 	return out
@@ -788,6 +789,37 @@ func (l *Local) findDNSList(ctx context.Context, id string) (*dnsroute.DomainLis
 		}
 	}
 	return nil, fmt.Errorf("dns route %q not found", id)
+}
+
+// ListDNSRouteDetails reads every list in full with one List call.
+func (l *Local) ListDNSRouteDetails(ctx context.Context) ([]mcpsrv.DNSRouteDetail, error) {
+	if l.c.DNSRoutes == nil {
+		return nil, errUnavailable("dns routes")
+	}
+	list, err := l.c.DNSRoutes.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]mcpsrv.DNSRouteDetail, 0, len(list))
+	for i := range list {
+		out = append(out, dnsRouteDetail(&list[i]))
+	}
+	return out, nil
+}
+
+// redactURL strips userinfo and the query from a subscription URL. Private
+// feeds carry their token there, and a read-only key must not walk away
+// with it along with the list. Host and path stay so the feed is still
+// recognisable.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
 // GetDNSRoute reads one list in full for get_dns_route.

@@ -276,6 +276,15 @@ func (f *Fake) ListDNSRoutes(context.Context) ([]mcpsrv.DNSRoute, error) {
 	return out, nil
 }
 
+func (f *Fake) ListDNSRouteDetails(context.Context) ([]mcpsrv.DNSRouteDetail, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]mcpsrv.DNSRouteDetail(nil), f.DNSRoutes...), nil
+}
+
 func (f *Fake) GetDNSRoute(_ context.Context, id string) (mcpsrv.DNSRouteDetail, error) {
 	if f.Err != nil {
 		return mcpsrv.DNSRouteDetail{}, f.Err

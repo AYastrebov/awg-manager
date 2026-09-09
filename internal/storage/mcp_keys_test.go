@@ -836,3 +836,39 @@ func TestMcpKeyStore_ScopedKeysAreWrittenAsANewerFileVersion(t *testing.T) {
 		t.Fatalf("file version = %d; a build that does not know readOnly must refuse to rewrite this file", f.Version)
 	}
 }
+
+// TestMcpKeyStore_FileVersionStaysOldWithoutScopedKeys — ревью заметило:
+// версия 2 писалась при каждом сохранении, даже почасовом Touch, и без
+// единого ключа только для чтения. Откат на прошлую сборку тогда
+// закрывал MCP для всех ключей без причины. Новый формат нужен только
+// тогда, когда в файле есть поле, которое старая сборка потеряла бы.
+func TestMcpKeyStore_FileVersionStaysOldWithoutScopedKeys(t *testing.T) {
+	dir := t.TempDir()
+	s := NewMcpKeyStore(dir)
+	if err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Create("laptop", false); err != nil {
+		t.Fatal(err)
+	}
+	var f struct {
+		Version int `json:"version"`
+	}
+	raw, _ := os.ReadFile(filepath.Join(dir, mcpKeysFile))
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	if f.Version != 1 {
+		t.Fatalf("file version = %d with only full-access keys, want 1 so an older build still reads it", f.Version)
+	}
+
+	// The moment a read-only key exists, the file must say so.
+	if _, _, err := s.Create("reader", true); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = os.ReadFile(filepath.Join(dir, mcpKeysFile))
+	_ = json.Unmarshal(raw, &f)
+	if f.Version != 2 {
+		t.Fatalf("file version = %d with a read-only key, want 2", f.Version)
+	}
+}

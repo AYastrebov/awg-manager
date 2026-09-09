@@ -2500,3 +2500,47 @@ func TestLocal_CheckSingboxDelayReportsABusyProbeAsBusy(t *testing.T) {
 		t.Fatalf("got %+v: reachable carries no information while busy and must not claim the proxy answered", got)
 	}
 }
+
+// TestLocal_ListDNSRouteDetailsIsOneListCall — для explain_route: все
+// списки целиком за один List, без Get на каждый.
+func TestLocal_ListDNSRouteDetailsIsOneListCall(t *testing.T) {
+	h := newHarness(t)
+	h.dns.lists = []dnsroute.DomainList{
+		{ID: "dl-1", Name: "A", Domains: []string{"a.example"}},
+		{ID: "hr:b", Name: "B", Backend: "hydraroute", Domains: []string{"b.example"}},
+	}
+	got, err := h.l.ListDNSRouteDetails(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[1].ID != "hr:b" || got[1].Domains[0] != "b.example" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+// TestLocal_DNSRouteDetailRedactsSubscriptionSecrets — URL подписки часто
+// несёт токен в query или userinfo. Ключ только для чтения не должен
+// уносить его вместе со списком.
+func TestLocal_DNSRouteDetailRedactsSubscriptionSecrets(t *testing.T) {
+	h := newHarness(t)
+	h.dns.lists = []dnsroute.DomainList{{
+		ID: "dl-1", Name: "A",
+		Subscriptions: []dnsroute.Subscription{
+			{URL: "https://user:s3cret@lists.example/a.txt?token=abc123&x=1", Name: "A"},
+			{URL: "https://lists.example/plain.txt", Name: "B"},
+		},
+	}}
+	got, err := h.l.GetDNSRoute(context.Background(), "dl-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u := got.Subscriptions[0].URL; strings.Contains(u, "s3cret") || strings.Contains(u, "abc123") {
+		t.Fatalf("subscription URL leaked credentials: %q", u)
+	}
+	if u := got.Subscriptions[0].URL; !strings.HasPrefix(u, "https://lists.example/a.txt") {
+		t.Fatalf("the host and path must survive redaction: %q", u)
+	}
+	if got.Subscriptions[1].URL != "https://lists.example/plain.txt" {
+		t.Fatalf("a plain URL must pass unchanged: %q", got.Subscriptions[1].URL)
+	}
+}
