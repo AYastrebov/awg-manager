@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -91,6 +93,47 @@ func NextFreePeerIP(serverAddress string, used []string) string {
 	return ""
 }
 
+// MaxPeerDescriptionRunes caps a peer description. It travels to the NDMS
+// peer comment, settings.json and the journal; a multi-megabyte value from
+// a valid key would bloat all three on a router with tens of MB of RAM.
+const MaxPeerDescriptionRunes = 64
+
+func validatePeerDescription(d string) (string, error) {
+	d = strings.TrimSpace(d)
+	if d == "" {
+		return "", fmt.Errorf("description is required — it is how the user recognises this client later")
+	}
+	if utf8.RuneCountInString(d) > MaxPeerDescriptionRunes {
+		return "", fmt.Errorf("description is longer than %d characters", MaxPeerDescriptionRunes)
+	}
+	for _, r := range d {
+		if unicode.IsControl(r) {
+			return "", fmt.Errorf("description must not contain control characters")
+		}
+	}
+	return d, nil
+}
+
+// validatePeerDNS mirrors managed.ValidatePeerDNS at the tool boundary, so
+// the model gets the refusal with the field named rather than a service
+// error. The value ends up verbatim in the client .conf: anything but IP
+// addresses is a line the user's wg-quick would execute.
+func validatePeerDNS(dns string) (string, error) {
+	if strings.TrimSpace(dns) == "" {
+		return "", nil
+	}
+	parts := strings.Split(dns, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		ip := net.ParseIP(strings.TrimSpace(p))
+		if ip == nil {
+			return "", fmt.Errorf("dns must be a comma-separated list of IP addresses; %q is not one", strings.TrimSpace(p))
+		}
+		out = append(out, ip.String())
+	}
+	return strings.Join(out, ", "), nil
+}
+
 func registerPeerTools(s *mcp.Server, d Deps) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "list_server_peers",
@@ -119,10 +162,16 @@ func registerPeerTools(s *mcp.Server, d Deps) {
 		}
 		// A peer with no description cannot be told apart from the others
 		// later, and the peer list is the only place the user sees it.
-		if strings.TrimSpace(in.Description) == "" {
-			return nil, ServerPeer{}, fmt.Errorf("description is required — it is how the user recognises this client later")
+		desc, err := validatePeerDescription(in.Description)
+		if err != nil {
+			return nil, ServerPeer{}, err
 		}
-		in.Description = strings.TrimSpace(in.Description)
+		in.Description = desc
+		dns, err := validatePeerDNS(in.DNS)
+		if err != nil {
+			return nil, ServerPeer{}, err
+		}
+		in.DNS = dns
 		if in.TunnelIP != "" {
 			in.TunnelIP = strings.TrimSpace(in.TunnelIP)
 			if _, _, err := net.ParseCIDR(in.TunnelIP); err != nil {
