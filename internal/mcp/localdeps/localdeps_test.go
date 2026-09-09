@@ -121,6 +121,7 @@ type fakeDNSRoutes struct {
 	api.DNSRouteService
 	lists   []dnsroute.DomainList
 	created dnsroute.DomainList
+	updated dnsroute.DomainList
 	enabled map[string]bool
 	deleted []string
 }
@@ -134,6 +135,31 @@ func (f *fakeDNSRoutes) Create(_ context.Context, l dnsroute.DomainList) (*dnsro
 	l.Domains = append([]string(nil), l.ManualDomains...)
 	f.lists = append(f.lists, l)
 	return &l, nil
+}
+
+// Update records the sparse payload verbatim: what the adapter leaves
+// unset is exactly what dnsroute.ServiceImpl.Update preserves.
+func (f *fakeDNSRoutes) Update(_ context.Context, l dnsroute.DomainList) (*dnsroute.DomainList, error) {
+	f.updated = l
+	for i := range f.lists {
+		if f.lists[i].ID != l.ID {
+			continue
+		}
+		merged := f.lists[i]
+		if l.Name != "" {
+			merged.Name = l.Name
+		}
+		if l.ManualDomains != nil {
+			merged.ManualDomains = l.ManualDomains
+			merged.Domains = l.ManualDomains
+		}
+		if l.Routes != nil {
+			merged.Routes = l.Routes
+		}
+		f.lists[i] = merged
+		return &merged, nil
+	}
+	return nil, errNotFound(l.ID)
 }
 
 func (f *fakeDNSRoutes) List(context.Context) ([]dnsroute.DomainList, error) {
@@ -1333,5 +1359,84 @@ func TestLocal_SetClientRouteEnabled(t *testing.T) {
 
 	if _, err := h.l.SetClientRouteEnabled(ctx, "192.168.1.99", true); err == nil {
 		t.Error("an IP with no route must be an error, not a silent no-op")
+	}
+}
+
+// TestLocal_UpdateDNSRouteSendsOnlyWhatChanged — dnsroute.Update трактует
+// нулевое значение как «поле не прислали» и сохраняет прежнее. Значит
+// адаптер обязан отправлять именно разреженную запись: пришли он список
+// целиком, любое непереносимое через MCP поле (подписки, excludes) было
+// бы затёрто нулём.
+func TestLocal_UpdateDNSRouteSendsOnlyWhatChanged(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.dns.lists = []dnsroute.DomainList{{
+		ID: "dl-1", Name: "Video", Enabled: true,
+		Domains: []string{"youtube.com"}, ManualDomains: []string{"youtube.com"},
+		Excludes: []string{"ads.example"}, Backend: "ndms",
+		Subscriptions: []dnsroute.Subscription{{URL: "https://example.invalid/list"}},
+		Routes:        []dnsroute.RouteTarget{{TunnelID: "tn-1"}},
+	}}
+
+	if _, _, err := h.l.UpdateDNSRoute(ctx, mcpsrv.DNSRouteUpdate{RouteID: "dl-1", Name: "Видео"}); err != nil {
+		t.Fatal(err)
+	}
+	sent := h.dns.updated
+	if sent.ID != "dl-1" || sent.Name != "Видео" {
+		t.Fatalf("sent = %+v", sent)
+	}
+	if sent.ManualDomains != nil || sent.Routes != nil || sent.Subscriptions != nil || sent.Excludes != nil || sent.Backend != "" {
+		t.Fatalf("a rename must send nothing but the name; the service preserves the rest: %+v", sent)
+	}
+
+	if _, _, err := h.l.UpdateDNSRoute(ctx, mcpsrv.DNSRouteUpdate{RouteID: "dl-1", Domains: []string{"a.example"}}); err != nil {
+		t.Fatal(err)
+	}
+	sent = h.dns.updated
+	if len(sent.ManualDomains) != 1 || sent.ManualDomains[0] != "a.example" {
+		t.Fatalf("domains must go into ManualDomains, got %+v", sent)
+	}
+	if sent.Domains != nil {
+		t.Errorf("Domains is derived by the service and must not be sent: %v", sent.Domains)
+	}
+	if sent.Name != "" {
+		t.Errorf("an unchanged name must not be sent: %q", sent.Name)
+	}
+
+	if !h.bus.has(events.ResourceRoutingDnsRoutes) {
+		t.Errorf("published %v, want a dns-routes invalidation", h.bus.pub)
+	}
+	if _, _, err := h.l.UpdateDNSRoute(ctx, mcpsrv.DNSRouteUpdate{RouteID: "nope", Name: "x"}); err == nil {
+		t.Error("unknown id must be an error")
+	}
+}
+
+// TestLocal_UpdateDNSRouteWarnsAboutDroppedTargets — tunnelId задаёт ровно
+// одну цель, поэтому у списка с несколькими целями остальные пропадают.
+func TestLocal_UpdateDNSRouteWarnsAboutDroppedTargets(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.dns.lists = []dnsroute.DomainList{{
+		ID: "dl-multi", Name: "Split", Enabled: true,
+		Routes: []dnsroute.RouteTarget{{TunnelID: "tn-1"}, {TunnelID: "tn-2"}},
+	}}
+
+	_, warnings, err := h.l.UpdateDNSRoute(ctx, mcpsrv.DNSRouteUpdate{RouteID: "dl-multi", TunnelID: "tn-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) == 0 {
+		t.Fatal("dropping a route target must warn")
+	}
+	if len(h.dns.updated.Routes) != 1 || h.dns.updated.Routes[0].TunnelID != "tn-2" {
+		t.Fatalf("sent routes = %+v", h.dns.updated.Routes)
+	}
+
+	_, warnings, err = h.l.UpdateDNSRoute(ctx, mcpsrv.DNSRouteUpdate{RouteID: "dl-multi", Name: "Split 2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("a rename touches no targets and must not warn: %v", warnings)
 	}
 }

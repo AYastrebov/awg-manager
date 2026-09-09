@@ -721,6 +721,51 @@ func (l *Local) AddDNSRoute(ctx context.Context, in mcpsrv.DNSRouteInput) (mcpsr
 	return dnsRoute(created), nil
 }
 
+// UpdateDNSRoute applies a partial edit. Only the fields the caller
+// actually changed are sent: dnsroute.Update reads a zero value as "not
+// sent" and restores it from the stored list, so a sparse payload is what
+// keeps subscriptions, excludes and the backend intact. Sending a full
+// record built from mcp.DNSRoute would wipe every field MCP cannot carry.
+func (l *Local) UpdateDNSRoute(ctx context.Context, in mcpsrv.DNSRouteUpdate) (mcpsrv.DNSRoute, []string, error) {
+	if l.c.DNSRoutes == nil {
+		return mcpsrv.DNSRoute{}, nil, errUnavailable("dns routes")
+	}
+	existing, err := l.c.DNSRoutes.Get(ctx, in.RouteID)
+	if err != nil {
+		return mcpsrv.DNSRoute{}, nil, err
+	}
+	if existing == nil {
+		return mcpsrv.DNSRoute{}, nil, fmt.Errorf("dns route %q not found", in.RouteID)
+	}
+
+	patch := dnsroute.DomainList{ID: in.RouteID, Name: in.Name}
+	if in.Domains != nil {
+		// ManualDomains only: the service recomputes Domains (and Subnets)
+		// from it and merges in whatever the subscriptions resolved to.
+		patch.ManualDomains = in.Domains
+	}
+	var warnings []string
+	if in.TunnelID != "" {
+		if n := len(existing.Routes); n > 1 {
+			warnings = append(warnings, fmt.Sprintf(
+				"the list routed to %d targets; they were replaced by the single tunnel %q — re-add the others from the web UI if that was not intended", n, in.TunnelID))
+		}
+		patch.Routes = []dnsroute.RouteTarget{{TunnelID: in.TunnelID}}
+	}
+
+	updated, err := l.c.DNSRoutes.Update(ctx, patch)
+	if err != nil {
+		l.dnsLog.Warn("update", existing.Name, "Failed to update DNS route list (MCP): "+err.Error())
+		return mcpsrv.DNSRoute{}, nil, err
+	}
+	if updated == nil {
+		return mcpsrv.DNSRoute{}, nil, fmt.Errorf("dns route update returned no list")
+	}
+	l.dnsLog.Info("update", updated.Name, "DNS route list updated (MCP)")
+	l.publish(events.ResourceRoutingDnsRoutes, "mcp-update")
+	return dnsRoute(updated), warnings, nil
+}
+
 // SetDNSRouteEnabled flips one list and reads it back, so the caller
 // sees the state the change produced rather than the one it asked for.
 func (l *Local) SetDNSRouteEnabled(ctx context.Context, id string, enabled bool) (mcpsrv.DNSRoute, error) {

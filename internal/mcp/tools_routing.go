@@ -38,6 +38,13 @@ type dnsRoutesOut struct {
 // setRouteEnabledIn carries an explicit enabled flag: there is no toggle
 // semantics on purpose, so an agent retrying after a timeout cannot flip
 // a list back to where it started.
+// updateDNSOut is the edited list plus anything the edit cost that the
+// caller did not ask for.
+type updateDNSOut struct {
+	DNSRoute
+	Warnings []string `json:"warnings,omitempty" jsonschema:"non-fatal losses the edit caused — show these to the user"`
+}
+
 type setRouteEnabledIn struct {
 	RouteID string `json:"routeId" jsonschema:"list id from the corresponding list_* tool"`
 	Enabled bool   `json:"enabled" jsonschema:"true turns the list on, false turns it off"`
@@ -187,6 +194,37 @@ func registerRoutingTools(s *mcp.Server, d Deps) {
 		}
 		out, err := d.AddDNSRoute(ctx, in)
 		return nil, out, err
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "update_dns_route",
+		Description: "Edit an existing domain routing list in place: rename it, replace its domains, or send it through a different tunnel. " +
+			"Omitted fields are left untouched, and everything MCP cannot express (subnets, excludes, subscriptions, backend) survives — " +
+			"which is why this is the way to change a list, not remove_dns_route followed by add_dns_route. Check the returned warnings.",
+		Annotations: safeWrite("Update DNS route", true),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in DNSRouteUpdate) (*mcp.CallToolResult, updateDNSOut, error) {
+		if in.RouteID == "" {
+			return nil, updateDNSOut{}, fmt.Errorf("routeId is required")
+		}
+		if strings.TrimSpace(in.Name) == "" && in.Domains == nil && in.TunnelID == "" {
+			return nil, updateDNSOut{}, fmt.Errorf("nothing to update: pass at least one of name, domains or tunnelId")
+		}
+		if in.Domains != nil {
+			if err := validateDomains(in.Domains); err != nil {
+				return nil, updateDNSOut{}, err
+			}
+		}
+		if in.TunnelID != "" {
+			if err := requireTunnelID(in.TunnelID); err != nil {
+				return nil, updateDNSOut{}, err
+			}
+		}
+		in.Name = strings.TrimSpace(in.Name)
+		updated, warnings, err := d.UpdateDNSRoute(ctx, in)
+		if err != nil {
+			return nil, updateDNSOut{}, err
+		}
+		return nil, updateDNSOut{DNSRoute: updated, Warnings: warnings}, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{

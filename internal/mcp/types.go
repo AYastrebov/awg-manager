@@ -178,6 +178,18 @@ type DNSRouteInput struct {
 	TunnelID string   `json:"tunnelId" jsonschema:"target tunnel id from list_tunnels"`
 }
 
+// DNSRouteUpdate is a partial edit of one list: an omitted field is left
+// alone. There is deliberately no way to clear a field — dnsroute.Update
+// itself treats a zero value as "not sent", and inventing a clear here
+// would mean a payload that empties Name or the domains on any caller who
+// simply forgot a field. Deleting is remove_dns_route's job.
+type DNSRouteUpdate struct {
+	RouteID  string   `json:"routeId" jsonschema:"list id from list_dns_routes"`
+	Name     string   `json:"name,omitempty" jsonschema:"new list name; omit to keep the current one"`
+	Domains  []string `json:"domains,omitempty" jsonschema:"replaces the list's own (manual) domains; omit to keep them. Domains pulled in by subscriptions are unaffected"`
+	TunnelID string   `json:"tunnelId,omitempty" jsonschema:"send the list through this tunnel instead; omit to keep the current target"`
+}
+
 type StaticRoute struct {
 	ID       string   `json:"id"`
 	Name     string   `json:"name"`

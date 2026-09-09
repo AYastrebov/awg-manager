@@ -245,6 +245,41 @@ func (f *Fake) AddDNSRoute(_ context.Context, in mcpsrv.DNSRouteInput) (mcpsrv.D
 	return r.Summary(), nil
 }
 
+func (f *Fake) UpdateDNSRoute(_ context.Context, in mcpsrv.DNSRouteUpdate) (mcpsrv.DNSRoute, []string, error) {
+	if f.Err != nil {
+		return mcpsrv.DNSRoute{}, nil, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.DNSRoutes {
+		if f.DNSRoutes[i].ID != in.RouteID {
+			continue
+		}
+		r := &f.DNSRoutes[i]
+		var warnings []string
+		if in.Name != "" {
+			r.Name = in.Name
+		}
+		if in.Domains != nil {
+			// Mirrors dnsroute.Update: the manual entries are replaced and
+			// the expanded list is recomputed from them.
+			r.ManualDomains = in.Domains
+			r.Domains = in.Domains
+		}
+		if in.TunnelID != "" {
+			if _, err := f.findTunnel(in.TunnelID); err != nil {
+				return mcpsrv.DNSRoute{}, nil, err
+			}
+			if len(r.Routes) > 1 {
+				warnings = append(warnings, fmt.Sprintf("the list had %d route targets; they were replaced by tunnel %q", len(r.Routes), in.TunnelID))
+			}
+			r.Routes = []mcpsrv.RouteTarget{{TunnelID: in.TunnelID}}
+		}
+		return r.Summary(), warnings, nil
+	}
+	return mcpsrv.DNSRoute{}, nil, fmt.Errorf("dns route %q not found", in.RouteID)
+}
+
 func (f *Fake) SetDNSRouteEnabled(_ context.Context, id string, enabled bool) (mcpsrv.DNSRoute, error) {
 	if f.Err != nil {
 		return mcpsrv.DNSRoute{}, f.Err

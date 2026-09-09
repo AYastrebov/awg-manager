@@ -30,6 +30,11 @@ type Deps interface {
 	// Domains; implementations must not truncate them here.
 	GetDNSRoute(ctx context.Context, id string) (DNSRouteDetail, error)
 	AddDNSRoute(ctx context.Context, in DNSRouteInput) (DNSRoute, error)
+	// UpdateDNSRoute applies a partial edit and returns the list as it
+	// stands afterwards. warnings carries losses the edit caused that the
+	// caller did not ask for — replacing a multi-target list's routes with
+	// the single tunnel the input names.
+	UpdateDNSRoute(ctx context.Context, in DNSRouteUpdate) (updated DNSRoute, warnings []string, err error)
 	// SetDNSRouteEnabled toggles a list on or off and returns it as it
 	// stands afterwards. Reversible: the record survives either way.
 	SetDNSRouteEnabled(ctx context.Context, id string, enabled bool) (DNSRoute, error)
