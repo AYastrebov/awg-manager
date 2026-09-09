@@ -465,14 +465,18 @@
 				{:else if hydraStatusLoading}
 					<Button variant="secondary" size="sm" disabled>Ожидание…</Button>
 				{:else}
+					<!-- HydraRoute ставится не отсюда: своего установщика у нас нет, ссылка ведёт
+					     на инструкцию проекта. Кнопка поэтому и подписана иначе, и выглядит иначе,
+					     чем «Установить» у остальных интеграций — те действительно ставят. -->
 					<Button
 						variant="outline-primary"
 						size="sm"
 						href="https://github.com/Ground-Zerro/HydraRoute"
 						target="_blank"
 						rel="noopener noreferrer"
+						title="Инструкция по установке HydraRoute на GitHub (откроется в новой вкладке)"
 					>
-						Установить
+						Инструкция →
 					</Button>
 				{/if}
 			</div>
