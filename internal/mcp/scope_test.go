@@ -157,8 +157,39 @@ func TestScope_ReadOnlySetMatchesTheAnnotations(t *testing.T) {
 	for _, tool := range tools.Tools {
 		annotated := tool.Annotations != nil && tool.Annotations.ReadOnlyHint
 		listed := mcpsrv.IsReadOnlyTool(tool.Name)
+		// A tool that changes nothing but hands out credentials is
+		// read-only by annotation and still off-limits to a read-only
+		// key; the exception list is the only place that is allowed.
+		if mcpsrv.ExportsCredentials(tool.Name) {
+			if !annotated || listed {
+				t.Errorf("%s: a credential exporter must be annotated read-only and kept OUT of the read-only scope", tool.Name)
+			}
+			continue
+		}
 		if annotated != listed {
 			t.Errorf("%s: readOnlyHint=%v but the scope list says read-only=%v", tool.Name, annotated, listed)
+		}
+	}
+}
+
+// TestScope_ReadOnlyKeyCannotExportCredentials — ревью нашло: набор
+// читающих инструментов включал экспорт конфигов, а они отдают приватные
+// ключи. Пользователю при этом обещали ключ, который «ничего не может
+// изменить», и он передавал его агенту с ограниченным доверием — который
+// этим ключом мог получить рабочий VPN-доступ откуда угодно.
+func TestScope_ReadOnlyKeyCannotExportCredentials(t *testing.T) {
+	s := scopedSession(t, true)
+	for name, args := range map[string]map[string]any{
+		"export_tunnel_config":   {"tunnelId": "tn-1"},
+		"get_server_peer_config": {"serverId": "Wireguard0", "publicKey": "pub-laptop="},
+	} {
+		res, _ := callTool(t, s, name, args)
+		if !res.IsError {
+			t.Errorf("%s handed out a private key on a read-only key", name)
+			continue
+		}
+		if txt := toolText(res); !strings.Contains(strings.ToLower(txt), "read-only") {
+			t.Errorf("%s: the refusal must name the cause, got %q", name, txt)
 		}
 	}
 }

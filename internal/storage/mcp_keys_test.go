@@ -1,7 +1,9 @@
 package storage
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -234,7 +236,9 @@ func TestMcpKeyStore_TouchThrottled(t *testing.T) {
 // уходит в read-only, файл остаётся как был.
 func TestMcpKeyStore_NewerFileVersionIsReadOnly(t *testing.T) {
 	dataDir := t.TempDir()
-	raw := []byte(`{"version":2,"keys":[{"id":"abc","name":"laptop","hash":"00","createdAt":"2026-09-01T00:00:00Z"}]}`)
+	// One past the current format, whatever it is: the guard is about
+	// "newer than me", not about a particular number.
+	raw := []byte(fmt.Sprintf(`{"version":%d,"keys":[{"id":"abc","name":"laptop","hash":"00","createdAt":"2026-09-01T00:00:00Z"}]}`, mcpKeysFileVersion+1))
 	if err := os.WriteFile(filepath.Join(dataDir, mcpKeysFile), raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -800,5 +804,35 @@ func TestMcpKeyStore_KeysWrittenBeforeScopesStayFull(t *testing.T) {
 	}
 	if keys[0].ReadOnly {
 		t.Fatal("a key stored before scopes existed must keep full access, not silently lose it")
+	}
+}
+
+// TestMcpKeyStore_ScopedKeysAreWrittenAsANewerFileVersion — ревью нашло:
+// поле readOnly добавили, а версию файла не подняли. Старая сборка,
+// прочитав такой файл как «свой», при первом же сохранении стирала бы
+// поле, и после обновления обратно ключ только для чтения становился
+// полноправным. Версия — единственная защита от этого: старая сборка
+// уходит в read-only на файле новее себя.
+func TestMcpKeyStore_ScopedKeysAreWrittenAsANewerFileVersion(t *testing.T) {
+	dir := t.TempDir()
+	s := NewMcpKeyStore(dir)
+	if err := s.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Create("reader", true); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, mcpKeysFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	if f.Version < 2 {
+		t.Fatalf("file version = %d; a build that does not know readOnly must refuse to rewrite this file", f.Version)
 	}
 }

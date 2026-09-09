@@ -56,7 +56,13 @@ type McpKey struct {
 	LastUsedAt time.Time `json:"lastUsedAt,omitzero"`
 }
 
-const mcpKeysFileVersion = 1
+// mcpKeysFileVersion is bumped whenever a field is added that an older
+// build would silently drop on its next save. Version 2 added readOnly:
+// an older build reading it as version 1 would rewrite the file without
+// the field on its first Touch, and the key would come back full-access
+// after the next upgrade. The version check turns that build read-only
+// instead (see Load).
+const mcpKeysFileVersion = 2
 
 type mcpKeysFileV1 struct {
 	// Version is the on-disk format. 0 (absent) and 1 are the current

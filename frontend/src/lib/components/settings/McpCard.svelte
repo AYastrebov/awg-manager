@@ -234,7 +234,7 @@
 				<span class="setting-description">Только чтение</span>
 			</label>
 			<span class="setting-description text-xs">
-				Такой ключ читает состояние, логи и маршруты, но не может ничего изменить на роутере.
+				Такой ключ читает состояние, логи и маршруты, но не может ничего изменить на роутере и не выдаёт конфиги с приватными ключами.
 			</span>
 			{#if createError}<span class="text-error text-sm">{createError}</span>{/if}
 		</div>
