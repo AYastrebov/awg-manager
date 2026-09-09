@@ -30,6 +30,8 @@ type Fake struct {
 	// the latency a probe answers with (0 = the proxy stayed silent).
 	SingboxTunnels []mcpsrv.SingboxTunnel
 	Delays         map[string]int
+	// BusyDelays marks tags whose probe is already in flight.
+	BusyDelays map[string]bool
 	// Router models the sing-box router's applied rules and its draft.
 	// Applied is what traffic follows; Draft is nil until an edit stages
 	// one, exactly as the real staging slot behaves.
@@ -834,7 +836,10 @@ func (f *Fake) CheckSingboxDelay(_ context.Context, tag string) (mcpsrv.SingboxD
 		if t.Tag != tag {
 			continue
 		}
-		// Mirrors DelayChecker.CheckOne: a silent proxy answers 0, which
+		if f.BusyDelays[tag] {
+			return mcpsrv.SingboxDelay{Tag: tag, Busy: true}, nil
+		}
+		// Mirrors DelayChecker.Probe: a silent proxy answers 0, which
 		// is why Reachable is carried separately.
 		ms := f.Delays[tag]
 		return mcpsrv.SingboxDelay{Tag: tag, Reachable: ms > 0, DelayMs: ms}, nil

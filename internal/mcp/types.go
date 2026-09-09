@@ -81,8 +81,12 @@ type SingboxStaging struct {
 // reads as an excellent result.
 type SingboxDelay struct {
 	Tag       string `json:"tag"`
-	Reachable bool   `json:"reachable" jsonschema:"false means the proxy did not answer in time; delayMs carries no information then"`
+	Reachable bool   `json:"reachable" jsonschema:"false means the proxy did not answer in time; delayMs carries no information then. Meaningless when busy is true"`
 	DelayMs   int    `json:"delayMs" jsonschema:"round-trip in milliseconds, meaningless when reachable is false"`
+	// Busy means a probe for this proxy was already running (the periodic
+	// sweep shares the prober) and nothing was measured by this call. It
+	// is neither reachable nor unreachable: retry in a few seconds.
+	Busy bool `json:"busy" jsonschema:"true means no probe ran because one was already in progress — retry in a few seconds; reachable carries no information then"`
 }
 
 type SystemStatus struct {

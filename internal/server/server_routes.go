@@ -36,7 +36,9 @@ func (s singboxOperatorWithDelay) CheckDelay(ctx context.Context, tag string) (i
 	if s.delay == nil {
 		return 0, fmt.Errorf("sing-box delay checker is not available on this build")
 	}
-	return s.delay.CheckOne(ctx, tag)
+	// Probe, not CheckOne: the checker is shared with the periodic sweep,
+	// and CheckOne answers 0 both for "timed out" and "already probing".
+	return s.delay.Probe(ctx, tag)
 }
 
 // routeHandlers держит handlers, разделяемые секциями registerRoutes.

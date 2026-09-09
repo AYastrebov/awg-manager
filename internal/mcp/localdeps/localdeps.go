@@ -52,7 +52,8 @@ type (
 		ListTunnels(ctx context.Context) ([]singbox.TunnelInfo, error)
 		// CheckDelay probes one proxy tag. It answers 0 ms for a proxy
 		// that stayed silent, which is why the caller keeps Reachable
-		// separate. Wired to singbox.DelayChecker.CheckOne.
+		// separate, and singbox.ErrProbeInFlight when a probe was already
+		// running, which is why Busy exists. Wired to DelayChecker.Probe.
 		CheckDelay(ctx context.Context, tag string) (int, error)
 	}
 	// ManagedServers is the subset of *managed.Service the peer tools use.
@@ -1751,6 +1752,12 @@ func (l *Local) CheckSingboxDelay(ctx context.Context, tag string) (mcpsrv.Singb
 		return mcpsrv.SingboxDelay{}, fmt.Errorf("sing-box proxy %q not found (use list_singbox_tunnels)", tag)
 	}
 	ms, err := l.c.Singbox.CheckDelay(ctx, tag)
+	if errors.Is(err, singbox.ErrProbeInFlight) {
+		// The periodic sweep shares the prober and holds a slow proxy's
+		// tag for several seconds; nothing was measured here, so neither
+		// verdict applies.
+		return mcpsrv.SingboxDelay{Tag: tag, Busy: true}, nil
+	}
 	if err != nil {
 		return mcpsrv.SingboxDelay{}, err
 	}

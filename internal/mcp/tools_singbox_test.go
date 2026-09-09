@@ -1,6 +1,7 @@
 package mcp_test
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -79,5 +80,27 @@ func TestTools_SingboxDelayCheckRejectsUnknownTag(t *testing.T) {
 	}
 	if res, _ := callTool(t, s, "singbox_delay_check", map[string]any{}); !res.IsError {
 		t.Error("a missing tag must be a tool error")
+	}
+}
+
+// TestTools_SingboxDelayCheckBusyIsNotUnreachable — «проба уже идёт» и
+// «не ответил» должны быть разными ответами: по второму агент скажет
+// пользователю, что прокси упал.
+func TestTools_SingboxDelayCheckBusyIsNotUnreachable(t *testing.T) {
+	s, fake := newTestSession(t)
+	fake.BusyDelays = map[string]bool{"vless-nl": true}
+
+	res, out := callTool(t, s, "singbox_delay_check", map[string]any{"tag": "vless-nl"})
+	if res.IsError {
+		t.Fatalf("busy is a result, not an error: %s", toolText(res))
+	}
+	if out["busy"] != true {
+		t.Fatalf("busy = %v", out["busy"])
+	}
+	if out["reachable"] != false {
+		t.Fatalf("reachable = %v, want false with busy=true — no probe ran", out["reachable"])
+	}
+	if txt := strings.ToLower(toolText(res)); !strings.Contains(txt, "retry") {
+		t.Fatalf("the text must tell the model to retry rather than conclude: %q", txt)
 	}
 }

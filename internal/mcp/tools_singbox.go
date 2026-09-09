@@ -37,14 +37,22 @@ func registerSingboxTools(s *mcp.Server, d Deps) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "singbox_delay_check",
 		Description: "Measure one sing-box proxy's latency through the running engine. reachable=false means it did not answer in time — " +
-			"a single silent check can be transient, so repeat it before telling the user the proxy is down. sing-box must be running.",
+			"a single silent check can be transient, so repeat it before telling the user the proxy is down. busy=true means nothing was measured because a probe was already running: retry in a few seconds. sing-box must be running.",
 		Annotations: readOnly("Sing-box delay check"),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in singboxTagIn) (*mcp.CallToolResult, SingboxDelay, error) {
 		if strings.TrimSpace(in.Tag) == "" {
 			return nil, SingboxDelay{}, fmt.Errorf("tag is required (use list_singbox_tunnels)")
 		}
 		out, err := d.CheckSingboxDelay(ctx, strings.TrimSpace(in.Tag))
-		return nil, out, err
+		if err != nil {
+			return nil, SingboxDelay{}, err
+		}
+		if out.Busy {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{
+				Text: "A probe for this proxy was already in progress, so nothing was measured; this says nothing about whether the proxy works. Retry in a few seconds.",
+			}}}, out, nil
+		}
+		return nil, out, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{

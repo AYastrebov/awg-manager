@@ -1586,6 +1586,7 @@ func TestLocal_ResolveDomainWithoutAResolverSaysSo(t *testing.T) {
 type fakeSingboxOp struct {
 	tunnels []singbox.TunnelInfo
 	delays  map[string]int
+	busy    map[string]bool
 	asked   []string
 	err     error
 }
@@ -1599,6 +1600,9 @@ func (f *fakeSingboxOp) ListTunnels(context.Context) ([]singbox.TunnelInfo, erro
 }
 func (f *fakeSingboxOp) CheckDelay(_ context.Context, tag string) (int, error) {
 	f.asked = append(f.asked, tag)
+	if f.busy[tag] {
+		return 0, singbox.ErrProbeInFlight
+	}
 	return f.delays[tag], nil
 }
 
@@ -2473,5 +2477,26 @@ func TestLocal_DiagnosticsResultWhileRunningSaysSo(t *testing.T) {
 	}
 	if got.Problems == nil {
 		t.Fatal("problems must be an empty list, not null, so the shape stays stable")
+	}
+}
+
+// TestLocal_CheckSingboxDelayReportsABusyProbeAsBusy — ревью нашло: MCP
+// делит проверяющий задержку с периодическим обходом, и пока тот держит
+// тег занятым, ответ 0 читался как «не ответил». Живой прокси
+// объявлялся упавшим. Занятость — отдельное состояние, а не молчание.
+func TestLocal_CheckSingboxDelayReportsABusyProbeAsBusy(t *testing.T) {
+	op := singboxHarness()
+	op.busy = map[string]bool{"vless-nl": true}
+	l := New(Config{Singbox: op})
+
+	got, err := l.CheckSingboxDelay(context.Background(), "vless-nl")
+	if err != nil {
+		t.Fatalf("a busy probe is a result to retry, not an error: %v", err)
+	}
+	if !got.Busy {
+		t.Fatalf("got %+v, want busy=true", got)
+	}
+	if got.Reachable {
+		t.Fatalf("got %+v: reachable carries no information while busy and must not claim the proxy answered", got)
 	}
 }
