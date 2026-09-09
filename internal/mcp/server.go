@@ -21,6 +21,8 @@ func NewServer(deps Deps, version string) *mcp.Server {
 	}, &mcp.ServerOptions{
 		Instructions: "Tools manage AmneziaWG/WireGuard tunnels and routing on a Keenetic router via awg-manager. " +
 			"Tunnel ids come from list_tunnels. Writes are reversible except remove_dns_route and remove_static_route, which delete a routing list permanently — MCP cannot restore it. " +
+			"To stop a routing list from applying, use set_dns_route_enabled / set_static_route_enabled / set_client_route_enabled; to change one, use update_dns_route. Removal is for lists the user wants gone for good. " +
+			"list_dns_routes truncates long domain lists: use get_dns_route or explain_route before telling the user a domain is not routed. " +
 			"Other destructive operations (delete tunnel, backup restore, system update) are not exposed.",
 	})
 	registerSystemTools(s, deps)
