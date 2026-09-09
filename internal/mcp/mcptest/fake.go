@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hoaxisr/awg-manager/internal/managed/peerip"
+	"github.com/hoaxisr/awg-manager/internal/managed"
 	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
 )
 
@@ -798,9 +798,11 @@ func (f *Fake) AddServerPeer(_ context.Context, in mcpsrv.AddPeerInput) (mcpsrv.
 		for _, p := range peers {
 			used = append(used, p.TunnelIP)
 		}
-		ip = peerip.NextFree(f.ServerAddresses[in.ServerID], used)
+		// Mirrors managed.Service.AddPeer: the same allocator, the same
+		// typed error when the subnet is exhausted.
+		ip = managed.NextFreePeerIP(f.ServerAddresses[in.ServerID], used)
 		if ip == "" {
-			return mcpsrv.ServerPeer{}, fmt.Errorf("no free address left in the server subnet")
+			return mcpsrv.ServerPeer{}, managed.ErrNoFreePeerIP
 		}
 	}
 	for _, p := range peers {

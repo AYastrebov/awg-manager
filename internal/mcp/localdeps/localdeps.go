@@ -25,7 +25,6 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/events"
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/managed"
-	"github.com/hoaxisr/awg-manager/internal/managed/peerip"
 	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
 	"github.com/hoaxisr/awg-manager/internal/monitoring"
 	"github.com/hoaxisr/awg-manager/internal/ndms"
@@ -1504,31 +1503,23 @@ func (l *Local) ListServerPeers(ctx context.Context, serverID string) ([]mcpsrv.
 	return out, nil
 }
 
-// AddServerPeer creates a client. When the caller named no address, one
-// is allocated from the server's own subnet here rather than left to the
-// model: an invented address either collides or lands outside the subnet,
-// and the second kind produces a peer that looks fine and never connects.
+// AddServerPeer creates a client. An empty TunnelIP is passed through as
+// is: managed.AddPeer allocates the first free address in the server's
+// subnet itself, so MCP never has to pick one — an address invented by a
+// model either collides or lands outside the subnet, and the second kind
+// produces a peer that looks fine and never connects.
 func (l *Local) AddServerPeer(ctx context.Context, in mcpsrv.AddPeerInput) (mcpsrv.ServerPeer, error) {
-	server, err := l.managedServer(ctx, in.ServerID)
-	if err != nil {
+	if _, err := l.managedServer(ctx, in.ServerID); err != nil {
 		return mcpsrv.ServerPeer{}, err
 	}
-	tunnelIP := in.TunnelIP
-	if tunnelIP == "" {
-		used := make([]string, 0, len(server.Peers))
-		for _, p := range server.Peers {
-			used = append(used, p.TunnelIP)
-		}
-		tunnelIP = peerip.NextFree(server.Address, used)
-		if tunnelIP == "" {
-			return mcpsrv.ServerPeer{}, fmt.Errorf("no free address left in the subnet of server %q — ask the user which address to use", in.ServerID)
-		}
-	}
 	created, err := l.c.Managed.AddPeer(ctx, in.ServerID, managed.AddPeerRequest{
-		Description: in.Description, TunnelIP: tunnelIP, DNS: in.DNS,
+		Description: in.Description, TunnelIP: in.TunnelIP, DNS: in.DNS,
 	})
 	if err != nil {
 		l.serverLog.Warn("add-peer", in.Description, "Failed to add server peer (MCP): "+err.Error())
+		if errors.Is(err, managed.ErrNoFreePeerIP) {
+			return mcpsrv.ServerPeer{}, fmt.Errorf("%w of %q — ask the user which address to use", err, in.ServerID)
+		}
 		return mcpsrv.ServerPeer{}, err
 	}
 	if created == nil {

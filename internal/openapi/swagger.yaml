@@ -256,6 +256,9 @@ definitions:
         example: 8.8.8.8
         type: string
       tunnelIP:
+        description: |-
+          TunnelIP is optional: when empty, the first free host address in the
+          server's subnet is allocated.
         example: 10.10.0.2/32
         type: string
     type: object

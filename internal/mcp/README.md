@@ -42,8 +42,9 @@ This check is cheap and it is the only proof the test can catch anything.
 
 ## The fake must not agree with you
 
-`mcptest.Fake` exists so tool tests run on macOS and in `cmd/mcp-dev`. It is
-worth exactly as much as its fidelity to the real service. Before writing a
+`mcptest.Fake` exists so tool tests run without a router and `cmd/mcp-dev`
+runs without one. It is worth exactly as much as its fidelity to the real
+service. Before writing a
 fake method, read the real one and copy its semantics, and cite the source in
 a comment so the next reader can re-check:
 
@@ -188,28 +189,23 @@ with exactly this mistake and cost a CI round trip.
 
 ## Testing
 
-`internal/mcp` and `internal/mcp/mcptest` run natively:
+On Linux the whole tree runs natively:
 
 ```
-go test ./internal/mcp/ ./internal/mcp/mcptest/ -count=1
+go test ./internal/mcp/... -count=1
 ```
 
-`internal/mcp/localdeps` does not build on macOS (transitive Linux syscalls).
-Typecheck it with `GOOS=linux go vet ./internal/mcp/...` and RUN it in a
-container:
+None of it builds on macOS: `localdeps` wraps the daemon's services and the
+fake imports `internal/managed` for the peer address allocator, and both pull
+in Linux syscalls transitively. Typecheck with `GOOS=linux go vet
+./internal/mcp/...` and RUN the tests in a container:
 
 ```
 docker run --rm -v "$PWD":/src -w /src golang:1.27rc1 go test ./internal/mcp/... -count=1
 ```
 
-Do not report the adapter tests as passing if the container did not run. Say
-they were typechecked only.
-
-A helper the fake shares with the adapter (the peer address allocator, for
-one) has to live in a package that builds on macOS, or the fake stops
-building there and takes every tool test with it. `internal/managed` does
-not (it pulls in `syscall.Uname`); the leaf `internal/managed/peerip` does.
-Check with `GOOS=darwin go build ./internal/mcp/... ` before importing.
+Do not report the tests as passing if the container did not run. Say they
+were typechecked only.
 
 ## Tell the model about the tool
 

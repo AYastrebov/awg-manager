@@ -1766,9 +1766,27 @@ func (f *fakeManaged) AddPeer(_ context.Context, id string, req managed.AddPeerR
 		return nil, f.addErr
 	}
 	f.addedTo, f.added = id, req
+	tunnelIP := req.TunnelIP
+	if tunnelIP == "" {
+		// Mirrors managed.Service.AddPeer: an empty address means "allocate
+		// the first free one", and a subnet with none left is ErrNoFreePeerIP.
+		for i := range f.servers {
+			if f.servers[i].InterfaceName != id {
+				continue
+			}
+			used := make([]string, 0, len(f.servers[i].Peers))
+			for _, p := range f.servers[i].Peers {
+				used = append(used, p.TunnelIP)
+			}
+			tunnelIP = managed.NextFreePeerIP(f.servers[i].Address, used)
+		}
+		if tunnelIP == "" {
+			return nil, managed.ErrNoFreePeerIP
+		}
+	}
 	peer := storage.ManagedPeer{
 		PublicKey: "pub-new=", PrivateKey: "secret-private", PresharedKey: "secret-psk",
-		Description: req.Description, TunnelIP: req.TunnelIP, DNS: req.DNS, Enabled: true,
+		Description: req.Description, TunnelIP: tunnelIP, DNS: req.DNS, Enabled: true,
 	}
 	for i := range f.servers {
 		if f.servers[i].InterfaceName == id {
@@ -1845,10 +1863,11 @@ func TestLocal_ListServerPeersCarriesNoKeys(t *testing.T) {
 	}
 }
 
-// TestLocal_AddServerPeerAllocatesFromTheServerSubnet — адрес считается
-// от адреса самого сервера, а не от произвольной сети: пир в чужой
-// подсети создастся и просто не будет работать.
-func TestLocal_AddServerPeerAllocatesFromTheServerSubnet(t *testing.T) {
+// TestLocal_AddServerPeerLeavesAllocationToTheService — ревью нашло третью
+// копию правила «первый свободный адрес» в слое инструментов. Правило
+// одно, в managed.AddPeer: адаптер отдаёт пустой TunnelIP как есть и
+// переводит ErrNoFreePeerIP в подсказку «спросить пользователя».
+func TestLocal_AddServerPeerLeavesAllocationToTheService(t *testing.T) {
 	ctx := context.Background()
 	m := managedHarness()
 	l := New(Config{Managed: m})
@@ -1857,14 +1876,14 @@ func TestLocal_AddServerPeerAllocatesFromTheServerSubnet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.added.TunnelIP != "10.0.0.4/32" {
-		t.Fatalf("allocated %q, want the first free address in the server subnet", m.added.TunnelIP)
+	if m.added.TunnelIP != "" {
+		t.Fatalf("sent %q, want an empty TunnelIP so the service allocates", m.added.TunnelIP)
 	}
 	if m.addedTo != "Wireguard3" || m.added.Description != "phone" {
 		t.Fatalf("request = %+v to %q", m.added, m.addedTo)
 	}
 	if got.TunnelIP != "10.0.0.4/32" || got.Description != "phone" || !got.Enabled {
-		t.Fatalf("returned peer = %+v", got)
+		t.Fatalf("returned peer = %+v, want the address the service allocated", got)
 	}
 	if got.PublicKey == "" {
 		t.Error("the caller needs the public key to address the peer later")
@@ -1876,6 +1895,12 @@ func TestLocal_AddServerPeerAllocatesFromTheServerSubnet(t *testing.T) {
 	}
 	if m.added.TunnelIP != "10.0.0.9/32" {
 		t.Fatalf("explicit address was rewritten to %q", m.added.TunnelIP)
+	}
+
+	m.addErr = managed.ErrNoFreePeerIP
+	_, err = l.AddServerPeer(ctx, mcpsrv.AddPeerInput{ServerID: "Wireguard3", Description: "y"})
+	if err == nil || !strings.Contains(err.Error(), "ask the user") {
+		t.Fatalf("err = %v, want the model told to ask the user for an address", err)
 	}
 }
 

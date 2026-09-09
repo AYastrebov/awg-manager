@@ -1,25 +1,27 @@
-// Package peerip allocates client addresses inside a managed WireGuard
-// server's subnet. It is a leaf package on purpose: internal/managed does
-// not build outside Linux, and the MCP fake that mirrors the daemon has
-// to run on a developer's macOS.
-package peerip
+package managed
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strings"
 )
 
-// NextFree returns the first unused host address in the server's /24, as
-// "x.y.z.n/32". It mirrors suggestNextPeerIP in the web UI
+// ErrNoFreePeerIP is returned by AddPeer when no TunnelIP was given and
+// the server's subnet has no host address left to allocate (or the
+// server address is not an IPv4 address the allocator understands).
+var ErrNoFreePeerIP = errors.New("no free address left in the server subnet")
+
+// NextFreePeerIP returns the first unused host address in the server's
+// /24, as "x.y.z.n/32". It mirrors suggestNextPeerIP in the web UI
 // (frontend/src/lib/utils/serverPeerOptions.ts): hosts start at .2, the
 // server's own address is never handed out, and used addresses may carry
 // a prefix, which is ignored when comparing.
 //
 // An empty result means the subnet is full or the server address is not
-// an IPv4 address the allocator understands; the caller must then ask the
-// user rather than invent an address.
-func NextFree(serverAddress string, used []string) string {
+// an IPv4 address; the caller must then ask the user rather than invent
+// an address.
+func NextFreePeerIP(serverAddress string, used []string) string {
 	host := strings.TrimSpace(serverAddress)
 	if i := strings.IndexByte(host, '/'); i >= 0 {
 		host = host[:i]

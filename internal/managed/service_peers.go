@@ -45,6 +45,20 @@ func (s *Service) AddPeer(ctx context.Context, id string, req AddPeerRequest) (*
 		return nil, fmt.Errorf("managed server not found: %s", id)
 	}
 
+	// An empty TunnelIP means "allocate": the first free host address in
+	// the server's subnet. The MCP tools rely on this — an address invented
+	// by a model either collides or lands outside the subnet.
+	if strings.TrimSpace(req.TunnelIP) == "" {
+		used := make([]string, 0, len(server.Peers))
+		for _, p := range server.Peers {
+			used = append(used, p.TunnelIP)
+		}
+		req.TunnelIP = NextFreePeerIP(server.Address, used)
+		if req.TunnelIP == "" {
+			return nil, ErrNoFreePeerIP
+		}
+	}
+
 	// Validate tunnel IP
 	if err := s.validateTunnelIP(server, req.TunnelIP); err != nil {
 		return nil, err
