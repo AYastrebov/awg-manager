@@ -35,6 +35,47 @@ type dnsRoutesOut struct {
 	Routes []DNSRoute `json:"routes"`
 }
 
+type dnsRouteDetailIn struct {
+	RouteID       string `json:"routeId" jsonschema:"list id from list_dns_routes"`
+	DomainsOffset int    `json:"domainsOffset,omitempty" jsonschema:"index of the first domain to return; default 0"`
+}
+
+// dnsRouteDetailOut is the full record with Domains replaced by one page
+// of at most MaxDomainsInDetail entries. DomainCount is always the real
+// size of the list, so an agent can tell a short page from a short list —
+// answering "that domain is not in the list" from a truncated page is the
+// failure this output is shaped to prevent.
+type dnsRouteDetailOut struct {
+	DNSRouteDetail
+	DomainCount      int  `json:"domainCount" jsonschema:"total domains in the list, ignoring paging"`
+	DomainsOffset    int  `json:"domainsOffset" jsonschema:"index of the first domain returned"`
+	DomainsTruncated bool `json:"domainsTruncated" jsonschema:"true when domains beyond this page remain — call again with a larger domainsOffset before concluding a domain is absent"`
+}
+
+// pageDNSRouteDetail cuts one page out of detail.Domains. An offset past
+// the end yields an empty page rather than an error: an agent walking the
+// pages should be able to stop on an empty result.
+func pageDNSRouteDetail(detail DNSRouteDetail, offset int) dnsRouteDetailOut {
+	total := len(detail.Domains)
+	start := min(offset, total)
+	end := min(start+MaxDomainsInDetail, total)
+	// Three-index slice: the page must not be able to grow into the rest
+	// of the list through an append somewhere downstream.
+	detail.Domains = detail.Domains[start:end:end]
+	if detail.Domains == nil {
+		detail.Domains = []string{}
+	}
+	if detail.Routes == nil {
+		detail.Routes = []RouteTarget{}
+	}
+	return dnsRouteDetailOut{
+		DNSRouteDetail:   detail,
+		DomainCount:      total,
+		DomainsOffset:    start,
+		DomainsTruncated: end < total,
+	}
+}
+
 type staticRoutesOut struct {
 	Routes []StaticRoute `json:"routes"`
 }
@@ -96,6 +137,25 @@ func registerRoutingTools(s *mcp.Server, d Deps) {
 			list = []DNSRoute{}
 		}
 		return nil, dnsRoutesOut{Routes: list}, err
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "get_dns_route",
+		Description: "One domain routing list in full: every domain (list_dns_routes shows only the first 50), plus the excludes and subscriptions it omits entirely. " +
+			"Use this to answer whether a specific domain is in a list. Domains are paged: when domainsTruncated is true, call again with domainsOffset to read on.",
+		Annotations: readOnly("Get DNS route"),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in dnsRouteDetailIn) (*mcp.CallToolResult, dnsRouteDetailOut, error) {
+		if in.RouteID == "" {
+			return nil, dnsRouteDetailOut{}, fmt.Errorf("routeId is required")
+		}
+		if in.DomainsOffset < 0 {
+			return nil, dnsRouteDetailOut{}, fmt.Errorf("domainsOffset must not be negative")
+		}
+		detail, err := d.GetDNSRoute(ctx, in.RouteID)
+		if err != nil {
+			return nil, dnsRouteDetailOut{}, err
+		}
+		return nil, pageDNSRouteDetail(detail, in.DomainsOffset), nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{

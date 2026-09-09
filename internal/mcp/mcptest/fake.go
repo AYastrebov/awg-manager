@@ -19,7 +19,7 @@ type Fake struct {
 	seq          int
 	Tunnels      []mcpsrv.TunnelDetail
 	Configs      map[string]string
-	DNSRoutes    []mcpsrv.DNSRoute
+	DNSRoutes    []mcpsrv.DNSRouteDetail
 	StaticRoutes []mcpsrv.StaticRoute
 	ClientRoutes []mcpsrv.ClientRoute
 	Policies     []mcpsrv.AccessPolicy
@@ -45,7 +45,7 @@ func New() *Fake {
 			"tn-1": "[Interface]\nPrivateKey = REDACTED\nAddress = 10.8.0.2/32\n\n[Peer]\nPublicKey = xyz=\nEndpoint = vpn.example.net:51820\nAllowedIPs = 0.0.0.0/0\n",
 			"tn-2": "[Interface]\nPrivateKey = REDACTED\nAddress = 10.9.0.2/32\n\n[Peer]\nPublicKey = abc=\nEndpoint = de.example.net:443\nAllowedIPs = 0.0.0.0/0\n",
 		},
-		DNSRoutes:    []mcpsrv.DNSRoute{{ID: "dl-1", Name: "Video", Enabled: true, Domains: []string{"youtube.com", "googlevideo.com"}, DomainCount: 2, ManualDomains: []string{"youtube.com", "googlevideo.com"}, Routes: []mcpsrv.RouteTarget{{TunnelID: "tn-1"}}}},
+		DNSRoutes:    []mcpsrv.DNSRouteDetail{{ID: "dl-1", Name: "Video", Enabled: true, Domains: []string{"youtube.com", "googlevideo.com"}, ManualDomains: []string{"youtube.com", "googlevideo.com"}, Routes: []mcpsrv.RouteTarget{{TunnelID: "tn-1"}}}},
 		StaticRoutes: []mcpsrv.StaticRoute{{ID: "sr-1", Name: "Office", TunnelID: "tn-1", Subnets: []string{"10.20.0.0/16"}, Enabled: true}},
 		Policies:     []mcpsrv.AccessPolicy{{Name: "Policy0", Description: "Amsterdam only", Interfaces: []string{"Wireguard0"}, DeviceCount: 1, IsStandard: true}},
 		Devices: []mcpsrv.Device{
@@ -206,7 +206,28 @@ func (f *Fake) ListDNSRoutes(context.Context) ([]mcpsrv.DNSRoute, error) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]mcpsrv.DNSRoute(nil), f.DNSRoutes...), nil
+	// Projected through Summary, exactly as localdeps does: the fake must
+	// truncate what production truncates, or a tool that over-reports
+	// domains passes its tests and fails on a router.
+	out := make([]mcpsrv.DNSRoute, 0, len(f.DNSRoutes))
+	for _, r := range f.DNSRoutes {
+		out = append(out, r.Summary())
+	}
+	return out, nil
+}
+
+func (f *Fake) GetDNSRoute(_ context.Context, id string) (mcpsrv.DNSRouteDetail, error) {
+	if f.Err != nil {
+		return mcpsrv.DNSRouteDetail{}, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, r := range f.DNSRoutes {
+		if r.ID == id {
+			return r, nil
+		}
+	}
+	return mcpsrv.DNSRouteDetail{}, fmt.Errorf("dns route %q not found", id)
 }
 
 func (f *Fake) AddDNSRoute(_ context.Context, in mcpsrv.DNSRouteInput) (mcpsrv.DNSRoute, error) {
@@ -219,9 +240,9 @@ func (f *Fake) AddDNSRoute(_ context.Context, in mcpsrv.DNSRouteInput) (mcpsrv.D
 		return mcpsrv.DNSRoute{}, err
 	}
 	// Always enabled — same as dnsroute.Create; MCP has no enabled input.
-	r := mcpsrv.DNSRoute{ID: f.nextID("dl"), Name: in.Name, Enabled: true, Domains: in.Domains, DomainCount: len(in.Domains), ManualDomains: in.Domains, Routes: []mcpsrv.RouteTarget{{TunnelID: in.TunnelID}}}
+	r := mcpsrv.DNSRouteDetail{ID: f.nextID("dl"), Name: in.Name, Enabled: true, Domains: in.Domains, ManualDomains: in.Domains, Routes: []mcpsrv.RouteTarget{{TunnelID: in.TunnelID}}}
 	f.DNSRoutes = append(f.DNSRoutes, r)
-	return r, nil
+	return r.Summary(), nil
 }
 
 func (f *Fake) RemoveDNSRoute(_ context.Context, id string) (mcpsrv.DNSRoute, error) {
@@ -233,7 +254,7 @@ func (f *Fake) RemoveDNSRoute(_ context.Context, id string) (mcpsrv.DNSRoute, er
 	for i, r := range f.DNSRoutes {
 		if r.ID == id {
 			f.DNSRoutes = append(f.DNSRoutes[:i], f.DNSRoutes[i+1:]...)
-			return r, nil
+			return r.Summary(), nil
 		}
 	}
 	return mcpsrv.DNSRoute{}, fmt.Errorf("dns route %q not found", id)

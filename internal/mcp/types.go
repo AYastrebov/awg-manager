@@ -105,6 +105,68 @@ type DNSRoute struct {
 	Backend       string        `json:"backend,omitempty"`
 }
 
+// MaxDomainsInDetail caps one page of DNSRouteDetail.Domains. It is far
+// larger than MaxDomainsInOutput because get_dns_route is asked for one
+// list at a time and deliberately, but a subscription list still holds
+// tens of thousands of domains — hence a page rather than the lot.
+const MaxDomainsInDetail = 200
+
+// DNSSubscription is a remote domain list feeding a routing list. Only
+// the fields that explain where the domains came from are carried over.
+type DNSSubscription struct {
+	URL         string `json:"url"`
+	Name        string `json:"name,omitempty"`
+	LastFetched string `json:"lastFetched,omitempty"`
+	LastCount   int    `json:"lastCount,omitempty"`
+	LastError   string `json:"lastError,omitempty" jsonschema:"non-empty when the last fetch failed — the list may be stale"`
+}
+
+// DNSRouteDetail is one domain list in full: Domains is NOT capped, and
+// the fields list_dns_routes drops (excludes, subscriptions) are present.
+// Everything the web editor keeps purely for round-tripping — raw editor
+// texts, dedupe reports, icon — still stays behind.
+type DNSRouteDetail struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
+	// Domains is the fully expanded list (manual entries plus everything
+	// the subscriptions resolved to). get_dns_route pages it.
+	Domains        []string          `json:"domains"`
+	ManualDomains  []string          `json:"manualDomains,omitempty" jsonschema:"the user's own entries, before subscriptions are expanded"`
+	Subnets        []string          `json:"subnets,omitempty"`
+	Excludes       []string          `json:"excludes,omitempty" jsonschema:"domains carved out of this list"`
+	ExcludeSubnets []string          `json:"excludeSubnets,omitempty"`
+	Subscriptions  []DNSSubscription `json:"subscriptions,omitempty"`
+	Routes         []RouteTarget     `json:"routes"`
+	Backend        string            `json:"backend,omitempty"`
+	CreatedAt      string            `json:"createdAt,omitempty"`
+	UpdatedAt      string            `json:"updatedAt,omitempty"`
+}
+
+// Summary projects the full record onto the capped list form, so
+// list_dns_routes and get_dns_route cannot drift apart in what they mean
+// by a field. Domains is truncated with a full three-index slice: the
+// result must not be able to grow into the detail's backing array.
+func (d DNSRouteDetail) Summary() DNSRoute {
+	out := DNSRoute{
+		ID: d.ID, Name: d.Name, Enabled: d.Enabled,
+		Domains: d.Domains, DomainCount: len(d.Domains),
+		ManualDomains: d.ManualDomains, Subnets: d.Subnets,
+		Backend: d.Backend,
+		Routes:  append([]RouteTarget(nil), d.Routes...),
+	}
+	if len(out.Domains) > MaxDomainsInOutput {
+		out.Domains = out.Domains[:MaxDomainsInOutput:MaxDomainsInOutput]
+	}
+	if out.Domains == nil {
+		out.Domains = []string{}
+	}
+	if out.Routes == nil {
+		out.Routes = []RouteTarget{}
+	}
+	return out
+}
+
 // DNSRouteInput has no `enabled` field on purpose: dnsroute.Create always
 // creates the list enabled and pushes the routing into NDMS immediately, so
 // honouring enabled:false would mean going live and then tearing it down a

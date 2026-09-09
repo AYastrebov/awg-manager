@@ -644,31 +644,54 @@ func (l *Local) ListDNSRoutes(ctx context.Context) ([]mcpsrv.DNSRoute, error) {
 	return out, nil
 }
 
-// dnsRoute maps a domain list field by field. Everything the editor
-// keeps for round-tripping (raw texts, subscriptions, dedupe reports,
-// icon) stays behind; Domains is capped, see mcp.MaxDomainsInOutput.
-func dnsRoute(dl *dnsroute.DomainList) mcpsrv.DNSRoute {
-	out := mcpsrv.DNSRoute{
-		ID:            dl.ID,
-		Name:          dl.Name,
-		Enabled:       dl.Enabled,
-		DomainCount:   len(dl.Domains),
-		Domains:       dl.Domains,
-		ManualDomains: dl.ManualDomains,
-		Subnets:       dl.Subnets,
-		Backend:       dl.Backend,
-		Routes:        make([]mcpsrv.RouteTarget, 0, len(dl.Routes)),
-	}
-	if len(out.Domains) > mcpsrv.MaxDomainsInOutput {
-		out.Domains = out.Domains[:mcpsrv.MaxDomainsInOutput:mcpsrv.MaxDomainsInOutput]
-	}
-	if out.Domains == nil {
-		out.Domains = []string{}
+// dnsRouteDetail maps a domain list field by field, uncapped. Everything
+// the editor keeps for round-tripping (raw texts, dedupe reports, icon)
+// stays behind.
+func dnsRouteDetail(dl *dnsroute.DomainList) mcpsrv.DNSRouteDetail {
+	out := mcpsrv.DNSRouteDetail{
+		ID:             dl.ID,
+		Name:           dl.Name,
+		Enabled:        dl.Enabled,
+		Domains:        dl.Domains,
+		ManualDomains:  dl.ManualDomains,
+		Subnets:        dl.Subnets,
+		Excludes:       dl.Excludes,
+		ExcludeSubnets: dl.ExcludeSubnets,
+		Backend:        dl.Backend,
+		CreatedAt:      dl.CreatedAt,
+		UpdatedAt:      dl.UpdatedAt,
+		Routes:         make([]mcpsrv.RouteTarget, 0, len(dl.Routes)),
 	}
 	for _, r := range dl.Routes {
 		out.Routes = append(out.Routes, mcpsrv.RouteTarget{Interface: r.Interface, TunnelID: r.TunnelID, Fallback: r.Fallback})
 	}
+	for _, sub := range dl.Subscriptions {
+		out.Subscriptions = append(out.Subscriptions, mcpsrv.DNSSubscription{
+			URL: sub.URL, Name: sub.Name, LastFetched: sub.LastFetched, LastCount: sub.LastCount, LastError: sub.LastError,
+		})
+	}
 	return out
+}
+
+// dnsRoute is the capped list projection; see mcp.MaxDomainsInOutput. It
+// goes through DNSRouteDetail.Summary so the two views cannot drift.
+func dnsRoute(dl *dnsroute.DomainList) mcpsrv.DNSRoute {
+	return dnsRouteDetail(dl).Summary()
+}
+
+// GetDNSRoute reads one list in full for get_dns_route.
+func (l *Local) GetDNSRoute(ctx context.Context, id string) (mcpsrv.DNSRouteDetail, error) {
+	if l.c.DNSRoutes == nil {
+		return mcpsrv.DNSRouteDetail{}, errUnavailable("dns routes")
+	}
+	existing, err := l.c.DNSRoutes.Get(ctx, id)
+	if err != nil {
+		return mcpsrv.DNSRouteDetail{}, err
+	}
+	if existing == nil {
+		return mcpsrv.DNSRouteDetail{}, fmt.Errorf("dns route %q not found", id)
+	}
+	return dnsRouteDetail(existing), nil
 }
 
 func (l *Local) AddDNSRoute(ctx context.Context, in mcpsrv.DNSRouteInput) (mcpsrv.DNSRoute, error) {

@@ -1167,3 +1167,51 @@ func TestLocal_LockedTunnelRejectsChanges(t *testing.T) {
 		t.Fatalf("events = %+v", fo.events)
 	}
 }
+
+// TestLocal_GetDNSRouteIsUncappedAndCarriesTheDroppedFields — get_dns_route
+// exists precisely because the list view truncates. If this adapter
+// applied the list cap too, the tool would answer "that domain is not in
+// the list" from a silently cut record.
+func TestLocal_GetDNSRouteIsUncappedAndCarriesTheDroppedFields(t *testing.T) {
+	h := newHarness(t)
+	big := make([]string, 0, 3*mcpsrv.MaxDomainsInOutput)
+	for i := range cap(big) {
+		big = append(big, fmt.Sprintf("d%d.example", i))
+	}
+	h.dns.lists = []dnsroute.DomainList{{
+		ID: "dl-big", Name: "Geo", Enabled: true, Domains: big, ManualDomains: []string{"my.example"},
+		Excludes: []string{"ads.example"}, ExcludeSubnets: []string{"10.1.0.0/16"},
+		Subnets: []string{"10.0.0.0/8"}, Backend: "ndms", CreatedAt: "2026-09-01T00:00:00Z",
+		Routes:        []dnsroute.RouteTarget{{Interface: "nwg0", TunnelID: "tn-1", Fallback: "bypass"}},
+		Subscriptions: []dnsroute.Subscription{{URL: "https://example.invalid/list", Name: "Geo feed", LastCount: 12, LastError: "timeout"}},
+	}}
+
+	got, err := h.l.GetDNSRoute(context.Background(), "dl-big")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Domains) != len(big) {
+		t.Fatalf("domains = %d, want all %d — the detail view must not cap", len(got.Domains), len(big))
+	}
+	if len(got.Excludes) != 1 || got.Excludes[0] != "ads.example" {
+		t.Errorf("excludes = %v", got.Excludes)
+	}
+	if len(got.ExcludeSubnets) != 1 {
+		t.Errorf("excludeSubnets = %v", got.ExcludeSubnets)
+	}
+	if len(got.Subscriptions) != 1 {
+		t.Fatalf("subscriptions = %v", got.Subscriptions)
+	}
+	sub := got.Subscriptions[0]
+	if sub.URL != "https://example.invalid/list" || sub.Name != "Geo feed" || sub.LastCount != 12 || sub.LastError != "timeout" {
+		t.Errorf("subscription mapping lost fields: %+v", sub)
+	}
+	want := mcpsrv.RouteTarget{Interface: "nwg0", TunnelID: "tn-1", Fallback: "bypass"}
+	if got.ID != "dl-big" || got.Name != "Geo" || !got.Enabled || got.Backend != "ndms" || got.CreatedAt == "" || len(got.Routes) != 1 || got.Routes[0] != want {
+		t.Errorf("record = %+v", got)
+	}
+
+	if _, err := h.l.GetDNSRoute(context.Background(), "nope"); err == nil {
+		t.Error("unknown id must be an error")
+	}
+}

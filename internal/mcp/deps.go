@@ -25,6 +25,10 @@ type Deps interface {
 	ExportTunnelConfig(ctx context.Context, id string) (string, error)
 
 	ListDNSRoutes(ctx context.Context) ([]DNSRoute, error)
+	// GetDNSRoute returns one list in full — Domains uncapped, plus the
+	// excludes and subscriptions the list view drops. The tool pages
+	// Domains; implementations must not truncate them here.
+	GetDNSRoute(ctx context.Context, id string) (DNSRouteDetail, error)
 	AddDNSRoute(ctx context.Context, in DNSRouteInput) (DNSRoute, error)
 	// RemoveDNSRoute deletes the list and returns it as it was; the
 	// deletion is permanent, so the record is the only thing left to show
