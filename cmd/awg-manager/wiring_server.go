@@ -295,6 +295,8 @@ func (a *app) setupDeviceProxy() {
 	a.geoRefreshScheduler.Start()
 	a.updaterService.SetDownloader(sharedDownloadSvc)
 	a.updaterService.SetFeatures(a.usageFeatures)
+	a.updaterService.Start()
+	a.deferOnExit(a.updaterService.Stop)
 	if a.singboxInstaller != nil {
 		a.singboxInstaller.SetDownloader(&installerDownloaderAdapter{svc: sharedDownloadSvc})
 		// Auto-migration goroutine: when legacy sing-box-naive opkg

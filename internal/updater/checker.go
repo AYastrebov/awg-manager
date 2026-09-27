@@ -54,13 +54,9 @@ func versionComparator(channel string) func(a, b string) int {
 	return semver.Compare
 }
 
-// Check queries the entware repo's Packages.gz for the latest awg-manager
-// version and returns update info including the .ipk download URL if a newer
-// version is available. Uses the stable channel.
-func Check(ctx context.Context, currentVersion string) *UpdateInfo {
-	return checkWithDownloader(ctx, currentVersion, channelStable, newDefaultDownloader(), nil)
-}
-
+// checkWithDownloader queries the entware repo's Packages.gz for the latest
+// awg-manager version and returns update info including the .ipk download URL
+// if a newer version is available.
 // stats — заголовки анонимной статистики (Service.statsHeaders), nil — без них.
 func checkWithDownloader(ctx context.Context, currentVersion, channel string, dl Downloader, stats http.Header) *UpdateInfo {
 	info := &UpdateInfo{
