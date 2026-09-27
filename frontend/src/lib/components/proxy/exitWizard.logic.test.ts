@@ -113,6 +113,11 @@ describe('поля из ссылки', () => {
 		expect(f.workers).toBe('9');
 	});
 
+	it('FreeTurn 4.0: ссылка на звонок из ссылки идёт в поле ссылок', () => {
+		const f = fieldsFromFtPayload({ v: 1, peer: 'vps:56000', vk: ' https://vk.ru/call/join/X ' });
+		expect(f.vkHashes).toBe('https://vk.ru/call/join/X');
+	});
+
 	it('ручное создание — пустые поля и дефолт потоков', () => {
 		expect(emptyFields()).toEqual({
 			name: '',
@@ -125,7 +130,7 @@ describe('поля из ссылки', () => {
 
 	it('дефолт потоков FreeTurn — дефолт бинаря, не wdtt-округление', () => {
 		expect(emptyFields('freeturn').workers).toBe(DEFAULT_FT_STREAMS);
-		expect(DEFAULT_FT_STREAMS).toBe('10');
+		expect(DEFAULT_FT_STREAMS).toBe('12');
 		const f = fieldsFromFtPayload({ v: 1, peer: 'vps:56000' });
 		expect(f.workers).toBe(DEFAULT_FT_STREAMS);
 	});
@@ -190,5 +195,13 @@ describe('applyFtPayload: DNS из ссылки', () => {
 		applyFtPayload(cfg, { v: 1 });
 		expect(cfg.dnsMode).toBe('auto');
 		expect(cfg.dnsServers).toBe('8.8.4.4');
+	});
+
+	it('bond и timing 4.0 берутся из ссылки и снимаются ссылкой без них', () => {
+		const cfg = baseCfg();
+		applyFtPayload(cfg, { v: 1, mode: 'tcp', bond: true, timing: 20 });
+		expect([cfg.bond, cfg.obfTimingMs]).toEqual([true, 20]);
+		applyFtPayload(cfg, { v: 1 });
+		expect([cfg.bond, cfg.obfTimingMs]).toEqual([false, 0]);
 	});
 });

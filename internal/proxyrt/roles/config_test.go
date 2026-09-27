@@ -103,12 +103,12 @@ func TestStoreWireFormatCanary(t *testing.T) {
 			[]string{"name"}, []string{"order"}},
 		{"freeturn-client", FreeTurnClientConfig{Listen: "l", Peer: "p",
 			Provider: "vk", Links: "x", Streams: 1, Transport: "tcp", Mode: "udp",
-			ObfProfile: "none", ObfKey: "k",
+			Bond: true, ObfProfile: "none", ObfKey: "k", ObfTimingMs: 20,
 			StreamsPerCred: 1, Platform: "desktop", DNSMode: "auto",
 			DNSServers: "s", ClientID: "c", Sub: "https://s", Debug: true,
 			KCP: &FreeTurnKCP{Interval: 20}},
 			[]string{"listen", "peer", "provider", "links", "streams", "transport",
-				"mode", "obfProfile", "obfKey",
+				"mode", "bond", "obfProfile", "obfKey", "obfTimingMs",
 				"streamsPerCred", "platform", "dnsMode", "dnsServers", "clientId",
 				"sub", "debug", "kcp"}, nil},
 		{"wdtt-server", WdttServerConfig{Listen: "l", WgPort: 1, ConfigDir: "c",
@@ -246,6 +246,33 @@ func TestFreeTurnClientValidateKCP(t *testing.T) {
 		base.KCP = &k
 		if err := base.Validate(); err == nil {
 			t.Errorf("%s: ожидали отказ", name)
+		}
+	}
+}
+
+// Лимит bond — зеркало validateBond клиента 4.0: не больше 256/ссылок потоков,
+// иначе процесс не стартует. Границы проверяются с обеих сторон.
+func TestFreeTurnClientValidateBondLimit(t *testing.T) {
+	base := FreeTurnClientConfig{Listen: "127.0.0.1:9000", Peer: "p:1", Provider: "vk",
+		Links: "a, b ,c", Mode: "tcp", Bond: true}
+	for _, tc := range []struct {
+		name    string
+		mut     func(*FreeTurnClientConfig)
+		wantErr bool
+	}{
+		{"3 ссылки, 85 — граница", func(c *FreeTurnClientConfig) { c.Streams = 85 }, false},
+		{"3 ссылки, 86", func(c *FreeTurnClientConfig) { c.Streams = 86 }, true},
+		{"udp: -bond не уходит", func(c *FreeTurnClientConfig) { c.Streams, c.Mode = 86, "udp" }, false},
+		{"bond выкл.", func(c *FreeTurnClientConfig) { c.Streams, c.Bond = 86, false }, false},
+		{"direct: одна группа", func(c *FreeTurnClientConfig) { c.Streams, c.Provider = 256, "direct" }, false},
+		{"без ссылок: одна группа", func(c *FreeTurnClientConfig) { c.Streams, c.Links = 257, "" }, true},
+		{"0 = дефолт 12, 21 ссылка — граница", func(c *FreeTurnClientConfig) { c.Links = strings.Repeat("x,", 20) + "x" }, false},
+		{"0 = дефолт 12, 22 ссылки", func(c *FreeTurnClientConfig) { c.Links = strings.Repeat("x,", 21) + "x" }, true},
+	} {
+		c := base
+		tc.mut(&c)
+		if err := c.Validate(); (err != nil) != tc.wantErr {
+			t.Errorf("%s: err=%v, ждали ошибку=%t", tc.name, err, tc.wantErr)
 		}
 	}
 }
