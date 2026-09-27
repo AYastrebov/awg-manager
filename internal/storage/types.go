@@ -519,6 +519,10 @@ type UpdateSettings struct {
 	AutoInstallEnabled      bool   `json:"autoInstallEnabled"`      // default: false
 	AutoInstallIntervalDays int    `json:"autoInstallIntervalDays"` // default: 7, valid 1-30
 	AutoInstallTime         string `json:"autoInstallTime"`         // "HH:MM", default: "05:00"
+	// StatsEnabled — анонимная статистика установок: ID установки и флаги
+	// используемых механизмов уходят заголовками ТОЛЬКО в запросе проверки
+	// обновлений (см. internal/updater/stats.go). Default: true.
+	StatsEnabled bool `json:"statsEnabled"`
 }
 
 // DNSRouteSettings contains DNS route auto-refresh configuration.

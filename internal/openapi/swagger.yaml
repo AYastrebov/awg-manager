@@ -7644,6 +7644,12 @@ definitions:
       checkEnabled:
         example: true
         type: boolean
+      statsEnabled:
+        description: |-
+          StatsEnabled — анонимная статистика установок: случайный ID установки
+          и флаги используемых механизмов в запросе проверки обновлений.
+        example: true
+        type: boolean
     type: object
   api.UpdateSubscriptionGroupRequest:
     properties:

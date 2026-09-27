@@ -368,6 +368,9 @@ func TestExportSkipsDeviceKey(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dataDir, storage.RCITokenFile+".tmp"), []byte("tok\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := storage.LoadOrCreateInstanceID(dataDir); err != nil {
+		t.Fatal(err)
+	}
 
 	var buf bytes.Buffer
 	if err := Export(dataDir, "2.18.2", &buf); err != nil {
@@ -377,7 +380,7 @@ func TestExportSkipsDeviceKey(t *testing.T) {
 	names := tarNames(t, buf.Bytes())
 	settingsFound := false
 	for _, name := range names {
-		if name == storage.DeviceKeyFile || strings.HasPrefix(name, storage.RCITokenFile) {
+		if name == storage.DeviceKeyFile || strings.HasPrefix(name, storage.RCITokenFile) || name == storage.InstanceIDFile {
 			t.Fatalf("секрет попал в архив: %v", names)
 		}
 		if name == "settings.json" {
@@ -529,9 +532,10 @@ func keyFromSettings(t *testing.T, dir string) string {
 func TestRestoreIgnoresDeviceKeyFromArchive(t *testing.T) {
 	foreign := strings.Repeat("A", 32)
 	archive := forgedArchive(t, map[string]string{
-		ManifestName:          validManifestJSON,
-		"settings.json":       `{"version":32}`,
-		storage.DeviceKeyFile: foreign,
+		ManifestName:           validManifestJSON,
+		"settings.json":        `{"version":32}`,
+		storage.DeviceKeyFile:  foreign,
+		storage.InstanceIDFile: strings.Repeat("f", 32),
 	})
 
 	// Свежая установка: каталога данных ещё нет (первый запуск, переезд,
@@ -548,6 +552,9 @@ func TestRestoreIgnoresDeviceKeyFromArchive(t *testing.T) {
 		}
 		if _, err := os.Stat(filepath.Join(dataDir, storage.DeviceKeyFile)); !os.IsNotExist(err) {
 			t.Fatalf("секрет из чужого архива приехал: err=%v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dataDir, storage.InstanceIDFile)); !os.IsNotExist(err) {
+			t.Fatalf("ID установки из чужого архива приехал: err=%v", err)
 		}
 	})
 
@@ -569,6 +576,10 @@ func TestRestoreIgnoresDeviceKeyFromArchive(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		ownID, err := storage.LoadOrCreateInstanceID(dataDir)
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		if err := Restore(dataDir, bytes.NewReader(archive)); err != nil {
 			t.Fatalf("Restore: %v", err)
@@ -580,6 +591,9 @@ func TestRestoreIgnoresDeviceKeyFromArchive(t *testing.T) {
 		}
 		if !bytes.Equal(after, own) {
 			t.Fatalf("секрет подменён архивным (архивный=%v)", bytes.Equal(after, []byte(foreign)))
+		}
+		if id, err := storage.LoadOrCreateInstanceID(dataDir); err != nil || id != ownID {
+			t.Fatalf("свой ID установки не пережил восстановление: %q → %q (%v)", ownID, id, err)
 		}
 	})
 }

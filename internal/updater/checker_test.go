@@ -208,7 +208,7 @@ func TestCheck_DevelopDetectsNewerRevision(t *testing.T) {
 		},
 	}
 
-	info := checkWithDownloader(context.Background(), "2.11.2+r70", "develop", dl)
+	info := checkWithDownloader(context.Background(), "2.11.2+r70", "develop", dl, nil)
 
 	if !strings.Contains(seen.URL, "/develop/") {
 		t.Errorf("request URL %q does not contain /develop/", seen.URL)
@@ -243,7 +243,7 @@ func TestCheck_DevelopSameRevisionUpToDate(t *testing.T) {
 		},
 	}
 
-	info := checkWithDownloader(context.Background(), "2.11.2+r70", "develop", dl)
+	info := checkWithDownloader(context.Background(), "2.11.2+r70", "develop", dl, nil)
 
 	if !strings.Contains(seen.URL, "/develop/") {
 		t.Errorf("request URL %q does not contain /develop/", seen.URL)

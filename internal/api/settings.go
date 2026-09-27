@@ -72,6 +72,9 @@ type UpdateSettingsDTO struct {
 	// AutoInstallTime is the daily "HH:MM" (24h) window an auto-install
 	// attempt may start in.
 	AutoInstallTime string `json:"autoInstallTime" example:"05:00"`
+	// StatsEnabled — анонимная статистика установок: случайный ID установки
+	// и флаги используемых механизмов в запросе проверки обновлений.
+	StatsEnabled bool `json:"statsEnabled" example:"true"`
 }
 
 type DownloadSettingsDTO struct {
@@ -350,6 +353,7 @@ func settingsResponse(s *storage.Settings) SettingsData {
 			AutoInstallEnabled:      s.Updates.AutoInstallEnabled,
 			AutoInstallIntervalDays: s.Updates.AutoInstallIntervalDays,
 			AutoInstallTime:         s.Updates.AutoInstallTime,
+			StatsEnabled:            s.Updates.StatsEnabled,
 		},
 		Download: DownloadSettingsDTO{
 			RouteTag:  s.Download.RouteTag,

@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	CurrentSchemaVersion   = 39
+	CurrentSchemaVersion   = 40
 	DefaultPort            = 2222
 	DefaultInterface       = "br0"
 	DefaultPingCheckTarget = "8.8.8.8"
@@ -327,6 +327,9 @@ func (s *SettingsStore) Load() (*Settings, error) {
 		if settings.SchemaVersion < 39 {
 			s.migrateToV39(&settings)
 		}
+		if settings.SchemaVersion < 40 {
+			s.migrateToV40(&settings)
+		}
 	}
 
 	// Self-heal duplicated managed servers — see dedupManagedServers comment.
@@ -400,6 +403,7 @@ func (s *SettingsStore) defaultSettings() *Settings {
 			Channel:                 "stable",
 			AutoInstallIntervalDays: 7,
 			AutoInstallTime:         "05:00",
+			StatsEnabled:            true,
 		},
 		Download: DownloadSettings{
 			RouteTag:  "direct",

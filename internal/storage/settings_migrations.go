@@ -505,3 +505,10 @@ func (s *SettingsStore) migrateToV39(settings *Settings) {
 		settings.SingboxRouter.FakeIPStack = ""
 	}
 }
+
+// migrateToV40 включает анонимную статистику установок (Updates.StatsEnabled)
+// существующим установкам: поле новое, нулевое значение — «выключено», а
+// дефолт — «включено»; выключить можно тумблером в настройках.
+func (s *SettingsStore) migrateToV40(settings *Settings) {
+	settings.Updates.StatsEnabled = true
+}

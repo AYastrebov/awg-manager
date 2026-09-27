@@ -240,6 +240,7 @@ export interface UpdateSettings {
 	autoInstallEnabled: boolean;
 	autoInstallIntervalDays: number;
 	autoInstallTime: string;
+	statsEnabled: boolean;
 }
 
 export interface DownloadSettings {

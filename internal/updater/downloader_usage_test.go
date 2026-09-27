@@ -80,7 +80,7 @@ func TestCheckWithDownloader_UsesDownloaderRequest(t *testing.T) {
 		},
 	}
 
-	info := checkWithDownloader(context.Background(), "2.0.0", channelStable, dl)
+	info := checkWithDownloader(context.Background(), "2.0.0", channelStable, dl, nil)
 	if !info.Available {
 		t.Fatalf("expected update available, got %+v", info)
 	}

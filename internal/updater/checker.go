@@ -58,10 +58,11 @@ func versionComparator(channel string) func(a, b string) int {
 // version and returns update info including the .ipk download URL if a newer
 // version is available. Uses the stable channel.
 func Check(ctx context.Context, currentVersion string) *UpdateInfo {
-	return checkWithDownloader(ctx, currentVersion, channelStable, newDefaultDownloader())
+	return checkWithDownloader(ctx, currentVersion, channelStable, newDefaultDownloader(), nil)
 }
 
-func checkWithDownloader(ctx context.Context, currentVersion, channel string, dl Downloader) *UpdateInfo {
+// stats — заголовки анонимной статистики (Service.statsHeaders), nil — без них.
+func checkWithDownloader(ctx context.Context, currentVersion, channel string, dl Downloader, stats http.Header) *UpdateInfo {
 	info := &UpdateInfo{
 		CurrentVersion: currentVersion,
 		CheckedAt:      time.Now(),
@@ -72,7 +73,7 @@ func checkWithDownloader(ctx context.Context, currentVersion, channel string, dl
 	archDir := archSuffixToRepoDir(archSuffix())
 	pkgsURL := fmt.Sprintf("%s/%s/Packages.gz", base, archDir)
 
-	pkg, err := fetchLatestPackageWithDownloader(ctx, dl, pkgsURL, pkgName, cmp)
+	pkg, err := fetchLatestPackageWithDownloader(ctx, dl, pkgsURL, pkgName, cmp, stats)
 	if err != nil {
 		info.Error = fmt.Sprintf("entware repo: %s", err)
 		return info

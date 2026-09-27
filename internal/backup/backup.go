@@ -325,6 +325,9 @@ func shouldSkip(rel string) bool {
 	if rel == storage.RCITokenFile {
 		return true
 	}
+	if rel == storage.InstanceIDFile {
+		return true
+	}
 	if rel == "run" || strings.HasPrefix(rel, "run/") {
 		return true
 	}
