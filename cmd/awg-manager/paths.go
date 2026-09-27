@@ -35,10 +35,12 @@ func applyDataDir(dataDir string) {
 	tunnel.ConfDir = dataDir
 	obfuscator.ConfDir = filepath.Join(dataDir, "obfuscator")
 	kmod.ModulesDir = filepath.Join(dataDir, "modules")
+	obfuscator.ArmPath = filepath.Join(kmod.ModulesDir, "awgm_relay.arming")
 	router.SetDataDir(dataDir)
 	ndmstransport.SetTokenFile(filepath.Join(dataDir, storage.RCITokenFile), ndmsinfo.SupportsRCIToken)
 
 	if dataDir == defaultDataDir {
+		singboxDataDir = ""
 		return
 	}
 	// Дальше — только для НЕбоевого каталога. Хук ndm лежит вне каталога
@@ -46,4 +48,9 @@ func applyDataDir(dataDir string) {
 	// месте, песочница переписала бы боевой скрипт ссылками на /tmp, и после
 	// её ухода ndm восстанавливал бы правила по мёртвым путям.
 	router.SetNetfilterHookPath(filepath.Join(dataDir, "ndm-netfilter.d", "50-awgm-tproxy.sh"))
+	singboxDataDir = filepath.Join(dataDir, "singbox")
 }
+
+// singboxDataDir — каталог sing-box для небоевого -data-dir (F487); пусто =
+// умолчание оператора рядом с боевым бинарём.
+var singboxDataDir string

@@ -1074,6 +1074,7 @@ const api_ObfuscatorDTO: v.GenericSchema = v.looseObject({
 const api_ObfuscatorItemDTO: v.GenericSchema = v.looseObject({
 	flavor: v.optional(v.nullable(v.string())),
 	localPort: v.optional(v.nullable(v.number())),
+	relay: v.optional(v.nullable(v.string())),
 	target: v.optional(v.nullable(v.string())),
 });
 
@@ -1498,6 +1499,8 @@ const api_SettingsData: v.GenericSchema = v.looseObject({
 	logging: v.optional(v.nullable(v.lazy(() => api_LoggingSettingsDTO))),
 	mcpEnabled: v.optional(v.nullable(v.boolean())),
 	monitoringExcludedTunnels: v.optional(v.nullable(v.array(v.string()))),
+	obfuscatorKmodTripped: v.optional(v.nullable(v.string())),
+	obfuscatorRelayProcess: v.optional(v.nullable(v.boolean())),
 	pingCheck: v.optional(v.nullable(v.lazy(() => api_PingCheckSettingsDTO))),
 	schemaVersion: v.optional(v.nullable(v.number())),
 	server: v.optional(v.nullable(v.lazy(() => api_ServerSettingsDTO))),
@@ -3498,6 +3501,7 @@ export const RESPONSE_SCHEMAS: Record<string, v.GenericSchema> = {
 	"POST /servers/enabled": v.lazy(() => api_ServersAllResponse),
 	"POST /servers/mark": v.lazy(() => api_ServersAllResponse),
 	"POST /servers/restart": v.lazy(() => api_APIEnvelope),
+	"POST /settings/obfuscator-relay": v.lazy(() => api_SettingsResponse),
 	"POST /settings/regenerate-api-key": v.lazy(() => api_SettingsResponse),
 	"POST /settings/update": v.lazy(() => api_SettingsResponse),
 	"POST /signature/generate": v.lazy(() => api_SignatureGenerateResponse),

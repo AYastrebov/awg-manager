@@ -2,10 +2,12 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,7 +30,17 @@ func nwgOperatorOnStub(t *testing.T) *nwg.OperatorNativeWG {
 	t.Helper()
 	// Интерфейс отвечает «поднят»: иначе Update решит, что синхронизировать
 	// нечего, и до ветки под замком не дойдёт.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Батч команд (POST массивом) принимается: ответ — массив той же
+		// длины. Без этого Start падал на разборе, и тест сохранения адреса
+		// зеленел только из-за дефекта F486 (адрес без маршрута).
+		if r.Method == http.MethodPost {
+			var cmds []json.RawMessage
+			if json.NewDecoder(r.Body).Decode(&cmds) == nil {
+				_, _ = w.Write([]byte("[" + strings.TrimSuffix(strings.Repeat("{},", len(cmds)), ",") + "]"))
+				return
+			}
+		}
 		_, _ = w.Write([]byte(`{"show":{"interface":{"id":"Wireguard0","link":"up","state":"up",
 			"summary":{"layer":{"conf":"running","link":"running"}},
 			"wireguard":{"status":"up","peer":[{"online":true}]}}}}`))
@@ -92,15 +104,16 @@ func TestUpdate_NativeWGDiffTakesTunnelLock(t *testing.T) {
 // дошёл до резолва target'а и положил адрес в трекер оператора.
 type fakeRelay struct{ alive map[string]bool }
 
-func (f *fakeRelay) Start(_ context.Context, id string, _ *storage.Obfuscator) error {
+func (f *fakeRelay) Start(_ context.Context, id string, _ *storage.Obfuscator, _ string) error {
 	if f.alive == nil {
 		f.alive = map[string]bool{}
 	}
 	f.alive[id] = true
 	return nil
 }
-func (f *fakeRelay) Stop(id string) error { delete(f.alive, id); return nil }
-func (f *fakeRelay) Alive(id string) bool { return f.alive[id] }
+func (f *fakeRelay) Stop(id string) error  { delete(f.alive, id); return nil }
+func (f *fakeRelay) Alive(id string) bool  { return f.alive[id] }
+func (f *fakeRelay) Backend(string) string { return "" }
 
 // Замена конфигурации у работающего обфусцированного туннеля обязана оставить
 // в записи адрес target'а: по нему после рестарта демона снимается host-route.

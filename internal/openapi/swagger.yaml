@@ -2997,9 +2997,25 @@ definitions:
       localPort:
         example: 39000
         type: integer
+      relay:
+        description: 'Relay — бэкенд релея: "kernel" (awgm_relay.ko) или "process".'
+        enum:
+        - kernel
+        - process
+        example: kernel
+        type: string
       target:
         example: 1.2.3.4:51824
         type: string
+    type: object
+  api.ObfuscatorRelayRequest:
+    properties:
+      process:
+        description: true — Phobos-релей процессом, false — модулем ядра awgm_relay.
+        example: true
+        type: boolean
+    required:
+    - process
     type: object
   api.OkData:
     properties:
@@ -4199,6 +4215,15 @@ definitions:
         items:
           type: string
         type: array
+      obfuscatorKmodTripped:
+        description: ObfuscatorKmodTripped — причина, по которой сторож выключил kernel-релей.
+        example: ""
+        type: string
+      obfuscatorRelayProcess:
+        description: ObfuscatorRelayProcess — Phobos-релей принудительно процессом
+          (выключатель ядра).
+        example: false
+        type: boolean
       pingCheck:
         $ref: '#/definitions/api.PingCheckSettingsDTO'
       schemaVersion:
@@ -14256,6 +14281,45 @@ paths:
       summary: Get settings
       tags:
       - settings
+  /settings/obfuscator-relay:
+    post:
+      consumes:
+      - application/json
+      description: 'Sets the Phobos relay backend: process=true forces the userspace
+        relay, process=false returns to the awgm_relay kernel module (and clears the
+        watchdog trip). Live Phobos relays are restarted on the new backend. Returns
+        the updated Settings.'
+      parameters:
+      - description: Relay backend
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/api.ObfuscatorRelayRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.SettingsResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "405":
+          description: Method Not Allowed
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Switch Phobos relay backend
+      tags:
+      - settings
   /settings/regenerate-api-key:
     post:
       description: 'Generates a fresh UUID v4 via crypto/rand, stores it into Settings.ApiKey,
@@ -14291,7 +14355,8 @@ paths:
         atomically. ApiKey preserved when omitted (rotate via /settings/regenerate-api-key).
         singboxRouter.routingMode and singboxRouter.enabled are ignored: the routing
         mode changes only via POST /singbox/router/mode, enable/disable only via the
-        dedicated endpoints.'
+        dedicated endpoints. obfuscatorRelayProcess is ignored: switch it via POST
+        /settings/obfuscator-relay.'
       parameters:
       - description: Settings patch — any subset of fields
         in: body

@@ -27,6 +27,7 @@ func TestApplyDataDir_RedirectsDerivedPaths(t *testing.T) {
 		"obfuscator.ConfDir": {obfuscator.ConfDir, filepath.Join(dir, "obfuscator")},
 		"kmod.ModulesDir":    {kmod.ModulesDir, filepath.Join(dir, "modules")},
 		"kmod.BundledDir":    {kmod.BundledDir(), filepath.Join(dir, "modules", "bundled")},
+		"obfuscator.ArmPath": {obfuscator.ArmPath, filepath.Join(dir, "modules", "awgm_relay.arming")},
 	} {
 		if pair[0] != pair[1] {
 			t.Errorf("%s = %q, ждали %q", name, pair[0], pair[1])
@@ -71,6 +72,23 @@ func TestApplyDataDir_RedirectsRouterPaths(t *testing.T) {
 	}
 }
 
+// F487: каталог sing-box (config.d, pid) тоже следует -data-dir — иначе
+// песочница пишет в боевой, а её --cleanup сносит боевой каталог целиком.
+// Боевой каталог данных оставляет умолчание оператора ("").
+func TestApplyDataDir_RedirectsSingboxDir(t *testing.T) {
+	restorePaths(t)
+
+	dir := t.TempDir()
+	applyDataDir(dir)
+	if want := filepath.Join(dir, "singbox"); singboxDataDir != want {
+		t.Errorf("singboxDataDir = %q, ждали %q", singboxDataDir, want)
+	}
+	applyDataDir(defaultDataDir)
+	if singboxDataDir != "" {
+		t.Errorf("боевой каталог данных сменил каталог sing-box: %q", singboxDataDir)
+	}
+}
+
 // Боевой каталог оставляет хук ndm на месте: иначе демон перестал бы ставить
 // его туда, откуда его читает роутер.
 func TestApplyDataDir_ProductionKeepsHook(t *testing.T) {
@@ -88,9 +106,13 @@ func TestApplyDataDir_ProductionKeepsHook(t *testing.T) {
 func restorePaths(t *testing.T) {
 	t.Helper()
 	conf, obf, mod, hook := tunnel.ConfDir, obfuscator.ConfDir, kmod.ModulesDir, router.NetfilterHookPath()
+	arm := obfuscator.ArmPath
 	routerPaths := router.DataDirPaths()
+	sb := singboxDataDir
 	t.Cleanup(func() {
+		singboxDataDir = sb
 		tunnel.ConfDir, obfuscator.ConfDir, kmod.ModulesDir = conf, obf, mod
+		obfuscator.ArmPath = arm
 		router.SetNetfilterHookPath(hook)
 		router.RestoreDataDirPaths(routerPaths)
 	})

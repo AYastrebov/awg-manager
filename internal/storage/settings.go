@@ -1150,6 +1150,95 @@ func (s *SettingsStore) IsMcpEnabled() bool {
 	return settings.McpEnabled
 }
 
+// IsObfuscatorRelayProcess reports whether the Phobos relay is forced onto
+// the userspace backend (kernel awgm_relay switched off) — either by user
+// choice or by TripObfuscatorKmod. Mirrors IsMcpEnabled's cheap Get() path.
+func (s *SettingsStore) IsObfuscatorRelayProcess() bool {
+	settings, err := s.Get()
+	if err != nil {
+		return false
+	}
+	return settings.ObfuscatorRelayProcess
+}
+
+// SetObfuscatorRelayProcess — пользовательский выключатель ядро/процесс
+// Phobos-релея (ручка POST /settings/obfuscator-relay; общий PATCH поле не
+// пишет). Атомарно под локом стора, как SetSingboxManuallyStopped; возвращает,
+// изменилось ли значение (по образцу SetAuthEnabled) — от этого зависит хук.
+func (s *SettingsStore) SetObfuscatorRelayProcess(v bool) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return false, fmt.Errorf("settings not loaded")
+	}
+	if s.settings.ObfuscatorRelayProcess == v {
+		return false, nil
+	}
+	if err := s.updateUnlocked(func(cp *Settings) error {
+		cp.ObfuscatorRelayProcess = v
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// TripObfuscatorKmod switches the Phobos relay backend to userspace and
+// records why — called by the oops watchdog (§4.9) after it detects a
+// kernel-relay crash. Mirrors SetSingboxManuallyStopped: atomic under the
+// store lock so it cannot race concurrent writers on other fields.
+func (s *SettingsStore) TripObfuscatorKmod(reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return fmt.Errorf("settings not loaded")
+	}
+	return s.updateUnlocked(func(cp *Settings) error {
+		cp.ObfuscatorRelayProcess = true
+		cp.ObfuscatorKmodTripped = reason
+		return nil
+	})
+}
+
+// ClearObfuscatorKmodTripped снимает записанную причину срабатывания
+// сторожа, не трогая сам выключатель ObfuscatorRelayProcess (его снимает
+// пользователь отдельно, через SetObfuscatorRelayProcess). Мирроит SetSingboxManuallyStopped.
+func (s *SettingsStore) ClearObfuscatorKmodTripped() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return fmt.Errorf("settings not loaded")
+	}
+	return s.updateUnlocked(func(cp *Settings) error {
+		cp.ObfuscatorKmodTripped = ""
+		return nil
+	})
+}
+
+// ObfuscatorKmodOopsHash returns the hash of the last /proc/mtdoops/oops
+// entry processed by the watchdog, used to dedupe across daemon restarts.
+func (s *SettingsStore) ObfuscatorKmodOopsHash() string {
+	settings, err := s.Get()
+	if err != nil {
+		return ""
+	}
+	return settings.ObfuscatorKmodOopsHash
+}
+
+// SetObfuscatorKmodOopsHash records the hash of the last processed oops
+// entry. Mirrors SetSingboxManuallyStopped.
+func (s *SettingsStore) SetObfuscatorKmodOopsHash(h string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.settings == nil {
+		return fmt.Errorf("settings not loaded")
+	}
+	return s.updateUnlocked(func(cp *Settings) error {
+		cp.ObfuscatorKmodOopsHash = h
+		return nil
+	})
+}
+
 // GetApiKey returns the configured API key, or empty string if none.
 // Used by the auth middleware to accept `Authorization: Bearer <key>` as
 // an alternative to a session cookie. On error returns empty (no key

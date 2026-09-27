@@ -118,6 +118,10 @@ type SettingsData struct {
 	// McpEnabled turns on the Model Context Protocol endpoint at /mcp.
 	// Off by default; keys are managed via /mcp/keys*.
 	McpEnabled bool `json:"mcpEnabled" example:"false"`
+	// ObfuscatorRelayProcess — Phobos-релей принудительно процессом (выключатель ядра).
+	ObfuscatorRelayProcess bool `json:"obfuscatorRelayProcess" example:"false"`
+	// ObfuscatorKmodTripped — причина, по которой сторож выключил kernel-релей.
+	ObfuscatorKmodTripped string `json:"obfuscatorKmodTripped,omitempty" example:""`
 	// ApiKey is the opaque secret accepted in place of a session cookie via
 	// `Authorization: Bearer <key>`. Отдаётся сознательно: панель настроек
 	// показывает его и даёт скопировать — ключ для того и заводится. Ротация
@@ -173,21 +177,22 @@ type MonitoringRefreshService interface {
 
 // SettingsHandler handles settings API endpoints.
 type SettingsHandler struct {
-	store                   *storage.SettingsStore
-	tunnels                 *storage.AWGTunnelStore
-	pingCheck               PingCheckToggleService
-	monitoring              MonitoringRefreshService
-	pingCheckSnapshot       func()
-	logsSnapshot            func()
-	applyLogSettings        func()
-	applySingboxLogSettings func() error
-	applyBootstrapDNS       func(string) error
-	applyClashPort          func(int) error
-	clashPorts              clashPortInspector
-	downloadSvc             *downloader.Service
-	log                     *logging.ScopedLogger
-	bus                     *events.Bus
-	exposure                exposureChecker
+	store                    *storage.SettingsStore
+	tunnels                  *storage.AWGTunnelStore
+	pingCheck                PingCheckToggleService
+	monitoring               MonitoringRefreshService
+	pingCheckSnapshot        func()
+	logsSnapshot             func()
+	applyLogSettings         func()
+	applySingboxLogSettings  func() error
+	applyBootstrapDNS        func(string) error
+	applyClashPort           func(int) error
+	clashPorts               clashPortInspector
+	onObfuscatorRelayChanged func()
+	downloadSvc              *downloader.Service
+	log                      *logging.ScopedLogger
+	bus                      *events.Bus
+	exposure                 exposureChecker
 }
 
 // exposureChecker re-runs the "are we exposed without a password" check
@@ -264,6 +269,12 @@ func (h *SettingsHandler) SetClashPortInspector(insp clashPortInspector) {
 	h.clashPorts = insp
 }
 
+// SetOnObfuscatorRelayChanged — смена выключателя ядро/процесс: перезапуск
+// Phobos-релеев на новом бэкенде (спека §4.8).
+func (h *SettingsHandler) SetOnObfuscatorRelayChanged(fn func()) {
+	h.onObfuscatorRelayChanged = fn
+}
+
 func (h *SettingsHandler) SetDownloadService(svc *downloader.Service) {
 	h.downloadSvc = svc
 }
@@ -301,11 +312,13 @@ func (h *SettingsHandler) SetEventBus(bus *events.Bus) { h.bus = bus }
 // подавшего сюда store.Get().
 func settingsResponse(s *storage.Settings) SettingsData {
 	return SettingsData{
-		SchemaVersion:   s.SchemaVersion,
-		AuthEnabled:     s.AuthEnabled,
-		SessionTtlHours: s.SessionTtlHours,
-		McpEnabled:      s.McpEnabled,
-		ApiKey:          s.ApiKey,
+		SchemaVersion:          s.SchemaVersion,
+		AuthEnabled:            s.AuthEnabled,
+		SessionTtlHours:        s.SessionTtlHours,
+		McpEnabled:             s.McpEnabled,
+		ObfuscatorRelayProcess: s.ObfuscatorRelayProcess,
+		ObfuscatorKmodTripped:  s.ObfuscatorKmodTripped,
+		ApiKey:                 s.ApiKey,
 		Server: ServerSettingsDTO{
 			Port:       s.Server.Port,
 			Interface:  s.Server.Interface,
@@ -392,7 +405,7 @@ func (h *SettingsHandler) Get(w http.ResponseWriter, r *http.Request) {
 // Update saves settings.
 //
 //	@Summary		Update settings
-//	@Description	Persists Settings via patch semantics: any field omitted from the payload is preserved, including top-level bool flags. Send only the fields you want to change, or send the full Settings object to update everything atomically. ApiKey preserved when omitted (rotate via /settings/regenerate-api-key). singboxRouter.routingMode and singboxRouter.enabled are ignored: the routing mode changes only via POST /singbox/router/mode, enable/disable only via the dedicated endpoints.
+//	@Description	Persists Settings via patch semantics: any field omitted from the payload is preserved, including top-level bool flags. Send only the fields you want to change, or send the full Settings object to update everything atomically. ApiKey preserved when omitted (rotate via /settings/regenerate-api-key). singboxRouter.routingMode and singboxRouter.enabled are ignored: the routing mode changes only via POST /singbox/router/mode, enable/disable only via the dedicated endpoints. obfuscatorRelayProcess is ignored: switch it via POST /settings/obfuscator-relay.
 //	@Tags			settings
 //	@Accept			json
 //	@Produce		json
@@ -711,6 +724,62 @@ func (h *SettingsHandler) RegenerateApiKey(w http.ResponseWriter, r *http.Reques
 	h.log.Info("api-key", "", "API key regenerated")
 	response.Success(w, settingsResponse(settings))
 	h.bus.PublishInvalidated(events.ResourceSettings, "api-key-rotated")
+}
+
+// ObfuscatorRelayRequest — тело POST /settings/obfuscator-relay. Process —
+// указатель: отсутствующее поле — отказ, а не молчаливый возврат к ядру
+// (соседние DTO берут голый bool; здесь его false — небезопасный дефолт).
+type ObfuscatorRelayRequest struct {
+	// true — Phobos-релей процессом, false — модулем ядра awgm_relay.
+	Process *bool `json:"process" validate:"required" example:"true"`
+}
+
+// SetObfuscatorRelay — выключатель ядро/процесс Phobos-релея (спека §4.8).
+// Отдельная ручка, а не поле общего update: страница настроек шлёт тело
+// целиком, и устаревшее false с другой вкладки снимало бы срабатывание
+// сторожа (§4.9) и возвращало ядро.
+//
+//	@Summary		Switch Phobos relay backend
+//	@Description	Sets the Phobos relay backend: process=true forces the userspace relay, process=false returns to the awgm_relay kernel module (and clears the watchdog trip). Live Phobos relays are restarted on the new backend. Returns the updated Settings.
+//	@Tags			settings
+//	@Accept			json
+//	@Produce		json
+//	@Security		CookieAuth
+//	@Param			body	body		ObfuscatorRelayRequest	true	"Relay backend"
+//	@Success		200		{object}	SettingsResponse
+//	@Failure		400		{object}	APIErrorEnvelope
+//	@Failure		405		{object}	APIErrorEnvelope
+//	@Failure		500		{object}	APIErrorEnvelope
+//	@Router			/settings/obfuscator-relay [post]
+func (h *SettingsHandler) SetObfuscatorRelay(w http.ResponseWriter, r *http.Request) {
+	req, ok := parseJSON[ObfuscatorRelayRequest](w, r, http.MethodPost)
+	if !ok {
+		return
+	}
+	if req.Process == nil {
+		response.ErrorWithStatus(w, http.StatusBadRequest, "process is required", "INVALID_BODY")
+		return
+	}
+	changed, err := h.store.SetObfuscatorRelayProcess(*req.Process)
+	if err != nil {
+		response.Error(w, err.Error(), "SETTINGS_SAVE_ERROR")
+		return
+	}
+	if changed {
+		h.log.Info("obfuscator", "", fmt.Sprintf("Phobos relay backend: process=%v", *req.Process))
+		if h.onObfuscatorRelayChanged != nil {
+			go h.onObfuscatorRelayChanged() // значение хук читает из стора (F478)
+		}
+	}
+	settings, err := h.store.Snapshot()
+	if err != nil {
+		response.Error(w, err.Error(), "SETTINGS_LOAD_ERROR")
+		return
+	}
+	response.Success(w, settingsResponse(settings))
+	if changed {
+		h.bus.PublishInvalidated(events.ResourceSettings, "updated")
+	}
 }
 
 // generateUUIDv4 produces an RFC 4122 v4 UUID using crypto/rand.

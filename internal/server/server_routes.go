@@ -170,6 +170,7 @@ func (s *Server) buildRouteHandlers() *routeHandlers {
 		}
 		return s.singboxOp.ApplyClashPort(port)
 	})
+	h.settingsHandler.SetOnObfuscatorRelayChanged(s.obfuscatorRelayChanged)
 	h.settingsHandler.SetClashPortInspector(sysports.NewScanner())
 	h.settingsHandler.SetApplySingboxLogSettings(func() error {
 		if s.singboxOp == nil || s.settings == nil {
@@ -461,6 +462,7 @@ func (s *Server) registerSettingsRoutes(mux *http.ServeMux, h *routeHandlers) {
 	// Settings (protected + boot guarded)
 	mux.HandleFunc("/api/settings/get", h.guarded(h.settingsHandler.Get))
 	mux.HandleFunc("/api/settings/update", h.guarded(h.settingsHandler.Update))
+	mux.HandleFunc("/api/settings/obfuscator-relay", h.guarded(h.settingsHandler.SetObfuscatorRelay))
 	mux.HandleFunc("/api/settings/regenerate-api-key", h.guarded(h.settingsHandler.RegenerateApiKey))
 
 	// Ping check (protected + boot guarded)
