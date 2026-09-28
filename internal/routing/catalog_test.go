@@ -18,9 +18,16 @@ type mockTunnelProvider struct {
 	err     error
 	states  map[string]tunnel.StateInfo
 	wan     *wan.Model
+	// listCalls — число вызовов ListTunnels (опрос состояния всех туннелей).
+	listCalls int
 }
 
 func (m *mockTunnelProvider) ListTunnels(_ context.Context) ([]TunnelWithStatus, error) {
+	m.listCalls++
+	return m.tunnels, m.err
+}
+
+func (m *mockTunnelProvider) ListStored(_ context.Context) ([]TunnelWithStatus, error) {
 	return m.tunnels, m.err
 }
 
@@ -45,13 +52,28 @@ type mockNDMSClient struct {
 	// input as-is when no mapping is found (mimics "not found"). When
 	// false (default), returns "".
 	sysNamesDefaultIdentity bool
+	// Счётчики обращений за именами ядра: SystemTunnelsByIface обязан
+	// обходиться одним пакетным SystemNames.
+	resolveCalls, systemNamesCalls int
 }
 
 func (m *mockNDMSClient) List(_ context.Context) ([]ndms.Interface, error) {
 	return m.ifaces, m.err
 }
 
+func (m *mockNDMSClient) SystemNames(_ context.Context, ids []string) map[string]string {
+	m.systemNamesCalls++
+	out := map[string]string{}
+	for _, id := range ids {
+		if n, ok := m.sysNames[id]; ok {
+			out[id] = n
+		}
+	}
+	return out
+}
+
 func (m *mockNDMSClient) ResolveSystemName(_ context.Context, ndmsName string) string {
+	m.resolveCalls++
 	if m.sysNames != nil {
 		if n, ok := m.sysNames[ndmsName]; ok {
 			return n
@@ -589,5 +611,30 @@ func TestListAll_OwnedLookupErrorKeepsList(t *testing.T) {
 	cat.SetOwnedOpkgTun(func(context.Context) (map[int]bool, error) { return nil, errors.New("boom") })
 	if len(cat.ListAll(context.Background())) != 1 {
 		t.Fatal("ошибка владельцев обнулила список")
+	}
+}
+
+// F503: WG-сервер (managed или помеченный — id из сеттера — и встроенный по
+// описанию) помечается Server; обычный WireguardN — нет.
+func TestListAll_SystemServerFlag(t *testing.T) {
+	ndmsClient := &mockNDMSClient{
+		ifaces: []ndms.Interface{
+			{ID: "Wireguard0", Type: "wireguard", Description: "Обычный"},
+			{ID: "Wireguard1", Type: "wireguard", Description: "Managed-сервер"},
+			{ID: "Wireguard2", Type: "wireguard", Description: ndms.BuiltInVPNServerDescription},
+		},
+	}
+	cat := NewCatalog(&mockTunnelProvider{}, ndmsClient, nil, noExits(), nil)
+	cat.SetServerInterfaces(func(context.Context) map[string]bool { return map[string]bool{"Wireguard1": true} })
+
+	got := map[string]bool{}
+	for _, e := range cat.ListAll(context.Background()) {
+		got[e.ID] = e.Server
+	}
+	want := map[string]bool{"system:Wireguard0": false, "system:Wireguard1": true, "system:Wireguard2": true}
+	for id, w := range want {
+		if got[id] != w {
+			t.Errorf("%s: Server=%v, ждали %v (все: %v)", id, got[id], w, got)
+		}
 	}
 }

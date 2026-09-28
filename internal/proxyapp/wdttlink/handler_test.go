@@ -77,6 +77,15 @@ type fakeTunnels struct {
 
 	conflicts      []string
 	conflictsAsked []string
+	described      []describeCall
+	order          []string // «describe:<id>» / «start:<id>» по порядку
+}
+
+type describeCall struct{ ID, Prev, Name string }
+
+func (f *fakeTunnels) SyncDescription(_ context.Context, id, prevName, name string) {
+	f.described = append(f.described, describeCall{id, prevName, name})
+	f.order = append(f.order, "describe:"+id)
 }
 
 func (f *fakeTunnels) List() ([]storage.AWGTunnel, error) {
@@ -137,6 +146,7 @@ func (f *fakeTunnels) Import(_ context.Context, conf, name, clientID string) (st
 
 func (f *fakeTunnels) Start(_ context.Context, id string) error {
 	f.started = append(f.started, id)
+	f.order = append(f.order, "start:"+id)
 	return nil
 }
 
@@ -698,6 +708,38 @@ func TestEnsureWG_AdoptsMatchingTunnel(t *testing.T) {
 	}
 	if data["message"] != "AWG-туннель с таким WireGuard-конфигом уже существует" {
 		t.Fatalf("сообщение: %v", data["message"])
+	}
+}
+
+// Переименование усыновлённого туннеля обязано дойти до описания его записи
+// OpkgTun в NDMS: F517 признаёт запись своей по равенству описания имени, и
+// без синхронизации после ребута туннель не стартовал бы. Описание — ДО
+// старта; без переименования NDMS не трогается.
+func TestEnsureWG_RenameSyncsDescriptionBeforeStart(t *testing.T) {
+	rec := wgClient()
+	h, _, _, tunnels := newTestHandler(t, rec)
+	h.deps.Snapshots = func(string) (awgmproto.State, bool) {
+		return awgmproto.State{PID: 42, WG: &awgmproto.WGState{Config: wgConf}}, true
+	}
+	tunnels.tunnels = []storage.AWGTunnel{{
+		ID: "old", Name: "Старое имя",
+		Peer: storage.AWGPeer{PublicKey: "srvkey=", Endpoint: "127.0.0.1:9000"},
+	}}
+
+	h.EnsureWGTunnel(httptest.NewRecorder(), post(t, ``), rec.Key())
+
+	if len(tunnels.described) != 1 || tunnels.described[0] != (describeCall{"old", "Старое имя", "Германия wdtt"}) {
+		t.Fatalf("описание записи: %+v", tunnels.described)
+	}
+	if strings.Join(tunnels.order, ",") != "describe:old,start:old" {
+		t.Fatalf("порядок: %v", tunnels.order)
+	}
+
+	// Повтор: имя уже то же — описание не трогаем.
+	tunnels.described = nil
+	h.EnsureWGTunnel(httptest.NewRecorder(), post(t, ``), rec.Key())
+	if len(tunnels.described) != 0 {
+		t.Fatalf("описание тронуто без переименования: %+v", tunnels.described)
 	}
 }
 

@@ -48,6 +48,10 @@ type TunnelService interface {
 	// ReplaceConfig replaces a tunnel's config from a new .conf file.
 	ReplaceConfig(ctx context.Context, tunnelID, confContent, newName string, opts service.ReplaceOptions) error
 
+	// SyncDescription — описание НАШЕЙ записи в NDMS = name; prevName — имя
+	// до переименования, по нему проверяется владение (F517).
+	SyncDescription(ctx context.Context, tunnelID, prevName, name string)
+
 	// WAN state model
 	WANModel() *wan.Model
 

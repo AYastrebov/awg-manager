@@ -610,6 +610,123 @@ func TestInterfaceStore_Invalidate_OnHTTPErrorLeavesMapUntouched(t *testing.T) {
 	}
 }
 
+// === Refresh (F532: freshness for ownership decisions — bypasses the
+// event-sourced cache, which an out-of-band description edit never
+// invalidates via a hook) ===
+
+func TestInterfaceStore_Refresh_SeesChangeWithoutHook(t *testing.T) {
+	fg := newFakeGetter()
+	fg.SetJSON(ifaceListPath, sampleIfaceList)
+	s := NewInterfaceStore(fg, NopLogger())
+
+	// Кэш поднят на старом описании — как будто хука ifcreated/ifdestroyed
+	// на смену описания снаружи никогда не было.
+	cached, _ := s.Get(context.Background(), "Wireguard0")
+	if cached == nil || cached.Description != "my tunnel" {
+		t.Fatalf("precondition: cached = %#v", cached)
+	}
+
+	fg.SetPostInterface("Wireguard0", `{"show":{"interface":{
+		"id":"Wireguard0","interface-name":"nwg0","type":"Wireguard","description":"csqtt-probe"
+	}}}`)
+
+	got, err := s.Refresh(context.Background(), "Wireguard0")
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if got == nil || got.Description != "csqtt-probe" {
+		t.Errorf("Refresh: want fresh description, got %#v", got)
+	}
+	if again, _ := s.Get(context.Background(), "Wireguard0"); again == nil || again.Description != "csqtt-probe" {
+		t.Errorf("Refresh must patch the cache: Get = %#v", again)
+	}
+}
+
+// Форма, которую реально отдаёт NDMS на отсутствующую запись через POST
+// (стенд KN-1810, 5.02.A.11: `unable to find`, код 6553619) — см.
+// TestFetchSummary_NoDataMeansNilDetails и
+// TestWGServerStore_List_SkipsVanishedInterface для того же конверта.
+func TestInterfaceStore_Refresh_AbsentGivesNilNotError(t *testing.T) {
+	fg := newFakeGetter()
+	fg.SetJSON(ifaceListPath, sampleIfaceList)
+	fg.SetPostInterface("Wireguard0", `{"show":{"interface":{
+		"status":[{"status":"error","code":"6553619","ident":"Network::Interface::Base","message":"unable to find \"Wireguard0\"."}]
+	}}}`)
+	s := NewInterfaceStore(fg, NopLogger())
+
+	_, _ = s.Get(context.Background(), "Wireguard0")
+
+	got, err := s.Refresh(context.Background(), "Wireguard0")
+	if err != nil || got != nil {
+		t.Fatalf("Refresh на отсутствующей записи: want (nil, nil), got (%#v, %v)", got, err)
+	}
+	if again, _ := s.Get(context.Background(), "Wireguard0"); again != nil {
+		t.Errorf("Refresh must drop the absent entry from the cache, got %#v", again)
+	}
+}
+
+// Ревью F532: вложенный конверт статус-ошибки с ЛЮБЫМ кодом, кроме
+// "unable to find" (6553619), — это «не знаем», а не «записи нет». До
+// правки fetchOne путал их: отсутствие id/interface-name трактовалось как
+// абсент независимо от кода, и гейт Фазы 1 создал бы запись поверх уже
+// существующей, а Refresh выкинул бы верный кэш.
+func TestInterfaceStore_Refresh_OtherStatusErrorIsErrorNotAbsent(t *testing.T) {
+	fg := newFakeGetter()
+	fg.SetJSON(ifaceListPath, sampleIfaceList)
+	fg.SetPostInterface("Wireguard0", `{"show":{"interface":{
+		"status":[{"status":"error","code":"6553601","ident":"Network::Interface::Base","message":"internal error"}]
+	}}}`)
+	s := NewInterfaceStore(fg, NopLogger())
+
+	_, _ = s.Get(context.Background(), "Wireguard0")
+
+	got, err := s.Refresh(context.Background(), "Wireguard0")
+	if err == nil {
+		t.Fatalf("Refresh на непонятной вложенной ошибке: want error, got %#v", got)
+	}
+	if !strings.Contains(err.Error(), "6553601") || !strings.Contains(err.Error(), "internal error") {
+		t.Errorf("ошибка должна нести код/сообщение NDMS, got %q", err.Error())
+	}
+	if again, _ := s.Get(context.Background(), "Wireguard0"); again == nil || again.Description != "my tunnel" {
+		t.Errorf("Refresh на непонятной ошибке должен оставить кэш прежним, got %#v", again)
+	}
+}
+
+// Код во вложенном конверте числом: сбой разбора не должен тихо превращаться
+// в «записи нет» — 6553619 остаётся отсутствием, прочее — ошибкой.
+func TestInterfaceStore_Refresh_NumericStatusCode(t *testing.T) {
+	for _, tc := range []struct {
+		code    string
+		wantErr bool
+	}{{"6553601", true}, {"6553619", false}} {
+		fg := newFakeGetter()
+		fg.SetJSON(ifaceListPath, sampleIfaceList)
+		fg.SetPostInterface("Wireguard0", `{"show":{"interface":{"status":[{"status":"error","code":`+tc.code+`,"message":"x"}]}}}`)
+		s := NewInterfaceStore(fg, NopLogger())
+		got, err := s.Refresh(context.Background(), "Wireguard0")
+		if (err != nil) != tc.wantErr || got != nil {
+			t.Errorf("code %s: got (%#v, %v), wantErr %v", tc.code, got, err, tc.wantErr)
+		}
+	}
+}
+
+func TestInterfaceStore_Refresh_ErrorLeavesCacheUntouched(t *testing.T) {
+	fg := newFakeGetter()
+	fg.SetJSON(ifaceListPath, sampleIfaceList)
+	fg.SetPostInterfaceError("Wireguard0", errors.New("ndms flake"))
+	s := NewInterfaceStore(fg, NopLogger())
+
+	_, _ = s.Get(context.Background(), "Wireguard0")
+
+	got, err := s.Refresh(context.Background(), "Wireguard0")
+	if err == nil {
+		t.Fatalf("Refresh: want error, got nil (got=%#v)", got)
+	}
+	if again, _ := s.Get(context.Background(), "Wireguard0"); again == nil || again.Description != "my tunnel" {
+		t.Errorf("Refresh error must leave the cache untouched, got %#v", again)
+	}
+}
+
 // === Hook-side write API: OnCreated / OnDestroyed / OnLayerChanged / OnIPChanged ===
 
 func TestInterfaceStore_OnCreated_FetchesOnce(t *testing.T) {
@@ -1356,5 +1473,73 @@ func TestInterfaceStore_ListAll_DedupDeterministic(t *testing.T) {
 	}
 	if got := fg.PostSystemNameCalls("GigabitEthernet1/0"); got != 0 {
 		t.Errorf("порт резолвится в ListAll (%d раз) — его там быть не должно", got)
+	}
+}
+
+// SystemNames — имена ядра для обратной карты (SystemTunnelsByIface):
+// `interface-name` из списка (byID.SystemName) сам по себе резолвером не
+// подтверждён, поэтому проходит ту же проверку kernelIfaceExists, что и
+// trustedSystemName — устройства нет ни у одного из трёх, все идут в один
+// пакетный запрос; итог резолвера (s.sysNames) кэшируется и трудится дальше
+// даже без живого устройства (карте нужно имя, а не живость) — повтор в
+// резолвер не ходит.
+func TestInterfaceStore_SystemNames_CachedOrOneBatch(t *testing.T) {
+	orig := kernelIfaceExists
+	kernelIfaceExists = func(string) bool { return false } // устройств нет
+	defer func() { kernelIfaceExists = orig }()
+
+	fg := newFakeGetter()
+	fg.SetJSON(ifaceListPath, `{
+		"Wireguard0": {"id":"Wireguard0","interface-name":"nwg0","type":"Wireguard","state":"down"},
+		"Wireguard1": {"id":"Wireguard1","interface-name":"Wireguard1","type":"Wireguard","state":"down"},
+		"Wireguard2": {"id":"Wireguard2","interface-name":"Wireguard2","type":"Wireguard","state":"down"}
+	}`)
+	fg.SetPostSystemName("Wireguard0", `"nwg0"`)
+	fg.SetPostSystemName("Wireguard1", `"nwg1"`)
+	fg.SetPostSystemName("Wireguard2", `"nwg2"`)
+	s := NewInterfaceStore(fg, NopLogger())
+	ids := []string{"Wireguard0", "Wireguard1", "Wireguard2"}
+	want := map[string]string{"Wireguard0": "nwg0", "Wireguard1": "nwg1", "Wireguard2": "nwg2"}
+
+	for round := 1; round <= 2; round++ {
+		got := s.SystemNames(context.Background(), ids)
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("круг %d: %v, want %v", round, got, want)
+		}
+		if n := fg.BatchPostCalls(); n != 1 {
+			t.Fatalf("круг %d: пакетных POST %d, ждали 1", round, n)
+		}
+		for _, id := range ids {
+			// Wireguard0 тоже без device — его byID-имя "nwg0" не резолвером
+			// подтверждено, поэтому и оно должно уйти в пакет один раз, а не
+			// быть взято из списка вслепую.
+			if n := fg.PostSystemNameCalls(id); n != 1 {
+				t.Fatalf("круг %d: %s спрошен %d раз, ждали 1", round, id, n)
+			}
+		}
+	}
+}
+
+// SystemNames: byID.SystemName, прошедший синтаксическую форму
+// (looksLikeKernelIfname), но не kernelIfaceExists — НЕ берётся из кэша, а
+// уходит в резолвер (защита от лейбла NDMS, похожего на имя ядра, на 5.02).
+func TestInterfaceStore_SystemNames_ByIDNameFailsExistenceCheck(t *testing.T) {
+	orig := kernelIfaceExists
+	kernelIfaceExists = func(string) bool { return false }
+	defer func() { kernelIfaceExists = orig }()
+
+	fg := newFakeGetter()
+	fg.SetJSON(ifaceListPath, `{
+		"Wireguard0": {"id":"Wireguard0","interface-name":"nwg0","type":"Wireguard","state":"down"}
+	}`)
+	fg.SetPostSystemName("Wireguard0", `"nwg0"`)
+	s := NewInterfaceStore(fg, NopLogger())
+
+	got := s.SystemNames(context.Background(), []string{"Wireguard0"})
+	if got["Wireguard0"] != "nwg0" {
+		t.Fatalf("got %v, want nwg0 через резолвер", got)
+	}
+	if n := fg.PostSystemNameCalls("Wireguard0"); n != 1 {
+		t.Fatalf("byID-имя взято из кэша без проверки существования: резолвер спрошен %d раз, ждали 1", n)
 	}
 }

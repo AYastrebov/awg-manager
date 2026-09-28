@@ -497,6 +497,64 @@ func (s *InterfaceStore) resolveSystemNames(ctx context.Context, ids []string) {
 	}
 }
 
+// SystemNames — имена ядра для ids (id → имя; неразрешённых в карте нет)
+// без запроса на каждый id. В отличие от ResolveSystemName имени из кэша
+// достаточно, даже если устройства сейчас нет: обратной карте целей
+// (routing.SystemTunnelsByIface) нужно имя, а не живость устройства, — а
+// ResolveSystemName на отсутствующем устройстве каждый раз шёл бы в резолвер.
+// Прочие разрешаются одним пакетом (resolveSystemNames), одиночный — одним
+// запросом.
+func (s *InterfaceStore) SystemNames(ctx context.Context, ids []string) map[string]string {
+	out := make(map[string]string, len(ids))
+	if len(ids) == 0 || s.ensureBootstrap(ctx) != nil {
+		return out
+	}
+	// Имя из s.sysNames уже прошло через резолвер — доверяем ему без
+	// kernelIfaceExists (сюда и приходят за именем отсутствующего сейчас
+	// устройства). Имя из byID.SystemName — сырое `interface-name` из
+	// списка, резолвером не подтверждено, поэтому проверяем его так же,
+	// как ResolveSystemName: trustedSystemName (включая kernelIfaceExists).
+	// Без этой проверки лейбл NDMS, похожий на имя ядра (5.02.A.11),
+	// использовался бы вечно, а реальное имя так и не запрашивалось.
+	cached := func(id string) string {
+		s.mu.RLock()
+		resolverName, viaResolver := s.sysNames[id]
+		iface, hasIface := s.byID[id]
+		s.mu.RUnlock()
+		if viaResolver {
+			if resolverName != id && looksLikeKernelIfname(resolverName) {
+				return resolverName
+			}
+			return ""
+		}
+		if hasIface && trustedSystemName(id, iface.SystemName) {
+			return iface.SystemName
+		}
+		return ""
+	}
+	var todo []string
+	for _, id := range ids {
+		if name := cached(id); name != "" {
+			out[id] = name
+		} else {
+			todo = append(todo, id)
+		}
+	}
+	if len(todo) == 1 {
+		if name := s.fetchSystemName(ctx, todo[0]); name != "" {
+			s.rememberSystemName(todo[0], name)
+		}
+	} else {
+		s.resolveSystemNames(ctx, todo)
+	}
+	for _, id := range todo {
+		if name := cached(id); name != "" {
+			out[id] = name
+		}
+	}
+	return out
+}
+
 // fetchSystemName resolves an NDMS interface id to its kernel name via
 // {"show":{"interface":{"system-name":{"name":X}}}} POST payload.
 //
@@ -709,6 +767,9 @@ func (s *InterfaceStore) ListAll(ctx context.Context) ([]ndms.AllInterface, erro
 	winnerID := make(map[string]string, len(all))
 	for _, iface := range all {
 		kernelName := s.ResolveSystemName(ctx, iface.ID)
+		// Запасной путь оставлен намеренно: эхо метки (`Home`,
+		// `GigabitEthernet0`) wireToInterface уже вычистил, сюда доходит
+		// имя ядра отсутствующего сейчас устройства (выдернутый usb0).
 		if kernelName == "" {
 			kernelName = iface.SystemName
 		}
@@ -838,11 +899,8 @@ func (s *InterfaceStore) OnDestroyed(id string) {
 //   - State field is the overall interface-up flag and tracks the
 //     ctrl layer the same way: running=up, anything else=down. ctrl
 //     also gates startedAt (the uptime clock).
-//
-// IPv4 / IPv6 layer events are accepted but currently produce no
-// field updates — the existing summary-layer fields aren't part of
-// any read path's hot loop yet. If they become hot, mirror the
-// running→up mapping.
+//   - IPv4 layer events store the level as-is into the IPv4 field (it
+//     is layer-state, not up/down). IPv6 events produce no updates.
 func (s *InterfaceStore) OnLayerChanged(id, layer, level string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -906,31 +964,28 @@ func layerLevelToUpDown(level string) string {
 
 // === Command-side write API (proactive refresh after a successful POST) ===
 
-// Invalidate is called by command-side code AFTER a successful NDMS
-// write to ensure the next read sees the new state without waiting
-// for the eventual hook. Issues ONE HTTP (/show/interface/<name>) and
-// patches the map. If the interface no longer exists in NDMS (200 +
-// empty body), it is removed from the map.
+// Refresh issues ONE fresh /show/interface/<name> read regardless of what
+// the cache holds, patches the cache with the result the same way
+// Invalidate does, and returns it. Use this instead of Get when the
+// decision must reflect what NDMS holds RIGHT NOW rather than the last
+// hook-driven snapshot: NDMS hooks (ifcreated/ifdestroyed/…) don't fire
+// for an out-of-band edit like `interface OpkgTunN description …`, so
+// Get can stay stale indefinitely (F532).
 //
-// 404 is not expected here — command callers invoke this only after
-// a successful POST, so the interface exists. If a 404 does arrive
-// (e.g. a different actor deleted the interface concurrently), the
-// HTTPError propagates as a logged warning and the map is left
-// untouched (next bootstrap or hook will reconcile).
-func (s *InterfaceStore) Invalidate(name string) {
+// Absent record (200 + empty body, or the "unable to find" status
+// envelope NDMS returns for this POST form) → (nil, nil), and the entry
+// is removed from the cache. Transport/parse error → error returned,
+// cache left untouched — same contract Invalidate already had.
+func (s *InterfaceStore) Refresh(ctx context.Context, name string) (*ndms.Interface, error) {
 	if name == "" {
-		return
+		return nil, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	if err := s.ensureBootstrap(ctx); err != nil {
-		s.log.Warnf("Invalidate %s: bootstrap failed: %v", name, err)
-		return
+		return nil, err
 	}
 	iface, err := s.fetchOne(ctx, name)
 	if err != nil {
-		s.log.Warnf("Invalidate %s: refresh failed: %v", name, err)
-		return
+		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -938,13 +993,38 @@ func (s *InterfaceStore) Invalidate(name string) {
 		// NDMS confirms absent — remove from map.
 		delete(s.byID, name)
 		delete(s.startedAt, name)
-		return
+		return nil, nil
 	}
 	s.byID[name] = iface
 	if iface.Uptime > 0 && iface.ConfLayer == "running" {
 		if _, exists := s.startedAt[name]; !exists {
 			s.startedAt[name] = time.Now().Add(-time.Duration(iface.Uptime) * time.Second)
 		}
+	}
+	cp := *iface
+	return &cp, nil
+}
+
+// Invalidate is called by command-side code AFTER a successful NDMS
+// write to ensure the next read sees the new state without waiting
+// for the eventual hook. Thin wrapper over Refresh (5s timeout, own
+// background context) that swallows the error into a Warn log — this
+// is a fire-and-forget call, callers don't check the outcome.
+//
+// 404/"unable to find" is not expected here — command callers invoke
+// this only after a successful POST, so the interface exists. If it
+// does arrive anyway (e.g. a different actor deleted the interface
+// concurrently), Refresh already treats it as "absent" and removes the
+// entry; any other error is logged and the map is left untouched (next
+// bootstrap or hook will reconcile).
+func (s *InterfaceStore) Invalidate(name string) {
+	if name == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := s.Refresh(ctx, name); err != nil {
+		s.log.Warnf("Invalidate %s: refresh failed: %v", name, err)
 	}
 }
 
@@ -1026,6 +1106,17 @@ func (s *InterfaceStore) fetchListMap(ctx context.Context) (map[string]ndms.Inte
 // to be a 404 in the GET form; now the POST may return an empty envelope
 // for the same case). HTTPError 404 (rare race condition on POST) is
 // returned as-is.
+//
+// F532: NDMS answers this POST form with HTTP 200 even for a record that
+// doesn't exist — a nested `{"status":[{"status":"error","code":...}]}`
+// envelope, NOT the top-level `{"status":"error",...}` shape
+// transport.Client.postJSON's ExtractError checks for (stand: KN-1810,
+// 5.02.A.11). Only code 6553619 ("unable to find") means "no such
+// record" → (nil, nil). Any OTHER code inside that envelope is a real
+// NDMS-side failure ("don't know", not "doesn't exist") and must not be
+// silently treated as absence — a Phase-1 ownership gate acting on a
+// false (nil, nil) would create a record on top of one that already
+// exists, and Refresh would evict a perfectly good cache entry.
 func (s *InterfaceStore) fetchOne(ctx context.Context, name string) (*ndms.Interface, error) {
 	raw, err := s.getter.Post(ctx, transport.ShowInterface(name, nil))
 	if err != nil {
@@ -1037,6 +1128,12 @@ func (s *InterfaceStore) fetchOne(ctx context.Context, name string) (*ndms.Inter
 	}
 	if len(inner) == 0 {
 		return nil, nil
+	}
+	if statusErr := parseNestedStatusError(inner); statusErr != nil {
+		if statusErr.Code == ndmsUnableToFindCode {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("fetch interface %s: ndms status error %s: %s", name, statusErr.Code, statusErr.Message)
 	}
 	var w ifaceWire
 	if err := json.Unmarshal(inner, &w); err != nil {
@@ -1050,6 +1147,43 @@ func (s *InterfaceStore) fetchOne(ctx context.Context, name string) (*ndms.Inter
 	}
 	iface := wireToInterface(w)
 	return &iface, nil
+}
+
+// ndmsUnableToFindCode — код NDMS-конверта "unable to find" (стенд
+// KN-1810, 5.02.A.11): единственное значение code, которое означает
+// «записи нет», а не «запрос не удался».
+const ndmsUnableToFindCode = "6553619"
+
+// ndmsStatusError is one `{"status":"error",...}` element of a nested
+// NDMS status array — the shape this POST form wraps into `show.interface`
+// on failure, distinct from the top-level status envelope
+// transport.ExtractError checks.
+type ndmsStatusError struct {
+	Code    string
+	Message string
+}
+
+// parseNestedStatusError reports the first `status: "error"` entry of a
+// `{"status":[...]}` array at the top of inner, or nil if inner isn't
+// that shape (a normal interface object has no top-level "status" field
+// of this form, so this never misfires on a real record).
+func parseNestedStatusError(inner []byte) *ndmsStatusError {
+	var w struct {
+		Status []struct {
+			Status  string          `json:"status"`
+			Code    json.RawMessage `json:"code"` // строка у стенда; число тоже принимаем
+			Message string          `json:"message"`
+		} `json:"status"`
+	}
+	if json.Unmarshal(inner, &w) != nil {
+		return nil
+	}
+	for _, s := range w.Status {
+		if s.Status == "error" {
+			return &ndmsStatusError{Code: strings.Trim(string(s.Code), `"`), Message: s.Message}
+		}
+	}
+	return nil
 }
 
 // === Wire format ===

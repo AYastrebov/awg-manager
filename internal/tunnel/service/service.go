@@ -76,6 +76,11 @@ type Service interface {
 	// мутатором (см. ReplaceOptions).
 	ReplaceConfig(ctx context.Context, tunnelID, confContent, newName string, opts ReplaceOptions) error
 
+	// CaptureDescription ставит описание записи kernel-туннеля = name БЕЗ
+	// проверки владения — только для взятия стороннего туннеля (Adopt).
+	// Провал — только Warn в журнале.
+	CaptureDescription(ctx context.Context, tunnelID, name string)
+
 	// Validation
 
 	// CheckAddressConflicts returns warnings if the tunnel's address

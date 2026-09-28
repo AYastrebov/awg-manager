@@ -372,6 +372,9 @@ func (s *Service) Adopt(ctx context.Context, req AdoptRequest) (*service.TunnelW
 	if t.Name == "" {
 		t.Name = fmt.Sprintf("Imported %s", req.InterfaceName)
 	}
+	if err := tunnel.ValidateName(t.Name); err != nil {
+		return nil, err
+	}
 
 	// Set defaults
 	t.Type = "awg"
@@ -414,6 +417,12 @@ func (s *Service) Adopt(ctx context.Context, req AdoptRequest) (*service.TunnelW
 	}
 
 	s.appLog.Info("adopt", t.ID, "Adopted external tunnel: "+t.Name)
+
+	// Запись OpkgTunN несёт описание сторонней программы, а F517 признаёт её
+	// нашей только с описанием = имени туннеля: без этого туннель без живого
+	// устройства не стартовал бы никогда. Взятие забирает запись осознанно —
+	// поэтому захват без проверки владения. Записи нет — её заведёт Фаза 1.
+	s.tunnelService.CaptureDescription(ctx, t.ID, t.Name)
 
 	// Start the tunnel under awg-manager control
 	if err := s.tunnelService.Start(ctx, t.ID); err != nil {
