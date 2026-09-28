@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -53,6 +54,22 @@ func (g *stateAwareGetter) Get(ctx context.Context, path string, out any) error 
 				}
 			}
 			raw, err := json.Marshal(src)
+			if err != nil {
+				return err
+			}
+			return json.Unmarshal(raw, out)
+		}
+		// rc интерфейса: обогащение WGServers.Get без него — ошибка (F510).
+		// Пиры — записанные в хранилище (роутер совпадает с записью): правка
+		// по ключу проверяет наличие пира свежим чтением.
+		if strings.HasPrefix(path, "/show/rc/interface/") && !strings.Contains(strings.TrimPrefix(path, "/show/rc/interface/"), "/") {
+			var peers []map[string]any
+			if sv, ok := g.store.GetManagedServerByID(strings.TrimPrefix(path, "/show/rc/interface/")); ok {
+				for _, p := range sv.Peers {
+					peers = append(peers, map[string]any{"key": p.PublicKey})
+				}
+			}
+			raw, err := json.Marshal(map[string]any{"wireguard": map[string]any{"peer": peers}})
 			if err != nil {
 				return err
 			}
@@ -174,6 +191,10 @@ func (g *stateAwareGetter) GetRaw(ctx context.Context, path string) ([]byte, err
 		}
 		return []byte(`""`), nil
 	}
+	// Удаление пира сверяет маршруты с его меткой (#713) — статических нет.
+	if path == "/show/rc/ip/route" {
+		return []byte(`[]`), nil
+	}
 	return nil, errors.New("stateAwareGetter: GetRaw not faked: " + path)
 }
 
@@ -220,12 +241,25 @@ type recordingPoster struct {
 	err    error
 	onPost func(map[string]interface{})
 	failOn func(map[string]interface{}) error // per-command инъекция ошибки
+	// respond — per-command тело ответа (nil — "{}"): отказы NDMS внутри
+	// вложенного status, которые транспорт ошибкой не считает.
+	respond func(map[string]interface{}) json.RawMessage
+	// honorCtx — отменённый ctx отвергается без записи, как у настоящего транспорта.
+	honorCtx bool
 }
 
 func (p *recordingPoster) Post(ctx context.Context, payload any) (json.RawMessage, error) {
 	p.mu.Lock()
+	if p.honorCtx && ctx.Err() != nil {
+		p.mu.Unlock()
+		return nil, ctx.Err()
+	}
 	var injected error
+	var resp json.RawMessage
 	if m, ok := payload.(map[string]interface{}); ok {
+		if p.respond != nil {
+			resp = p.respond(m)
+		}
 		p.posts = append(p.posts, m) // запись ДО проверки failOn: тест видит, что было попытано
 		if p.onPost != nil {
 			p.onPost(m)
@@ -241,6 +275,9 @@ func (p *recordingPoster) Post(ctx context.Context, payload any) (json.RawMessag
 	}
 	if err != nil {
 		return nil, err
+	}
+	if resp != nil {
+		return resp, nil
 	}
 	return json.RawMessage("{}"), nil
 }
@@ -264,6 +301,7 @@ func newCreateTestService(t *testing.T) (*Service, *storage.SettingsStore, *stat
 		Policies:      query.NewPolicyStore(getter, query.NopLogger()),
 		WGServers:     query.NewWGServerStore(getter, query.NopLogger(), ifaces),
 		RunningConfig: query.NewRunningConfigStore(getter, query.NopLogger()),
+		StaticRoutes:  query.NewStaticRouteStore(getter, query.NopLogger()),
 	}
 	poster := &recordingPoster{onPost: getter.applyPost}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -279,12 +317,12 @@ func newCreateTestService(t *testing.T) (*Service, *storage.SettingsStore, *stat
 	svc.wgRun = func(_ context.Context, _ string, _ ...string) (string, error) {
 		return "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n", nil
 	}
-	// AddPeer иначе форкает /opt/sbin/awg — на машине разработчика его нет.
+	// AddPeer иначе форкает /opt/bin/wg — на машине разработчика его нет.
 	svc.keyGen = &fakeKeyGen{}
 	return svc, store, getter
 }
 
-// fakeKeyGen выдаёт детерминированные ключи вместо awg genkey/pubkey/genpsk.
+// fakeKeyGen выдаёт детерминированные ключи вместо wg genkey/pubkey/genpsk.
 type fakeKeyGen struct{ n int }
 
 func (f *fakeKeyGen) next() int {
@@ -915,6 +953,7 @@ func newLANSegmentsTestService(t *testing.T) (*Service, *storage.SettingsStore, 
 		Policies:      query.NewPolicyStore(getter, query.NopLogger()),
 		WGServers:     query.NewWGServerStore(getter, query.NopLogger(), ifaces),
 		RunningConfig: query.NewRunningConfigStore(getter, query.NopLogger()),
+		StaticRoutes:  query.NewStaticRouteStore(getter, query.NopLogger()),
 	}
 	poster := &recordingPoster{onPost: getter.applyPost}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -990,10 +1029,14 @@ func TestSetLANSegments_RebuildOrder(t *testing.T) {
 		}
 	}
 
+	// Живой привязанный список — прежняя последовательность.
+	ourACL := []string{"access-list AWGM_Wireguard0", "    permit ip 10.66.66.0 255.255.255.0 10.10.10.0 255.255.255.0", "    auto-delete", "!",
+		"interface Wireguard0", "    security-level private", "    ip access-group AWGM_Wireguard0 in", "!"}
+
 	t.Run("non-empty segments", func(t *testing.T) {
 		svc, store, poster := newLANSegmentsTestService(t)
 		ctx := context.Background()
-		withRunningConfig(svc, "interface Wireguard0", "    security-level private", "!")
+		withRunningConfig(svc, ourACL...)
 		seedServer(t, store, ifaceName)
 		resetPosts(poster)
 
@@ -1025,10 +1068,27 @@ func TestSetLANSegments_RebuildOrder(t *testing.T) {
 		}
 	})
 
+	// Стенд 28.09: первое включение — привязки и списка нет; unbind и
+	// `no access-list` вслепую дали бы E «argument parse error» в журнале роутера.
+	t.Run("first enable without list: no unbind/remove", func(t *testing.T) {
+		svc, store, poster := newLANSegmentsTestService(t)
+		withRunningConfig(svc, "interface Wireguard0", "    security-level private", "!")
+		seedServer(t, store, ifaceName)
+		resetPosts(poster)
+		if err := svc.SetLANSegments(context.Background(), ifaceName, []string{"Home"}); err != nil {
+			t.Fatalf("SetLANSegments: %v", err)
+		}
+		assertParses(t, parseStrings(poster), []string{
+			fmt.Sprintf("access-list %s permit ip 10.66.66.0 255.255.255.0 10.10.10.0 255.255.255.0", acl),
+			fmt.Sprintf("interface %s ip access-group %s in", ifaceName, acl),
+			fmt.Sprintf("access-list %s auto-delete", acl),
+		})
+	})
+
 	t.Run("empty segments unbinds and removes only", func(t *testing.T) {
 		svc, store, poster := newLANSegmentsTestService(t)
 		ctx := context.Background()
-		withRunningConfig(svc, "interface Wireguard0", "    security-level private", "!")
+		withRunningConfig(svc, ourACL...)
 		seedServer(t, store, ifaceName)
 		resetPosts(poster)
 
@@ -1066,11 +1126,10 @@ func TestSetLANSegments_RebuildOrder(t *testing.T) {
 			t.Fatalf("SetLANSegments(empty): %v", err)
 		}
 
-		assertParses(t, parseStrings(poster), []string{
-			fmt.Sprintf("no interface %s ip access-group %s in", ifaceName, acl),
-			"no access-list " + acl,
-		})
+		// Нашего списка нет — снимать нечего; чужой не тронут.
+		assertParses(t, parseStrings(poster), nil)
 	})
+
 }
 
 func TestResolveLANSegmentsPlan(t *testing.T) {
@@ -1079,13 +1138,13 @@ func TestResolveLANSegmentsPlan(t *testing.T) {
 		{Name: "Guest", Address: "10.10.20.1", Mask: "255.255.255.0"},
 	}
 	t.Run("valid segments → network-subnet permit rules", func(t *testing.T) {
-		rules, err := resolveLANSegmentsPlan("10.66.66.1", "255.255.255.0", []string{"Home", "Guest"}, bridges)
+		rules, err := resolveLANSegmentsPlan("10.66.66.1", "255.255.255.0", nil, []string{"Home", "Guest"}, bridges)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		want := []permitRule{
-			{srcSub: "10.66.66.0", srcMask: "255.255.255.0", dstSub: "10.10.10.0", dstMask: "255.255.255.0"},
-			{srcSub: "10.66.66.0", srcMask: "255.255.255.0", dstSub: "10.10.20.0", dstMask: "255.255.255.0"},
+			{srcSub: "10.66.66.0", srcMask: "255.255.255.0", dstSub: "10.10.10.0", dstMask: "255.255.255.0", seg: "Home"},
+			{srcSub: "10.66.66.0", srcMask: "255.255.255.0", dstSub: "10.10.20.0", dstMask: "255.255.255.0", seg: "Guest"},
 		}
 		if len(rules) != len(want) {
 			t.Fatalf("got %d rules, want %d: %+v", len(rules), len(want), rules)
@@ -1097,17 +1156,17 @@ func TestResolveLANSegmentsPlan(t *testing.T) {
 		}
 	})
 	t.Run("unknown segment errors", func(t *testing.T) {
-		if _, err := resolveLANSegmentsPlan("10.66.66.1", "255.255.255.0", []string{"Ghost"}, bridges); err == nil {
+		if _, err := resolveLANSegmentsPlan("10.66.66.1", "255.255.255.0", nil, []string{"Ghost"}, bridges); err == nil {
 			t.Fatal("expected error for unknown segment")
 		}
 	})
 	t.Run("bad peer subnet errors", func(t *testing.T) {
-		if _, err := resolveLANSegmentsPlan("not-an-ip", "255.255.255.0", []string{"Home"}, bridges); err == nil {
+		if _, err := resolveLANSegmentsPlan("not-an-ip", "255.255.255.0", nil, []string{"Home"}, bridges); err == nil {
 			t.Fatal("expected error for bad peer subnet")
 		}
 	})
 	t.Run("empty catalog with requested segments errors", func(t *testing.T) {
-		if _, err := resolveLANSegmentsPlan("10.66.66.1", "255.255.255.0", []string{"Home"}, nil); err == nil {
+		if _, err := resolveLANSegmentsPlan("10.66.66.1", "255.255.255.0", nil, []string{"Home"}, nil); err == nil {
 			t.Fatal("expected error when catalog empty")
 		}
 	})
@@ -1120,9 +1179,11 @@ func TestUpdate_SubnetChange_RebuildsLANACL(t *testing.T) {
 	if err := store.AddManagedServer(storage.ManagedServer{
 		InterfaceName: ifaceName, Address: "10.66.66.1", Mask: "255.255.255.0",
 		ListenPort: 51820, LANSegments: []string{"Home"},
+		Peers: []storage.ManagedPeer{{PublicKey: "PEER1", TunnelIP: "10.66.66.2/32", RemoteSubnets: []string{"192.168.77.0/24"}}},
 	}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+	withRunningConfig(svc)
 	poster.mu.Lock()
 	poster.posts = nil
 	poster.mu.Unlock()
@@ -1151,6 +1212,10 @@ func TestUpdate_SubnetChange_RebuildsLANACL(t *testing.T) {
 	}
 	if !foundNew {
 		t.Errorf("expected permit with new source subnet 10.77.77.0; posts=%v", posts)
+	}
+	// Сети за клиентом пиров пересборка сохраняет (#713).
+	if !slices.Contains(parseStrings(poster), "access-list AWGM_Wireguard0 permit ip 192.168.77.0 255.255.255.0 10.10.10.0 255.255.255.0") {
+		t.Errorf("пересборка потеряла сеть за клиентом; posts=%v", parseStrings(poster))
 	}
 }
 

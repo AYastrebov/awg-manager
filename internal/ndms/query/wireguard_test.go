@@ -867,3 +867,69 @@ func TestWithLivePeers(t *testing.T) {
 		t.Error("исходный срез изменён — список из кэша общий для всех читателей")
 	}
 }
+
+// PeersRCFresh читает мимо кэша и без stale-on-error: после удачного чтения
+// сбой возвращается ошибкой, а смена rc видна сразу (#713, проверка пересечений).
+func TestPeersRCFresh_NoCacheNoStale(t *testing.T) {
+	fg := NewFakeGetter()
+	fg.SetJSON("/show/rc/interface/Wireguard0", `{"wireguard":{"peer":[{"key":"K1=","comment":"office","allow-ips":[{"address":"172.16.5.0","mask":"255.255.255.0"}]}]}}`)
+	s := NewWGServerStore(fg, NopLogger(), NewInterfaceStore(fg, NopLogger()))
+	ctx := context.Background()
+
+	peers, err := s.PeersRCFresh(ctx, "Wireguard0")
+	if err != nil || len(peers) != 1 || peers[0].Description != "office" ||
+		len(peers[0].AllowedIPs) != 1 || peers[0].AllowedIPs[0] != "172.16.5.0/24" {
+		t.Fatalf("peers = %+v, err = %v", peers, err)
+	}
+	fg.SetJSON("/show/rc/interface/Wireguard0", `{"wireguard":{"peer":[]}}`)
+	if peers, err := s.PeersRCFresh(ctx, "Wireguard0"); err != nil || len(peers) != 0 {
+		t.Fatalf("закэшировано: %+v %v", peers, err)
+	}
+	fg.SetError("/show/rc/interface/Wireguard0", errors.New("rci down"))
+	if _, err := s.PeersRCFresh(ctx, "Wireguard0"); err == nil {
+		t.Fatal("сбой чтения замаскирован")
+	}
+}
+
+// F510: сбой чтения rc одного сервера — ошибка List, а не список с пирами без
+// allow-ips: неполный список лёг бы в кэш на TTL. После починки чтения
+// следующий List полный — неполный результат не закэширован.
+func TestWGServerStore_List_EnrichmentErrorNotCached(t *testing.T) {
+	fg := newFakeGetter()
+	primeWGFakeGetter(fg)
+	fg.SetError("/show/rc/interface/Wireguard1", errors.New("rci down"))
+	s := NewWGServerStore(fg, NopLogger(), NewInterfaceStore(fg, NopLogger()))
+
+	if servers, err := s.List(context.Background()); err == nil {
+		t.Fatalf("сбой обогащения замаскирован: %+v", servers)
+	}
+	fg.SetError("/show/rc/interface/Wireguard1", nil)
+	servers, err := s.List(context.Background())
+	if err != nil {
+		t.Fatalf("List после починки: %v", err)
+	}
+	if len(servers) != 2 || len(servers[1].Peers) != 1 || len(servers[1].Peers[0].AllowedIPs) == 0 {
+		t.Fatalf("неполный список: %+v", servers)
+	}
+}
+
+// Тот же класс, что F510, у одиночного Get: сбой rc — ошибка, а не элемент без
+// allow-ips в кэше на TTL.
+func TestWGServerStore_Get_EnrichmentErrorNotCached(t *testing.T) {
+	fg := newFakeGetter()
+	primeWGFakeGetter(fg)
+	fg.SetError("/show/rc/interface/Wireguard1", errors.New("rci down"))
+	s := NewWGServerStore(fg, NopLogger(), NewInterfaceStore(fg, NopLogger()))
+
+	if srv, err := s.Get(context.Background(), "Wireguard1"); err == nil {
+		t.Fatalf("сбой обогащения замаскирован: %+v", srv)
+	}
+	fg.SetError("/show/rc/interface/Wireguard1", nil)
+	srv, err := s.Get(context.Background(), "Wireguard1")
+	if err != nil {
+		t.Fatalf("Get после починки: %v", err)
+	}
+	if len(srv.Peers) != 1 || len(srv.Peers[0].AllowedIPs) == 0 {
+		t.Fatalf("неполный элемент: %+v", srv)
+	}
+}

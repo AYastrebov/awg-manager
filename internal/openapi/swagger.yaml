@@ -249,12 +249,24 @@ definitions:
     type: object
   api.AddPeerRequestDTO:
     properties:
+      clientAllowedIPs:
+        description: |-
+          ClientAllowedIPs — строка AllowedIPs в .conf клиента (CIDR через запятую,
+          пусто — весь трафик). RemoteSubnets — сети за клиентом, IPv4 CIDR (#713).
+        example: 10.10.0.0/24, 192.168.1.0/24
+        type: string
       description:
         example: My Phone
         type: string
       dns:
         example: 8.8.8.8
         type: string
+      remoteSubnets:
+        example:
+        - 192.168.77.0/24
+        items:
+          type: string
+        type: array
       tunnelIP:
         description: |-
           TunnelIP is optional: when empty, the first free host address in the
@@ -2464,6 +2476,12 @@ definitions:
     type: object
   api.ManagedPeerDTO:
     properties:
+      clientAllowedIPs:
+        description: |-
+          ClientAllowedIPs — строка AllowedIPs в .conf клиента (CIDR через запятую,
+          пусто — весь трафик). RemoteSubnets — сети за клиентом, IPv4 CIDR (#713).
+        example: 10.10.0.0/24, 192.168.1.0/24
+        type: string
       description:
         example: My Phone
         type: string
@@ -2496,6 +2514,12 @@ definitions:
       publicKey:
         example: HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH=
         type: string
+      remoteSubnets:
+        example:
+        - 192.168.77.0/24
+        items:
+          type: string
+        type: array
       signatureProfile:
         example: quic_initial
         type: string
@@ -3116,6 +3140,23 @@ definitions:
     properties:
       data:
         $ref: '#/definitions/api.PeerConfData'
+      success:
+        example: true
+        type: boolean
+    type: object
+  api.PeerPresetsDTO:
+    properties:
+      exceptRouter:
+        example: 0.0.0.0/5, 8.0.0.0/7, 192.168.1.1/32, ::/0
+        type: string
+      routerOnly:
+        example: 10.10.0.0/24, 192.168.1.0/24
+        type: string
+    type: object
+  api.PeerPresetsResponse:
+    properties:
+      data:
+        $ref: '#/definitions/api.PeerPresetsDTO'
       success:
         example: true
         type: boolean
@@ -3981,6 +4022,12 @@ definitions:
     type: object
   api.ServerAddPeerRequestDTO:
     properties:
+      clientAllowedIPs:
+        description: |-
+          ClientAllowedIPs — строка AllowedIPs в .conf клиента (CIDR через запятую,
+          пусто — весь трафик). RemoteSubnets — сети за клиентом, IPv4 CIDR (#713).
+        example: 10.0.14.0/24, 192.168.1.0/24
+        type: string
       description:
         example: My Phone
         type: string
@@ -3990,6 +4037,12 @@ definitions:
           LAN-адрес роутера (#933).
         example: 192.168.1.1
         type: string
+      remoteSubnets:
+        example:
+        - 192.168.77.0/24
+        items:
+          type: string
+        type: array
       tunnelIP:
         example: 10.0.14.2/32
         type: string
@@ -4112,6 +4165,12 @@ definitions:
     type: object
   api.ServerUpdatePeerRequestDTO:
     properties:
+      clientAllowedIPs:
+        description: |-
+          ClientAllowedIPs — строка AllowedIPs в .conf клиента (CIDR через запятую,
+          пусто — весь трафик). Отсутствие поля или null — не менять.
+        example: 10.0.14.0/24, 192.168.1.0/24
+        type: string
       description:
         example: My Phone
         type: string
@@ -4121,6 +4180,15 @@ definitions:
           снимает свой резолвер и возвращает пира к LAN-адресу роутера (#933).
         example: 192.168.1.1
         type: string
+      remoteSubnets:
+        description: |-
+          RemoteSubnets — сети за клиентом, IPv4 CIDR (#713); полная замена списка:
+          отсутствие поля или null — не менять; пустой список — снять все.
+        example:
+        - 192.168.77.0/24
+        items:
+          type: string
+        type: array
       signature:
         allOf:
         - $ref: '#/definitions/api.PeerSignatureDTO'
@@ -7630,12 +7698,27 @@ definitions:
     type: object
   api.UpdatePeerRequestDTO:
     properties:
+      clientAllowedIPs:
+        description: |-
+          ClientAllowedIPs — строка AllowedIPs в .conf клиента (CIDR через запятую,
+          пусто — весь трафик). Отсутствие поля или null — не менять.
+        example: 10.10.0.0/24, 192.168.1.0/24
+        type: string
       description:
         example: My Phone
         type: string
       dns:
         example: 8.8.8.8
         type: string
+      remoteSubnets:
+        description: |-
+          RemoteSubnets — сети за клиентом, IPv4 CIDR (#713); полная замена списка:
+          отсутствие поля или null — не менять; пустой список — снять все.
+        example:
+        - 192.168.77.0/24
+        items:
+          type: string
+        type: array
       signature:
         allOf:
         - $ref: '#/definitions/api.PeerSignatureDTO'
@@ -7923,6 +8006,14 @@ definitions:
         items:
           type: string
         type: array
+      clientAllowedIPs:
+        description: |-
+          ClientAllowedIPs / RemoteSubnets — сети клиента (#713); есть только у
+          пиров с локальным секретом. TunnelIP — адрес из секрета: у пира с
+          сетями за клиентом в allowedIPs больше одного кандидата, и фронт не
+          должен угадывать; у чужих пиров пусто — фронт применяет эвристику.
+        example: 10.0.1.0/24, 192.168.1.0/24
+        type: string
       confAvailable:
         example: true
         type: boolean
@@ -7965,11 +8056,20 @@ definitions:
       publicKey:
         example: DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=
         type: string
+      remoteSubnets:
+        example:
+        - 192.168.77.0/24
+        items:
+          type: string
+        type: array
       rxBytes:
         example: 1048576
         type: integer
       signatureProfile:
         example: quic_initial
+        type: string
+      tunnelIP:
+        example: 10.0.1.2/32
         type: string
       txBytes:
         example: 524288
@@ -11824,12 +11924,8 @@ paths:
           description: OK
           schema:
             $ref: '#/definitions/api.ServersAllResponse'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/api.APIErrorEnvelope'
-        "500":
-          description: Internal Server Error
+        "400":
+          description: Any failure (code DELETE_PEER_FAILED)
           schema:
             $ref: '#/definitions/api.APIErrorEnvelope'
       security:
@@ -11843,6 +11939,7 @@ paths:
       description: |-
         Updates fields (name, allowed-ips, ...) of the peer identified by pubkey on the named managed server.
         The signature field: absent — the peer signature is left untouched; present — it replaces all five packets and the profile.
+        clientAllowedIPs and remoteSubnets: absent or null keeps the stored value; "" / [] clears it (removes all subnets behind the client). With LAN segments set, subnets behind the client are permitted into those segments; a segment missing on the router fails with LAN_SEGMENTS_FAILED.
       parameters:
       - description: Server id
         in: path
@@ -11868,15 +11965,7 @@ paths:
           schema:
             $ref: '#/definitions/api.ServersAllResponse'
         "400":
-          description: Bad Request
-          schema:
-            $ref: '#/definitions/api.APIErrorEnvelope'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/api.APIErrorEnvelope'
-        "500":
-          description: Internal Server Error
+          description: Any failure, including a peer missing on the router (code NOT_FOUND)
           schema:
             $ref: '#/definitions/api.APIErrorEnvelope'
       security:
@@ -11950,16 +12039,43 @@ paths:
           schema:
             $ref: '#/definitions/api.ServersAllResponse'
         "400":
-          description: Bad Request
-          schema:
-            $ref: '#/definitions/api.APIErrorEnvelope'
-        "500":
-          description: Internal Server Error
+          description: Any failure, including a peer missing on the router (code NOT_FOUND)
           schema:
             $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Toggle managed-server peer enabled
+      tags:
+      - managed-servers
+  /managed-servers/{id}/peers/presets:
+    get:
+      description: routerOnly — server subnet plus LAN bridges (LANSegments or all);
+        exceptRouter — everything else plus /32 of the resolver and ::/0.
+      parameters:
+      - description: Server id
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Peer DNS as typed in the form; empty — server DNS, then router
+          LAN IP
+        in: query
+        name: dns
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.PeerPresetsResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Peer AllowedIPs presets
       tags:
       - managed-servers
   /managed-servers/{id}/policy:
@@ -14028,12 +14144,8 @@ paths:
           description: OK
           schema:
             $ref: '#/definitions/api.ServersAllResponse'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/api.APIErrorEnvelope'
-        "500":
-          description: Internal Server Error
+        "400":
+          description: Any failure, including an unknown peer (code NOT_FOUND)
           schema:
             $ref: '#/definitions/api.APIErrorEnvelope'
       security:
@@ -14044,8 +14156,9 @@ paths:
     put:
       consumes:
       - application/json
-      description: Changes a peer's allowed-IP and/or description on the named WireGuard
-        server. Returns the fresh servers snapshot.
+      description: |-
+        Changes a peer's allowed-IP and/or description on the named WireGuard server. Returns the fresh servers snapshot.
+        clientAllowedIPs and remoteSubnets: absent or null keeps the stored value; "" / [] clears it (removes all subnets behind the client).
       parameters:
       - description: Interface name (e.g. Wireguard0)
         in: path
@@ -14071,15 +14184,7 @@ paths:
           schema:
             $ref: '#/definitions/api.ServersAllResponse'
         "400":
-          description: Bad Request
-          schema:
-            $ref: '#/definitions/api.APIErrorEnvelope'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/api.APIErrorEnvelope'
-        "500":
-          description: Internal Server Error
+          description: Any failure, including a peer missing on the router (code NOT_FOUND)
           schema:
             $ref: '#/definitions/api.APIErrorEnvelope'
       security:
@@ -14157,17 +14262,43 @@ paths:
           description: OK
           schema:
             $ref: '#/definitions/api.ServersAllResponse'
-        "404":
-          description: Not Found
-          schema:
-            $ref: '#/definitions/api.APIErrorEnvelope'
-        "500":
-          description: Internal Server Error
+        "400":
+          description: Any failure, including a peer missing on the router (code NOT_FOUND)
           schema:
             $ref: '#/definitions/api.APIErrorEnvelope'
       security:
       - CookieAuth: []
       summary: Toggle server peer
+      tags:
+      - servers
+  /servers/{name}/peers/presets:
+    get:
+      description: routerOnly — server subnet plus all LAN bridges; exceptRouter —
+        everything else plus /32 of the resolver and ::/0.
+      parameters:
+      - description: Interface name (e.g. Wireguard0)
+        in: path
+        name: name
+        required: true
+        type: string
+      - description: Peer DNS as typed in the form; empty — router LAN IP
+        in: query
+        name: dns
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/api.PeerPresetsResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/api.APIErrorEnvelope'
+      security:
+      - CookieAuth: []
+      summary: Peer AllowedIPs presets
       tags:
       - servers
   /servers/{name}/policy:

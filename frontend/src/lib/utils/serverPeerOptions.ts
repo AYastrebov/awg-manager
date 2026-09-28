@@ -127,6 +127,18 @@ export interface ConnectServer {
 
 export const hostIP = (raw: string) => raw.replace(/\/\d+$/, '');
 
+/**
+ * Tunnel IP системного пира (CIDR): из записи (`tunnelIP`) у своих; эвристика
+ * «первый /32 в allowedIPs» — только у чужих. С сетями за клиентом (#713) в
+ * allowedIPs больше одного кандидата, угадывать нельзя.
+ */
+export function systemPeerTunnelIP(p: { tunnelIP?: string; allowedIPs?: string[] }): string {
+	if (p.tunnelIP) return p.tunnelIP;
+	const raw = p.allowedIPs?.find((ip) => ip.includes('/32')) || p.allowedIPs?.[0] || '';
+	if (!raw) return '';
+	return raw.includes('/') ? raw : `${raw}/32`;
+}
+
 export function findServerByListenPort(
 	snap: ServersSnapshot | null,
 	port: number,
@@ -151,7 +163,8 @@ export function findServerByListenPort(
 		kind: 'system',
 		serverId: s.id,
 		address: hostIP(s.address),
-		peerIPs: (s.peers ?? []).flatMap((p) => (p.allowedIPs ?? []).map(hostIP)),
+		// Сети за клиентом (#713) тоже лежат в allowedIPs — занят только туннельный адрес.
+		peerIPs: (s.peers ?? []).map((p) => hostIP(systemPeerTunnelIP(p))).filter(Boolean),
 	};
 }
 

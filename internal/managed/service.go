@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 
 	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/ndms/command"
 	"github.com/hoaxisr/awg-manager/internal/ndms/query"
 	"github.com/hoaxisr/awg-manager/internal/ndms/transport"
+	"github.com/hoaxisr/awg-manager/internal/peersubnet"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 )
 
@@ -39,6 +41,9 @@ type ManagedServerService interface {
 	// LAN segments
 	SetLANSegments(ctx context.Context, id string, segments []string) error
 	ListLANSegments(ctx context.Context) ([]LANSegmentDTO, error)
+
+	// Presets AllowedIPs клиента (#713)
+	PeerPresets(ctx context.Context, id, dns string) (peersubnet.Presets, error)
 
 	// Policy
 	SetPolicy(ctx context.Context, id, policy string) error
@@ -93,8 +98,10 @@ type Service struct {
 	// tests inject a stub to avoid forking real binaries.
 	wgRun wgRunner
 	// keyGen is the peer key-generation seam. Production uses realKeyGen
-	// (execs /opt/sbin/awg); tests inject deterministic keys.
+	// (execs /opt/bin/wg); tests inject deterministic keys.
 	keyGen keyGenerator
+	// peerSubnetsMu — см. LockPeerSubnets.
+	peerSubnetsMu sync.Mutex
 }
 
 // keyGenerator produces WireGuard key material for a new peer.
@@ -103,7 +110,7 @@ type keyGenerator interface {
 	GeneratePresharedKey(ctx context.Context) (string, error)
 }
 
-// realKeyGen is the production keyGenerator over keys.go (awg genkey/pubkey/genpsk).
+// realKeyGen is the production keyGenerator over keys.go (wg genkey/pubkey/genpsk).
 type realKeyGen struct{}
 
 func (realKeyGen) GenerateKeyPair(ctx context.Context) (string, string, error) {
