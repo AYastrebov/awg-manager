@@ -117,7 +117,17 @@ func TestTools_GetSingboxOutbound(t *testing.T) {
 		t.Fatalf("a server with no test on record must say so: %v", third)
 	}
 	if _, has := third["lastDelayMs"]; has {
-		t.Fatalf("a delay of 0 must never be returned as a measurement: %v", third)
+		t.Fatalf("a server with no test on record must not carry a delay: %v", third)
+	}
+
+	// A test that got no answer: known, and never a 0 ms measurement.
+	_, out = callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "auto"})
+	hy2 := out["members"].([]any)[1].(map[string]any)
+	if hy2["tag"] != "hy2-de" || hy2["delayKnown"] != true {
+		t.Fatalf("member = %v", hy2)
+	}
+	if _, has := hy2["lastDelayMs"]; has {
+		t.Fatalf("a delay of 0 must never be returned as a measurement: %v", hy2)
 	}
 
 	// A group can hold another group.
@@ -326,5 +336,43 @@ func TestTools_DiscardSingboxStaging(t *testing.T) {
 		if !strings.Contains(strings.ToLower(tool.Description), "web") {
 			t.Errorf("the description must warn that the draft may hold web-interface edits: %q", tool.Description)
 		}
+	}
+}
+
+// TestTools_SingboxOutboundStaged — состав группы читается из черновика,
+// а активный участник — из движка. Когда они расходятся, агент должен
+// узнать об этом из ответа, а не догадываться.
+func TestTools_SingboxOutboundStaged(t *testing.T) {
+	fake := mcptest.New()
+	fake.RouterOutbounds = append(fake.RouterOutbounds, mcpsrv.SingboxOutbound{Tag: "draft-only", Type: "selector", Source: "user"})
+	fake.GroupMembers["draft-only"] = []mcpsrv.SingboxGroupMember{{Tag: "vless-nl", Kind: "proxy"}}
+	fake.EngineMembers = map[string][]string{"auto": {"vless-nl", "hy2-de", "gone"}}
+	s := connect(t, mcpsrv.NewServer(fake, "test"))
+
+	_, out := callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "draft-only"})
+	if out["runtimeKnown"] != false || out["staged"] != true {
+		t.Fatalf("a group the engine does not run: runtimeKnown=%v staged=%v", out["runtimeKnown"], out["staged"])
+	}
+	if _, has := out["activeMember"]; has {
+		t.Fatalf("no active member can be known for it: %v", out)
+	}
+	if m := out["members"].([]any)[0].(map[string]any); m["delayKnown"] != false {
+		t.Fatalf("member of a group the engine does not run: %v", m)
+	}
+
+	_, out = callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "auto"})
+	if out["runtimeKnown"] != true || out["staged"] != true || out["activeMember"] != "vless-nl" {
+		t.Fatalf("a group whose members are staged: %v", out)
+	}
+
+	_, out = callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "sub-706dcf33"})
+	if out["staged"] != false {
+		t.Fatalf("an applied group must not be marked staged: %v", out)
+	}
+
+	fake.ClashDown = true
+	_, out = callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "draft-only"})
+	if out["runtimeKnown"] != false || out["staged"] != false {
+		t.Fatalf("with the engine down nothing is known either way: %v", out)
 	}
 }

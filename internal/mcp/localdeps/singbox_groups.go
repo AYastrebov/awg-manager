@@ -90,8 +90,8 @@ func lastErrorKind(s *subscription.Subscription) string {
 // keyed the way the group tools look things up.
 type sbIndex struct {
 	groups      map[string]router.CompositeOutboundView
-	order       []string                             // group tags, in configuration order
-	subByGroup  map[string]subscription.Subscription // a subscription's own group tag → the subscription
+	order       []string          // group tags, in configuration order
+	subByGroup  map[string]string // a subscription's own group tag → its id
 	aggByTag    map[string]subscription.AggregateGroup
 	member      map[string]subscription.MemberInfo // subscription server tag → what it is
 	isMember    map[string]bool                    // tags that are outbounds of a subscription
@@ -105,7 +105,7 @@ type sbIndex struct {
 func (l *Local) singboxIndex(ctx context.Context) (sbIndex, error) {
 	idx := sbIndex{
 		groups:      map[string]router.CompositeOutboundView{},
-		subByGroup:  map[string]subscription.Subscription{},
+		subByGroup:  map[string]string{},
 		aggByTag:    map[string]subscription.AggregateGroup{},
 		member:      map[string]subscription.MemberInfo{},
 		isMember:    map[string]bool{},
@@ -125,7 +125,7 @@ func (l *Local) singboxIndex(ctx context.Context) (sbIndex, error) {
 	if l.c.Subscriptions != nil {
 		for _, s := range l.c.Subscriptions.List() {
 			name := sanitizeLabel(s.Label)
-			idx.subByGroup[s.SelectorTag] = s
+			idx.subByGroup[s.SelectorTag] = s.ID
 			// A server orphaned by the last refresh stays an outbound until
 			// the user deletes it (subscription.Service.DeleteOrphans).
 			for _, tag := range s.MemberTags {
@@ -190,23 +190,54 @@ func (l *Local) clashProxies() (map[string]singbox.ClashProxy, bool) {
 }
 
 // outbound assembles one group's summary.
-func (idx sbIndex) outbound(o router.CompositeOutboundView, proxies map[string]singbox.ClashProxy, runtimeKnown bool) mcpsrv.SingboxOutbound {
+//
+// runtimeKnown is per group: the engine answered AND has an entry for this
+// group. The router lists groups from the draft when one exists
+// (orchestrator.LoadEffective), so a group can be configured and unknown to
+// the engine; staged marks that, and a member list that differs from the
+// engine's.
+func (idx sbIndex) outbound(o router.CompositeOutboundView, proxies map[string]singbox.ClashProxy, engineAnswered bool) mcpsrv.SingboxOutbound {
+	gp, inEngine := proxies[o.Tag]
+	runtimeKnown := engineAnswered && inEngine
 	out := mcpsrv.SingboxOutbound{
 		Tag: o.Tag, Type: o.Type, Source: o.Source,
 		MemberCount:  len(o.Outbounds),
 		RuntimeKnown: runtimeKnown,
+		Staged:       engineAnswered && (!inEngine || !sameTags(gp.All, o.Outbounds)),
 	}
-	if s, ok := idx.subByGroup[o.Tag]; ok {
-		out.SubscriptionID = s.ID
+	if id, ok := idx.subByGroup[o.Tag]; ok {
+		out.SubscriptionID = id
 	}
 	if g, ok := idx.aggByTag[o.Tag]; ok {
 		out.AggregateOf = append([]string(nil), g.UseSubscriptionIDs...)
 	}
 	if runtimeKnown {
-		out.ActiveMember = proxies[o.Tag].Now
+		out.ActiveMember = gp.Now
 		out.ActiveMemberLabel = sanitizeLabel(idx.member[out.ActiveMember].Label)
 	}
 	return out
+}
+
+// sameTags compares two tag lists as sets: the order of members is not a
+// difference.
+func sameTags(a, b []string) bool {
+	set := make(map[string]struct{}, len(a))
+	for _, t := range a {
+		set[t] = struct{}{}
+	}
+	other := make(map[string]struct{}, len(b))
+	for _, t := range b {
+		other[t] = struct{}{}
+	}
+	if len(set) != len(other) {
+		return false
+	}
+	for t := range other {
+		if _, ok := set[t]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // ListSingboxOutbounds lists every group. The engine is read once for
@@ -287,7 +318,7 @@ func (l *Local) GetSingboxOutbound(ctx context.Context, tag string) (mcpsrv.Sing
 		Members:         make([]mcpsrv.SingboxGroupMember, 0, len(o.Outbounds)),
 	}
 	for _, memberTag := range o.Outbounds {
-		out.Members = append(out.Members, idx.groupMember(memberTag, out.ActiveMember, proxies, known))
+		out.Members = append(out.Members, idx.groupMember(memberTag, out.ActiveMember, proxies, out.RuntimeKnown))
 	}
 	return out, nil
 }

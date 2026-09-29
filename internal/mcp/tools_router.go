@@ -93,7 +93,8 @@ func registerRouterTools(s *mcp.Server, d Deps) {
 		Name: "list_singbox_outbounds",
 		Description: "Groups of servers in sing-box — selectors and urltest groups — that a rule can point at, with the member each one is routing through now. " +
 			"Subscriptions appear here as groups (subscriptionId set); so do groups that gather several subscriptions (aggregateOf set). " +
-			"runtimeKnown=false means sing-box did not answer: the group exists, and nothing is known about what it is doing. " +
+			"runtimeKnown=false means sing-box gave no answer for that group: it exists, and nothing is known about what it is doing. " +
+			"staged=true means sing-box is not running the group as listed, because its members come from changes not applied yet. " +
 			"For the members of one group, call get_singbox_outbound. A rule may also target a single proxy from list_singbox_tunnels, or the built-in direct and block.",
 		Annotations: readOnly("List sing-box outbounds"),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, outboundsOut, error) {
@@ -109,7 +110,8 @@ func registerRouterTools(s *mcp.Server, d Deps) {
 		Description: "One sing-box group in full: its members, which one carries traffic now, and the last delay the engine recorded for each. Use it to answer which server a subscription or group is using. " +
 			"Members are paged: when membersTruncated is true, call again with membersOffset. " +
 			"Read lastDelayMs here before probing — singbox_delay_check makes a real request through the server, and a subscription can hold hundreds. " +
-			"delayKnown=false means no test is on record, not that the server is down; runtimeKnown=false means sing-box did not answer and nothing here describes the present.",
+			"delayKnown=false means no test is on record, not that the server is down; runtimeKnown=false means sing-box gave no answer for this group and nothing here describes the present. " +
+			"staged=true means the listed members come from changes not applied yet: activeMember describes what is running and may not be among them.",
 		Annotations: readOnly("Get sing-box group"),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in outboundDetailIn) (*mcp.CallToolResult, outboundDetailOut, error) {
 		tag, err := requireSingboxTag(in.Tag, "list_singbox_outbounds")

@@ -283,9 +283,9 @@ func groupsHarness() (*Local, *fakeSubs, *fakeClash) {
 	clash := &fakeClash{proxies: map[string]singbox.ClashProxy{
 		"auto":            {Name: "auto", Type: "URLTest", Now: "vless-nl", All: []string{"vless-nl", "hy2-de"}},
 		"manual":          {Name: "manual", Type: "Selector", Now: "auto", All: []string{"auto", "vless-nl"}},
-		"sub-706dcf33":    {Name: "sub-706dcf33", Type: "URLTest", Now: "sub-706dcf33-b2"},
-		"sub-1a00ae3b":    {Name: "sub-1a00ae3b", Type: "Selector", Now: "sub-1a00ae3b-k1"},
-		"agg-5e6f7a8b":    {Name: "agg-5e6f7a8b", Type: "URLTest", Now: "sub-706dcf33-a1"},
+		"sub-706dcf33":    {Name: "sub-706dcf33", Type: "URLTest", Now: "sub-706dcf33-b2", All: []string{"sub-706dcf33-a1", "sub-706dcf33-b2", "sub-706dcf33-c3", "sub-706dcf33-old"}},
+		"sub-1a00ae3b":    {Name: "sub-1a00ae3b", Type: "Selector", Now: "sub-1a00ae3b-k1", All: []string{"sub-1a00ae3b-k1", "sub-1a00ae3b-k2"}},
+		"agg-5e6f7a8b":    {Name: "agg-5e6f7a8b", Type: "URLTest", Now: "sub-706dcf33-a1", All: []string{"sub-706dcf33-a1", "sub-706dcf33-b2", "sub-706dcf33-c3"}},
 		"vless-nl":        {Name: "vless-nl", Type: "VLESS", History: []singbox.DelayHistory{{Delay: 130}, {Delay: 120}}},
 		"hy2-de":          {Name: "hy2-de", Type: "Hysteria2", History: []singbox.DelayHistory{{Delay: 0}}},
 		"sub-706dcf33-a1": {Name: "sub-706dcf33-a1", Type: "VLESS", History: []singbox.DelayHistory{{Delay: 48}}},
@@ -295,7 +295,7 @@ func groupsHarness() (*Local, *fakeSubs, *fakeClash) {
 	rt := &fakeRouter{outbounds: []router.CompositeOutboundView{
 		{Outbound: router.Outbound{Tag: "auto", Type: "urltest", Outbounds: []string{"vless-nl", "hy2-de"}}, Source: "router"},
 		{Outbound: router.Outbound{Tag: "manual", Type: "selector", Outbounds: []string{"auto", "vless-nl"}}, Source: "router"},
-		{Outbound: router.Outbound{Tag: "sub-706dcf33", Type: "urltest", Outbounds: []string{"sub-706dcf33-a1", "sub-706dcf33-b2", "sub-706dcf33-c3"}}, Source: "subscription"},
+		{Outbound: router.Outbound{Tag: "sub-706dcf33", Type: "urltest", Outbounds: []string{"sub-706dcf33-a1", "sub-706dcf33-b2", "sub-706dcf33-c3", "sub-706dcf33-old"}}, Source: "subscription"},
 		{Outbound: router.Outbound{Tag: "sub-1a00ae3b", Type: "selector", Outbounds: []string{"sub-1a00ae3b-k1", "sub-1a00ae3b-k2"}}, Source: "subscription"},
 		{Outbound: router.Outbound{Tag: "agg-5e6f7a8b", Type: "urltest", Outbounds: []string{"sub-706dcf33-a1", "sub-706dcf33-b2", "sub-706dcf33-c3"}}, Source: "subscription"},
 		{Outbound: router.Outbound{Tag: "sub-empty", Type: "selector"}, Source: "subscription"},
@@ -319,11 +319,14 @@ func TestLocal_ListSingboxOutboundsLinksAndRuntime(t *testing.T) {
 		byTag[o.Tag] = i
 	}
 	auto := got[byTag["auto"]]
+	if auto.Staged || got[byTag["sub-706dcf33"]].Staged {
+		t.Fatalf("an applied group must not be staged: %+v", auto)
+	}
 	if auto.MemberCount != 2 || auto.SubscriptionID != "" || len(auto.AggregateOf) != 0 {
 		t.Fatalf("a user group = %+v", auto)
 	}
 	sub := got[byTag["sub-706dcf33"]]
-	if sub.SubscriptionID != subAutoID || sub.MemberCount != 3 {
+	if sub.SubscriptionID != subAutoID || sub.MemberCount != 4 {
 		t.Fatalf("a subscription's group = %+v", sub)
 	}
 	// The store says a1 is active; the engine says b2. In urltest mode the
@@ -353,11 +356,11 @@ func TestLocal_ListSingboxOutboundsWithTheEngineDown(t *testing.T) {
 		t.Fatalf("a stopped engine must not fail the listing: %v", err)
 	}
 	for _, o := range got {
-		if o.RuntimeKnown || o.ActiveMember != "" || o.ActiveMemberLabel != "" {
+		if o.RuntimeKnown || o.Staged || o.ActiveMember != "" || o.ActiveMemberLabel != "" {
 			t.Fatalf("%s reports the present with the engine down: %+v", o.Tag, o)
 		}
 	}
-	if got[2].MemberCount != 3 {
+	if got[2].MemberCount != 4 {
 		t.Fatalf("configuration must survive: %+v", got[2])
 	}
 
@@ -377,7 +380,7 @@ func TestLocal_GetSingboxOutbound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Members) != 3 || got.MemberCount != 3 || got.ActiveMember != "sub-706dcf33-b2" {
+	if len(got.Members) != 4 || got.MemberCount != 4 || got.ActiveMember != "sub-706dcf33-b2" {
 		t.Fatalf("detail = %+v", got)
 	}
 	a1, b2, c3 := got.Members[0], got.Members[1], got.Members[2]
@@ -396,6 +399,11 @@ func TestLocal_GetSingboxOutbound(t *testing.T) {
 	// No history at all: nothing is known.
 	if c3.DelayKnown || c3.LastDelayMs != nil {
 		t.Fatalf("c3 = %+v, want no delay on record", c3)
+	}
+
+	// An orphan is kept by the store as a tag only.
+	if orphan := got.Members[3]; orphan.Tag != "sub-706dcf33-old" || orphan.Kind != "member" || orphan.Label != "" || orphan.Protocol != "" || orphan.Server != "" {
+		t.Fatalf("orphan = %+v", orphan)
 	}
 
 	// The last recorded test got no answer: known, and no number.
@@ -471,5 +479,80 @@ func TestLocal_GetSingboxOutboundCarriesNoSecrets(t *testing.T) {
 				t.Fatalf("%s leaked %q: %s", tag, secret, raw)
 			}
 		}
+	}
+}
+
+// TestLocal_GroupTheEngineDoesNotRun — роутер отдаёт группы из черновика,
+// если он есть, а движок исполняет применённый конфиг. Группа, добавленная
+// в веб-интерфейсе и ещё не применённая, движку неизвестна: сказать про
+// неё «активного участника нет» значит выдать незнание за факт.
+func TestLocal_GroupTheEngineDoesNotRun(t *testing.T) {
+	l, _, _ := groupsHarness()
+	ctx := context.Background()
+
+	got, err := l.GetSingboxOutbound(ctx, "sub-empty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RuntimeKnown || !got.Staged || got.ActiveMember != "" {
+		t.Fatalf("a group absent from the engine = %+v, want runtimeKnown=false staged=true", got.SingboxOutbound)
+	}
+
+	// A group with members, known to configuration only.
+	rt := l.c.Router.(*fakeRouter)
+	rt.outbounds = append(rt.outbounds, router.CompositeOutboundView{
+		Outbound: router.Outbound{Tag: "draft-only", Type: "selector", Outbounds: []string{"vless-nl", "hy2-de"}}, Source: "router",
+	})
+	got, err = l.GetSingboxOutbound(ctx, "draft-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RuntimeKnown || !got.Staged {
+		t.Fatalf("draft-only = %+v", got.SingboxOutbound)
+	}
+	for _, m := range got.Members {
+		// vless-nl has a delay on record in the engine, but this group is
+		// not running: nothing about it describes the present.
+		if m.Active != nil || m.DelayKnown || m.LastDelayMs != nil {
+			t.Fatalf("member %s of a group the engine does not run carries runtime data: %+v", m.Tag, m)
+		}
+	}
+	if got.MemberCount != 2 || got.Members[0].Kind != "proxy" {
+		t.Fatalf("configuration must still be returned: %+v", got)
+	}
+}
+
+// TestLocal_GroupWhoseMembersAreStaged — черновик убрал из группы сервер,
+// через который движок сейчас ведёт трафик. Активный участник назван
+// верно, но среди перечисленных его нет; без пометки это выглядит ошибкой.
+func TestLocal_GroupWhoseMembersAreStaged(t *testing.T) {
+	l, _, _ := groupsHarness()
+	rt := l.c.Router.(*fakeRouter)
+	for i := range rt.outbounds {
+		if rt.outbounds[i].Tag == "auto" {
+			rt.outbounds[i].Outbounds = []string{"hy2-de"} // the draft dropped vless-nl
+		}
+	}
+
+	got, err := l.GetSingboxOutbound(context.Background(), "auto")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.RuntimeKnown || !got.Staged || got.ActiveMember != "vless-nl" {
+		t.Fatalf("got %+v, want the engine's active member and staged=true", got.SingboxOutbound)
+	}
+	if len(got.Members) != 1 || got.Members[0].Active == nil || *got.Members[0].Active {
+		t.Fatalf("members = %+v", got.Members)
+	}
+
+	// The same members in another order is not a difference.
+	for i := range rt.outbounds {
+		if rt.outbounds[i].Tag == "auto" {
+			rt.outbounds[i].Outbounds = []string{"hy2-de", "vless-nl"}
+		}
+	}
+	got, _ = l.GetSingboxOutbound(context.Background(), "auto")
+	if got.Staged {
+		t.Fatalf("a reordered group is not staged: %+v", got.SingboxOutbound)
 	}
 }

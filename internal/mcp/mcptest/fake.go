@@ -56,6 +56,12 @@ type Fake struct {
 	// is a server that was never tested (Clash history, /proxies).
 	ActiveMembers map[string]string
 	LastDelays    map[string]int
+	// EngineMembers is what the engine runs for a group when that differs
+	// from configuration: a draft changed the members and was not applied.
+	// A missing key means the engine runs the group as configured. When a
+	// group has a key here and the set differs from its configured member
+	// tags, Staged is true.
+	EngineMembers map[string][]string
 	// ClashDown makes every read of the engine fail, as it does while
 	// sing-box is stopped or restarting.
 	ClashDown bool
@@ -981,11 +987,26 @@ func (f *Fake) groupMembers(o mcpsrv.SingboxOutbound) []mcpsrv.SingboxGroupMembe
 // outboundView joins configuration with what the engine reports. With
 // the engine down the configuration half is still returned, and the
 // runtime half is absent rather than zero — as the adapter does when
-// GetProxies fails.
+// GetProxies fails. Configuration and engine can also disagree with the
+// engine up: the router lists groups from the draft when one exists
+// (orchestrator.LoadEffective) while the engine runs what was applied. A
+// group with no key in ActiveMembers is one the engine does not run.
 func (f *Fake) outboundView(o mcpsrv.SingboxOutbound) (mcpsrv.SingboxOutbound, []mcpsrv.SingboxGroupMember) {
 	members := append([]mcpsrv.SingboxGroupMember(nil), f.groupMembers(o)...)
 	o.MemberCount = len(members)
-	o.RuntimeKnown = !f.ClashDown
+	_, inEngine := f.ActiveMembers[o.Tag]
+	o.RuntimeKnown = !f.ClashDown && inEngine
+	o.Staged = false
+	if !f.ClashDown {
+		o.Staged = !inEngine
+		if engine, ok := f.EngineMembers[o.Tag]; ok && inEngine {
+			var configured []string
+			for _, m := range members {
+				configured = append(configured, m.Tag)
+			}
+			o.Staged = !sameSet(engine, configured)
+		}
+	}
 	o.ActiveMember, o.ActiveMemberLabel = "", ""
 	if o.RuntimeKnown {
 		o.ActiveMember = f.ActiveMembers[o.Tag]
@@ -1147,3 +1168,24 @@ func (f *Fake) ControlSingbox(_ context.Context, action string) (mcpsrv.SingboxS
 }
 
 func (f *Fake) OpenAPISpec() []byte { return f.Spec }
+
+// sameSet compares two tag lists as sets, as the adapter does.
+func sameSet(a, b []string) bool {
+	set := map[string]bool{}
+	for _, t := range a {
+		set[t] = true
+	}
+	other := map[string]bool{}
+	for _, t := range b {
+		other[t] = true
+	}
+	if len(set) != len(other) {
+		return false
+	}
+	for t := range other {
+		if !set[t] {
+			return false
+		}
+	}
+	return true
+}
