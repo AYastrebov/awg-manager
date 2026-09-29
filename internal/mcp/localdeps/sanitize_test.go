@@ -41,31 +41,6 @@ func TestSanitizeLabelCapsOnARuneBoundary(t *testing.T) {
 	}
 }
 
-// TestMaskURLs — служба подписок вычищает из ошибки точный URL подписки
-// (subscription.MaskURL), но адрес, записанный иначе, проходит мимо:
-// цель редиректа несёт свой токен. Здесь любой URL режется до хоста.
-func TestMaskURLs(t *testing.T) {
-	cases := []struct{ name, in, want string }{
-		{"a go http error", `Get "https://sub.example.net/api/TOKEN123?key=QK": dial tcp: timeout`, `Get "https://sub.example.net/…": dial tcp: timeout`},
-		{"a redirect target with its own token", `redirect to https://cdn.example.org/u/TOKEN456 failed`, `redirect to https://cdn.example.org/… failed`},
-		{"userinfo is dropped, the port is kept", `fetch http://user:pass@host.example:8080/x`, `fetch http://host.example:8080/…`},
-		{"two urls in one message", `a https://a.example/t1 b https://b.example/t2`, `a https://a.example/… b https://b.example/…`},
-		{"the service's placeholder is left alone", `get <subscription-url>: TLS handshake timeout`, `get <subscription-url>: TLS handshake timeout`},
-		{"a message with no url", "parse error at line 3", "parse error at line 3"},
-		{"empty", "", ""},
-		{"an upper-case scheme", `Get HTTPS://sub.example.net/api/TOKEN123: timeout`, `Get https://sub.example.net/…: timeout`},
-		{"a mixed-case scheme", `fetch HtTp://host.example/x/TOKEN`, `fetch http://host.example/…`},
-		{"a percent-escaped url is replaced whole", `failed: https%3A%2F%2Fcdn.example.org%2Fu%2FTOKEN456`, `failed: <url>`},
-		{"a percent-escaped url in lower-case hex", `failed: http%3a%2f%2fcdn.example.org%2fTOKEN789 now`, `failed: <url> now`},
-		{"a url that does not parse falls back", `see http://[::1/TOKEN`, `see <url>`},
-	}
-	for _, c := range cases {
-		if got := maskURLs(c.in); got != c.want {
-			t.Errorf("%s: maskURLs(%q) = %q, want %q", c.name, c.in, got, c.want)
-		}
-	}
-}
-
 func TestHostOf(t *testing.T) {
 	cases := []struct{ name, in, want string }{
 		{"path and query are dropped", "https://sub.example.net/api/TOKEN?x=1", "sub.example.net"},

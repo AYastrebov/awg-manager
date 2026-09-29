@@ -1026,9 +1026,12 @@ func (f *Fake) CheckSingboxDelay(_ context.Context, tag string) (mcpsrv.SingboxD
 		}
 		return mcpsrv.SingboxDelay{}, fmt.Errorf("sing-box outbound %q not found (proxies are in list_singbox_tunnels, groups in list_singbox_outbounds, a group's servers in get_singbox_outbound)", tag)
 	}
-	// Mirrors the adapter: a group the engine answered about and does not
-	// run (it exists only in the draft) is refused, not probed — the
-	// prober would answer the same 0 it answers for a group that is down.
+	// Mirrors the adapter for groups: a group the engine answered about
+	// and does not run (it exists only in the draft) is refused, not
+	// probed — the prober would answer the same 0 it answers for a group
+	// that is down. The adapter refuses a server or a proxy the engine
+	// lacks too; the fake keeps no record of which servers the engine
+	// runs, so it cannot.
 	if _, running := f.ActiveMembers[tag]; kind == "group" && !running && !f.ClashDown {
 		return mcpsrv.SingboxDelay{}, fmt.Errorf("%q is configured but sing-box is not running it: it comes from changes that are not applied yet (get_singbox_staging), or sing-box has not reloaded. Nothing was measured, and this says nothing about whether it works", tag)
 	}

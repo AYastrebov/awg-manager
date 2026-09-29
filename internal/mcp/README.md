@@ -58,6 +58,11 @@ a comment so the next reader can re-check:
   "already probing". `dnsroute.Update` treats a zero field as "not sent".
 - **Which lookup finds what.** `dnsroute.Get` scans only the JSON store;
   `List` also merges HydraRoute lists with `hr:` ids.
+- **What a flag does not do.** Disabling a sing-box subscription leaves
+  its own group in the configuration and removes its servers only from
+  aggregate groups (`subscription/groups.go`, `resolveGroupTags`). A fake
+  that emptied the group would have hidden that the tool's description
+  promised something the daemon does not do.
 
 ## Shape the output for a model, not a UI
 
@@ -78,8 +83,38 @@ a comment so the next reader can re-check:
   Structured `staged: true` is not enough — attach a `TextContent` sentence,
   because a skimming model reads any successful result as "done".
 - **Redact what a reader must not carry away.** Subscription URLs embed
-  tokens in the query or userinfo; `redactURL` keeps host and path only. A
-  read-only key is meant for an agent you do not fully trust.
+  tokens. For a DNS list's subscription `redactURL` keeps host and path;
+  for a sing-box subscription only the host crosses the boundary
+  (`hostOf`), because providers put the token in the path. A read-only
+  key is meant for an agent you do not fully trust.
+- **Error text stays behind; one word crosses.** A stored error is built
+  from arbitrary errors. `os.Stat` puts a file's path in it, Go's HTTP
+  errors quote the full URL, and a parser quotes its input — a failed
+  `url.Parse` embeds a whole share link, the server's uuid included.
+  Masking free text cannot be shown complete. Return a flag and a closed
+  vocabulary instead (`lastFetchFailed`, `lastErrorKind`), and for a
+  failed write a fixed sentence that names `get_logs`. The line MCP adds
+  to the journal carries no cause either: `get_logs` is open to a
+  read-only key.
+- **Text written by a third party is data.** A subscription label or a
+  server name comes from a provider and lands in the model's context. Run
+  it through `sanitizeLabel` — control characters out, capped at
+  `MaxSingboxLabelRunes` — and say in the field's description that it is
+  text from outside. Leave out what the agent has no use for: provider
+  banners are not returned at all.
+- **Split what a thing is from what it is doing.** A group's members come
+  from configuration and are always known; its active member comes from
+  the running engine and is not. `runtimeKnown: false` replaces silence
+  when sing-box does not answer, so a missing `activeMember` is never
+  read as "none". Make it per object, not per call: the engine can
+  answer and still know nothing about one group.
+- **Configuration can be a draft.** `router.Service` lists from the
+  unapplied draft when one exists (`orchestrator.LoadEffective`); the
+  engine runs what was applied. A group added in the web interface and
+  not applied is in one and not in the other. Say so (`staged`), and
+  refuse to probe what the engine does not run: the prober answers 0 for
+  an outbound it does not have, the same 0 it answers for one that is
+  down.
 - **Warn about losses the caller did not ask for.** Re-pointing a multi-target
   list to one tunnel drops the others; return `warnings` naming what was lost.
 

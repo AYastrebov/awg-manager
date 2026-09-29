@@ -172,7 +172,7 @@ type SingboxDelay struct {
 	// probed. A group is measured along the path traffic takes now; its
 	// other members are not tested.
 	Via       string `json:"via,omitempty" jsonschema:"for a group: the member it was routing through, read right after the probe; absent when sing-box could not say"`
-	Reachable bool   `json:"reachable" jsonschema:"false means the proxy did not answer in time; delayMs carries no information then. Meaningless when busy is true"`
+	Reachable bool   `json:"reachable" jsonschema:"false means the outbound did not answer in time; delayMs carries no information then. Meaningless when busy is true"`
 	DelayMs   int    `json:"delayMs" jsonschema:"round-trip in milliseconds, meaningless when reachable is false"`
 	// Busy means a probe for this proxy was already running (the periodic
 	// sweep shares the prober) and nothing was measured by this call. It
@@ -472,7 +472,7 @@ type MonitoringTunnel struct {
 	// Subscription and SingboxTag are set on sing-box rows only.
 	Subscription bool   `json:"subscription,omitempty" jsonschema:"true for a row that is the active server of a sing-box subscription"`
 	SingboxTag   string `json:"singboxTag,omitempty" jsonschema:"tag to pass to singbox_delay_check; set when source is singbox"`
-	Probed       bool   `json:"probed" jsonschema:"false means the matrix holds no cell for this row: it is not measured here, which says NOTHING about its health. True of every sing-box row, and of a tunnel whose check method is disabled or handshake"`
+	Probed       bool   `json:"probed" jsonschema:"false means the matrix holds no cell for this row: it is not measured here, which says NOTHING about its health. Every sing-box row is like this; so is a tunnel whose check method is disabled or handshake, and any tunnel before its first check has finished"`
 	// UrltestGroup and UrltestDelayMs come together or not at all: the
 	// engine records 0 for a server it has no delay for, and 0 ms reads
 	// as an excellent result.

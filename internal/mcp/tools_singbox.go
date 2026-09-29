@@ -48,8 +48,8 @@ func requireSingboxTag(tag, listTool string) (string, error) {
 func registerSingboxTools(s *mcp.Server, d Deps) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "list_singbox_tunnels",
-		Description: "Proxies configured inside sing-box (vless, hysteria2, naive) with their endpoint, local listen port and whether each one is actually up. " +
-			"These are separate from the WireGuard/AmneziaWG tunnels in list_tunnels. Passwords and uuids are not returned.",
+		Description: "Proxies configured by hand inside sing-box (vless, hysteria2, naive) with their endpoint, local listen port and whether each one is actually up. " +
+			"These are separate from the WireGuard/AmneziaWG tunnels in list_tunnels. Servers that come from a subscription are not listed here — see list_singbox_subscriptions. Passwords and uuids are not returned.",
 		Annotations: readOnly("List sing-box proxies"),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, singboxTunnelsOut, error) {
 		list, err := d.ListSingboxTunnels(ctx)
@@ -77,7 +77,7 @@ func registerSingboxTools(s *mcp.Server, d Deps) {
 		}
 		if out.Busy {
 			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{
-				Text: "A probe for this proxy was already in progress, so nothing was measured; this says nothing about whether the proxy works. Retry in a few seconds.",
+				Text: "A probe for this outbound was already in progress, so nothing was measured; this says nothing about whether it works. Retry in a few seconds.",
 			}}}, out, nil
 		}
 		return nil, out, nil
