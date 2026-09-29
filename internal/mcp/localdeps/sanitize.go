@@ -32,19 +32,29 @@ func sanitizeLabel(s string) string {
 	return clean
 }
 
-var urlInText = regexp.MustCompile(`https?://[^\s"'<>]+`)
+var (
+	// percent-encoded URL: https%3A%2F%2F... or http%3a%2f%2f...
+	escapedURLInText = regexp.MustCompile(`(?i)https?%3a%2f%2f[^\s"'<>]+`)
+	// plain URL: https://... or HTTPS://... (case-insensitive)
+	// Match colon only if followed by non-whitespace (for ports like :8080)
+	urlInText = regexp.MustCompile(`(?i)https?://(?:[^\s"'<>:]|:[^\s])+`)
+)
 
-// maskURLs reduces every URL in msg to its scheme and host.
+// maskURLs reduces every URL in msg to its scheme and host, or replaces
+// it with <url> if it is percent-escaped or does not parse.
 // subscription.MaskURL already replaces the exact subscription URL when
 // an error is stored; this catches the same secret spelled differently —
-// a redirect target, an escaped form.
+// a redirect target in any case, an escaped form.
 func maskURLs(msg string) string {
+	// Handle percent-escaped URLs first (replace whole)
+	msg = escapedURLInText.ReplaceAllString(msg, "<url>")
+	// Then handle plain URLs (reduce to scheme://host/…)
 	return urlInText.ReplaceAllStringFunc(msg, func(raw string) string {
 		u, err := url.Parse(raw)
 		if err != nil || u.Host == "" {
 			return "<url>"
 		}
-		return u.Scheme + "://" + u.Host + "/…"
+		return strings.ToLower(u.Scheme) + "://" + u.Host + "/…"
 	})
 }
 

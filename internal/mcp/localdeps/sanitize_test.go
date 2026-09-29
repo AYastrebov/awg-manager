@@ -53,6 +53,11 @@ func TestMaskURLs(t *testing.T) {
 		{"the service's placeholder is left alone", `get <subscription-url>: TLS handshake timeout`, `get <subscription-url>: TLS handshake timeout`},
 		{"a message with no url", "parse error at line 3", "parse error at line 3"},
 		{"empty", "", ""},
+		{"an upper-case scheme", `Get HTTPS://sub.example.net/api/TOKEN123: timeout`, `Get https://sub.example.net/…: timeout`},
+		{"a mixed-case scheme", `fetch HtTp://host.example/x/TOKEN`, `fetch http://host.example/…`},
+		{"a percent-escaped url is replaced whole", `failed: https%3A%2F%2Fcdn.example.org%2Fu%2FTOKEN456`, `failed: <url>`},
+		{"a percent-escaped url in lower-case hex", `failed: http%3a%2f%2fcdn.example.org%2fTOKEN789 now`, `failed: <url> now`},
+		{"a url that does not parse falls back", `see http://[::1/TOKEN`, `see <url>`},
 	}
 	for _, c := range cases {
 		if got := maskURLs(c.in); got != c.want {
