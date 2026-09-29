@@ -104,7 +104,14 @@ type Deps interface {
 	// ListSingboxRules returns the router's rules in evaluation order.
 	// hasDraft reports whether they come from an unapplied draft.
 	ListSingboxRules(ctx context.Context) (rules []SingboxRule, hasDraft bool, err error)
+	// ListSingboxOutbounds returns every group. An engine that does not
+	// answer is not an error: the entries come back with RuntimeKnown
+	// false and no active member.
 	ListSingboxOutbounds(ctx context.Context) ([]SingboxOutbound, error)
+	// GetSingboxOutbound returns one group with all its members, in
+	// configuration order. An unknown tag is an error; so is a tag that
+	// names a single server, and the error says which it is.
+	GetSingboxOutbound(ctx context.Context, tag string) (SingboxOutboundDetail, error)
 	SingboxStaging(ctx context.Context) (SingboxStaging, error)
 	// SetSingboxRuleOutbound retargets one rule. The write lands in the
 	// draft; nothing changes for traffic until ApplySingboxStaging.

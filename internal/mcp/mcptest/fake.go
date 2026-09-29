@@ -45,7 +45,21 @@ type Fake struct {
 	// Subscriptions are the sing-box subscriptions, in the order
 	// subscription.Store.List returns them: by label, then by id.
 	Subscriptions []mcpsrv.SingboxSubscription
-	Servers       []mcpsrv.ManagedServer
+	// GroupMembers maps a group tag to its members in configuration
+	// order. An aggregate group has no entry of its own: its members are
+	// the servers of its ENABLED subscriptions, as resolveGroupTags
+	// computes them (subscription/groups.go).
+	GroupMembers map[string][]mcpsrv.SingboxGroupMember
+	// ActiveMembers and LastDelays are what the running engine reports:
+	// the member each group routes through, and the last delay on record
+	// per tag. A delay of 0 is a test that got no answer; a missing key
+	// is a server that was never tested (Clash history, /proxies).
+	ActiveMembers map[string]string
+	LastDelays    map[string]int
+	// ClashDown makes every read of the engine fail, as it does while
+	// sing-box is stopped or restarting.
+	ClashDown bool
+	Servers   []mcpsrv.ManagedServer
 	// Peers maps a server id to its clients; ServerAddresses maps it to
 	// the server's own tunnel address, which the allocator counts from.
 	Peers           map[string][]mcpsrv.ServerPeer
@@ -106,6 +120,36 @@ func New() *Fake {
 		RouterOutbounds: []mcpsrv.SingboxOutbound{
 			{Tag: "auto", Type: "urltest", Source: "user"},
 			{Tag: "manual", Type: "selector", Source: "user"},
+			{Tag: "sub-706dcf33", Type: "urltest", Source: "subscription", SubscriptionID: "706dcf33aabbccddeeff0011"},
+			{Tag: "sub-1a00ae3b", Type: "selector", Source: "subscription", SubscriptionID: "1a00ae3b0011223344556677"},
+			{Tag: "agg-5e6f7a8b", Type: "urltest", Source: "subscription", AggregateOf: []string{"706dcf33aabbccddeeff0011", "1a00ae3b0011223344556677"}},
+		},
+		GroupMembers: map[string][]mcpsrv.SingboxGroupMember{
+			"auto": {
+				{Tag: "vless-nl", Kind: "proxy", Protocol: "vless", Server: "nl.example.net", Port: 443, Transport: "tcp", Security: "reality"},
+				{Tag: "hy2-de", Kind: "proxy", Protocol: "hysteria2", Server: "de.example.net", Port: 8443, Transport: "quic", Security: "tls"},
+			},
+			"manual": {
+				{Tag: "auto", Kind: "group"},
+				{Tag: "vless-nl", Kind: "proxy", Protocol: "vless", Server: "nl.example.net", Port: 443, Transport: "tcp", Security: "reality"},
+			},
+			"sub-706dcf33": {
+				{Tag: "sub-706dcf33-a1", Kind: "member", Label: "🇩🇪 Frankfurt-1", Protocol: "vless", Server: "de1.example.net", Port: 443, Transport: "tcp", Security: "reality"},
+				{Tag: "sub-706dcf33-b2", Kind: "member", Label: "🇳🇱 Amsterdam-1", Protocol: "vless", Server: "nl1.example.net", Port: 443, Transport: "tcp", Security: "reality"},
+				{Tag: "sub-706dcf33-c3", Kind: "member", Label: "🇫🇮 Helsinki-1", Protocol: "trojan", Server: "fi1.example.net", Port: 8443, Security: "tls"},
+			},
+			"sub-1a00ae3b": {
+				{Tag: "sub-1a00ae3b-k1", Kind: "member", Label: "🇺🇸 New York-1", Protocol: "vless", Server: "us1.example.net", Port: 443, Transport: "tcp", Security: "reality"},
+				{Tag: "sub-1a00ae3b-k2", Kind: "member", Label: "🇯🇵 Tokyo-1", Protocol: "vless", Server: "jp1.example.net", Port: 443, Transport: "tcp", Security: "reality"},
+			},
+		},
+		ActiveMembers: map[string]string{
+			"auto": "vless-nl", "manual": "auto",
+			"sub-706dcf33": "sub-706dcf33-a1", "sub-1a00ae3b": "sub-1a00ae3b-k1", "agg-5e6f7a8b": "sub-706dcf33-a1",
+		},
+		LastDelays: map[string]int{
+			"vless-nl": 120, "hy2-de": 0,
+			"sub-706dcf33-a1": 48, "sub-706dcf33-b2": 95, "sub-1a00ae3b-k1": 60,
 		},
 		Subscriptions: []mcpsrv.SingboxSubscription{
 			{ID: "706dcf33aabbccddeeff0011", Label: "AXO auto", Source: "url", Host: "sub.example.net", Enabled: true, Mode: "urltest", GroupTag: "sub-706dcf33", MemberCount: 3, RefreshHours: 12, LastFetched: "2026-09-02T09:00:00Z"},
@@ -916,13 +960,97 @@ func (f *Fake) ListSingboxRules(context.Context) ([]mcpsrv.SingboxRule, bool, er
 	return append([]mcpsrv.SingboxRule(nil), f.routerRules()...), f.Draft != nil, nil
 }
 
+// groupMembers returns a group's members as the configuration holds
+// them. An aggregate group skips the servers of a disabled subscription
+// (subscription/groups.go, resolveGroupTags: "err != nil || !sub.Enabled").
+func (f *Fake) groupMembers(o mcpsrv.SingboxOutbound) []mcpsrv.SingboxGroupMember {
+	if len(o.AggregateOf) == 0 {
+		return f.GroupMembers[o.Tag]
+	}
+	var out []mcpsrv.SingboxGroupMember
+	for _, id := range o.AggregateOf {
+		for _, s := range f.Subscriptions {
+			if s.ID == id && s.Enabled {
+				out = append(out, f.GroupMembers[s.GroupTag]...)
+			}
+		}
+	}
+	return out
+}
+
+// outboundView joins configuration with what the engine reports. With
+// the engine down the configuration half is still returned, and the
+// runtime half is absent rather than zero — as the adapter does when
+// GetProxies fails.
+func (f *Fake) outboundView(o mcpsrv.SingboxOutbound) (mcpsrv.SingboxOutbound, []mcpsrv.SingboxGroupMember) {
+	members := append([]mcpsrv.SingboxGroupMember(nil), f.groupMembers(o)...)
+	o.MemberCount = len(members)
+	o.RuntimeKnown = !f.ClashDown
+	o.ActiveMember, o.ActiveMemberLabel = "", ""
+	if o.RuntimeKnown {
+		o.ActiveMember = f.ActiveMembers[o.Tag]
+	}
+	for i := range members {
+		m := &members[i]
+		m.Active, m.LastDelayMs, m.DelayKnown = nil, nil, false
+		if !o.RuntimeKnown {
+			continue
+		}
+		active := m.Tag == o.ActiveMember
+		m.Active = &active
+		if active {
+			o.ActiveMemberLabel = m.Label
+		}
+		if ms, tested := f.LastDelays[m.Tag]; tested {
+			m.DelayKnown = true
+			if ms > 0 {
+				d := ms
+				m.LastDelayMs = &d
+			}
+		}
+	}
+	return o, members
+}
+
 func (f *Fake) ListSingboxOutbounds(context.Context) ([]mcpsrv.SingboxOutbound, error) {
 	if f.Err != nil {
 		return nil, f.Err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]mcpsrv.SingboxOutbound(nil), f.RouterOutbounds...), nil
+	out := make([]mcpsrv.SingboxOutbound, 0, len(f.RouterOutbounds))
+	for _, o := range f.RouterOutbounds {
+		view, _ := f.outboundView(o)
+		out = append(out, view)
+	}
+	return out, nil
+}
+
+func (f *Fake) GetSingboxOutbound(_ context.Context, tag string) (mcpsrv.SingboxOutboundDetail, error) {
+	if f.Err != nil {
+		return mcpsrv.SingboxOutboundDetail{}, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, o := range f.RouterOutbounds {
+		if o.Tag == tag {
+			view, members := f.outboundView(o)
+			return mcpsrv.SingboxOutboundDetail{SingboxOutbound: view, Members: members}, nil
+		}
+	}
+	for _, t := range f.SingboxTunnels {
+		if t.Tag == tag {
+			return mcpsrv.SingboxOutboundDetail{}, fmt.Errorf("%q is a single proxy, not a group (groups are in list_singbox_outbounds)", tag)
+		}
+	}
+	for _, members := range f.GroupMembers {
+		for _, m := range members {
+			if m.Tag == tag && m.Kind == "member" {
+				return mcpsrv.SingboxOutboundDetail{}, fmt.Errorf("%q is a single server, not a group (groups are in list_singbox_outbounds)", tag)
+			}
+		}
+	}
+	return mcpsrv.SingboxOutboundDetail{}, fmt.Errorf("sing-box group %q not found (use list_singbox_outbounds)", tag)
 }
 
 func (f *Fake) SingboxStaging(context.Context) (mcpsrv.SingboxStaging, error) {

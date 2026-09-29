@@ -41,6 +41,7 @@ var readOnlyTools = map[string]bool{
 	"list_singbox_outbounds":     true,
 	"get_singbox_staging":        true,
 	"list_singbox_subscriptions": true,
+	"get_singbox_outbound":       true,
 }
 
 // credentialTools change nothing on the router but hand out material

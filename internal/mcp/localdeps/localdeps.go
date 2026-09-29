@@ -96,6 +96,12 @@ type (
 		Update(id string, patch subscription.UpdatePatch) (*subscription.Subscription, error)
 		ListGroups() []subscription.AggregateGroup
 	}
+	// ClashState reads the running engine: which member each group routes
+	// through and the delays it has on record. Satisfied by
+	// *singbox.ClashClient, whose HTTP client times out after 5 s.
+	ClashState interface {
+		GetProxies() (map[string]singbox.ClashProxy, error)
+	}
 	MonitoringSnapshotter interface {
 		Snapshot() monitoring.Snapshot
 	}
@@ -151,7 +157,10 @@ type Config struct {
 	// Subscriptions serves the subscription tools. nil makes them report
 	// that sing-box subscriptions are unavailable on this router.
 	Subscriptions SubscriptionService
-	SystemInfo    func() map[string]interface{}
+	// Clash reads the engine's runtime state. nil, or an engine that does
+	// not answer, makes every RuntimeKnown false.
+	Clash      ClashState
+	SystemInfo func() map[string]interface{}
 	// Resolve looks a hostname up. Injected rather than called directly so
 	// tests need no network; nil disables explain_route's subnet leg.
 	Resolve func(ctx context.Context, host string) ([]string, error)
@@ -1667,21 +1676,6 @@ func (l *Local) ListSingboxRules(ctx context.Context) ([]mcpsrv.SingboxRule, boo
 		out = append(out, singboxRule(i, r))
 	}
 	return out, l.c.Router.StagingStatus(ctx).HasDraft, nil
-}
-
-func (l *Local) ListSingboxOutbounds(ctx context.Context) ([]mcpsrv.SingboxOutbound, error) {
-	if l.c.Router == nil {
-		return nil, errUnavailable("sing-box router")
-	}
-	list, err := l.c.Router.ListCompositeOutbounds(ctx)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]mcpsrv.SingboxOutbound, 0, len(list))
-	for _, o := range list {
-		out = append(out, mcpsrv.SingboxOutbound{Tag: o.Tag, Type: o.Type, Source: o.Source})
-	}
-	return out, nil
 }
 
 func (l *Local) SingboxStaging(ctx context.Context) (mcpsrv.SingboxStaging, error) {

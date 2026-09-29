@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -18,6 +19,30 @@ type singboxTagIn struct {
 
 type singboxIn struct {
 	Action string `json:"action" jsonschema:"start|stop|restart"`
+}
+
+// maxSingboxTagLen bounds a tag before it reaches the engine. Tags the
+// daemon generates are under 40 bytes; a user's group tag is a short name.
+const maxSingboxTagLen = 128
+
+// requireSingboxTag checks a tag's shape before Deps. The tag travels
+// into a URL path of the engine's local API, so it is bounded and free of
+// control characters; whether it exists is for Deps to say. listTool is
+// named in the refusal so the agent knows where valid tags come from.
+func requireSingboxTag(tag, listTool string) (string, error) {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return "", fmt.Errorf("tag is required (use %s)", listTool)
+	}
+	if len(tag) > maxSingboxTagLen {
+		return "", fmt.Errorf("tag is longer than %d bytes", maxSingboxTagLen)
+	}
+	for _, r := range tag {
+		if unicode.IsControl(r) {
+			return "", fmt.Errorf("tag must not contain control characters")
+		}
+	}
+	return tag, nil
 }
 
 func registerSingboxTools(s *mcp.Server, d Deps) {

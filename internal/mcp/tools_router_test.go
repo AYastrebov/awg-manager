@@ -1,8 +1,12 @@
 package mcp_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+
+	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
+	"github.com/hoaxisr/awg-manager/internal/mcp/mcptest"
 )
 
 // TestTools_ListSingboxRules — правила маршрутизатора sing-box до сих пор
@@ -43,19 +47,161 @@ func TestTools_ListSingboxRules(t *testing.T) {
 	}
 }
 
+// TestTools_ListSingboxOutbounds — список групп отвечал только тегом и
+// типом. На вопрос «через какой сервер сейчас идёт подписка» агенту
+// нечем было ответить.
 func TestTools_ListSingboxOutbounds(t *testing.T) {
-	s, _ := newTestSession(t)
+	s, fake := newTestSession(t)
 
 	res, out := callTool(t, s, "list_singbox_outbounds", nil)
 	if res.IsError {
 		t.Fatal(toolText(res))
 	}
 	outbounds := out["outbounds"].([]any)
-	if len(outbounds) != 2 {
+	if len(outbounds) != 5 {
 		t.Fatalf("outbounds = %v", outbounds)
 	}
-	if first := outbounds[0].(map[string]any); first["tag"] != "auto" || first["type"] != "urltest" {
+	if first := outbounds[0].(map[string]any); first["tag"] != "auto" || first["type"] != "urltest" || first["memberCount"] != float64(2) {
 		t.Fatalf("outbound = %v", first)
+	}
+	sub := outbounds[2].(map[string]any)
+	if sub["tag"] != "sub-706dcf33" || sub["subscriptionId"] != "706dcf33aabbccddeeff0011" {
+		t.Fatalf("a subscription's group must name its subscription: %v", sub)
+	}
+	if sub["runtimeKnown"] != true || sub["activeMember"] != "sub-706dcf33-a1" || sub["activeMemberLabel"] != "🇩🇪 Frankfurt-1" {
+		t.Fatalf("the active server must be readable in one call: %v", sub)
+	}
+	agg := outbounds[4].(map[string]any)
+	if n := len(agg["aggregateOf"].([]any)); n != 2 || agg["memberCount"] != float64(5) {
+		t.Fatalf("aggregate group = %v", agg)
+	}
+
+	// sing-box is stopped: configuration is still true, the present is not.
+	fake.ClashDown = true
+	_, out = callTool(t, s, "list_singbox_outbounds", nil)
+	sub = out["outbounds"].([]any)[2].(map[string]any)
+	if sub["runtimeKnown"] != false {
+		t.Fatalf("runtimeKnown = %v with the engine down", sub["runtimeKnown"])
+	}
+	if _, has := sub["activeMember"]; has {
+		t.Fatalf("an active server reported with the engine down is a guess: %v", sub)
+	}
+	if sub["memberCount"] != float64(3) {
+		t.Fatalf("configuration must survive the engine being down: %v", sub)
+	}
+}
+
+// TestTools_GetSingboxOutbound — в подписке бывают сотни серверов. Список
+// групп остаётся сводкой, а состав читается страницами.
+func TestTools_GetSingboxOutbound(t *testing.T) {
+	s, fake := newTestSession(t)
+
+	res, out := callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "sub-706dcf33"})
+	if res.IsError {
+		t.Fatal(toolText(res))
+	}
+	if out["memberCount"] != float64(3) || out["membersTruncated"] != false || out["activeMember"] != "sub-706dcf33-a1" {
+		t.Fatalf("out = %v", out)
+	}
+	members := out["members"].([]any)
+	first := members[0].(map[string]any)
+	if first["tag"] != "sub-706dcf33-a1" || first["kind"] != "member" || first["active"] != true {
+		t.Fatalf("member = %v", first)
+	}
+	if first["delayKnown"] != true || first["lastDelayMs"] != float64(48) {
+		t.Fatalf("member = %v", first)
+	}
+	// Never tested: that is not the same as down.
+	third := members[2].(map[string]any)
+	if third["delayKnown"] != false {
+		t.Fatalf("a server with no test on record must say so: %v", third)
+	}
+	if _, has := third["lastDelayMs"]; has {
+		t.Fatalf("a delay of 0 must never be returned as a measurement: %v", third)
+	}
+
+	// A group can hold another group.
+	_, out = callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "manual"})
+	if m := out["members"].([]any)[0].(map[string]any); m["tag"] != "auto" || m["kind"] != "group" {
+		t.Fatalf("a nested group must be marked as one: %v", m)
+	}
+
+	fake.ClashDown = true
+	_, out = callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "sub-706dcf33"})
+	if out["runtimeKnown"] != false {
+		t.Fatalf("runtimeKnown = %v", out["runtimeKnown"])
+	}
+	m := out["members"].([]any)[0].(map[string]any)
+	if _, has := m["active"]; has {
+		t.Fatalf("active reported with the engine down: %v", m)
+	}
+	if m["delayKnown"] != false {
+		t.Fatalf("delayKnown = %v with the engine down", m["delayKnown"])
+	}
+}
+
+func TestTools_GetSingboxOutboundPages(t *testing.T) {
+	fake := mcptest.New()
+	var many []mcpsrv.SingboxGroupMember
+	for i := range mcpsrv.MaxGroupMembersInOutput + 7 {
+		many = append(many, mcpsrv.SingboxGroupMember{Tag: fmt.Sprintf("sub-706dcf33-%03d", i), Kind: "member"})
+	}
+	fake.GroupMembers["sub-706dcf33"] = many
+	s := connect(t, mcpsrv.NewServer(fake, "test"))
+
+	_, out := callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "sub-706dcf33"})
+	if n := len(out["members"].([]any)); n != mcpsrv.MaxGroupMembersInOutput {
+		t.Fatalf("first page = %d members", n)
+	}
+	if out["memberCount"] != float64(mcpsrv.MaxGroupMembersInOutput+7) || out["membersTruncated"] != true {
+		t.Fatalf("a capped page must carry the real size: %v %v", out["memberCount"], out["membersTruncated"])
+	}
+	_, out = callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "sub-706dcf33", "membersOffset": mcpsrv.MaxGroupMembersInOutput})
+	if n := len(out["members"].([]any)); n != 7 || out["membersTruncated"] != false {
+		t.Fatalf("last page = %d members, truncated=%v", n, out["membersTruncated"])
+	}
+	res, out := callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "sub-706dcf33", "membersOffset": 9000})
+	if res.IsError || len(out["members"].([]any)) != 0 {
+		t.Fatalf("an offset past the end must be an empty page: %v", out)
+	}
+}
+
+// TestTools_GetSingboxOutboundEmptyGroup — подписка, у которой первая
+// загрузка не удалась, даёт группу без серверов. Это состояние, а не
+// ошибка: агент должен увидеть ноль и lastError подписки.
+func TestTools_GetSingboxOutboundEmptyGroup(t *testing.T) {
+	fake := mcptest.New()
+	fake.GroupMembers["sub-706dcf33"] = nil
+	s := connect(t, mcpsrv.NewServer(fake, "test"))
+
+	res, out := callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "sub-706dcf33"})
+	if res.IsError {
+		t.Fatalf("an empty group is a state, not an error: %s", toolText(res))
+	}
+	if out["memberCount"] != float64(0) || len(out["members"].([]any)) != 0 {
+		t.Fatalf("out = %v", out)
+	}
+}
+
+func TestTools_GetSingboxOutboundRejectsNonsense(t *testing.T) {
+	s, _ := newTestSession(t)
+
+	for name, args := range map[string]map[string]any{
+		"an empty tag":                 {"tag": "  "},
+		"an unknown tag":               {"tag": "nope"},
+		"a negative offset":            {"tag": "auto", "membersOffset": -1},
+		"a control character":          {"tag": "auto\nx"},
+		"a tag longer than a tag":      {"tag": strings.Repeat("a", 200)},
+		"a single server, not a group": {"tag": "vless-nl"},
+	} {
+		if res, _ := callTool(t, s, "get_singbox_outbound", args); !res.IsError {
+			t.Errorf("%s must be a tool error", name)
+		}
+	}
+	// An id the agent was just given must not be answered with "not found".
+	res, _ := callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "vless-nl"})
+	if txt := toolText(res); !strings.Contains(txt, "not a group") {
+		t.Errorf("the refusal must say why: %q", txt)
 	}
 }
 
