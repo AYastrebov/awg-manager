@@ -2,6 +2,7 @@ package localdeps
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -319,6 +320,57 @@ func (l *Local) GetSingboxOutbound(ctx context.Context, tag string) (mcpsrv.Sing
 	}
 	for _, memberTag := range o.Outbounds {
 		out.Members = append(out.Members, idx.groupMember(memberTag, out.ActiveMember, proxies, out.RuntimeKnown))
+	}
+	return out, nil
+}
+
+// CheckSingboxDelay probes one outbound. The tag is classified from
+// configuration first: the delay test itself answers "no response" for a
+// tag that does not exist, so a typo would otherwise be reported as an
+// outbound that is down.
+func (l *Local) CheckSingboxDelay(ctx context.Context, tag string) (mcpsrv.SingboxDelay, error) {
+	if l.c.Singbox == nil {
+		return mcpsrv.SingboxDelay{}, errUnavailable("sing-box")
+	}
+	idx, err := l.singboxIndex(ctx)
+	if err != nil {
+		return mcpsrv.SingboxDelay{}, err
+	}
+	kind := idx.kindOf(tag)
+	if kind == "" {
+		if why, ok := idx.notOutbound[tag]; ok {
+			return mcpsrv.SingboxDelay{}, fmt.Errorf("%q cannot be probed: %s", tag, why)
+		}
+		return mcpsrv.SingboxDelay{}, fmt.Errorf("sing-box outbound %q not found (proxies are in list_singbox_tunnels, groups in list_singbox_outbounds, a group's servers in get_singbox_outbound)", tag)
+	}
+	// Configuration may be an unapplied draft (orchestrator.LoadEffective),
+	// and the prober answers 0 for an outbound the engine does not have —
+	// the same 0 it answers for one that is down. So an outbound the engine
+	// answered about and does not know is refused, not probed. When the
+	// engine does not answer at all, the probe goes ahead and says so.
+	if proxies, answered := l.clashProxies(); answered {
+		if _, running := proxies[tag]; !running {
+			return mcpsrv.SingboxDelay{}, fmt.Errorf("%q is configured but sing-box is not running it: it comes from changes that are not applied yet (get_singbox_staging), or sing-box has not reloaded. Nothing was measured, and this says nothing about whether it works", tag)
+		}
+	}
+	ms, err := l.c.Singbox.CheckDelay(ctx, tag)
+	if errors.Is(err, singbox.ErrProbeInFlight) {
+		// The periodic sweep shares the prober and holds a slow outbound's
+		// tag for several seconds; nothing was measured here, so neither
+		// verdict applies.
+		return mcpsrv.SingboxDelay{Tag: tag, Kind: kind, Busy: true}, nil
+	}
+	if err != nil {
+		return mcpsrv.SingboxDelay{}, err
+	}
+	// CheckOne normalises a timeout to 0 ms, so 0 means silence — not a
+	// round trip that took no time.
+	out := mcpsrv.SingboxDelay{Tag: tag, Kind: kind, Reachable: ms > 0, DelayMs: ms}
+	if kind == "group" {
+		// Read after the probe: a urltest group may have just re-chosen.
+		if proxies, answered := l.clashProxies(); answered {
+			out.Via = proxies[tag].Now
+		}
 	}
 	return out, nil
 }

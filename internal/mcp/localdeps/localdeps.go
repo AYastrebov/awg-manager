@@ -1787,43 +1787,6 @@ func (l *Local) ListSingboxTunnels(ctx context.Context) ([]mcpsrv.SingboxTunnel,
 	return out, nil
 }
 
-// CheckSingboxDelay probes one proxy. The tag is checked against the
-// configured proxies first: the delay test itself answers "no response"
-// for a tag that does not exist, so a typo would otherwise be reported as
-// a proxy that is down.
-func (l *Local) CheckSingboxDelay(ctx context.Context, tag string) (mcpsrv.SingboxDelay, error) {
-	if l.c.Singbox == nil {
-		return mcpsrv.SingboxDelay{}, errUnavailable("sing-box")
-	}
-	list, err := l.c.Singbox.ListTunnels(ctx)
-	if err != nil {
-		return mcpsrv.SingboxDelay{}, err
-	}
-	known := false
-	for _, t := range list {
-		if t.Tag == tag {
-			known = true
-			break
-		}
-	}
-	if !known {
-		return mcpsrv.SingboxDelay{}, fmt.Errorf("sing-box proxy %q not found (use list_singbox_tunnels)", tag)
-	}
-	ms, err := l.c.Singbox.CheckDelay(ctx, tag)
-	if errors.Is(err, singbox.ErrProbeInFlight) {
-		// The periodic sweep shares the prober and holds a slow proxy's
-		// tag for several seconds; nothing was measured here, so neither
-		// verdict applies.
-		return mcpsrv.SingboxDelay{Tag: tag, Busy: true}, nil
-	}
-	if err != nil {
-		return mcpsrv.SingboxDelay{}, err
-	}
-	// CheckOne normalises a timeout to 0 ms, so 0 means silence — not a
-	// round trip that took no time.
-	return mcpsrv.SingboxDelay{Tag: tag, Reachable: ms > 0, DelayMs: ms}, nil
-}
-
 // onOff renders a flag for the journal, matching the REST handlers.
 func onOff(v bool) string {
 	if v {

@@ -65,7 +65,11 @@ type Fake struct {
 	// ClashDown makes every read of the engine fail, as it does while
 	// sing-box is stopped or restarting.
 	ClashDown bool
-	Servers   []mcpsrv.ManagedServer
+	// NotOutbound maps a tag that is in a subscription but not in the
+	// engine's configuration to the reason: excluded by the user, or
+	// hidden by the subscription's filter.
+	NotOutbound map[string]string
+	Servers     []mcpsrv.ManagedServer
 	// Peers maps a server id to its clients; ServerAddresses maps it to
 	// the server's own tunnel address, which the allocator counts from.
 	Peers           map[string][]mcpsrv.ServerPeer
@@ -117,7 +121,15 @@ func New() *Fake {
 			{Tag: "vless-nl", Protocol: "vless", Server: "nl.example.net", Port: 443, Security: "reality", Transport: "tcp", ListenPort: 2081, ProxyInterface: "Proxy0", SNI: "www.example.com", Running: true},
 			{Tag: "hy2-de", Protocol: "hysteria2", Server: "de.example.net", Port: 8443, Security: "tls", Transport: "quic", ListenPort: 2082, Running: false},
 		},
-		Delays: map[string]int{"vless-nl": 120, "hy2-de": 0},
+		Delays: map[string]int{
+			"vless-nl": 120, "hy2-de": 0,
+			"sub-706dcf33-a1": 50, "sub-706dcf33-b2": 96, "sub-706dcf33-c3": 140,
+			"sub-1a00ae3b-k1": 61, "sub-1a00ae3b-k2": 0,
+			"auto": 121, "manual": 121, "sub-706dcf33": 52, "sub-1a00ae3b": 63, "agg-5e6f7a8b": 52,
+		},
+		NotOutbound: map[string]string{
+			"sub-706dcf33-x9": `it is excluded from subscription "AXO auto" by the user, so it is not an outbound`,
+		},
 		Rules: []mcpsrv.SingboxRule{
 			{Index: 0, Match: "domain_suffix youtube.com, googlevideo.com", Action: "route", Outbound: "vless-nl"},
 			{Index: 1, Match: "rule_set geosite-ru", Action: "route", Outbound: "direct"},
@@ -926,25 +938,59 @@ func (f *Fake) ListSingboxTunnels(context.Context) ([]mcpsrv.SingboxTunnel, erro
 	return append([]mcpsrv.SingboxTunnel(nil), f.SingboxTunnels...), nil
 }
 
+// kindOf classifies a tag from configuration. The first match wins:
+// group, member, proxy — the order localdeps uses.
+func (f *Fake) kindOf(tag string) string {
+	for _, o := range f.RouterOutbounds {
+		if o.Tag == tag {
+			return "group"
+		}
+	}
+	for _, members := range f.GroupMembers {
+		for _, m := range members {
+			if m.Tag == tag && m.Kind == "member" {
+				return "member"
+			}
+		}
+	}
+	for _, t := range f.SingboxTunnels {
+		if t.Tag == tag {
+			return "proxy"
+		}
+	}
+	return ""
+}
+
 func (f *Fake) CheckSingboxDelay(_ context.Context, tag string) (mcpsrv.SingboxDelay, error) {
 	if f.Err != nil {
 		return mcpsrv.SingboxDelay{}, f.Err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, t := range f.SingboxTunnels {
-		if t.Tag != tag {
-			continue
+	kind := f.kindOf(tag)
+	if kind == "" {
+		if why, ok := f.NotOutbound[tag]; ok {
+			return mcpsrv.SingboxDelay{}, fmt.Errorf("%q cannot be probed: %s", tag, why)
 		}
-		if f.BusyDelays[tag] {
-			return mcpsrv.SingboxDelay{Tag: tag, Busy: true}, nil
-		}
-		// Mirrors DelayChecker.Probe: a silent proxy answers 0, which
-		// is why Reachable is carried separately.
-		ms := f.Delays[tag]
-		return mcpsrv.SingboxDelay{Tag: tag, Reachable: ms > 0, DelayMs: ms}, nil
+		return mcpsrv.SingboxDelay{}, fmt.Errorf("sing-box outbound %q not found (proxies are in list_singbox_tunnels, groups in list_singbox_outbounds, a group's servers in get_singbox_outbound)", tag)
 	}
-	return mcpsrv.SingboxDelay{}, fmt.Errorf("sing-box proxy %q not found", tag)
+	// Mirrors the adapter: a group the engine answered about and does not
+	// run (it exists only in the draft) is refused, not probed — the
+	// prober would answer the same 0 it answers for a group that is down.
+	if _, running := f.ActiveMembers[tag]; kind == "group" && !running && !f.ClashDown {
+		return mcpsrv.SingboxDelay{}, fmt.Errorf("%q is configured but sing-box is not running it: it comes from changes that are not applied yet (get_singbox_staging), or sing-box has not reloaded. Nothing was measured, and this says nothing about whether it works", tag)
+	}
+	if f.BusyDelays[tag] {
+		return mcpsrv.SingboxDelay{Tag: tag, Kind: kind, Busy: true}, nil
+	}
+	// Mirrors DelayChecker.Probe: a silent outbound answers 0, which is
+	// why Reachable is carried separately.
+	ms := f.Delays[tag]
+	out := mcpsrv.SingboxDelay{Tag: tag, Kind: kind, Reachable: ms > 0, DelayMs: ms}
+	if kind == "group" && !f.ClashDown {
+		out.Via = f.ActiveMembers[tag]
+	}
+	return out, nil
 }
 
 // routerRules returns the draft when one exists, mirroring the real

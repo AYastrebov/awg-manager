@@ -1,6 +1,8 @@
 package mcp_test
 
 import (
+	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
+	"github.com/hoaxisr/awg-manager/internal/mcp/mcptest"
 	"strings"
 	"testing"
 )
@@ -102,5 +104,86 @@ func TestTools_SingboxDelayCheckBusyIsNotUnreachable(t *testing.T) {
 	}
 	if txt := strings.ToLower(toolText(res)); !strings.Contains(txt, "retry") {
 		t.Fatalf("the text must tell the model to retry rather than conclude: %q", txt)
+	}
+}
+
+// TestTools_SingboxDelayCheckKinds — проба принимала только теги из
+// list_singbox_tunnels. Сервер подписки и группа получали «не найден»,
+// хотя движок умеет мерить любой outbound.
+func TestTools_SingboxDelayCheckKinds(t *testing.T) {
+	s, _ := newTestSession(t)
+
+	for tag, want := range map[string]string{
+		"vless-nl":        "proxy",
+		"sub-706dcf33-a1": "member",
+		"sub-706dcf33":    "group",
+	} {
+		res, out := callTool(t, s, "singbox_delay_check", map[string]any{"tag": tag})
+		if res.IsError {
+			t.Fatalf("%s: %s", tag, toolText(res))
+		}
+		if out["kind"] != want || out["reachable"] != true {
+			t.Fatalf("%s: out = %v, want kind %s", tag, out, want)
+		}
+	}
+
+	// A group is measured through the member it routes through now, and
+	// the answer must say which one that was.
+	_, out := callTool(t, s, "singbox_delay_check", map[string]any{"tag": "sub-706dcf33"})
+	if out["via"] != "sub-706dcf33-a1" {
+		t.Fatalf("via = %v, want the active member", out["via"])
+	}
+	_, out = callTool(t, s, "singbox_delay_check", map[string]any{"tag": "vless-nl"})
+	if _, has := out["via"]; has {
+		t.Fatalf("via is for groups only: %v", out)
+	}
+}
+
+// TestTools_SingboxDelayCheckSaysWhyItCannotProbe — исключённый сервер
+// есть в подписке, но не в конфиге движка. «Не найден» отправил бы
+// агента искать опечатку в теге, который ему только что выдали.
+func TestTools_SingboxDelayCheckSaysWhyItCannotProbe(t *testing.T) {
+	s, _ := newTestSession(t)
+
+	res, _ := callTool(t, s, "singbox_delay_check", map[string]any{"tag": "sub-706dcf33-x9"})
+	if !res.IsError {
+		t.Fatal("an excluded server cannot be probed")
+	}
+	if txt := toolText(res); !strings.Contains(txt, "excluded") {
+		t.Fatalf("the refusal must say why: %q", txt)
+	}
+
+	res, _ = callTool(t, s, "singbox_delay_check", map[string]any{"tag": "nope"})
+	if !res.IsError {
+		t.Fatal("an unknown tag must be an error, not a proxy that is down")
+	}
+	txt := toolText(res)
+	for _, tool := range []string{"list_singbox_tunnels", "list_singbox_outbounds", "get_singbox_outbound"} {
+		if !strings.Contains(txt, tool) {
+			t.Errorf("the refusal must name %s: %q", tool, txt)
+		}
+	}
+
+	for name, tag := range map[string]string{"a control character": "vless-nl\nx", "an over-long tag": strings.Repeat("a", 200)} {
+		if res, _ := callTool(t, s, "singbox_delay_check", map[string]any{"tag": tag}); !res.IsError {
+			t.Errorf("%s must be refused before Deps", name)
+		}
+	}
+}
+
+// TestTools_SingboxDelayCheckRefusesADraftOnlyGroup — группа из
+// неприменённого черновика движку неизвестна. «Не отвечает» про неё —
+// неправда: её никто не спрашивал.
+func TestTools_SingboxDelayCheckRefusesADraftOnlyGroup(t *testing.T) {
+	fake := mcptest.New()
+	fake.RouterOutbounds = append(fake.RouterOutbounds, mcpsrv.SingboxOutbound{Tag: "draft-only", Type: "selector", Source: "user"})
+	s := connect(t, mcpsrv.NewServer(fake, "test"))
+
+	res, _ := callTool(t, s, "singbox_delay_check", map[string]any{"tag": "draft-only"})
+	if !res.IsError {
+		t.Fatal("a group the engine does not run must not be reported as unreachable")
+	}
+	if txt := toolText(res); !strings.Contains(txt, "not running it") || !strings.Contains(txt, "get_singbox_staging") {
+		t.Fatalf("the refusal must say why and name the tool that shows the draft: %q", txt)
 	}
 }

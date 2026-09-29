@@ -118,8 +118,12 @@ type Deps interface {
 	SetSingboxRuleOutbound(ctx context.Context, index int, outbound string) error
 	ApplySingboxStaging(ctx context.Context) error
 	DiscardSingboxStaging(ctx context.Context) error
-	// CheckSingboxDelay probes one proxy. An unknown tag is an error;
-	// a proxy that stays silent is a result with Reachable false.
+	// CheckSingboxDelay probes one outbound: a proxy, a subscription
+	// server or a group. The tag is classified from configuration, so an
+	// unknown tag is an error even while the engine is down, and a tag
+	// that exists but is not an outbound (an excluded server) is an error
+	// that says why. An outbound that stays silent is a result with
+	// Reachable false. A group is probed through its active member.
 	CheckSingboxDelay(ctx context.Context, tag string) (SingboxDelay, error)
 	// ListSingboxSubscriptions returns every subscription, sorted by label
 	// and then id, so that an offset means the same thing on every call.

@@ -166,7 +166,12 @@ type SingboxStaging struct {
 // test answers 0 both for "did not respond" and for a real zero, and 0 ms
 // reads as an excellent result.
 type SingboxDelay struct {
-	Tag       string `json:"tag"`
+	Tag  string `json:"tag"`
+	Kind string `json:"kind" jsonschema:"what was probed: proxy, member (a subscription server) or group"`
+	// Via names the member a group was routing through when it was
+	// probed. A group is measured along the path traffic takes now; its
+	// other members are not tested.
+	Via       string `json:"via,omitempty" jsonschema:"for a group: the member it was routing through, read right after the probe; absent when sing-box could not say"`
 	Reachable bool   `json:"reachable" jsonschema:"false means the proxy did not answer in time; delayMs carries no information then. Meaningless when busy is true"`
 	DelayMs   int    `json:"delayMs" jsonschema:"round-trip in milliseconds, meaningless when reachable is false"`
 	// Busy means a probe for this proxy was already running (the periodic

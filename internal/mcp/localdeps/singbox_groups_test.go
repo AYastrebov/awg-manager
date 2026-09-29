@@ -281,16 +281,17 @@ func (f *fakeClash) GetProxies() (map[string]singbox.ClashProxy, error) {
 func groupsHarness() (*Local, *fakeSubs, *fakeClash) {
 	subs := subsHarness()
 	clash := &fakeClash{proxies: map[string]singbox.ClashProxy{
-		"auto":            {Name: "auto", Type: "URLTest", Now: "vless-nl", All: []string{"vless-nl", "hy2-de"}},
-		"manual":          {Name: "manual", Type: "Selector", Now: "auto", All: []string{"auto", "vless-nl"}},
-		"sub-706dcf33":    {Name: "sub-706dcf33", Type: "URLTest", Now: "sub-706dcf33-b2", All: []string{"sub-706dcf33-a1", "sub-706dcf33-b2", "sub-706dcf33-c3", "sub-706dcf33-old"}},
-		"sub-1a00ae3b":    {Name: "sub-1a00ae3b", Type: "Selector", Now: "sub-1a00ae3b-k1", All: []string{"sub-1a00ae3b-k1", "sub-1a00ae3b-k2"}},
-		"agg-5e6f7a8b":    {Name: "agg-5e6f7a8b", Type: "URLTest", Now: "sub-706dcf33-a1", All: []string{"sub-706dcf33-a1", "sub-706dcf33-b2", "sub-706dcf33-c3"}},
-		"vless-nl":        {Name: "vless-nl", Type: "VLESS", History: []singbox.DelayHistory{{Delay: 130}, {Delay: 120}}},
-		"hy2-de":          {Name: "hy2-de", Type: "Hysteria2", History: []singbox.DelayHistory{{Delay: 0}}},
-		"sub-706dcf33-a1": {Name: "sub-706dcf33-a1", Type: "VLESS", History: []singbox.DelayHistory{{Delay: 48}}},
-		"sub-706dcf33-b2": {Name: "sub-706dcf33-b2", Type: "VLESS", History: []singbox.DelayHistory{{Delay: 95}}},
-		"sub-706dcf33-c3": {Name: "sub-706dcf33-c3", Type: "Trojan"},
+		"auto":             {Name: "auto", Type: "URLTest", Now: "vless-nl", All: []string{"vless-nl", "hy2-de"}},
+		"manual":           {Name: "manual", Type: "Selector", Now: "auto", All: []string{"auto", "vless-nl"}},
+		"sub-706dcf33":     {Name: "sub-706dcf33", Type: "URLTest", Now: "sub-706dcf33-b2", All: []string{"sub-706dcf33-a1", "sub-706dcf33-b2", "sub-706dcf33-c3", "sub-706dcf33-old"}},
+		"sub-1a00ae3b":     {Name: "sub-1a00ae3b", Type: "Selector", Now: "sub-1a00ae3b-k1", All: []string{"sub-1a00ae3b-k1", "sub-1a00ae3b-k2"}},
+		"agg-5e6f7a8b":     {Name: "agg-5e6f7a8b", Type: "URLTest", Now: "sub-706dcf33-a1", All: []string{"sub-706dcf33-a1", "sub-706dcf33-b2", "sub-706dcf33-c3"}},
+		"vless-nl":         {Name: "vless-nl", Type: "VLESS", History: []singbox.DelayHistory{{Delay: 130}, {Delay: 120}}},
+		"hy2-de":           {Name: "hy2-de", Type: "Hysteria2", History: []singbox.DelayHistory{{Delay: 0}}},
+		"sub-706dcf33-a1":  {Name: "sub-706dcf33-a1", Type: "VLESS", History: []singbox.DelayHistory{{Delay: 48}}},
+		"sub-706dcf33-b2":  {Name: "sub-706dcf33-b2", Type: "VLESS", History: []singbox.DelayHistory{{Delay: 95}}},
+		"sub-706dcf33-c3":  {Name: "sub-706dcf33-c3", Type: "Trojan"},
+		"sub-706dcf33-old": {Name: "sub-706dcf33-old", Type: "VLESS"},
 	}}
 	rt := &fakeRouter{outbounds: []router.CompositeOutboundView{
 		{Outbound: router.Outbound{Tag: "auto", Type: "urltest", Outbounds: []string{"vless-nl", "hy2-de"}}, Source: "router"},
@@ -554,5 +555,132 @@ func TestLocal_GroupWhoseMembersAreStaged(t *testing.T) {
 	got, _ = l.GetSingboxOutbound(context.Background(), "auto")
 	if got.Staged {
 		t.Fatalf("a reordered group is not staged: %+v", got.SingboxOutbound)
+	}
+}
+
+// TestLocal_CheckSingboxDelayKinds — тег классифицируется по конфигу, а
+// не по движку: опечатка получает точный отказ, даже когда sing-box
+// остановлен.
+func TestLocal_CheckSingboxDelayKinds(t *testing.T) {
+	l, _, _ := groupsHarness()
+	op := l.c.Singbox.(*fakeSingboxOp)
+	op.delays["sub-706dcf33-a1"] = 50
+	op.delays["sub-706dcf33"] = 97
+	op.delays["sub-706dcf33-old"] = 210
+	ctx := context.Background()
+
+	got, err := l.CheckSingboxDelay(ctx, "sub-706dcf33-a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Kind != "member" || !got.Reachable || got.DelayMs != 50 || got.Via != "" {
+		t.Fatalf("a subscription server = %+v", got)
+	}
+
+	got, err = l.CheckSingboxDelay(ctx, "sub-706dcf33")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Kind != "group" || got.DelayMs != 97 || got.Via != "sub-706dcf33-b2" {
+		t.Fatalf("a group = %+v, want it measured through the engine's active member", got)
+	}
+
+	got, err = l.CheckSingboxDelay(ctx, "vless-nl")
+	if err != nil || got.Kind != "proxy" {
+		t.Fatalf("a proxy = %+v, %v", got, err)
+	}
+
+	// Orphaned by the last refresh, and still an outbound.
+	got, err = l.CheckSingboxDelay(ctx, "sub-706dcf33-old")
+	if err != nil || got.Kind != "member" || got.DelayMs != 210 {
+		t.Fatalf("an orphaned server = %+v, %v", got, err)
+	}
+
+	// A tag can be both: the group wins, because that is what a rule
+	// pointing at the tag routes through.
+	subs := l.c.Subscriptions.(*fakeSubs)
+	subs.subs[0].MemberTags = append(subs.subs[0].MemberTags, "auto")
+	op.delays["auto"] = 121
+	got, err = l.CheckSingboxDelay(ctx, "auto")
+	if err != nil || got.Kind != "group" {
+		t.Fatalf("a tag that is both a group and a member = %+v, %v, want group", got, err)
+	}
+}
+
+func TestLocal_CheckSingboxDelayRefusesWithTheReason(t *testing.T) {
+	l, _, _ := groupsHarness()
+	op := l.c.Singbox.(*fakeSingboxOp)
+	ctx := context.Background()
+
+	for tag, want := range map[string]string{
+		"sub-706dcf33-x9": "excluded",
+		"sub-706dcf33-f7": "filter",
+		"nope":            "not found",
+	} {
+		_, err := l.CheckSingboxDelay(ctx, tag)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err = %v, want it to say %q", tag, err, want)
+		}
+	}
+	if len(op.asked) != 0 {
+		t.Fatalf("a refused tag must not reach the prober: %v", op.asked)
+	}
+}
+
+// TestLocal_CheckSingboxDelayWithTheEngineDown — остановленный sing-box
+// не должен превращать известный тег в «не найден»: агент пойдёт искать
+// опечатку вместо того, чтобы запустить движок.
+func TestLocal_CheckSingboxDelayWithTheEngineDown(t *testing.T) {
+	l, _, clash := groupsHarness()
+	clash.err = fmt.Errorf("connection refused")
+	op := l.c.Singbox.(*fakeSingboxOp)
+	op.delays["sub-706dcf33"] = 0
+
+	got, err := l.CheckSingboxDelay(context.Background(), "sub-706dcf33")
+	if err != nil {
+		t.Fatalf("a known group must be probed, not refused: %v", err)
+	}
+	if got.Kind != "group" || got.Reachable || got.Via != "" {
+		t.Fatalf("got %+v, want an unreachable group with no member named", got)
+	}
+}
+
+// TestLocal_CheckSingboxDelayRefusesWhatTheEngineDoesNotRun — группа из
+// неприменённого черновика есть в конфиге, но не в движке. Проба ответила
+// бы нулём — тем же, что и для упавшего сервера.
+func TestLocal_CheckSingboxDelayRefusesWhatTheEngineDoesNotRun(t *testing.T) {
+	l, _, clash := groupsHarness()
+	op := l.c.Singbox.(*fakeSingboxOp)
+	rt := l.c.Router.(*fakeRouter)
+	rt.outbounds = append(rt.outbounds, router.CompositeOutboundView{
+		Outbound: router.Outbound{Tag: "draft-only", Type: "selector", Outbounds: []string{"vless-nl"}}, Source: "router",
+	})
+
+	_, err := l.CheckSingboxDelay(context.Background(), "draft-only")
+	if err == nil || !strings.Contains(err.Error(), "not running it") {
+		t.Fatalf("err = %v, want it said that sing-box is not running this group", err)
+	}
+	if len(op.asked) != 0 {
+		t.Fatalf("an outbound the engine does not run must not reach the prober: %v", op.asked)
+	}
+
+	// With the engine silent there is nothing to check against: the probe
+	// runs and reports what it sees.
+	clash.err = fmt.Errorf("connection refused")
+	op.delays["draft-only"] = 0
+	got, err := l.CheckSingboxDelay(context.Background(), "draft-only")
+	if err != nil || got.Reachable || got.Kind != "group" {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+}
+
+func TestLocal_CheckSingboxDelayBusyKeepsTheKind(t *testing.T) {
+	l, _, _ := groupsHarness()
+	op := l.c.Singbox.(*fakeSingboxOp)
+	op.busy = map[string]bool{"sub-706dcf33-a1": true}
+
+	got, err := l.CheckSingboxDelay(context.Background(), "sub-706dcf33-a1")
+	if err != nil || !got.Busy || got.Kind != "member" || got.Reachable {
+		t.Fatalf("got %+v, %v", got, err)
 	}
 }
