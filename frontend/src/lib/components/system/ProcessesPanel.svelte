@@ -147,7 +147,10 @@
 					res = a.cpuPercent - b.cpuPercent;
 					break;
 				case 'mem':
-					res = a.memoryRss - b.memoryRss;
+					res = a.memoryOwn - b.memoryOwn;
+					break;
+				case 'time':
+					res = a.cpuTimeSec - b.cpuTimeSec;
 					break;
 				case 'pid':
 					res = a.pid - b.pid;
@@ -226,6 +229,7 @@
 			processes={filteredProcesses}
 			{loading}
 			{initialLoaded}
+			cpuCount={snapshot?.cpuCount ?? 0}
 			{sortField}
 			{sortAsc}
 			onsort={toggleSort}

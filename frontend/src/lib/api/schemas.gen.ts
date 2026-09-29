@@ -3094,10 +3094,13 @@ const procmon_ProcSummary: v.GenericSchema = v.looseObject({
 const procmon_ProcessItem: v.GenericSchema = v.looseObject({
 	cmdline: v.optional(v.nullable(v.string())),
 	cpuPercent: v.optional(v.nullable(v.number())),
+	cpuTimeSec: v.optional(v.nullable(v.number())),
 	exe: v.optional(v.nullable(v.string())),
 	isCritical: v.optional(v.nullable(v.boolean())),
 	isKernel: v.optional(v.nullable(v.boolean())),
 	isSelf: v.optional(v.nullable(v.boolean())),
+	memoryFile: v.optional(v.nullable(v.number())),
+	memoryOwn: v.optional(v.nullable(v.number())),
 	memoryPercent: v.optional(v.nullable(v.number())),
 	memoryRss: v.optional(v.nullable(v.number())),
 	memoryVsize: v.optional(v.nullable(v.number())),

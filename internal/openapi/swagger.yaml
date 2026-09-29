@@ -8618,6 +8618,10 @@ definitions:
       cmdline:
         type: string
       cpuPercent:
+        description: доля всего процессора (все ядра), 0..100
+        type: number
+      cpuTimeSec:
+        description: utime+stime с запуска процесса
         type: number
       exe:
         type: string
@@ -8627,10 +8631,19 @@ definitions:
         type: boolean
       isSelf:
         type: boolean
+      memoryFile:
+        description: |-
+          RssFile, bytes: чистые страницы бинарей и библиотек — ядро выбрасывает
+          их при нехватке памяти, размер зависит от page cache
+        type: integer
+      memoryOwn:
+        description: 'RssAnon+RssShmem, bytes: память, которую ядро без swap не отдаст'
+        type: integer
       memoryPercent:
+        description: MemoryOwn от MemTotal
         type: number
       memoryRss:
-        description: bytes
+        description: bytes, VmRSS = memoryOwn + memoryFile
         type: integer
       memoryVsize:
         description: bytes
