@@ -288,3 +288,31 @@ func TestRegisterMcpRoutes_DisabledDoesNotBuildServer(t *testing.T) {
 	}
 	runtime.KeepAlive(mux)
 }
+
+// Паника при сборке не хоронит обработчик до перезапуска: следующий запрос
+// собирает заново.
+func TestLazyHandler_RetriesAfterPanickedBuild(t *testing.T) {
+	calls := 0
+	l := &lazyHandler{build: func() http.Handler {
+		calls++
+		if calls == 1 {
+			panic("сборка упала")
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) })
+	}}
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("ждали панику первой сборки")
+			}
+		}()
+		l.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	}()
+
+	rec := httptest.NewRecorder()
+	l.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusTeapot {
+		t.Fatalf("code = %d, want 418: после паники обработчик не пересобран", rec.Code)
+	}
+}

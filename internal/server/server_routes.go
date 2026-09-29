@@ -1240,7 +1240,8 @@ func (s *Server) registerMcpRoutes(mux *http.ServeMux, h *routeHandlers) {
 	s.mcpCalls, s.mcpCallsCancel = context.WithCancel(context.Background())
 	// Сервер со схемами всех инструментов стоит ~0,6 МБ живой кучи на
 	// 32-битной сборке (F541), а MCP по умолчанию выключен. Собираем его при
-	// первом запросе, прошедшем KeyMiddleware (включён + верный ключ).
+	// первом запросе, прошедшем KeyMiddleware (включён + верный ключ), и
+	// держим до перезапуска демона — выключение MCP его не освобождает.
 	mcpHTTP := &lazyHandler{build: func() http.Handler {
 		mcpServer := mcp.NewServer(local, s.config.Version)
 		// Каждый вызов инструмента ограничен по времени и отменяется при
@@ -1345,13 +1346,24 @@ func (s *Server) registerStaticRoutes(mux *http.ServeMux, h *routeHandlers) {
 
 // lazyHandler строит обработчик при первом запросе: то, что дорого держать
 // в памяти, но чаще всего не нужно, не собирается на старте демона.
+// Не sync.Once: тот считает сборку выполненной и после паники, и обработчик
+// остался бы nil до перезапуска. Здесь запоминается только удачная сборка —
+// следующий запрос попробует снова.
 type lazyHandler struct {
-	once  sync.Once
+	mu    sync.Mutex
 	build func() http.Handler
 	h     http.Handler
 }
 
 func (l *lazyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	l.once.Do(func() { l.h = l.build() })
-	l.h.ServeHTTP(w, r)
+	l.handler().ServeHTTP(w, r)
+}
+
+func (l *lazyHandler) handler() http.Handler {
+	l.mu.Lock()
+	defer l.mu.Unlock() // defer: паника в build не должна оставить мьютекс занятым
+	if l.h == nil {
+		l.h = l.build()
+	}
+	return l.h
 }

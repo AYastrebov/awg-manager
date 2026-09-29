@@ -2,7 +2,7 @@
 	import type { SystemProcessItem } from '$lib/api/client';
 	import { formatBytes, formatDuration } from '$lib/utils/format';
 	import { Square } from 'lucide-svelte';
-	import { getCpuClass } from './shared';
+	import { cpuBarWidth, getCpuClass } from './shared';
 
 	interface Props {
 		proc: SystemProcessItem;
@@ -53,7 +53,7 @@
 				<div class="mini-bar">
 					<div
 						class="mini-bar-fill bar-level-{cpuLvl}"
-						style="width: {Math.min(100, proc.cpuPercent)}%"
+						style="width: {cpuBarWidth(proc.cpuPercent, cpuCount)}%"
 					></div>
 				</div>
 			{/if}
