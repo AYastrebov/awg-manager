@@ -435,8 +435,26 @@ func (l *Local) MonitoringMatrix(context.Context) (mcpsrv.MonitoringMatrix, erro
 	for _, t := range snap.Targets {
 		out.Targets = append(out.Targets, mcpsrv.MonitoringTarget{ID: t.ID, Host: t.Host, Name: t.Name})
 	}
+	// A row has a cell only if the scheduler probed it. Only self-cells
+	// are probed (monitoring/scheduler.go, runOnce), so a sing-box row —
+	// which has no self-target — never has one.
+	probed := make(map[string]bool, len(snap.Cells))
+	for _, c := range snap.Cells {
+		probed[c.TunnelID] = true
+	}
 	for _, t := range snap.Tunnels {
-		out.Tunnels = append(out.Tunnels, mcpsrv.MonitoringTunnel{ID: t.ID, Name: t.Name})
+		row := mcpsrv.MonitoringTunnel{
+			ID: t.ID, Name: sanitizeLabel(t.Name), Source: t.Source,
+			Subscription: t.Subscription, SingboxTag: t.SingboxTag,
+			Probed: probed[t.ID],
+		}
+		// ClashDelay is 0 for "not a urltest member", "nothing recorded"
+		// and "the engine is unreachable" alike, so 0 is never passed on.
+		if t.ClashDelay > 0 && t.UrltestGroup != "" {
+			d := t.ClashDelay
+			row.UrltestGroup, row.UrltestDelayMs = t.UrltestGroup, &d
+		}
+		out.Tunnels = append(out.Tunnels, row)
 	}
 	for _, c := range snap.Cells {
 		out.Cells = append(out.Cells, mcpsrv.MonitoringCell{TargetID: c.TargetID, TunnelID: c.TunnelID, OK: c.OK, LatencyMs: c.LatencyMs, TS: c.TS})

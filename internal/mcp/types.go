@@ -462,9 +462,22 @@ type MonitoringTarget struct {
 	Name string `json:"name"`
 }
 
+// MonitoringTunnel is one row of the matrix. A row is not always an AWG
+// tunnel, and a row is not always measured: Source says what it is and
+// Probed says whether the matrix holds a cell for it.
 type MonitoringTunnel struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Source string `json:"source" jsonschema:"awg (a tunnel from list_tunnels), system (a WireGuard interface of the router itself) or singbox"`
+	// Subscription and SingboxTag are set on sing-box rows only.
+	Subscription bool   `json:"subscription,omitempty" jsonschema:"true for a row that is the active server of a sing-box subscription"`
+	SingboxTag   string `json:"singboxTag,omitempty" jsonschema:"tag to pass to singbox_delay_check; set when source is singbox"`
+	Probed       bool   `json:"probed" jsonschema:"false means the matrix holds no cell for this row: it is not measured here, which says NOTHING about its health. True of every sing-box row, and of a tunnel whose check method is disabled or handshake"`
+	// UrltestGroup and UrltestDelayMs come together or not at all: the
+	// engine records 0 for a server it has no delay for, and 0 ms reads
+	// as an excellent result.
+	UrltestGroup   string `json:"urltestGroup,omitempty" jsonschema:"the urltest group this sing-box row belongs to, when the engine has a delay on record for it"`
+	UrltestDelayMs *int   `json:"urltestDelayMs,omitempty" jsonschema:"that delay in milliseconds, as the engine last recorded it"`
 }
 
 type MonitoringMatrix struct {

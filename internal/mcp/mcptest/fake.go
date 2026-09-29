@@ -768,6 +768,10 @@ func (f *Fake) DiagnosticsResult(context.Context) (mcpsrv.DiagnosticsResult, err
 	return *f.Diagnostics, nil
 }
 
+// MonitoringMatrix mirrors the scheduler (monitoring/scheduler.go): AWG
+// rows are probed and carry a cell; sing-box rows — every proxy, and the
+// active server of every ENABLED subscription — are listed and carry
+// none, because only self-cells are probed and they have no self-target.
 func (f *Fake) MonitoringMatrix(context.Context) (mcpsrv.MonitoringMatrix, error) {
 	if f.Err != nil {
 		return mcpsrv.MonitoringMatrix{}, f.Err
@@ -776,15 +780,31 @@ func (f *Fake) MonitoringMatrix(context.Context) (mcpsrv.MonitoringMatrix, error
 	m.Targets = append(m.Targets, mcpsrv.MonitoringTarget{ID: "t-google", Host: "8.8.8.8", Name: "Google DNS"})
 	lat := 21
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	for _, t := range f.Tunnels {
-		m.Tunnels = append(m.Tunnels, mcpsrv.MonitoringTunnel{ID: t.ID, Name: t.Name})
+		m.Tunnels = append(m.Tunnels, mcpsrv.MonitoringTunnel{ID: t.ID, Name: t.Name, Source: "awg", Probed: true})
 		cell := mcpsrv.MonitoringCell{TargetID: "t-google", TunnelID: t.ID, OK: t.State == "running", TS: time.Now()}
 		if cell.OK {
 			cell.LatencyMs = &lat
 		}
 		m.Cells = append(m.Cells, cell)
 	}
-	f.mu.Unlock()
+	for _, t := range f.SingboxTunnels {
+		m.Tunnels = append(m.Tunnels, mcpsrv.MonitoringTunnel{ID: t.Tag, Name: t.Tag, Source: "singbox", SingboxTag: t.Tag})
+	}
+	for _, sub := range f.Subscriptions {
+		active := f.ActiveMembers[sub.GroupTag]
+		if !sub.Enabled || active == "" {
+			continue
+		}
+		row := mcpsrv.MonitoringTunnel{ID: active, Name: sub.Label, Source: "singbox", SingboxTag: active, Subscription: true}
+		// Only a member of a urltest group has the engine's own delay.
+		if ms := f.LastDelays[active]; sub.Mode == "urltest" && ms > 0 {
+			d := ms
+			row.UrltestGroup, row.UrltestDelayMs = sub.GroupTag, &d
+		}
+		m.Tunnels = append(m.Tunnels, row)
+	}
 	m.UpdatedAt = time.Now()
 	return m, nil
 }

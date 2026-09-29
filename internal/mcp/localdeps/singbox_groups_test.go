@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/hoaxisr/awg-manager/internal/logging"
+	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
+	"github.com/hoaxisr/awg-manager/internal/monitoring"
 	"github.com/hoaxisr/awg-manager/internal/singbox"
 	"github.com/hoaxisr/awg-manager/internal/singbox/router"
 	"github.com/hoaxisr/awg-manager/internal/singbox/subscription"
@@ -866,4 +868,61 @@ func TestLocal_SetSingboxSubscriptionEnabledReportsFailure(t *testing.T) {
 			t.Fatal("without the subscription service the tool must say it is unavailable")
 		}
 	})
+}
+
+type fakeMon struct{ snap monitoring.Snapshot }
+
+func (f fakeMon) Snapshot() monitoring.Snapshot { return f.snap }
+
+// TestLocal_MonitoringMatrixLabelsRows — планировщик мониторинга меряет
+// только self-ячейки, а у строк sing-box self-цели нет
+// (monitoring/scheduler.go, runOnce). Строка без ячейки и без пометки
+// читается как упавший туннель.
+func TestLocal_MonitoringMatrixLabelsRows(t *testing.T) {
+	lat := 21
+	l := New(Config{Monitoring: fakeMon{snap: monitoring.Snapshot{
+		Targets: []monitoring.Target{{ID: "cc-connectivity.example", Host: "connectivity.example", Name: "connectivity.example"}},
+		Tunnels: []monitoring.Tunnel{
+			{ID: "tn-1", Name: "Amsterdam", Source: "awg", SelfTarget: "connectivity.example", SelfMethod: "http"},
+			{ID: "tn-2", Name: "Frankfurt", Source: "awg", SelfMethod: "handshake"},
+			{ID: "Wireguard0", Name: "Home", Source: "system", SelfTarget: "connectivity.example"},
+			{ID: "vless-nl", Name: "vless-nl", Source: "singbox", SingboxTag: "vless-nl"},
+			{ID: "sub-706dcf33-a1", Name: "AXO auto", Source: "singbox", SingboxTag: "sub-706dcf33-a1", Subscription: true, ClashDelay: 48, UrltestGroup: "sub-706dcf33"},
+		},
+		Cells: []monitoring.Cell{
+			{TargetID: "cc-connectivity.example", TunnelID: "tn-1", OK: true, LatencyMs: &lat},
+			{TargetID: "cc-connectivity.example", TunnelID: "Wireguard0", OK: false},
+		},
+	}}})
+
+	got, err := l.MonitoringMatrix(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := map[string]mcpsrv.MonitoringTunnel{}
+	for _, r := range got.Tunnels {
+		rows[r.ID] = r
+	}
+	if r := rows["tn-1"]; r.Source != "awg" || !r.Probed || r.SingboxTag != "" {
+		t.Fatalf("tn-1 = %+v", r)
+	}
+	// A failing cell is still a measurement.
+	if r := rows["Wireguard0"]; r.Source != "system" || !r.Probed {
+		t.Fatalf("Wireguard0 = %+v", r)
+	}
+	// An AWG tunnel whose check method probes no host has no cell either.
+	if r := rows["tn-2"]; r.Probed {
+		t.Fatalf("tn-2 = %+v, want probed=false for a handshake-only check", r)
+	}
+	if r := rows["vless-nl"]; r.Source != "singbox" || r.SingboxTag != "vless-nl" || r.Probed || r.Subscription {
+		t.Fatalf("vless-nl = %+v", r)
+	}
+	// No delay on record: no number, and no group without a number.
+	if r := rows["vless-nl"]; r.UrltestDelayMs != nil || r.UrltestGroup != "" {
+		t.Fatalf("vless-nl = %+v, want no urltest data", r)
+	}
+	r := rows["sub-706dcf33-a1"]
+	if !r.Subscription || r.Probed || r.UrltestGroup != "sub-706dcf33" || r.UrltestDelayMs == nil || *r.UrltestDelayMs != 48 {
+		t.Fatalf("sub-706dcf33-a1 = %+v", r)
+	}
 }
