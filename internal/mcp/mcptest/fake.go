@@ -41,7 +41,11 @@ type Fake struct {
 	Rules           []mcpsrv.SingboxRule
 	Draft           []mcpsrv.SingboxRule
 	RouterOutbounds []mcpsrv.SingboxOutbound
-	Servers         []mcpsrv.ManagedServer
+
+	// Subscriptions are the sing-box subscriptions, in the order
+	// subscription.Store.List returns them: by label, then by id.
+	Subscriptions []mcpsrv.SingboxSubscription
+	Servers       []mcpsrv.ManagedServer
 	// Peers maps a server id to its clients; ServerAddresses maps it to
 	// the server's own tunnel address, which the allocator counts from.
 	Peers           map[string][]mcpsrv.ServerPeer
@@ -102,6 +106,10 @@ func New() *Fake {
 		RouterOutbounds: []mcpsrv.SingboxOutbound{
 			{Tag: "auto", Type: "urltest", Source: "user"},
 			{Tag: "manual", Type: "selector", Source: "user"},
+		},
+		Subscriptions: []mcpsrv.SingboxSubscription{
+			{ID: "706dcf33aabbccddeeff0011", Label: "AXO auto", Source: "url", Host: "sub.example.net", Enabled: true, Mode: "urltest", GroupTag: "sub-706dcf33", MemberCount: 3, RefreshHours: 12, LastFetched: "2026-09-02T09:00:00Z"},
+			{ID: "1a00ae3b0011223344556677", Label: "AXO manual", Source: "url", Host: "sub.example.net", Enabled: true, Mode: "selector", GroupTag: "sub-1a00ae3b", MemberCount: 2, RefreshHours: 12, LastFetched: "2026-09-02T09:00:00Z"},
 		},
 		Peers: map[string][]mcpsrv.ServerPeer{
 			"Wireguard0": {
@@ -848,6 +856,15 @@ func (f *Fake) ServerPeerConfig(_ context.Context, serverID, publicKey string) (
 		}
 	}
 	return "", fmt.Errorf("peer %q not found on server %q", publicKey, serverID)
+}
+
+func (f *Fake) ListSingboxSubscriptions(context.Context) ([]mcpsrv.SingboxSubscription, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]mcpsrv.SingboxSubscription(nil), f.Subscriptions...), nil
 }
 
 func (f *Fake) ListSingboxTunnels(context.Context) ([]mcpsrv.SingboxTunnel, error) {

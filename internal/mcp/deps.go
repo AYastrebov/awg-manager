@@ -114,6 +114,10 @@ type Deps interface {
 	// CheckSingboxDelay probes one proxy. An unknown tag is an error;
 	// a proxy that stays silent is a result with Reachable false.
 	CheckSingboxDelay(ctx context.Context, tag string) (SingboxDelay, error)
+	// ListSingboxSubscriptions returns every subscription, sorted by label
+	// and then id, so that an offset means the same thing on every call.
+	// The tool pages the result; implementations must not truncate it.
+	ListSingboxSubscriptions(ctx context.Context) ([]SingboxSubscription, error)
 
 	OpenAPISpec() []byte
 }

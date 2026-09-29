@@ -35,6 +35,7 @@ func NewServer(deps Deps, version string) *mcp.Server {
 	registerExplainTools(s, deps)
 	registerSingboxTools(s, deps)
 	registerRouterTools(s, deps)
+	registerSubscriptionTools(s, deps)
 	registerServerTools(s, deps)
 	registerPeerTools(s, deps)
 	s.AddResource(&mcp.Resource{

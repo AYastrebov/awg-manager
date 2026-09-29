@@ -35,6 +35,7 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/singbox"
 	singboxorch "github.com/hoaxisr/awg-manager/internal/singbox/orchestrator"
 	"github.com/hoaxisr/awg-manager/internal/singbox/router"
+	"github.com/hoaxisr/awg-manager/internal/singbox/subscription"
 	"github.com/hoaxisr/awg-manager/internal/storage"
 	awgtesting "github.com/hoaxisr/awg-manager/internal/testing"
 	"github.com/hoaxisr/awg-manager/internal/traffic"
@@ -87,6 +88,14 @@ type (
 		ApplyStaging(ctx context.Context) (singboxorch.ValidationResult, error)
 		DiscardStaging(ctx context.Context) error
 	}
+	// SubscriptionService is the subset of *subscription.Service MCP
+	// uses. List is sorted by label and then id (subscription.Store.List).
+	SubscriptionService interface {
+		List() []subscription.Subscription
+		Get(id string) (*subscription.Subscription, error)
+		Update(id string, patch subscription.UpdatePatch) (*subscription.Subscription, error)
+		ListGroups() []subscription.AggregateGroup
+	}
 	MonitoringSnapshotter interface {
 		Snapshot() monitoring.Snapshot
 	}
@@ -137,9 +146,12 @@ type Config struct {
 	Connections ConnectionLister
 	Diagnostics DiagnosticsRunner
 	// Router serves the sing-box routing-rule tools.
-	Router     SingboxRouter
-	Singbox    SingboxOperator
-	SystemInfo func() map[string]interface{}
+	Router  SingboxRouter
+	Singbox SingboxOperator
+	// Subscriptions serves the subscription tools. nil makes them report
+	// that sing-box subscriptions are unavailable on this router.
+	Subscriptions SubscriptionService
+	SystemInfo    func() map[string]interface{}
 	// Resolve looks a hostname up. Injected rather than called directly so
 	// tests need no network; nil disables explain_route's subnet leg.
 	Resolve func(ctx context.Context, host string) ([]string, error)
