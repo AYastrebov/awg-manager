@@ -4,6 +4,7 @@
 	import { RefreshCw, Search, ArrowUp, ArrowDown } from 'lucide-svelte';
 	import ProcessRow from './ProcessRow.svelte';
 	import type { SortField } from './shared';
+	import { CORE_WORDS, pluralize } from '$lib/utils/pluralize';
 
 	interface Props {
 		processes: SystemProcessItem[];
@@ -69,7 +70,7 @@
 						</th>
 						<th
 							class="th-sortable col-th-cpu"
-							title="Доля всего процессора роутера{cpuCount > 1 ? ` (${cpuCount} ядер)` : ''}: 100 % — заняты все ядра"
+							title="Доля всего процессора роутера{cpuCount > 1 ? ` (${pluralize(cpuCount, CORE_WORDS)})` : ''}: 100 % — заняты все ядра"
 							onclick={() => onsort('cpu')}
 						>
 							<div class="th-wrap">
@@ -93,7 +94,7 @@
 						</th>
 						<th
 							class="th-sortable col-th-mem"
-							title="Своя память процесса — ядро не может её отдать. Отдельно — страницы файлов (бинари, библиотеки): их ядро освобождает при нехватке памяти"
+							title="Своя память процесса — ядро не может её отдать. Отдельно — страницы файлов (бинари, библиотеки): их ядро освобождает при нехватке памяти. У процессов, порождённых через fork (например, воркеры nginx), общие страницы засчитываются каждому — сумма по строкам больше реального расхода"
 							onclick={() => onsort('mem')}
 						>
 							<div class="th-wrap">
