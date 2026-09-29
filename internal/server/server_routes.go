@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/hoaxisr/awg-manager/internal/api"
@@ -1233,47 +1234,55 @@ func (s *Server) registerMcpRoutes(mux *http.ServeMux, h *routeHandlers) {
 		PingCheckSnapshot: pingSnapshot,
 		AppLog:            appLog,
 	})
-	mcpServer := mcp.NewServer(local, s.config.Version)
-	// Каждый вызов инструмента ограничен по времени и отменяется при
-	// остановке демона (см. mcp.CallDeadline). Контекст создаётся здесь,
-	// а не в конструкторе Server: до регистрации маршрутов MCP нет.
+	// Контекст вызовов создаётся здесь, а не в конструкторе Server: до
+	// регистрации маршрутов MCP нет. И не в сборке сервера ниже — Shutdown
+	// читает mcpCallsCancel без блокировки.
 	s.mcpCalls, s.mcpCallsCancel = context.WithCancel(context.Background())
-	mcpServer.AddReceivingMiddleware(mcp.CallDeadline(mcpToolTimeout, s.mcpCalls))
-	// Ключ только для чтения не должен доходить до записи. Проверка стоит
-	// перед обработчиком инструмента: «нельзя» после применения изменения
-	// было бы худшим из исходов.
-	mcpServer.AddReceivingMiddleware(mcp.RequireWriteScope())
-	// Один info-лог на вызов инструмента: имя инструмента + имя ключа
-	// (никогда сам ключ), длительность и исход — спека §8.
-	mcpServer.AddReceivingMiddleware(func(next sdk.MethodHandler) sdk.MethodHandler {
-		return func(ctx context.Context, method string, req sdk.Request) (sdk.Result, error) {
-			if method != "tools/call" {
-				return next(ctx, method, req)
+	// Сервер со схемами всех инструментов стоит ~0,6 МБ живой кучи на
+	// 32-битной сборке (F541), а MCP по умолчанию выключен. Собираем его при
+	// первом запросе, прошедшем KeyMiddleware (включён + верный ключ).
+	mcpHTTP := &lazyHandler{build: func() http.Handler {
+		mcpServer := mcp.NewServer(local, s.config.Version)
+		// Каждый вызов инструмента ограничен по времени и отменяется при
+		// остановке демона (см. mcp.CallDeadline).
+		mcpServer.AddReceivingMiddleware(mcp.CallDeadline(mcpToolTimeout, s.mcpCalls))
+		// Ключ только для чтения не должен доходить до записи. Проверка стоит
+		// перед обработчиком инструмента: «нельзя» после применения изменения
+		// было бы худшим из исходов.
+		mcpServer.AddReceivingMiddleware(mcp.RequireWriteScope())
+		// Один info-лог на вызов инструмента: имя инструмента + имя ключа
+		// (никогда сам ключ), длительность и исход — спека §8.
+		mcpServer.AddReceivingMiddleware(func(next sdk.MethodHandler) sdk.MethodHandler {
+			return func(ctx context.Context, method string, req sdk.Request) (sdk.Result, error) {
+				if method != "tools/call" {
+					return next(ctx, method, req)
+				}
+				toolName := ""
+				if p, ok := req.GetParams().(*sdk.CallToolParamsRaw); ok && p != nil {
+					toolName = p.Name
+				}
+				keyName := "-"
+				if k, ok := mcp.KeyFromContext(ctx); ok {
+					keyName = k.Name
+				}
+				start := time.Now()
+				res, err := next(ctx, method, req)
+				outcome := "ok"
+				if err != nil {
+					outcome = "error"
+				} else if r, ok := res.(*sdk.CallToolResult); ok && r.IsError {
+					outcome = "tool-error"
+				}
+				scope := ""
+				if k, ok := mcp.KeyFromContext(ctx); ok && k.ReadOnly {
+					scope = " scope=read-only"
+				}
+				mcpLog.Info("call", toolName, fmt.Sprintf("key=%s%s %s %dms", keyName, scope, outcome, time.Since(start).Milliseconds()))
+				return res, err
 			}
-			toolName := ""
-			if p, ok := req.GetParams().(*sdk.CallToolParamsRaw); ok && p != nil {
-				toolName = p.Name
-			}
-			keyName := "-"
-			if k, ok := mcp.KeyFromContext(ctx); ok {
-				keyName = k.Name
-			}
-			start := time.Now()
-			res, err := next(ctx, method, req)
-			outcome := "ok"
-			if err != nil {
-				outcome = "error"
-			} else if r, ok := res.(*sdk.CallToolResult); ok && r.IsError {
-				outcome = "tool-error"
-			}
-			scope := ""
-			if k, ok := mcp.KeyFromContext(ctx); ok && k.ReadOnly {
-				scope = " scope=read-only"
-			}
-			mcpLog.Info("call", toolName, fmt.Sprintf("key=%s%s %s %dms", keyName, scope, outcome, time.Since(start).Milliseconds()))
-			return res, err
-		}
-	})
+		})
+		return mcp.NewHTTPHandler(mcpServer)
+	}}
 	// Собственный throttle: web-login throttle делит ключ (IP клиента) со
 	// всеми пользователями за реверс-прокси KeenDNS, и общий инстанс дал бы
 	// перекрёстную блокировку веб-входа и MCP.
@@ -1287,7 +1296,7 @@ func (s *Server) registerMcpRoutes(mux *http.ServeMux, h *routeHandlers) {
 		Touch:    s.mcpKeys.Touch,
 		Throttle: throttle,
 		Log:      func(f string, a ...any) { mcpLog.Warn("auth", "", fmt.Sprintf(f, a...)) },
-	}, mcp.NewHTTPHandler(mcpServer))
+	}, mcpHTTP)
 	mux.Handle("/mcp", mcpHandler)
 	// Без этого «/mcp/» (и любой подпуть) проваливается в catch-all SPA и
 	// отдаёт HTML без авторизации вместо честного 401/404: клиент, который
@@ -1332,4 +1341,17 @@ func (s *Server) registerStaticRoutes(mux *http.ServeMux, h *routeHandlers) {
 	if s.config.FrontendFS != nil {
 		mux.Handle("/", spaHandler(s.config.FrontendFS))
 	}
+}
+
+// lazyHandler строит обработчик при первом запросе: то, что дорого держать
+// в памяти, но чаще всего не нужно, не собирается на старте демона.
+type lazyHandler struct {
+	once  sync.Once
+	build func() http.Handler
+	h     http.Handler
+}
+
+func (l *lazyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	l.once.Do(func() { l.h = l.build() })
+	l.h.ServeHTTP(w, r)
 }
