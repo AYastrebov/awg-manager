@@ -21,6 +21,11 @@ type SingboxStatus struct {
 	LastError   string `json:"lastError,omitempty"`
 }
 
+// MaxSingboxLabelRunes caps a subscription label or a server name. Both
+// are written by a third party — the provider — and land in a model's
+// context, so they are bounded like any other untrusted text.
+const MaxSingboxLabelRunes = 64
+
 // SingboxTunnel is one proxy configured inside sing-box. Credentials
 // (passwords, uuids, the naive username) are deliberately left out: an
 // agent needs to tell proxies apart and see whether they work, not to
