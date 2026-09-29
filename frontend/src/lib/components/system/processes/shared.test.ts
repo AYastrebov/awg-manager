@@ -3,24 +3,26 @@ import { cpuBarWidth, getCpuClass } from './shared';
 
 describe('getCpuClass', () => {
 	// Процесс: pct — доля всего процессора, пороги в ядрах.
-	it('процесс на 4 ядрах: целое ядро (25 %) — high, половина — med', () => {
-		expect(getCpuClass(25, 4)).toBe('high');
-		expect(getCpuClass(24.9, 4)).toBe('high'); // допуск на усечение до десятых
-		expect(getCpuClass(24.8, 4)).toBe('med');
+	// Замер стенда: `yes`, упёршийся в ядро, — 23.6 % на 4 ядрах.
+	it('процесс на 4 ядрах: 90 % ядра (22.5 %) — high, половина — med', () => {
+		expect(getCpuClass(23.6, 4)).toBe('high');
+		expect(getCpuClass(22.5, 4)).toBe('high');
+		expect(getCpuClass(22.3, 4)).toBe('med');
 		expect(getCpuClass(12.5, 4)).toBe('med');
 		expect(getCpuClass(12.3, 4)).toBe('low');
 	});
 
-	it('процесс на 2 ядрах: пороги 50 % и 25 %', () => {
-		expect(getCpuClass(50, 2)).toBe('high');
+	it('процесс на 2 ядрах: пороги 45 % и 25 %', () => {
+		expect(getCpuClass(45, 2)).toBe('high');
+		expect(getCpuClass(44.8, 2)).toBe('med');
 		expect(getCpuClass(25, 2)).toBe('med');
 		expect(getCpuClass(24, 2)).toBe('low');
 	});
 
-	// Ядро из трёх, занятое целиком, приходит усечённым до 33.3 % (33.33…).
-	it('процесс на 3 ядрах: усечённое целое ядро — high, половина — med', () => {
-		expect(getCpuClass(33.3, 3)).toBe('high');
-		expect(getCpuClass(33.1, 3)).toBe('med');
+	// 100/3 × 0.9 в float чуть больше 30, половина ядра приходит усечённой.
+	it('процесс на 3 ядрах: 30 % — high, усечённая половина — med', () => {
+		expect(getCpuClass(30, 3)).toBe('high');
+		expect(getCpuClass(29.8, 3)).toBe('med');
 		expect(getCpuClass(16.6, 3)).toBe('med');
 		expect(getCpuClass(16.4, 3)).toBe('low');
 	});
