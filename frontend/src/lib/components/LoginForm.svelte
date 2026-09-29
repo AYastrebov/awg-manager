@@ -48,7 +48,7 @@
 			<p class="login-subtitle">
 				{isEntware
 					? 'Введите данные учётной записи Entware'
-					: 'Введите данные от входа в админ-панель роутера'}
+					: 'Введите данные для входа в админ-панель роутера'}
 			</p>
 		</div>
 
@@ -81,7 +81,7 @@
 					bind:value={login}
 					oninput={() => auth.clearError()}
 					onkeydown={handleKeydown}
-					placeholder={isEntware ? 'root' : 'admin'}
+					placeholder={isEntware ? 'имя пользователя - обычно root' : 'имя пользователя - обычно admin'}
 					autocomplete="username"
 					disabled={submitting}
 				/>
