@@ -23,12 +23,19 @@ const peerTTL = 8 * time.Second
 type PeerStore struct {
 	getter Getter
 	log    Logger
+	// interfaces — отсечка по кэшу: пиров отсутствующего интерфейса не
+	// спрашиваем (F546). nil — без отсечки (тесты).
+	interfaces *InterfaceStore
 
 	store *cache.KeyedStore[string, []ndms.Peer]
 }
 
-func NewPeerStore(g Getter, log Logger) *PeerStore {
-	return NewPeerStoreWithTTL(g, log, peerTTL)
+// NewPeerStore — PeerStore с отсечкой по кэшу интерфейсов ifaces (nil — без
+// отсечки).
+func NewPeerStore(g Getter, log Logger, ifaces *InterfaceStore) *PeerStore {
+	s := NewPeerStoreWithTTL(g, log, peerTTL)
+	s.interfaces = ifaces
+	return s
 }
 
 func NewPeerStoreWithTTL(g Getter, log Logger, ttl time.Duration) *PeerStore {
@@ -79,6 +86,12 @@ func (s *PeerStore) fetch(ctx context.Context, name string) ([]ndms.Peer, error)
 	// as a command continuation and answers "not found". Querying the
 	// interface and reading .wireguard.peer works in both the direct-GET and
 	// batch-POST transports. Verified against Keenetic RCI 2026-05-23.
+	// Интерфейса нет в кэше — ноль пиров без запроса: на show interface по
+	// отсутствующему имени NDMS пишет E «unable to find» в свой журнал, а
+	// managed-сервер с пропавшим WireguardN опрашивается постоянно (F546).
+	if s.interfaces != nil && !s.interfaces.mayExist(ctx, name) {
+		return []ndms.Peer{}, nil
+	}
 	var wrap struct {
 		Wireguard struct {
 			Peer []peerWire `json:"peer"`

@@ -828,6 +828,15 @@ func nwgStalled(rci NWGState, now time.Time) bool {
 // direct GET path costs ~115ms flat on NDMS regardless of response size,
 // POST is ~10x cheaper and coalesces in the transport batcher.
 func (o *OperatorNativeWG) fetchInterfaceRCI(ctx context.Context, ndmsName string) ([]byte, error) {
+	// Интерфейса нет в кэше (держится хуками ifcreated/ifdestroyed) — не
+	// спрашиваем: на запрос по отсутствующему имени NDMS пишет E «unable to
+	// find» в свой журнал, а состояние читается на каждом опросе (F546).
+	// Ошибка кэша — «не знаем», идём в NDMS.
+	if o.queries != nil {
+		if iface, err := o.queries.Interfaces.Get(ctx, ndmsName); err == nil && iface == nil {
+			return []byte("{}"), nil
+		}
+	}
 	raw, err := o.transport.Post(ctx, transport.ShowInterface(ndmsName, nil))
 	if err != nil {
 		return nil, err

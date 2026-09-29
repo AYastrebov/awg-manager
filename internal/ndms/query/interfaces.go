@@ -242,7 +242,8 @@ func (s *InterfaceStore) GetProxy(ctx context.Context, name string) (*ndms.Proxy
 }
 
 // FetchSummary returns InterfaceDetails by issuing a fresh batch-POST
-// show.interface query on every call — no cache read. Used by
+// show.interface query on every call; an interface absent from NDMS is
+// answered without the point query (F546). Used by
 // state.Manager for kernel-tunnel state determination because NDMS
 // `iflayerchanged link=running` hooks are not reliable for OpkgTun:
 // the cache that GetDetails consults can stay frozen with Link != "up"
@@ -254,6 +255,14 @@ func (s *InterfaceStore) GetProxy(ctx context.Context, name string) (*ndms.Proxy
 // GetDetails (cache helper, not authoritative).
 func (s *InterfaceStore) FetchSummary(ctx context.Context, name string) (*ndms.InterfaceDetails, error) {
 	if name == "" {
+		return nil, nil
+	}
+	// Интерфейса нет в NDMS — не спрашиваем: на запрос по отсутствующему
+	// имени NDMS пишет E «unable to find» в свой журнал (F546). nil — тот же
+	// ответ, что давал status-error NDMS.
+	if ok, err := s.exists(ctx, name); err != nil {
+		return nil, err
+	} else if !ok {
 		return nil, nil
 	}
 	// Batch POST вместо прямого GET /summary: NDMS обрабатывает GET с
@@ -417,6 +426,12 @@ func (s *InterfaceStore) ResolveSystemName(ctx context.Context, ndmsName string)
 	if sysName := s.cachedSystemName(ndmsName); trustedSystemName(ndmsName, sysName) {
 		return sysName
 	}
+	// Интерфейса нет в кэше — резолвер не спрашиваем: на отсутствующее имя
+	// NDMS пишет E `unable to find X in "Network::Interface::Base"` в свой
+	// журнал (F546), а запомнить ответ всё равно негде (rememberSystemName).
+	if !s.mayExist(ctx, ndmsName) {
+		return ""
+	}
 
 	// Fallback: dedicated NDMS resolver endpoint.
 	resolved := s.fetchSystemName(ctx, ndmsName)
@@ -536,7 +551,7 @@ func (s *InterfaceStore) SystemNames(ctx context.Context, ids []string) map[stri
 	for _, id := range ids {
 		if name := cached(id); name != "" {
 			out[id] = name
-		} else {
+		} else if s.mayExist(ctx, id) { // отсутствующее — без резолвера (F546)
 			todo = append(todo, id)
 		}
 	}
@@ -964,18 +979,23 @@ func layerLevelToUpDown(level string) string {
 
 // === Command-side write API (proactive refresh after a successful POST) ===
 
-// Refresh issues ONE fresh /show/interface/<name> read regardless of what
-// the cache holds, patches the cache with the result the same way
-// Invalidate does, and returns it. Use this instead of Get when the
-// decision must reflect what NDMS holds RIGHT NOW rather than the last
-// hook-driven snapshot: NDMS hooks (ifcreated/ifdestroyed/…) don't fire
-// for an out-of-band edit like `interface OpkgTunN description …`, so
-// Get can stay stale indefinitely (F532).
+// Refresh reads the record as NDMS holds it RIGHT NOW, patches the cache
+// with the result the same way Invalidate does, and returns it. Use this
+// instead of Get when the decision must reflect NDMS now rather than the
+// last hook-driven snapshot: NDMS hooks (ifcreated/ifdestroyed/…) don't
+// fire for an out-of-band edit like `interface OpkgTunN description …`,
+// so Get can stay stale indefinitely (F532).
 //
-// Absent record (200 + empty body, or the "unable to find" status
-// envelope NDMS returns for this POST form) → (nil, nil), and the entry
-// is removed from the cache. Transport/parse error → error returned,
-// cache left untouched — same contract Invalidate already had.
+// A record the cache knows is read point-wise (`show interface <name>`).
+// A record the cache doesn't know is looked up in a fresh full list
+// instead: on a point read of an absent name NDMS writes E `unable to find
+// "<name>"` into its own log (F546), while the list is silent and just as
+// fresh — a record the cache missed (lost hook) is still found, so the
+// ownership gate never mistakes a foreign record for an absent one (F517).
+//
+// Absent record → (nil, nil), and the entry is removed from the cache.
+// Transport/parse error → error returned, cache left untouched — same
+// contract Invalidate already had.
 func (s *InterfaceStore) Refresh(ctx context.Context, name string) (*ndms.Interface, error) {
 	if name == "" {
 		return nil, nil
@@ -983,9 +1003,25 @@ func (s *InterfaceStore) Refresh(ctx context.Context, name string) (*ndms.Interf
 	if err := s.ensureBootstrap(ctx); err != nil {
 		return nil, err
 	}
-	iface, err := s.fetchOne(ctx, name)
-	if err != nil {
-		return nil, err
+	s.mu.RLock()
+	_, known := s.byID[name]
+	s.mu.RUnlock()
+	var iface *ndms.Interface
+	if known {
+		var err error
+		if iface, err = s.fetchOne(ctx, name); err != nil {
+			return nil, err
+		}
+	} else {
+		// Из списка берём только эту запись: подмена всей карты затёрла бы
+		// то, что хуки успели применить к соседям, пока шёл запрос.
+		raw, err := s.fetchListMap(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if rec, ok := raw[name]; ok {
+			iface = &rec
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1066,6 +1102,26 @@ func (s *InterfaceStore) InvalidateAll() {
 		}
 	}
 	s.booted.Store(true)
+}
+
+// mayExist — false, только если кэш уверен, что записи нет. Ошибка кэша —
+// «не знаем» (true): вызывающий спросит NDMS, как раньше. Для частых опросов:
+// запись, пропущенную кэшем, до ближайшего хука или перечитывания не видно.
+func (s *InterfaceStore) mayExist(ctx context.Context, name string) bool {
+	iface, err := s.Get(ctx, name)
+	return err != nil || iface != nil
+}
+
+// exists — есть ли запись name в NDMS, без точечного запроса по отсутствующей
+// (F546): известная кэшу есть; неизвестная проверяется свежим списком
+// (Refresh), который E не пишет и находит запись, пропущенную кэшем. Для
+// путей, где решение обязано опираться на NDMS сейчас.
+func (s *InterfaceStore) exists(ctx context.Context, name string) (bool, error) {
+	if !s.mayExist(ctx, name) {
+		rec, err := s.Refresh(ctx, name)
+		return rec != nil, err
+	}
+	return true, nil
 }
 
 // === Internal helpers ===

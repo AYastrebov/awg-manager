@@ -642,6 +642,58 @@ func TestInterfaceStore_Refresh_SeesChangeWithoutHook(t *testing.T) {
 	}
 }
 
+// F546: запись, которой нет ни в кэше, ни в NDMS, точечно не спрашивается —
+// на `show interface <name>` по отсутствующему имени NDMS пишет E в журнал.
+func TestInterfaceStore_Refresh_AbsentNoPointQuery(t *testing.T) {
+	fg := newFakeGetter()
+	fg.SetJSON(ifaceListPath, sampleIfaceList)
+	s := NewInterfaceStore(fg, NopLogger())
+
+	got, err := s.Refresh(context.Background(), "OpkgTun11")
+	if err != nil || got != nil {
+		t.Fatalf("want (nil, nil), got (%#v, %v)", got, err)
+	}
+	if n := fg.PostInterfaceCalls("OpkgTun11"); n != 0 {
+		t.Fatalf("show interface OpkgTun11 ушёл %d раз — NDMS запишет E «unable to find»", n)
+	}
+}
+
+// Запись, которую кэш пропустил (потерянный хук), находится свежим списком:
+// гейт владения не должен принять чужую запись за отсутствующую (F517).
+func TestInterfaceStore_Refresh_MissedByCacheFoundInList(t *testing.T) {
+	fg := newFakeGetter()
+	fg.SetJSON(ifaceListPath, sampleIfaceList)
+	s := NewInterfaceStore(fg, NopLogger())
+	_, _ = s.Get(context.Background(), "Wireguard0") // кэш поднят без OpkgTun11
+
+	fg.SetJSON(ifaceListPath, `{"OpkgTun11":{"id":"OpkgTun11","type":"OpkgTun","description":"csqtt"}}`)
+	got, err := s.Refresh(context.Background(), "OpkgTun11")
+	if err != nil || got == nil || got.Description != "csqtt" {
+		t.Fatalf("want record with description csqtt, got (%#v, %v)", got, err)
+	}
+	if n := fg.PostInterfaceCalls("OpkgTun11"); n != 0 {
+		t.Fatalf("точечный запрос не нужен, ушло %d", n)
+	}
+}
+
+// Известная кэшу запись читается точечно и свежо (F532).
+func TestInterfaceStore_Refresh_KnownReadsFresh(t *testing.T) {
+	fg := newFakeGetter()
+	fg.SetJSON(ifaceListPath, sampleIfaceList)
+	s := NewInterfaceStore(fg, NopLogger())
+	fg.SetPostInterface("Wireguard0", `{"show":{"interface":{
+		"id":"Wireguard0","interface-name":"nwg0","type":"Wireguard","description":"csqtt-probe"
+	}}}`)
+
+	got, err := s.Refresh(context.Background(), "Wireguard0")
+	if err != nil || got == nil || got.Description != "csqtt-probe" {
+		t.Fatalf("want fresh description, got (%#v, %v)", got, err)
+	}
+	if n := fg.PostInterfaceCalls("Wireguard0"); n != 1 {
+		t.Fatalf("want 1 point read, got %d", n)
+	}
+}
+
 // Форма, которую реально отдаёт NDMS на отсутствующую запись через POST
 // (стенд KN-1810, 5.02.A.11: `unable to find`, код 6553619) — см.
 // TestFetchSummary_NoDataMeansNilDetails и
@@ -1295,9 +1347,20 @@ func TestInterfaceStore_ResolveSystemName_OnDestroyedForgetsMemo(t *testing.T) {
 	fg.SetPostSystemName("Wireguard0", `"nwg0"`)
 	s := NewInterfaceStore(fg, NopLogger())
 
-	_ = s.ResolveSystemName(context.Background(), "Wireguard0")
+	ctx := context.Background()
+	_ = s.ResolveSystemName(ctx, "Wireguard0")
 	s.OnDestroyed("Wireguard0")
-	_ = s.ResolveSystemName(context.Background(), "Wireguard0")
+	// Удалённого нет в кэше: имя не отдаётся и резолвер не спрашивается
+	// (запрос по отсутствующему — E в журнале NDMS, F546).
+	if got := s.ResolveSystemName(ctx, "Wireguard0"); got != "" {
+		t.Fatalf("имя пережило удаление: %q", got)
+	}
+	if got := fg.PostSystemNameCalls("Wireguard0"); got != 1 {
+		t.Fatalf("резолвер спрошен %d раз после удаления, ждали 1 (до удаления)", got)
+	}
+	// Пересоздан — резолвер спрашивается заново, а не отдаёт старый memo.
+	s.OnCreated(ctx, "Wireguard0")
+	_ = s.ResolveSystemName(ctx, "Wireguard0")
 	if got := fg.PostSystemNameCalls("Wireguard0"); got != 2 {
 		t.Errorf("резолвер спрошен %d раз, ждали 2 — имя пережило удаление", got)
 	}

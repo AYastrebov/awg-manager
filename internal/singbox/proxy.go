@@ -119,6 +119,15 @@ func (pm *ProxyManager) NextFreeIndex(ctx context.Context, reserved map[int]bool
 func (pm *ProxyManager) RemoveProxy(ctx context.Context, index int) error {
 	defer markProxyMgrDur(fmt.Sprintf("RemoveProxy(%d)", index), time.Now())
 	name := fmt.Sprintf("%s%d", proxyIfacePrefix, index)
+	// Прокси нет в NDMS — снимать нечего, и слать ничего нельзя: `interface
+	// ProxyN down` по отсутствующему имени NDMS СОЗДАЁТ запись, `no` тут же
+	// её сносит, а запоздалый хук ifcreated читает уже снятую — E «unable to
+	// find» в журнале NDMS (стенд 5.01.C.6, F546). Refresh свежий и по
+	// отсутствующему имени точечно не спрашивает. Ошибка чтения — «не
+	// знаем»: снимаем как раньше, чтобы не оставить сироту.
+	if rec, err := pm.queries.Interfaces.Refresh(ctx, name); err == nil && rec == nil {
+		return nil
+	}
 	_ = pm.commands.Proxies.ProxyDown(ctx, name) // ignore error — may be already down
 	return pm.commands.Proxies.DeleteProxy(ctx, name)
 }

@@ -39,7 +39,7 @@ func TestPeerStore_GetPeers_ParsesInterfacePeerField(t *testing.T) {
 	fg := newFakeGetter()
 	fg.SetJSON("/show/interface/Wireguard0", sampleInterfaceJSON)
 
-	s := NewPeerStore(fg, NopLogger())
+	s := NewPeerStore(fg, NopLogger(), nil)
 
 	peers, err := s.GetPeers(context.Background(), "Wireguard0")
 	if err != nil {
@@ -69,7 +69,7 @@ func TestPeerStore_GetPeers_NoPeerFieldIsEmpty(t *testing.T) {
 	fg := newFakeGetter()
 	fg.SetJSON("/show/interface/Wireguard0", `{"type":"Wireguard","wireguard":{}}`)
 
-	s := NewPeerStore(fg, NopLogger())
+	s := NewPeerStore(fg, NopLogger(), nil)
 
 	peers, err := s.GetPeers(context.Background(), "Wireguard0")
 	if err != nil {
@@ -83,7 +83,7 @@ func TestPeerStore_GetPeers_NoPeerFieldIsEmpty(t *testing.T) {
 func TestPeerStore_GetPeers_CacheHitSkipsFetch(t *testing.T) {
 	fg := newFakeGetter()
 	fg.SetJSON("/show/interface/Wireguard0", sampleInterfaceJSON)
-	s := NewPeerStore(fg, NopLogger())
+	s := NewPeerStore(fg, NopLogger(), nil)
 
 	_, _ = s.GetPeers(context.Background(), "Wireguard0")
 	_, _ = s.GetPeers(context.Background(), "Wireguard0")
@@ -121,7 +121,7 @@ func TestPeerStore_GetPeers_404IsTreatedAsEmpty(t *testing.T) {
 	fg.SetError("/show/interface/Wireguard1",
 		&transport.HTTPError{Method: "GET", Path: "/show/interface/Wireguard1", Status: 404})
 
-	s := NewPeerStore(fg, NopLogger())
+	s := NewPeerStore(fg, NopLogger(), nil)
 
 	peers, err := s.GetPeers(context.Background(), "Wireguard1")
 	if err != nil {
@@ -142,7 +142,7 @@ func TestPeerStore_InvalidateSingleAffectsOnlyThatName(t *testing.T) {
 	fg := newFakeGetter()
 	fg.SetJSON("/show/interface/Wireguard0", sampleInterfaceJSON)
 	fg.SetJSON("/show/interface/Wireguard1", sampleInterfaceJSON)
-	s := NewPeerStore(fg, NopLogger())
+	s := NewPeerStore(fg, NopLogger(), nil)
 
 	_, _ = s.GetPeers(context.Background(), "Wireguard0")
 	_, _ = s.GetPeers(context.Background(), "Wireguard1")
