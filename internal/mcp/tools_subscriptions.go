@@ -40,7 +40,7 @@ type setSubscriptionEnabledIn struct {
 
 type setSubscriptionEnabledOut struct {
 	SingboxSubscription
-	Warnings []string `json:"warnings,omitempty" jsonschema:"aggregate groups whose servers changed because of this call — show these to the user"`
+	Warnings []string `json:"warnings,omitempty" jsonschema:"aggregate groups whose servers may have changed because of this call — show these to the user"`
 }
 
 // subscriptionIDGrammar is hex and dashes. Ids are 24 hex characters
@@ -59,16 +59,17 @@ func requireSubscriptionID(id string) (string, error) {
 	return id, nil
 }
 
-// subscriptionNotice says in words what the switch did and did not do.
+// subscriptionNotice says in words what state the subscription is in after
+// the call, which is true whether or not this call changed anything.
 // Structured output is not enough: a model reads any successful result
 // as "the traffic stopped".
 func subscriptionNotice(sub SingboxSubscription) string {
 	if sub.Enabled {
-		return fmt.Sprintf("The subscription is enabled: scheduled refresh is back on and its servers are in the aggregate groups again. "+
-			"No server list was fetched by this call. Its group %q was in the configuration all along.", sub.GroupTag)
+		return fmt.Sprintf("The subscription is enabled: its servers are part of the aggregate groups that list it, and it is refreshed on schedule if it has one. "+
+			"No server list was fetched by this call. Its own group is %q.", sub.GroupTag)
 	}
-	return fmt.Sprintf("The subscription is disabled: it is no longer refreshed and its servers left the aggregate groups. "+
-		"This did NOT stop traffic: its own group %q is still in the sing-box configuration, and routing rules that point at it keep using it. "+
+	return fmt.Sprintf("The subscription is disabled: it is not refreshed on schedule and its servers are not part of any aggregate group. "+
+		"This does NOT stop traffic: its own group %q is still in the sing-box configuration, and routing rules that point at it keep using it. "+
 		"To stop that traffic, retarget those rules with set_singbox_rule_outbound.", sub.GroupTag)
 }
 
@@ -92,7 +93,7 @@ func registerSubscriptionTools(s *mcp.Server, d Deps) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "set_singbox_subscription_enabled",
-		Description: "Enable or disable one sing-box subscription. Disabling stops its scheduled refresh and takes its servers out of aggregate groups. " +
+		Description: "Enable or disable one sing-box subscription. Disabling stops its scheduled refresh, if it has one, and takes its servers out of aggregate groups. " +
 			"It does NOT stop traffic: the subscription's own group stays in the configuration, and routing rules that point at it keep using it — retarget them with set_singbox_rule_outbound if the traffic must stop. " +
 			"A change reloads sing-box, which can interrupt open connections for a moment; a call that changes nothing reloads nothing. Reversible: call it again with the other value.",
 		Annotations: safeWrite("Enable/disable sing-box subscription", true),

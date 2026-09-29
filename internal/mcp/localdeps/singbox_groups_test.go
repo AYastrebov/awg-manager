@@ -22,6 +22,13 @@ type fakeSubs struct {
 	patched   subscription.UpdatePatch
 	updates   int
 	updateErr error
+	// updateKeepsFlag mirrors a failed rollback: Update returns an error
+	// and the store keeps the new value (subscription.Service.Update,
+	// "failed to restore previous settings").
+	updateKeepsFlag bool
+	// updateDeletes mirrors a subscription deleted between the adapter's
+	// read and its write.
+	updateDeletes bool
 }
 
 // List mirrors subscription.Store.List: sorted by label, then id.
@@ -45,6 +52,18 @@ func (f *fakeSubs) Update(id string, p subscription.UpdatePatch) (*subscription.
 	f.updates++
 	f.patchedID, f.patched = id, p
 	if f.updateErr != nil {
+		for i := range f.subs {
+			if f.subs[i].ID != id {
+				continue
+			}
+			if f.updateKeepsFlag && p.Enabled != nil {
+				f.subs[i].Enabled = *p.Enabled
+			}
+			if f.updateDeletes {
+				f.subs = append(f.subs[:i], f.subs[i+1:]...)
+			}
+			break
+		}
 		return nil, f.updateErr
 	}
 	for i := range f.subs {
@@ -765,38 +784,86 @@ func TestLocal_SetSingboxSubscriptionEnabledUnknownID(t *testing.T) {
 	}
 }
 
+// TestLocal_SetSingboxSubscriptionEnabledReportsFailure — причина отказа
+// собрана из произвольных ошибок и может цитировать ссылку с uuid. Модель
+// получает фиксированную фразу. Но фраза обязана быть правдой: служба
+// откатывает флаг при неудаче, и сам откат тоже может не удаться.
 func TestLocal_SetSingboxSubscriptionEnabledReportsFailure(t *testing.T) {
-	subs := subsHarness()
-	subs.updateErr = fmt.Errorf(`subscription: применение настроек: reload failed: parse "vless://uuid-secret@de1.example.net:443x": invalid port, see https://sub.example.net/api/TOKEN123`)
-	journal := &recLog{}
-	l := New(Config{Subscriptions: subs, AppLog: journal})
+	cause := fmt.Errorf(`subscription: применение настроек: reload failed: parse "vless://uuid-secret@de1.example.net:443x": invalid port, see https://sub.example.net/api/TOKEN123`)
+	ctx := context.Background()
 
-	_, _, err := l.SetSingboxSubscriptionEnabled(context.Background(), subAutoID, false)
-	if err == nil {
-		t.Fatal("a failed write must be an error, never a record that looks applied")
-	}
-	// The cause is free text and can quote the list's content. The model
-	// gets a fixed sentence and the name of the tool that reads the journal.
-	for _, secret := range []string{"uuid-secret", "TOKEN123", "invalid port", "de1.example.net"} {
-		if strings.Contains(err.Error(), secret) {
-			t.Fatalf("the error handed to the model carries %q: %v", secret, err)
+	carriesNoCause := func(t *testing.T, err error, journal *recLog) {
+		t.Helper()
+		for _, secret := range []string{"uuid-secret", "TOKEN123", "invalid port", "de1.example.net"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("the error handed to the model carries %q: %v", secret, err)
+			}
+			// get_logs is open to a read-only key, so the line MCP adds to
+			// the journal must not carry the cause either.
+			for _, line := range journal.lines {
+				if strings.Contains(line, secret) {
+					t.Fatalf("the journal line carries %q: %v", secret, journal.lines)
+				}
+			}
 		}
-	}
-	if !strings.Contains(err.Error(), "get_logs") || !strings.Contains(err.Error(), "restored") {
-		t.Fatalf("err = %v, want it to say the state was restored and where the cause is", err)
-	}
-	if len(journal.lines) != 1 || !strings.Contains(journal.lines[0], "(MCP)") {
-		t.Fatalf("a failure must be journalled too: %v", journal.lines)
-	}
-	// get_logs is open to a read-only key, so the line MCP adds to the
-	// journal must not carry the cause either.
-	for _, secret := range []string{"uuid-secret", "TOKEN123", "invalid port"} {
-		if strings.Contains(journal.lines[0], secret) {
-			t.Fatalf("the journal line carries %q: %v", secret, journal.lines)
+		if len(journal.lines) != 1 || !strings.Contains(journal.lines[0], "(MCP)") || !strings.HasPrefix(journal.lines[0], "routing/subscription ") {
+			t.Fatalf("a failure must be journalled once, under routing/subscription: %v", journal.lines)
 		}
 	}
 
-	if _, _, err := New(Config{}).SetSingboxSubscriptionEnabled(context.Background(), subAutoID, false); err == nil {
-		t.Fatal("without the subscription service the tool must say it is unavailable")
-	}
+	t.Run("the service restored the previous value", func(t *testing.T) {
+		subs, journal := subsHarness(), &recLog{}
+		subs.updateErr = cause
+		l := New(Config{Subscriptions: subs, AppLog: journal})
+
+		_, _, err := l.SetSingboxSubscriptionEnabled(ctx, subAutoID, false)
+		if err == nil {
+			t.Fatal("a failed write must be an error, never a record that looks applied")
+		}
+		carriesNoCause(t, err, journal)
+		if !strings.Contains(err.Error(), "unchanged") || !strings.Contains(err.Error(), "still on") {
+			t.Fatalf("err = %v, want it said that the subscription is unchanged and still on", err)
+		}
+		// The service logs the cause under singbox/runtime, not under the
+		// group this tool logs to.
+		if !strings.Contains(err.Error(), "get_logs") || !strings.Contains(err.Error(), "group singbox") {
+			t.Fatalf("err = %v, want the journal group the cause is really in", err)
+		}
+	})
+
+	t.Run("the rollback failed too and the flag stayed stored", func(t *testing.T) {
+		subs, journal := subsHarness(), &recLog{}
+		subs.updateErr, subs.updateKeepsFlag = cause, true
+		l := New(Config{Subscriptions: subs, AppLog: journal})
+
+		_, _, err := l.SetSingboxSubscriptionEnabled(ctx, subAutoID, false)
+		if err == nil {
+			t.Fatal("a failed write must be an error")
+		}
+		carriesNoCause(t, err, journal)
+		if strings.Contains(err.Error(), "unchanged") {
+			t.Fatalf("err = %v — the store holds the new value, so \"unchanged\" is false", err)
+		}
+		if !strings.Contains(err.Error(), "STORED as off") || !strings.Contains(err.Error(), "disagree") {
+			t.Fatalf("err = %v, want it said that the flag is stored and the engine disagrees", err)
+		}
+	})
+
+	t.Run("the subscription was deleted between the read and the write", func(t *testing.T) {
+		subs, journal := subsHarness(), &recLog{}
+		subs.updateErr, subs.updateDeletes = cause, true
+		l := New(Config{Subscriptions: subs, AppLog: journal})
+
+		_, _, err := l.SetSingboxSubscriptionEnabled(ctx, subAutoID, false)
+		if err == nil || !strings.Contains(err.Error(), "list_singbox_subscriptions") {
+			t.Fatalf("err = %v, want not found, with the tool that lists valid ids", err)
+		}
+		carriesNoCause(t, err, journal)
+	})
+
+	t.Run("no subscription service", func(t *testing.T) {
+		if _, _, err := New(Config{}).SetSingboxSubscriptionEnabled(ctx, subAutoID, false); err == nil {
+			t.Fatal("without the subscription service the tool must say it is unavailable")
+		}
+	})
 }

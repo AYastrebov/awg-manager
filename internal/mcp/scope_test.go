@@ -200,6 +200,10 @@ func TestScope_ReadOnlyKeyCannotExportCredentials(t *testing.T) {
 func TestScope_ReadOnlyKeyAndSubscriptions(t *testing.T) {
 	s := scopedSession(t, true)
 
+	// This does not prove the tool exists: a read-only key refuses an
+	// unknown tool name with the same words. TestServer_ListsToolsWithAnnotations
+	// does that. What it proves is that the tool is not in readOnlyTools —
+	// if it were, this call would go through.
 	res, _ := callTool(t, s, "set_singbox_subscription_enabled", map[string]any{"subscriptionId": "706dcf33aabbccddeeff0011", "enabled": false})
 	if !res.IsError || !strings.Contains(strings.ToLower(toolText(res)), "read-only") {
 		t.Fatalf("a read-only key must be refused with the cause named: %q", toolText(res))

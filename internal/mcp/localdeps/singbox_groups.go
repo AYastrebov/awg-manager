@@ -394,18 +394,23 @@ func (l *Local) SetSingboxSubscriptionEnabled(_ context.Context, id string, enab
 	if err != nil || current == nil {
 		return mcpsrv.SingboxSubscription{}, nil, fmt.Errorf("sing-box subscription %q not found (use list_singbox_subscriptions)", id)
 	}
+	// Read outside the service's per-subscription lock: Update reads the
+	// value again under it and does not return what it saw. If another
+	// client switches the subscription between the two reads, the
+	// warnings below describe a change that did not happen, or miss one
+	// that did. The record returned is right either way.
 	changed := current.Enabled != enabled
 	label := sanitizeLabel(current.Label)
 
 	updated, err := l.c.Subscriptions.Update(id, subscription.UpdatePatch{Enabled: &enabled})
 	if err != nil {
-		// The cause goes neither to the model nor into this line: like a
-		// stored fetch error, it is free text that can quote the
-		// subscription's address or its content. The service journals it
-		// itself (subscription.Service, "settings change rolled back");
-		// this line only marks the attempt as MCP's.
-		l.subLog.Warn("subscription-update", label, "Failed to switch subscription "+onOff(enabled)+" (MCP); the service journalled the cause")
-		return mcpsrv.SingboxSubscription{}, nil, fmt.Errorf("the subscription could not be switched %s: applying the change to sing-box failed and the service restored the previous state. Nothing is different from before the call. The cause is in the journal — get_logs, group routing", onOff(enabled))
+		// The cause goes neither to the model nor into this line: it is
+		// free text that can quote the subscription's address or its
+		// content. The service journals it itself, under singbox/runtime
+		// (subscription.Service.SetAppLogger); this line only marks the
+		// attempt as MCP's.
+		l.subLog.Warn("subscription-update", label, "Failed to switch subscription "+onOff(enabled)+" (MCP); the service journalled the cause under singbox/runtime")
+		return mcpsrv.SingboxSubscription{}, nil, l.switchFailure(id, current.Enabled, enabled)
 	}
 	if updated == nil {
 		return mcpsrv.SingboxSubscription{}, nil, fmt.Errorf("subscription update returned no record")
@@ -414,17 +419,30 @@ func (l *Local) SetSingboxSubscriptionEnabled(_ context.Context, id string, enab
 
 	var warnings []string
 	if changed {
-		verb := "lost"
-		if enabled {
-			verb = "regained"
-		}
 		// resolveGroupTags skips a disabled subscription, so every enabled
 		// aggregate group that lists this one just changed its members.
 		for _, g := range l.c.Subscriptions.ListGroups() {
 			if g.Enabled && slices.Contains(g.UseSubscriptionIDs, id) {
-				warnings = append(warnings, fmt.Sprintf("aggregate group %q (%s) %s this subscription's servers", sanitizeLabel(g.Label), g.Tag, verb))
+				warnings = append(warnings, fmt.Sprintf("aggregate group %q (%s) lists this subscription, so its set of servers may have changed — get_singbox_outbound shows it", sanitizeLabel(g.Label), g.Tag))
 			}
 		}
 	}
 	return singboxSubscription(updated), warnings, nil
+}
+
+// switchFailure says what state a failed switch left behind. It reads the
+// subscription again rather than assume: the service restores the previous
+// value when applying fails, but that restore can fail too
+// (subscription.Service.Update, "rollback"), and the subscription can be
+// deleted between our read and the write.
+func (l *Local) switchFailure(id string, before, wanted bool) error {
+	const where = "The cause is in the journal — get_logs, group singbox"
+	after, err := l.c.Subscriptions.Get(id)
+	switch {
+	case err != nil || after == nil:
+		return fmt.Errorf("sing-box subscription %q not found (use list_singbox_subscriptions)", id)
+	case after.Enabled != before:
+		return fmt.Errorf("the subscription is now STORED as %s, but applying that to sing-box failed and the previous value could not be restored. The stored setting and the running engine disagree, and the stored one takes effect when sing-box next reloads. Tell the user. %s", onOff(after.Enabled), where)
+	}
+	return fmt.Errorf("the subscription could not be switched %s and is unchanged: it is still %s. %s", onOff(wanted), onOff(before), where)
 }

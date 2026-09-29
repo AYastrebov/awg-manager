@@ -948,15 +948,11 @@ func (f *Fake) SetSingboxSubscriptionEnabled(_ context.Context, id string, enabl
 			return *sub, nil, nil
 		}
 		sub.Enabled = enabled
-		verb := "lost"
-		if enabled {
-			verb = "regained"
-		}
 		var warnings []string
 		for _, o := range f.RouterOutbounds {
 			for _, member := range o.AggregateOf {
 				if member == id {
-					warnings = append(warnings, fmt.Sprintf("aggregate group %s %s this subscription's servers", o.Tag, verb))
+					warnings = append(warnings, fmt.Sprintf("aggregate group %s lists this subscription, so its set of servers may have changed — get_singbox_outbound shows it", o.Tag))
 				}
 			}
 		}

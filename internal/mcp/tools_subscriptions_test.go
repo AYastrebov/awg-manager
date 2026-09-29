@@ -123,10 +123,17 @@ func TestTools_SetSingboxSubscriptionEnabled(t *testing.T) {
 	if w, _ := out["warnings"].([]any); len(w) != 0 {
 		t.Fatalf("a call that changed nothing must not warn: %v", w)
 	}
+	// The sentence describes a state, so it is just as true on a retry.
+	if txt := toolText(res); !strings.Contains(txt, "is disabled") || strings.Contains(txt, "left the aggregate") {
+		t.Fatalf("on a call that changed nothing the sentence must not claim a change: %q", txt)
+	}
 
 	res, out = callTool(t, s, "set_singbox_subscription_enabled", map[string]any{"subscriptionId": id, "enabled": true})
 	if res.IsError || out["enabled"] != true {
 		t.Fatalf("out = %v", out)
+	}
+	if txt := toolText(res); !strings.Contains(txt, "is enabled") || !strings.Contains(txt, "if it has one") {
+		t.Fatalf("a pasted subscription has no schedule to come back on: %q", txt)
 	}
 }
 
