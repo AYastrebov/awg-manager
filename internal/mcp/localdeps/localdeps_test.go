@@ -2376,7 +2376,7 @@ func TestLocal_RouterToolsWithoutTheServiceSaySo(t *testing.T) {
 	if _, _, err := l.ListSingboxRules(ctx); err == nil {
 		t.Error("listing rules must report the missing service")
 	}
-	if _, err := l.ListSingboxOutbounds(ctx); err == nil {
+	if _, _, err := l.ListSingboxOutbounds(ctx); err == nil {
 		t.Error("listing outbounds must report the missing service")
 	}
 	if _, err := l.SingboxStaging(ctx); err == nil {

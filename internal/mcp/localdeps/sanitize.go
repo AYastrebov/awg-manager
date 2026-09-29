@@ -2,6 +2,7 @@ package localdeps
 
 import (
 	"net/url"
+	"regexp"
 	"strings"
 	"unicode"
 
@@ -17,7 +18,7 @@ import (
 func sanitizeLabel(s string) string {
 	spaced := strings.Map(func(r rune) rune {
 		switch {
-		case unicode.IsControl(r), r == ' ', r == ' ':
+		case unicode.IsControl(r), r == '\u2028', r == '\u2029':
 			return ' '
 		case unicode.Is(unicode.Cf, r):
 			return -1
@@ -33,11 +34,47 @@ func sanitizeLabel(s string) string {
 
 // hostOf returns the host of a subscription URL and nothing else: the
 // token usually sits in the path, which is why redactURL (host and path)
-// is not used for subscriptions.
+// is not used for subscriptions. Only an http or https URL has a host
+// worth naming: in happ://crypt4/… the "host" is the name of an
+// encryption scheme. The host itself is the user's or the provider's
+// text, so it goes through hostShaped.
 func hostOf(raw string) string {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
 		return ""
 	}
-	return u.Host
+	if scheme := strings.ToLower(u.Scheme); scheme != "http" && scheme != "https" {
+		return ""
+	}
+	return hostShaped(u.Host)
+}
+
+var (
+	hostShape  = regexp.MustCompile(`^[A-Za-z0-9._:\[\]-]{1,253}$`)
+	tokenShape = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
+)
+
+// hostShaped returns s when it looks like a host or an address, and ""
+// otherwise. A subscription server's address is written by the provider;
+// the daemon checks only that it is not empty. Letters, digits, dots,
+// hyphens, underscores, colons and brackets cover host names, IPv4 and
+// IPv6; anything else is text, and text from a provider is not passed on.
+func hostShaped(s string) string {
+	s = strings.TrimSpace(s)
+	if !hostShape.MatchString(s) {
+		return ""
+	}
+	return s
+}
+
+// token returns s lower-cased when it is a short identifier — letters,
+// digits, hyphen, underscore, at most 32 bytes — and "" otherwise. For
+// fields that hold one word from a known family (protocol, transport,
+// security) and must not hold a sentence.
+func token(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if !tokenShape.MatchString(s) {
+		return ""
+	}
+	return s
 }

@@ -23,6 +23,7 @@ type rulesOut struct {
 
 type outboundsOut struct {
 	Outbounds []SingboxOutbound `json:"outbounds"`
+	HasDraft  bool              `json:"hasDraft" jsonschema:"true means the router holds changes that are not applied; the groups and members listed include them, and sing-box is not running them yet"`
 }
 
 type outboundDetailIn struct {
@@ -38,6 +39,7 @@ type outboundDetailOut struct {
 	Members          []SingboxGroupMember `json:"members"`
 	MembersOffset    int                  `json:"membersOffset" jsonschema:"index of the first member returned"`
 	MembersTruncated bool                 `json:"membersTruncated" jsonschema:"true when members beyond this page remain — call again with a larger membersOffset before concluding a server is absent"`
+	HasDraft         bool                 `json:"hasDraft" jsonschema:"true means the router holds changes that are not applied; the groups and members listed include them, and sing-box is not running them yet"`
 }
 
 // pageOutboundDetail cuts one page of members. An offset past the end
@@ -50,7 +52,7 @@ func pageOutboundDetail(detail SingboxOutboundDetail, offset int) outboundDetail
 	if page == nil {
 		page = []SingboxGroupMember{}
 	}
-	out := outboundDetailOut{SingboxOutbound: detail.SingboxOutbound, Members: page, MembersOffset: start, MembersTruncated: end < total}
+	out := outboundDetailOut{SingboxOutbound: detail.SingboxOutbound, Members: page, MembersOffset: start, MembersTruncated: end < total, HasDraft: detail.HasDraft}
 	out.MemberCount = total
 	return out
 }
@@ -94,15 +96,15 @@ func registerRouterTools(s *mcp.Server, d Deps) {
 		Description: "Groups of servers in sing-box — selectors and urltest groups — that a rule can point at, with the member each one is routing through now. " +
 			"Subscriptions appear here as groups (subscriptionId set); so do groups that gather several subscriptions (aggregateOf set). " +
 			"runtimeKnown=false means sing-box gave no answer for that group: it exists, and nothing is known about what it is doing. " +
-			"staged=true means sing-box is not running the group as listed, because its members come from changes not applied yet. " +
+			"outOfSync=true means sing-box answered and is not running the group as listed — because of a draft not applied yet (hasDraft says whether there is one), the sing-box router being switched off, or a reload in progress. " +
 			"For the members of one group, call get_singbox_outbound. A rule may also target a single proxy from list_singbox_tunnels, or the built-in direct and block.",
 		Annotations: readOnly("List sing-box outbounds"),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ empty) (*mcp.CallToolResult, outboundsOut, error) {
-		list, err := d.ListSingboxOutbounds(ctx)
+		list, hasDraft, err := d.ListSingboxOutbounds(ctx)
 		if list == nil {
 			list = []SingboxOutbound{}
 		}
-		return nil, outboundsOut{Outbounds: list}, err
+		return nil, outboundsOut{Outbounds: list, HasDraft: hasDraft}, err
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -111,7 +113,7 @@ func registerRouterTools(s *mcp.Server, d Deps) {
 			"Members are paged: when membersTruncated is true, call again with membersOffset. " +
 			"Read lastDelayMs here before probing — singbox_delay_check makes a real request through the server, and a subscription can hold hundreds. " +
 			"delayKnown=false means no test is on record, not that the server is down; runtimeKnown=false means sing-box gave no answer for this group and nothing here describes the present. " +
-			"staged=true means the listed members come from changes not applied yet: activeMember describes what is running and may not be among them.",
+			"outOfSync=true means sing-box is not running the group as listed — a draft not applied yet (see hasDraft), the sing-box router switched off, or a reload in progress; activeMember then describes what is running and may not be among the members.",
 		Annotations: readOnly("Get sing-box group"),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in outboundDetailIn) (*mcp.CallToolResult, outboundDetailOut, error) {
 		tag, err := requireSingboxTag(in.Tag, "list_singbox_outbounds")

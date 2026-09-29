@@ -65,7 +65,7 @@ func requireSubscriptionID(id string) (string, error) {
 // as "the traffic stopped".
 func subscriptionNotice(sub SingboxSubscription) string {
 	if sub.Enabled {
-		return fmt.Sprintf("The subscription is enabled: its servers are part of the aggregate groups that list it, and it is refreshed on schedule if it has one. "+
+		return fmt.Sprintf("The subscription is enabled: its servers can be part of the aggregate groups that list it, and it is refreshed on schedule if it has one. "+
 			"No server list was fetched by this call. Its own group is %q.", sub.GroupTag)
 	}
 	return fmt.Sprintf("The subscription is disabled: it is not refreshed on schedule and its servers are not part of any aggregate group. "+

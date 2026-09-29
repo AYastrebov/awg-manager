@@ -21,7 +21,7 @@ func singboxSubscription(s *subscription.Subscription) mcpsrv.SingboxSubscriptio
 	out := mcpsrv.SingboxSubscription{
 		ID:              s.ID,
 		Label:           sanitizeLabel(s.Label),
-		Source:          "url",
+		SourceType:      "url",
 		Host:            hostOf(s.URL),
 		Enabled:         s.Enabled,
 		Mode:            string(s.EffectiveMode()),
@@ -35,9 +35,9 @@ func singboxSubscription(s *subscription.Subscription) mcpsrv.SingboxSubscriptio
 	}
 	switch {
 	case s.IsInline():
-		out.Source = "inline"
+		out.SourceType = "inline"
 	case s.IsFile():
-		out.Source = "file"
+		out.SourceType = "file"
 	}
 	if !s.LastFetched.IsZero() {
 		out.LastFetched = s.LastFetched.UTC().Format(time.RFC3339)
@@ -66,9 +66,13 @@ func (l *Local) ListSingboxSubscriptions(context.Context) ([]mcpsrv.SingboxSubsc
 // the list itself, a server's uuid included (a failed url.Parse embeds
 // the whole share link).
 //
-// The two markers are the daemon's own wording in subscription.Service
-// (refreshLockedOpts, "len(parts.Valid) == 0"). If that wording changes,
-// the answer degrades to the source-based kind below; it never leaks.
+// Only what is known is claimed. The two markers are the daemon's own
+// wording in subscription.Service (refreshLockedOpts, "len(parts.Valid)
+// == 0") and are true when present. Everything else is other: the same
+// field records a failed download, an unreadable file, a body that is not
+// a server list, a failed apply or reload, an undecryptable link and a bad
+// filter, and the text cannot be told apart reliably. If the daemon's
+// wording changes, the answer degrades to other; it never leaks.
 func lastErrorKind(s *subscription.Subscription) string {
 	switch {
 	case s.LastError == "":
@@ -77,13 +81,6 @@ func lastErrorKind(s *subscription.Subscription) string {
 		return "empty"
 	case strings.Contains(s.LastError, "ни одной валидной ссылки"):
 		return "parse"
-	case s.IsFile():
-		return "file"
-	case s.IsInline():
-		// A pasted list is never fetched: what can fail is parsing it.
-		return "parse"
-	case s.URL != "":
-		return "network"
 	}
 	return "other"
 }
@@ -195,9 +192,10 @@ func (l *Local) clashProxies() (map[string]singbox.ClashProxy, bool) {
 //
 // runtimeKnown is per group: the engine answered AND has an entry for this
 // group. The router lists groups from the draft when one exists
-// (orchestrator.LoadEffective), so a group can be configured and unknown to
-// the engine; staged marks that, and a member list that differs from the
-// engine's.
+// (orchestrator.LoadEffective) and from the disabled copy when the sing-box
+// router is switched off, so a group can be configured and unknown to the
+// engine; OutOfSync marks that, and a member list that differs from the
+// engine's. It names no cause: the engine's view cannot tell them apart.
 func (idx sbIndex) outbound(o router.CompositeOutboundView, proxies map[string]singbox.ClashProxy, engineAnswered bool) mcpsrv.SingboxOutbound {
 	gp, inEngine := proxies[o.Tag]
 	runtimeKnown := engineAnswered && inEngine
@@ -205,7 +203,7 @@ func (idx sbIndex) outbound(o router.CompositeOutboundView, proxies map[string]s
 		Tag: o.Tag, Type: o.Type, Source: o.Source,
 		MemberCount:  len(o.Outbounds),
 		RuntimeKnown: runtimeKnown,
-		Staged:       engineAnswered && (!inEngine || !sameTags(gp.All, o.Outbounds)),
+		OutOfSync:    engineAnswered && (!inEngine || !sameTags(gp.All, o.Outbounds)),
 	}
 	if id, ok := idx.subByGroup[o.Tag]; ok {
 		out.SubscriptionID = id
@@ -244,20 +242,20 @@ func sameTags(a, b []string) bool {
 
 // ListSingboxOutbounds lists every group. The engine is read once for
 // the whole list.
-func (l *Local) ListSingboxOutbounds(ctx context.Context) ([]mcpsrv.SingboxOutbound, error) {
+func (l *Local) ListSingboxOutbounds(ctx context.Context) ([]mcpsrv.SingboxOutbound, bool, error) {
 	if l.c.Router == nil {
-		return nil, errUnavailable("sing-box router")
+		return nil, false, errUnavailable("sing-box router")
 	}
 	idx, err := l.singboxIndex(ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	proxies, known := l.clashProxies()
 	out := make([]mcpsrv.SingboxOutbound, 0, len(idx.order))
 	for _, tag := range idx.order {
 		out = append(out, idx.outbound(idx.groups[tag], proxies, known))
 	}
-	return out, nil
+	return out, l.c.Router.StagingStatus(ctx).HasDraft, nil
 }
 
 // groupMember describes one member of a group.
@@ -265,14 +263,17 @@ func (idx sbIndex) groupMember(tag, active string, proxies map[string]singbox.Cl
 	m := mcpsrv.SingboxGroupMember{Tag: tag, Kind: idx.kindOf(tag)}
 	switch m.Kind {
 	case "member":
+		// Every field here is the provider's text: for a sing-box JSON or
+		// Clash YAML subscription the daemon checks only that the server
+		// is not empty, and transport is transport.type verbatim.
 		info := idx.member[tag]
 		m.Label = sanitizeLabel(info.Label)
-		m.Protocol, m.Server, m.Port = info.Protocol, info.Server, int(info.Port)
-		m.Transport, m.Security = info.Transport, info.Security
+		m.Protocol, m.Server, m.Port = token(info.Protocol), hostShaped(info.Server), int(info.Port)
+		m.Transport, m.Security = token(info.Transport), token(info.Security)
 	case "proxy":
 		t := idx.proxies[tag]
-		m.Protocol, m.Server, m.Port = t.Protocol, t.Server, t.Port
-		m.Transport, m.Security = t.Transport, t.Security
+		m.Protocol, m.Server, m.Port = token(t.Protocol), hostShaped(t.Server), t.Port
+		m.Transport, m.Security = token(t.Transport), token(t.Security)
 	case "":
 		// In the group's configuration and nowhere else we can see: a
 		// built-in such as direct, or an AWG outbound. Calling it a proxy
@@ -318,6 +319,7 @@ func (l *Local) GetSingboxOutbound(ctx context.Context, tag string) (mcpsrv.Sing
 	out := mcpsrv.SingboxOutboundDetail{
 		SingboxOutbound: idx.outbound(o, proxies, known),
 		Members:         make([]mcpsrv.SingboxGroupMember, 0, len(o.Outbounds)),
+		HasDraft:        l.c.Router.StagingStatus(ctx).HasDraft,
 	}
 	for _, memberTag := range o.Outbounds {
 		out.Members = append(out.Members, idx.groupMember(memberTag, out.ActiveMember, proxies, out.RuntimeKnown))
@@ -344,14 +346,21 @@ func (l *Local) CheckSingboxDelay(ctx context.Context, tag string) (mcpsrv.Singb
 		}
 		return mcpsrv.SingboxDelay{}, fmt.Errorf("sing-box outbound %q not found (proxies are in list_singbox_tunnels, groups in list_singbox_outbounds, a group's servers in get_singbox_outbound)", tag)
 	}
-	// Configuration may be an unapplied draft (orchestrator.LoadEffective),
-	// and the prober answers 0 for an outbound the engine does not have —
-	// the same 0 it answers for one that is down. So an outbound the engine
-	// answered about and does not know is refused, not probed. When the
-	// engine does not answer at all, the probe goes ahead and says so.
-	if proxies, answered := l.clashProxies(); answered {
+	// The prober answers 0 whenever it learns nothing: DelayChecker.Probe
+	// swallows every transport error, and it goes through the same Clash
+	// API. So the engine is asked first, and nothing is probed unless it
+	// answers and runs the tag. Configuration may be an unapplied draft or
+	// the disabled copy of a router that is switched off
+	// (orchestrator.LoadEffective), so a configured tag can be missing
+	// from the engine; probing it would read as "down". When no engine is
+	// wired at all there is nothing to ask, and the probe runs as it is.
+	if l.c.Clash != nil {
+		proxies, answered := l.clashProxies()
+		if !answered {
+			return mcpsrv.SingboxDelay{}, fmt.Errorf("sing-box did not answer, so nothing was measured; this says nothing about whether %q works. sing-box may be stopped or reloading — check get_system_status and try again", tag)
+		}
 		if _, running := proxies[tag]; !running {
-			return mcpsrv.SingboxDelay{}, fmt.Errorf("%q is configured but sing-box is not running it: it comes from changes that are not applied yet (get_singbox_staging), or sing-box has not reloaded. Nothing was measured, and this says nothing about whether it works", tag)
+			return mcpsrv.SingboxDelay{}, fmt.Errorf("%q is configured but sing-box is not running it. Either it comes from a draft that is not applied yet (get_singbox_staging says whether one exists), or the sing-box router is switched off, or sing-box is still reloading. Nothing was measured, and this says nothing about whether it works", tag)
 		}
 	}
 	ms, err := l.c.Singbox.CheckDelay(ctx, tag)
@@ -409,7 +418,7 @@ func (l *Local) SetSingboxSubscriptionEnabled(_ context.Context, id string, enab
 		// content. The service journals it itself, under singbox/runtime
 		// (subscription.Service.SetAppLogger); this line only marks the
 		// attempt as MCP's.
-		l.subLog.Warn("subscription-update", label, "Failed to switch subscription "+onOff(enabled)+" (MCP); the service journalled the cause under singbox/runtime")
+		l.subLog.Warn("subscription-update", label, "Failed to switch subscription "+onOff(enabled)+" (MCP); the service journalled the cause in bucket singbox")
 		return mcpsrv.SingboxSubscription{}, nil, l.switchFailure(id, current.Enabled, enabled)
 	}
 	if updated == nil {
@@ -420,10 +429,12 @@ func (l *Local) SetSingboxSubscriptionEnabled(_ context.Context, id string, enab
 	var warnings []string
 	if changed {
 		// resolveGroupTags skips a disabled subscription, so every enabled
-		// aggregate group that lists this one just changed its members.
+		// aggregate group that lists this one just changed its members; one
+		// left with no member has no outbound at all (subscription/groups.go),
+		// so the warning points at the list, not at the group.
 		for _, g := range l.c.Subscriptions.ListGroups() {
 			if g.Enabled && slices.Contains(g.UseSubscriptionIDs, id) {
-				warnings = append(warnings, fmt.Sprintf("aggregate group %q (%s) lists this subscription, so its set of servers may have changed — get_singbox_outbound shows it", sanitizeLabel(g.Label), g.Tag))
+				warnings = append(warnings, fmt.Sprintf("aggregate group %q (%s) lists this subscription, so its set of servers may have changed. If no enabled subscription is left in it, the group is gone from sing-box — list_singbox_outbounds shows what is there now", sanitizeLabel(g.Label), g.Tag))
 			}
 		}
 	}
@@ -436,7 +447,7 @@ func (l *Local) SetSingboxSubscriptionEnabled(_ context.Context, id string, enab
 // (subscription.Service.Update, "rollback"), and the subscription can be
 // deleted between our read and the write.
 func (l *Local) switchFailure(id string, before, wanted bool) error {
-	const where = "The cause is in the journal — get_logs, group singbox"
+	const where = `The cause is in the journal — get_logs with bucket "singbox"`
 	after, err := l.c.Subscriptions.Get(id)
 	switch {
 	case err != nil || after == nil:

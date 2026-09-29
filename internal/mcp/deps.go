@@ -106,11 +106,13 @@ type Deps interface {
 	ListSingboxRules(ctx context.Context) (rules []SingboxRule, hasDraft bool, err error)
 	// ListSingboxOutbounds returns every group. An engine that does not
 	// answer is not an error: the entries come back with RuntimeKnown
-	// false and no active member.
-	ListSingboxOutbounds(ctx context.Context) ([]SingboxOutbound, error)
+	// false and no active member. hasDraft reports whether the router
+	// holds an unapplied draft; groups are listed from it when it exists.
+	ListSingboxOutbounds(ctx context.Context) (groups []SingboxOutbound, hasDraft bool, err error)
 	// GetSingboxOutbound returns one group with all its members, in
-	// configuration order. An unknown tag is an error; so is a tag that
-	// names a single server, and the error says which it is.
+	// configuration order, and HasDraft as ListSingboxOutbounds reports
+	// it. An unknown tag is an error; so is a tag that names a single
+	// server, and the error says which it is.
 	GetSingboxOutbound(ctx context.Context, tag string) (SingboxOutboundDetail, error)
 	SingboxStaging(ctx context.Context) (SingboxStaging, error)
 	// SetSingboxRuleOutbound retargets one rule. The write lands in the
@@ -122,8 +124,11 @@ type Deps interface {
 	// server or a group. The tag is classified from configuration, so an
 	// unknown tag is an error even while the engine is down, and a tag
 	// that exists but is not an outbound (an excluded server) is an error
-	// that says why. An outbound that stays silent is a result with
-	// Reachable false. A group is probed through its active member.
+	// that says why. An engine that does not answer, or answers without
+	// the tag, is an error too: nothing is probed, because the prober
+	// answers 0 then, the same 0 as for a silent outbound. An outbound
+	// that stays silent is a result with Reachable false. A group is
+	// probed through its active member.
 	CheckSingboxDelay(ctx context.Context, tag string) (SingboxDelay, error)
 	// ListSingboxSubscriptions returns every subscription, sorted by label
 	// and then id, so that an offset means the same thing on every call.

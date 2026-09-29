@@ -67,7 +67,7 @@ func registerSingboxTools(s *mcp.Server, d Deps) {
 			"busy=true means nothing was measured because a probe was already running: retry in a few seconds. sing-box must be running.",
 		Annotations: readOnly("Sing-box delay check"),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in singboxTagIn) (*mcp.CallToolResult, SingboxDelay, error) {
-		tag, err := requireSingboxTag(in.Tag, "list_singbox_tunnels")
+		tag, err := requireSingboxTag(in.Tag, "list_singbox_tunnels, list_singbox_outbounds or get_singbox_outbound")
 		if err != nil {
 			return nil, SingboxDelay{}, err
 		}

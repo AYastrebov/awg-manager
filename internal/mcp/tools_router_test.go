@@ -75,6 +75,22 @@ func TestTools_ListSingboxOutbounds(t *testing.T) {
 	if n := len(agg["aggregateOf"].([]any)); n != 2 || agg["memberCount"] != float64(5) {
 		t.Fatalf("aggregate group = %v", agg)
 	}
+	// outOfSync names no cause; hasDraft says whether one of the causes,
+	// an unapplied draft, is there.
+	if out["hasDraft"] != false {
+		t.Fatalf("hasDraft = %v on a router with no draft", out["hasDraft"])
+	}
+	if res, _ := callTool(t, s, "set_singbox_rule_outbound", map[string]any{"index": 0, "outbound": "hy2-de"}); res.IsError {
+		t.Fatal("setup")
+	}
+	_, out = callTool(t, s, "list_singbox_outbounds", nil)
+	if out["hasDraft"] != true {
+		t.Fatalf("hasDraft = %v after an edit was staged", out["hasDraft"])
+	}
+	_, detail := callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "auto"})
+	if detail["hasDraft"] != true {
+		t.Fatalf("get_singbox_outbound hasDraft = %v after an edit was staged", detail["hasDraft"])
+	}
 
 	// sing-box is stopped: configuration is still true, the present is not.
 	fake.ClashDown = true
@@ -339,19 +355,19 @@ func TestTools_DiscardSingboxStaging(t *testing.T) {
 	}
 }
 
-// TestTools_SingboxOutboundStaged — состав группы читается из черновика,
-// а активный участник — из движка. Когда они расходятся, агент должен
-// узнать об этом из ответа, а не догадываться.
-func TestTools_SingboxOutboundStaged(t *testing.T) {
+// TestTools_SingboxOutboundOutOfSync — состав группы читается из
+// черновика, а активный участник — из движка. Когда они расходятся, агент
+// должен узнать об этом из ответа, а не догадываться.
+func TestTools_SingboxOutboundOutOfSync(t *testing.T) {
 	fake := mcptest.New()
-	fake.RouterOutbounds = append(fake.RouterOutbounds, mcpsrv.SingboxOutbound{Tag: "draft-only", Type: "selector", Source: "user"})
+	fake.RouterOutbounds = append(fake.RouterOutbounds, mcpsrv.SingboxOutbound{Tag: "draft-only", Type: "selector", Source: "router"})
 	fake.GroupMembers["draft-only"] = []mcpsrv.SingboxGroupMember{{Tag: "vless-nl", Kind: "proxy"}}
 	fake.EngineMembers = map[string][]string{"auto": {"vless-nl", "hy2-de", "gone"}}
 	s := connect(t, mcpsrv.NewServer(fake, "test"))
 
 	_, out := callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "draft-only"})
-	if out["runtimeKnown"] != false || out["staged"] != true {
-		t.Fatalf("a group the engine does not run: runtimeKnown=%v staged=%v", out["runtimeKnown"], out["staged"])
+	if out["runtimeKnown"] != false || out["outOfSync"] != true {
+		t.Fatalf("a group the engine does not run: runtimeKnown=%v outOfSync=%v", out["runtimeKnown"], out["outOfSync"])
 	}
 	if _, has := out["activeMember"]; has {
 		t.Fatalf("no active member can be known for it: %v", out)
@@ -361,18 +377,18 @@ func TestTools_SingboxOutboundStaged(t *testing.T) {
 	}
 
 	_, out = callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "auto"})
-	if out["runtimeKnown"] != true || out["staged"] != true || out["activeMember"] != "vless-nl" {
-		t.Fatalf("a group whose members are staged: %v", out)
+	if out["runtimeKnown"] != true || out["outOfSync"] != true || out["activeMember"] != "vless-nl" {
+		t.Fatalf("a group whose members are out of sync: %v", out)
 	}
 
 	_, out = callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "sub-706dcf33"})
-	if out["staged"] != false {
-		t.Fatalf("an applied group must not be marked staged: %v", out)
+	if out["outOfSync"] != false {
+		t.Fatalf("an applied group must not be marked out of sync: %v", out)
 	}
 
 	fake.ClashDown = true
 	_, out = callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "draft-only"})
-	if out["runtimeKnown"] != false || out["staged"] != false {
+	if out["runtimeKnown"] != false || out["outOfSync"] != false {
 		t.Fatalf("with the engine down nothing is known either way: %v", out)
 	}
 }

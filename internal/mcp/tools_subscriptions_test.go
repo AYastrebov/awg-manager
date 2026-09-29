@@ -27,7 +27,7 @@ func TestTools_ListSingboxSubscriptions(t *testing.T) {
 	if first["id"] != "706dcf33aabbccddeeff0011" || first["groupTag"] != "sub-706dcf33" || first["mode"] != "urltest" {
 		t.Fatalf("subscription = %v", first)
 	}
-	if first["host"] != "sub.example.net" || first["source"] != "url" {
+	if first["host"] != "sub.example.net" || first["sourceType"] != "url" {
 		t.Fatalf("subscription = %v", first)
 	}
 	// The store keeps an active server in every mode, and in urltest mode
@@ -48,7 +48,7 @@ func TestTools_ListSingboxSubscriptionsPages(t *testing.T) {
 	fake.Subscriptions = nil
 	for i := range mcpsrv.MaxSubscriptionsInOutput + 5 {
 		fake.Subscriptions = append(fake.Subscriptions, mcpsrv.SingboxSubscription{
-			ID: fmt.Sprintf("%024x", i), Label: fmt.Sprintf("sub %03d", i), Source: "url", Mode: "selector", Enabled: true,
+			ID: fmt.Sprintf("%024x", i), Label: fmt.Sprintf("sub %03d", i), SourceType: "url", Mode: "selector", Enabled: true,
 		})
 	}
 	s := connect(t, mcpsrv.NewServer(fake, "test"))
@@ -163,5 +163,51 @@ func TestTools_SetSingboxSubscriptionEnabledRejectsNonsense(t *testing.T) {
 	res, _ := callTool(t, s, "set_singbox_subscription_enabled", map[string]any{"subscriptionId": "00000000aabbccddeeff0011", "enabled": false})
 	if !res.IsError || !strings.Contains(toolText(res), "list_singbox_subscriptions") {
 		t.Fatalf("an unknown id must name the tool that lists valid ones: %q", toolText(res))
+	}
+}
+
+// TestTools_DisablingEverySubscriptionOfAnAggregateGroupRemovesIt — сводная
+// группа без единого участника в конфиг не попадает (subscription/groups.go).
+// Совет «посмотри get_singbox_outbound» привёл бы агента к «не найдено».
+func TestTools_DisablingEverySubscriptionOfAnAggregateGroupRemovesIt(t *testing.T) {
+	s, _ := newTestSession(t)
+
+	var warnings []any
+	for _, id := range []string{"706dcf33aabbccddeeff0011", "1a00ae3b0011223344556677"} {
+		res, out := callTool(t, s, "set_singbox_subscription_enabled", map[string]any{"subscriptionId": id, "enabled": false})
+		if res.IsError {
+			t.Fatal(toolText(res))
+		}
+		warnings, _ = out["warnings"].([]any)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0].(string), "list_singbox_outbounds") {
+		t.Fatalf("warnings = %v, want list_singbox_outbounds named", warnings)
+	}
+
+	_, out := callTool(t, s, "list_singbox_outbounds", nil)
+	for _, o := range out["outbounds"].([]any) {
+		if o.(map[string]any)["tag"] == "agg-5e6f7a8b" {
+			t.Fatalf("an aggregate group with no enabled subscription is not in sing-box: %v", o)
+		}
+	}
+	if res, _ := callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "agg-5e6f7a8b"}); !res.IsError {
+		t.Fatal("get_singbox_outbound on a group that is gone must be an error")
+	}
+}
+
+// TestTools_SubscriptionMemberCountFollowsTheGroup — memberCount говорит,
+// сколько серверов в группе подписки. Число, не связанное с группой,
+// разошлось бы с get_singbox_outbound.
+func TestTools_SubscriptionMemberCountFollowsTheGroup(t *testing.T) {
+	s, fake := newTestSession(t)
+	fake.GroupMembers["sub-1a00ae3b"] = fake.GroupMembers["sub-1a00ae3b"][:1]
+
+	_, out := callTool(t, s, "list_singbox_subscriptions", nil)
+	if n := out["subscriptions"].([]any)[1].(map[string]any)["memberCount"]; n != float64(1) {
+		t.Fatalf("memberCount = %v, want the size of the group", n)
+	}
+	_, out = callTool(t, s, "set_singbox_subscription_enabled", map[string]any{"subscriptionId": "1a00ae3b0011223344556677", "enabled": false})
+	if n := out["memberCount"]; n != float64(1) {
+		t.Fatalf("memberCount after the write = %v, want the size of the group", n)
 	}
 }

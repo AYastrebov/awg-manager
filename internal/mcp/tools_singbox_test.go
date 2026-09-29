@@ -1,10 +1,11 @@
 package mcp_test
 
 import (
-	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
-	"github.com/hoaxisr/awg-manager/internal/mcp/mcptest"
 	"strings"
 	"testing"
+
+	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
+	"github.com/hoaxisr/awg-manager/internal/mcp/mcptest"
 )
 
 // TestTools_ListSingboxTunnels — control_singbox умеет запустить и
@@ -164,6 +165,18 @@ func TestTools_SingboxDelayCheckSaysWhyItCannotProbe(t *testing.T) {
 		}
 	}
 
+	// A tag comes from any of three tools; the refusal names all three.
+	res, _ = callTool(t, s, "singbox_delay_check", map[string]any{"tag": " "})
+	if !res.IsError {
+		t.Fatal("an empty tag must be refused")
+	}
+	txt = toolText(res)
+	for _, tool := range []string{"list_singbox_tunnels", "list_singbox_outbounds", "get_singbox_outbound"} {
+		if !strings.Contains(txt, tool) {
+			t.Errorf("the refusal of an empty tag must name %s: %q", tool, txt)
+		}
+	}
+
 	for name, tag := range map[string]string{"a control character": "vless-nl\nx", "an over-long tag": strings.Repeat("a", 200)} {
 		if res, _ := callTool(t, s, "singbox_delay_check", map[string]any{"tag": tag}); !res.IsError {
 			t.Errorf("%s must be refused before Deps", name)
@@ -176,7 +189,7 @@ func TestTools_SingboxDelayCheckSaysWhyItCannotProbe(t *testing.T) {
 // неправда: её никто не спрашивал.
 func TestTools_SingboxDelayCheckRefusesADraftOnlyGroup(t *testing.T) {
 	fake := mcptest.New()
-	fake.RouterOutbounds = append(fake.RouterOutbounds, mcpsrv.SingboxOutbound{Tag: "draft-only", Type: "selector", Source: "user"})
+	fake.RouterOutbounds = append(fake.RouterOutbounds, mcpsrv.SingboxOutbound{Tag: "draft-only", Type: "selector", Source: "router"})
 	s := connect(t, mcpsrv.NewServer(fake, "test"))
 
 	res, _ := callTool(t, s, "singbox_delay_check", map[string]any{"tag": "draft-only"})
@@ -185,5 +198,27 @@ func TestTools_SingboxDelayCheckRefusesADraftOnlyGroup(t *testing.T) {
 	}
 	if txt := toolText(res); !strings.Contains(txt, "not running it") || !strings.Contains(txt, "get_singbox_staging") {
 		t.Fatalf("the refusal must say why and name the tool that shows the draft: %q", txt)
+	}
+}
+
+// TestTools_SingboxDelayCheckWithTheEngineDown — проба идёт через тот же
+// Clash API, что не ответил, и любую ошибку транспорта превращает в 0.
+// «Не ответил вовремя» про исправный сервер при остановленном sing-box —
+// неправда: не мерили ничего.
+func TestTools_SingboxDelayCheckWithTheEngineDown(t *testing.T) {
+	s, fake := newTestSession(t)
+	fake.ClashDown = true
+
+	res, _ := callTool(t, s, "singbox_delay_check", map[string]any{"tag": "sub-706dcf33"})
+	if !res.IsError {
+		t.Fatal("with sing-box not answering, a probe must not report reachable=false")
+	}
+	if txt := toolText(res); !strings.Contains(txt, "nothing was measured") {
+		t.Fatalf("the refusal must say nothing was measured: %q", txt)
+	}
+	// A typo is still a typo.
+	res, _ = callTool(t, s, "singbox_delay_check", map[string]any{"tag": "nope"})
+	if txt := toolText(res); !res.IsError || !strings.Contains(txt, "not found") {
+		t.Fatalf("a mistyped tag with the engine down = %q, want not found", txt)
 	}
 }
