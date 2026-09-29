@@ -193,3 +193,31 @@ func TestScope_ReadOnlyKeyCannotExportCredentials(t *testing.T) {
 		}
 	}
 }
+
+// TestScope_ReadOnlyKeyAndSubscriptions — ключ «только чтение» читает
+// подписки и группы, но переключить подписку им нельзя: это
+// перезагружает sing-box.
+func TestScope_ReadOnlyKeyAndSubscriptions(t *testing.T) {
+	s := scopedSession(t, true)
+
+	res, _ := callTool(t, s, "set_singbox_subscription_enabled", map[string]any{"subscriptionId": "706dcf33aabbccddeeff0011", "enabled": false})
+	if !res.IsError || !strings.Contains(strings.ToLower(toolText(res)), "read-only") {
+		t.Fatalf("a read-only key must be refused with the cause named: %q", toolText(res))
+	}
+	_, out := callTool(t, s, "list_singbox_subscriptions", nil)
+	if out["subscriptions"].([]any)[0].(map[string]any)["enabled"] != true {
+		t.Fatal("a refused write must not have been applied")
+	}
+
+	for name, args := range map[string]map[string]any{
+		"list_singbox_subscriptions": nil,
+		"list_singbox_outbounds":     nil,
+		"get_singbox_outbound":       {"tag": "sub-706dcf33"},
+		"singbox_delay_check":        {"tag": "sub-706dcf33-a1"},
+		"get_monitoring_matrix":      nil,
+	} {
+		if res, _ := callTool(t, s, name, args); res.IsError {
+			t.Errorf("%s must be allowed on a read-only key: %s", name, toolText(res))
+		}
+	}
+}

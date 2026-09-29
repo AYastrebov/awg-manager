@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -31,6 +33,45 @@ func pageSubscriptions(all []SingboxSubscription, offset int) subscriptionsOut {
 	return subscriptionsOut{Subscriptions: page, Total: total, Offset: start, Truncated: end < total}
 }
 
+type setSubscriptionEnabledIn struct {
+	SubscriptionID string `json:"subscriptionId" jsonschema:"subscription id from list_singbox_subscriptions"`
+	Enabled        bool   `json:"enabled" jsonschema:"true enables the subscription, false disables it"`
+}
+
+type setSubscriptionEnabledOut struct {
+	SingboxSubscription
+	Warnings []string `json:"warnings,omitempty" jsonschema:"aggregate groups whose servers changed because of this call — show these to the user"`
+}
+
+// subscriptionIDGrammar is hex and dashes. Ids are 24 hex characters
+// today; the grammar is wider than that on purpose, and still leaves no
+// room for a path separator or a control character to reach the store.
+var subscriptionIDGrammar = regexp.MustCompile(`^[0-9a-fA-F-]{8,64}$`)
+
+func requireSubscriptionID(id string) (string, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", fmt.Errorf("subscriptionId is required (use list_singbox_subscriptions)")
+	}
+	if !subscriptionIDGrammar.MatchString(id) {
+		return "", fmt.Errorf("subscriptionId is not a subscription id (use list_singbox_subscriptions)")
+	}
+	return id, nil
+}
+
+// subscriptionNotice says in words what the switch did and did not do.
+// Structured output is not enough: a model reads any successful result
+// as "the traffic stopped".
+func subscriptionNotice(sub SingboxSubscription) string {
+	if sub.Enabled {
+		return fmt.Sprintf("The subscription is enabled: scheduled refresh is back on and its servers are in the aggregate groups again. "+
+			"No server list was fetched by this call. Its group %q was in the configuration all along.", sub.GroupTag)
+	}
+	return fmt.Sprintf("The subscription is disabled: it is no longer refreshed and its servers left the aggregate groups. "+
+		"This did NOT stop traffic: its own group %q is still in the sing-box configuration, and routing rules that point at it keep using it. "+
+		"To stop that traffic, retarget those rules with set_singbox_rule_outbound.", sub.GroupTag)
+}
+
 func registerSubscriptionTools(s *mcp.Server, d Deps) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "list_singbox_subscriptions",
@@ -47,5 +88,24 @@ func registerSubscriptionTools(s *mcp.Server, d Deps) {
 			return nil, subscriptionsOut{}, err
 		}
 		return nil, pageSubscriptions(all, in.Offset), nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "set_singbox_subscription_enabled",
+		Description: "Enable or disable one sing-box subscription. Disabling stops its scheduled refresh and takes its servers out of aggregate groups. " +
+			"It does NOT stop traffic: the subscription's own group stays in the configuration, and routing rules that point at it keep using it — retarget them with set_singbox_rule_outbound if the traffic must stop. " +
+			"A change reloads sing-box, which can interrupt open connections for a moment; a call that changes nothing reloads nothing. Reversible: call it again with the other value.",
+		Annotations: safeWrite("Enable/disable sing-box subscription", true),
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in setSubscriptionEnabledIn) (*mcp.CallToolResult, setSubscriptionEnabledOut, error) {
+		id, err := requireSubscriptionID(in.SubscriptionID)
+		if err != nil {
+			return nil, setSubscriptionEnabledOut{}, err
+		}
+		updated, warnings, err := d.SetSingboxSubscriptionEnabled(ctx, id, in.Enabled)
+		if err != nil {
+			return nil, setSubscriptionEnabledOut{}, err
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: subscriptionNotice(updated)}}},
+			setSubscriptionEnabledOut{SingboxSubscription: updated, Warnings: warnings}, nil
 	})
 }

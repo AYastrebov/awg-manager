@@ -2,6 +2,7 @@ package mcp_test
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	mcpsrv "github.com/hoaxisr/awg-manager/internal/mcp"
@@ -76,5 +77,84 @@ func TestTools_ListSingboxSubscriptionsPages(t *testing.T) {
 
 	if res, _ := callTool(t, s, "list_singbox_subscriptions", map[string]any{"offset": -1}); !res.IsError {
 		t.Error("a negative offset must be a tool error")
+	}
+}
+
+// TestTools_SetSingboxSubscriptionEnabled — бот держал логин и пароль от
+// веб-интерфейса только ради этого переключателя: в MCP его не было.
+func TestTools_SetSingboxSubscriptionEnabled(t *testing.T) {
+	s, _ := newTestSession(t)
+	id := "706dcf33aabbccddeeff0011"
+
+	res, out := callTool(t, s, "set_singbox_subscription_enabled", map[string]any{"subscriptionId": id, "enabled": false})
+	if res.IsError {
+		t.Fatal(toolText(res))
+	}
+	if out["id"] != id || out["enabled"] != false {
+		t.Fatalf("the record must be read back after the write: %v", out)
+	}
+	// A model reads any success as "traffic stopped". It did not.
+	txt := toolText(res)
+	if !strings.Contains(txt, "sub-706dcf33") || !strings.Contains(strings.ToLower(txt), "traffic") {
+		t.Fatalf("the result must say in words that the group still carries traffic: %q", txt)
+	}
+	warnings, _ := out["warnings"].([]any)
+	if len(warnings) != 1 || !strings.Contains(warnings[0].(string), "agg-5e6f7a8b") {
+		t.Fatalf("warnings = %v, want the aggregate group that lost its servers named", warnings)
+	}
+
+	// The aggregate group really did lose them.
+	_, grp := callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "agg-5e6f7a8b"})
+	if grp["memberCount"] != float64(2) {
+		t.Fatalf("aggregate group memberCount = %v, want only the enabled subscription's servers", grp["memberCount"])
+	}
+	// The subscription's own group did not.
+	_, own := callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "sub-706dcf33"})
+	if own["memberCount"] != float64(3) {
+		t.Fatalf("the subscription's own group must stay in place: %v", own["memberCount"])
+	}
+
+	// Retrying after a timeout must not undo anything, and must not warn
+	// about a change that did not happen.
+	res, out = callTool(t, s, "set_singbox_subscription_enabled", map[string]any{"subscriptionId": id, "enabled": false})
+	if res.IsError || out["enabled"] != false {
+		t.Fatalf("a repeated call must be a no-op: %v", out)
+	}
+	if w, _ := out["warnings"].([]any); len(w) != 0 {
+		t.Fatalf("a call that changed nothing must not warn: %v", w)
+	}
+
+	res, out = callTool(t, s, "set_singbox_subscription_enabled", map[string]any{"subscriptionId": id, "enabled": true})
+	if res.IsError || out["enabled"] != true {
+		t.Fatalf("out = %v", out)
+	}
+}
+
+func TestTools_SetSingboxSubscriptionEnabledRejectsNonsense(t *testing.T) {
+	s, fake := newTestSession(t)
+
+	for name, id := range map[string]string{
+		"an empty id":         "",
+		"a path traversal":    "../settings",
+		"a control character": "706dcf33\naabb",
+		"an id too short":     "abc",
+		"an id too long":      strings.Repeat("a", 65),
+		"letters outside hex": "zzzzzzzzzzzzzzzzzzzzzzzz",
+	} {
+		res, _ := callTool(t, s, "set_singbox_subscription_enabled", map[string]any{"subscriptionId": id, "enabled": false})
+		if !res.IsError {
+			t.Errorf("%s must be refused", name)
+		}
+	}
+	for _, sub := range fake.Subscriptions {
+		if !sub.Enabled {
+			t.Fatalf("a refused call changed %s", sub.ID)
+		}
+	}
+
+	// A well-formed id that no subscription has.
+	res, _ := callTool(t, s, "set_singbox_subscription_enabled", map[string]any{"subscriptionId": "00000000aabbccddeeff0011", "enabled": false})
+	if !res.IsError || !strings.Contains(toolText(res), "list_singbox_subscriptions") {
+		t.Fatalf("an unknown id must name the tool that lists valid ones: %q", toolText(res))
 	}
 }

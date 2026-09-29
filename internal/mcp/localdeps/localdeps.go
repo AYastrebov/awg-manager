@@ -204,6 +204,7 @@ type Local struct {
 	clientLog  *logging.ScopedLogger
 	serverLog  *logging.ScopedLogger
 	singboxLog *logging.ScopedLogger
+	subLog     *logging.ScopedLogger
 }
 
 // New wires a Local. It does not validate cfg: nil fields are checked per
@@ -219,6 +220,9 @@ func New(cfg Config) *Local {
 		clientLog:        logging.NewScopedLogger(cfg.AppLog, logging.GroupRouting, logging.SubClientRoute),
 		serverLog:        logging.NewScopedLogger(cfg.AppLog, logging.GroupServer, logging.SubManaged),
 		singboxLog:       logging.NewScopedLogger(cfg.AppLog, logging.GroupSingbox, logging.SubSBRouter),
+		// Same scope as api.SubscriptionHandler: user actions on
+		// subscriptions go to routing/subscription, not the sing-box bucket.
+		subLog: logging.NewScopedLogger(cfg.AppLog, logging.GroupRouting, logging.SubSubscription),
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hoaxisr/awg-manager/internal/logging"
 	"github.com/hoaxisr/awg-manager/internal/singbox"
 	"github.com/hoaxisr/awg-manager/internal/singbox/router"
 	"github.com/hoaxisr/awg-manager/internal/singbox/subscription"
@@ -682,5 +683,120 @@ func TestLocal_CheckSingboxDelayBusyKeepsTheKind(t *testing.T) {
 	got, err := l.CheckSingboxDelay(context.Background(), "sub-706dcf33-a1")
 	if err != nil || !got.Busy || got.Kind != "member" || got.Reachable {
 		t.Fatalf("got %+v, %v", got, err)
+	}
+}
+
+// recLog records journal lines as "group/subgroup action target: message".
+type recLog struct{ lines []string }
+
+func (r *recLog) AppLog(_ logging.Level, group, subgroup, action, target, message string) {
+	r.lines = append(r.lines, group+"/"+subgroup+" "+action+" "+target+": "+message)
+}
+
+// TestLocal_SetSingboxSubscriptionEnabled — subscription.Service.Update
+// читает nil в патче как «поле не прислали». Пришли адаптер запись
+// целиком — и правка флага перезаписала бы фильтры, режим и адрес.
+func TestLocal_SetSingboxSubscriptionEnabled(t *testing.T) {
+	subs := subsHarness()
+	journal := &recLog{}
+	l := New(Config{Subscriptions: subs, AppLog: journal})
+	ctx := context.Background()
+
+	got, warnings, err := l.SetSingboxSubscriptionEnabled(ctx, subAutoID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != subAutoID || got.Enabled {
+		t.Fatalf("returned = %+v, want the record as it stands after the write", got)
+	}
+	p := subs.patched
+	if subs.patchedID != subAutoID || p.Enabled == nil || *p.Enabled {
+		t.Fatalf("patch = %+v", p)
+	}
+	if p.Label != nil || p.URL != nil || p.Headers != nil || p.RefreshHours != nil || p.Mode != nil ||
+		p.URLTest != nil || p.FilterInclude != nil || p.FilterExclude != nil || p.BindInterface != nil {
+		t.Fatalf("only Enabled may be sent; the service preserves the rest: %+v", p)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "agg-5e6f7a8b") || !strings.Contains(warnings[0], "Fastest") {
+		t.Fatalf("warnings = %v, want the aggregate group named", warnings)
+	}
+	if len(journal.lines) != 1 || !strings.HasPrefix(journal.lines[0], "routing/subscription ") || !strings.Contains(journal.lines[0], "(MCP)") {
+		t.Fatalf("journal = %v, want one routing/subscription line marked (MCP)", journal.lines)
+	}
+	raw, _ := json.Marshal(got)
+	for _, secret := range []string{"TOKEN123", "HDRSECRET", "TOKEN456"} {
+		if strings.Contains(string(raw), secret) {
+			t.Fatalf("the returned record leaked %q", secret)
+		}
+	}
+
+	// Nothing changes: no warning, because no group lost anything.
+	_, warnings, err = l.SetSingboxSubscriptionEnabled(ctx, subAutoID, false)
+	if err != nil || len(warnings) != 0 {
+		t.Fatalf("a no-op returned warnings %v, err %v", warnings, err)
+	}
+}
+
+// TestLocal_SetSingboxSubscriptionEnabledSkipsDisabledGroups — выключенная
+// сводная группа ничего не маршрутизирует, и предупреждать о ней нечего.
+func TestLocal_SetSingboxSubscriptionEnabledSkipsDisabledGroups(t *testing.T) {
+	subs := subsHarness()
+	subs.groups[0].Enabled = false
+	l := New(Config{Subscriptions: subs})
+
+	_, warnings, err := l.SetSingboxSubscriptionEnabled(context.Background(), subAutoID, false)
+	if err != nil || len(warnings) != 0 {
+		t.Fatalf("warnings = %v, err = %v", warnings, err)
+	}
+}
+
+// TestLocal_SetSingboxSubscriptionEnabledUnknownID — подписку могли
+// удалить между списком и записью. Патч при этом уходить не должен.
+func TestLocal_SetSingboxSubscriptionEnabledUnknownID(t *testing.T) {
+	subs := subsHarness()
+	l := New(Config{Subscriptions: subs})
+
+	_, _, err := l.SetSingboxSubscriptionEnabled(context.Background(), "00000000aabbccddeeff0011", false)
+	if err == nil || !strings.Contains(err.Error(), "list_singbox_subscriptions") {
+		t.Fatalf("err = %v, want the listing tool named", err)
+	}
+	if subs.updates != 0 {
+		t.Fatalf("a patch was sent for a subscription that does not exist")
+	}
+}
+
+func TestLocal_SetSingboxSubscriptionEnabledReportsFailure(t *testing.T) {
+	subs := subsHarness()
+	subs.updateErr = fmt.Errorf(`subscription: применение настроек: reload failed: parse "vless://uuid-secret@de1.example.net:443x": invalid port, see https://sub.example.net/api/TOKEN123`)
+	journal := &recLog{}
+	l := New(Config{Subscriptions: subs, AppLog: journal})
+
+	_, _, err := l.SetSingboxSubscriptionEnabled(context.Background(), subAutoID, false)
+	if err == nil {
+		t.Fatal("a failed write must be an error, never a record that looks applied")
+	}
+	// The cause is free text and can quote the list's content. The model
+	// gets a fixed sentence and the name of the tool that reads the journal.
+	for _, secret := range []string{"uuid-secret", "TOKEN123", "invalid port", "de1.example.net"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("the error handed to the model carries %q: %v", secret, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "get_logs") || !strings.Contains(err.Error(), "restored") {
+		t.Fatalf("err = %v, want it to say the state was restored and where the cause is", err)
+	}
+	if len(journal.lines) != 1 || !strings.Contains(journal.lines[0], "(MCP)") {
+		t.Fatalf("a failure must be journalled too: %v", journal.lines)
+	}
+	// get_logs is open to a read-only key, so the line MCP adds to the
+	// journal must not carry the cause either.
+	for _, secret := range []string{"uuid-secret", "TOKEN123", "invalid port"} {
+		if strings.Contains(journal.lines[0], secret) {
+			t.Fatalf("the journal line carries %q: %v", secret, journal.lines)
+		}
+	}
+
+	if _, _, err := New(Config{}).SetSingboxSubscriptionEnabled(context.Background(), subAutoID, false); err == nil {
+		t.Fatal("without the subscription service the tool must say it is unavailable")
 	}
 }

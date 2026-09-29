@@ -130,5 +130,11 @@ type Deps interface {
 	// The tool pages the result; implementations must not truncate it.
 	ListSingboxSubscriptions(ctx context.Context) ([]SingboxSubscription, error)
 
+	// SetSingboxSubscriptionEnabled switches a subscription and returns it
+	// as it stands afterwards. warnings names the aggregate groups whose
+	// members changed; a call that changes nothing returns none. An
+	// unknown id is an error and nothing is written.
+	SetSingboxSubscriptionEnabled(ctx context.Context, id string, enabled bool) (updated SingboxSubscription, warnings []string, err error)
+
 	OpenAPISpec() []byte
 }

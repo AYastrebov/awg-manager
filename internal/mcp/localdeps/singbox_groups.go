@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -373,4 +374,57 @@ func (l *Local) CheckSingboxDelay(ctx context.Context, tag string) (mcpsrv.Singb
 		}
 	}
 	return out, nil
+}
+
+// SetSingboxSubscriptionEnabled switches one subscription. Only Enabled
+// is sent: subscription.Service.Update reads a nil field as "not sent"
+// and keeps the stored value, so a sparse patch is what leaves the
+// filters, the mode and the URL alone.
+//
+// No invalidation event is published, because the REST handler publishes
+// none: there is no subscription resource in internal/events, and an
+// open web tab sees the change on its next fetch either way.
+func (l *Local) SetSingboxSubscriptionEnabled(_ context.Context, id string, enabled bool) (mcpsrv.SingboxSubscription, []string, error) {
+	if l.c.Subscriptions == nil {
+		return mcpsrv.SingboxSubscription{}, nil, errUnavailable("sing-box subscriptions")
+	}
+	// Read first: the subscription may have been deleted since the agent
+	// listed it, and the error should send it back to the list.
+	current, err := l.c.Subscriptions.Get(id)
+	if err != nil || current == nil {
+		return mcpsrv.SingboxSubscription{}, nil, fmt.Errorf("sing-box subscription %q not found (use list_singbox_subscriptions)", id)
+	}
+	changed := current.Enabled != enabled
+	label := sanitizeLabel(current.Label)
+
+	updated, err := l.c.Subscriptions.Update(id, subscription.UpdatePatch{Enabled: &enabled})
+	if err != nil {
+		// The cause goes neither to the model nor into this line: like a
+		// stored fetch error, it is free text that can quote the
+		// subscription's address or its content. The service journals it
+		// itself (subscription.Service, "settings change rolled back");
+		// this line only marks the attempt as MCP's.
+		l.subLog.Warn("subscription-update", label, "Failed to switch subscription "+onOff(enabled)+" (MCP); the service journalled the cause")
+		return mcpsrv.SingboxSubscription{}, nil, fmt.Errorf("the subscription could not be switched %s: applying the change to sing-box failed and the service restored the previous state. Nothing is different from before the call. The cause is in the journal — get_logs, group routing", onOff(enabled))
+	}
+	if updated == nil {
+		return mcpsrv.SingboxSubscription{}, nil, fmt.Errorf("subscription update returned no record")
+	}
+	l.subLog.Info("subscription-update", label, "Subscription switched "+onOff(enabled)+" (MCP)")
+
+	var warnings []string
+	if changed {
+		verb := "lost"
+		if enabled {
+			verb = "regained"
+		}
+		// resolveGroupTags skips a disabled subscription, so every enabled
+		// aggregate group that lists this one just changed its members.
+		for _, g := range l.c.Subscriptions.ListGroups() {
+			if g.Enabled && slices.Contains(g.UseSubscriptionIDs, id) {
+				warnings = append(warnings, fmt.Sprintf("aggregate group %q (%s) %s this subscription's servers", sanitizeLabel(g.Label), g.Tag, verb))
+			}
+		}
+	}
+	return singboxSubscription(updated), warnings, nil
 }

@@ -929,6 +929,42 @@ func (f *Fake) ListSingboxSubscriptions(context.Context) ([]mcpsrv.SingboxSubscr
 	return append([]mcpsrv.SingboxSubscription(nil), f.Subscriptions...), nil
 }
 
+// SetSingboxSubscriptionEnabled mirrors subscription.Service.Update for
+// the enabled flag (service.go, "enabled change"): the subscription's own
+// group is left alone, aggregate groups are rebuilt, and nothing at all
+// happens when the flag already has the value asked for.
+func (f *Fake) SetSingboxSubscriptionEnabled(_ context.Context, id string, enabled bool) (mcpsrv.SingboxSubscription, []string, error) {
+	if f.Err != nil {
+		return mcpsrv.SingboxSubscription{}, nil, f.Err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.Subscriptions {
+		sub := &f.Subscriptions[i]
+		if sub.ID != id {
+			continue
+		}
+		if sub.Enabled == enabled {
+			return *sub, nil, nil
+		}
+		sub.Enabled = enabled
+		verb := "lost"
+		if enabled {
+			verb = "regained"
+		}
+		var warnings []string
+		for _, o := range f.RouterOutbounds {
+			for _, member := range o.AggregateOf {
+				if member == id {
+					warnings = append(warnings, fmt.Sprintf("aggregate group %s %s this subscription's servers", o.Tag, verb))
+				}
+			}
+		}
+		return *sub, warnings, nil
+	}
+	return mcpsrv.SingboxSubscription{}, nil, fmt.Errorf("sing-box subscription %q not found (use list_singbox_subscriptions)", id)
+}
+
 func (f *Fake) ListSingboxTunnels(context.Context) ([]mcpsrv.SingboxTunnel, error) {
 	if f.Err != nil {
 		return nil, f.Err
