@@ -95,12 +95,13 @@ type sbIndex struct {
 	member      map[string]subscription.MemberInfo // subscription server tag → what it is
 	isMember    map[string]bool                    // tags that are outbounds of a subscription
 	notOutbound map[string]string                  // tag → why it cannot be used
-	proxies     map[string]singbox.TunnelInfo      // hand-configured proxies
+	proxies     map[string]singbox.TunnelInfo      // hand-configured proxies; see withProxies
 }
 
-// singboxIndex reads the router, the subscriptions and the operator.
-// Each is optional: a daemon without subscriptions still lists its
-// groups, and the fields that would link them stay empty.
+// singboxIndex reads the router and the subscriptions. Each is optional:
+// a daemon without subscriptions still lists its groups, and the fields
+// that would link them stay empty. The hand-configured proxies are not
+// read here — see withProxies.
 func (l *Local) singboxIndex(ctx context.Context) (sbIndex, error) {
 	idx := sbIndex{
 		groups:      map[string]router.CompositeOutboundView{},
@@ -147,15 +148,29 @@ func (l *Local) singboxIndex(ctx context.Context) (sbIndex, error) {
 			idx.aggByTag[g.Tag] = g
 		}
 	}
-	if l.c.Singbox != nil {
-		// A failure here costs only the proxies' descriptions.
-		if list, err := l.c.Singbox.ListTunnels(ctx); err == nil {
-			for _, t := range list {
-				idx.proxies[t.Tag] = t
-			}
-		}
-	}
 	return idx, nil
+}
+
+// withProxies adds the hand-configured proxies to the index. It is a
+// separate step because Operator.ListTunnels asks the engine about every
+// proxy (operator_tunnels.go: HasOutbound, one Clash request each, 5 s
+// timeout) — a price only the lookups that classify a tag need to pay,
+// and one list_singbox_outbounds never does. A failure is returned, not
+// swallowed: with the proxies unknown a real tag would be classified as
+// nothing and reported as not found, sending the agent to hunt a typo
+// instead of the configuration error.
+func (l *Local) withProxies(ctx context.Context, idx *sbIndex) error {
+	if l.c.Singbox == nil {
+		return nil
+	}
+	list, err := l.c.Singbox.ListTunnels(ctx)
+	if err != nil {
+		return fmt.Errorf("sing-box proxies could not be read, so the tag was not looked up: %w", err)
+	}
+	for _, t := range list {
+		idx.proxies[t.Tag] = t
+	}
+	return nil
 }
 
 // kindOf classifies a tag from configuration, never from the engine, so
@@ -305,6 +320,11 @@ func (l *Local) GetSingboxOutbound(ctx context.Context, tag string) (mcpsrv.Sing
 	if err != nil {
 		return mcpsrv.SingboxOutboundDetail{}, err
 	}
+	// A group's members may be hand-configured proxies, and a tag that is
+	// not a group is told apart from a typo by the proxies too.
+	if err := l.withProxies(ctx, &idx); err != nil {
+		return mcpsrv.SingboxOutboundDetail{}, err
+	}
 	o, ok := idx.groups[tag]
 	if !ok {
 		switch idx.kindOf(tag) {
@@ -312,6 +332,9 @@ func (l *Local) GetSingboxOutbound(ctx context.Context, tag string) (mcpsrv.Sing
 			return mcpsrv.SingboxOutboundDetail{}, fmt.Errorf("%q is a single server, not a group (groups are in list_singbox_outbounds)", tag)
 		case "proxy":
 			return mcpsrv.SingboxOutboundDetail{}, fmt.Errorf("%q is a single proxy, not a group (groups are in list_singbox_outbounds)", tag)
+		}
+		if why, ok := idx.notOutbound[tag]; ok {
+			return mcpsrv.SingboxOutboundDetail{}, fmt.Errorf("%q is not a group: %s (groups are in list_singbox_outbounds)", tag, why)
 		}
 		return mcpsrv.SingboxOutboundDetail{}, fmt.Errorf("sing-box group %q not found (use list_singbox_outbounds)", tag)
 	}
@@ -337,6 +360,9 @@ func (l *Local) CheckSingboxDelay(ctx context.Context, tag string) (mcpsrv.Singb
 	}
 	idx, err := l.singboxIndex(ctx)
 	if err != nil {
+		return mcpsrv.SingboxDelay{}, err
+	}
+	if err := l.withProxies(ctx, &idx); err != nil {
 		return mcpsrv.SingboxDelay{}, err
 	}
 	kind := idx.kindOf(tag)

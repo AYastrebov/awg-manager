@@ -444,9 +444,16 @@ func (l *Local) MonitoringMatrix(context.Context) (mcpsrv.MonitoringMatrix, erro
 	}
 	for _, t := range snap.Tunnels {
 		row := mcpsrv.MonitoringTunnel{
-			ID: t.ID, Name: sanitizeLabel(t.Name), Source: t.Source,
+			ID: t.ID, Name: t.Name, Source: t.Source,
 			Subscription: t.Subscription, SingboxTag: t.SingboxTag,
 			Probed: probed[t.ID],
+		}
+		// A sing-box row is named by the provider (monitoring/scheduler.go
+		// lists subscription servers by their label). An AWG or system
+		// row is the user's own name, returned whole by list_tunnels —
+		// capping it here would make the two stop matching.
+		if t.Source == "singbox" {
+			row.Name = sanitizeLabel(t.Name)
 		}
 		// ClashDelay is 0 for "not a urltest member", "nothing recorded"
 		// and "the engine is unreachable" alike, so 0 is never passed on.

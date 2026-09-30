@@ -1623,6 +1623,7 @@ type fakeSingboxOp struct {
 	busy    map[string]bool
 	asked   []string
 	err     error
+	listed  int // ListTunnels calls
 }
 
 func (f *fakeSingboxOp) GetStatus(context.Context) singbox.Status {
@@ -1630,6 +1631,7 @@ func (f *fakeSingboxOp) GetStatus(context.Context) singbox.Status {
 }
 func (f *fakeSingboxOp) Control(context.Context, string) error { return nil }
 func (f *fakeSingboxOp) ListTunnels(context.Context) ([]singbox.TunnelInfo, error) {
+	f.listed++
 	return f.tunnels, f.err
 }
 func (f *fakeSingboxOp) CheckDelay(_ context.Context, tag string) (int, error) {

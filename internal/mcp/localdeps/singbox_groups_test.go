@@ -3,6 +3,7 @@ package localdeps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -521,6 +522,17 @@ func TestLocal_GetSingboxOutboundRefusesWithTheReason(t *testing.T) {
 			t.Fatalf("%s: err = %v, want it said that a single server is not a group", tag, err)
 		}
 	}
+	// A server the user excluded, or the filter hid, is a tag the agent
+	// saw in the web interface. "Not found" sends it hunting a typo.
+	for tag, want := range map[string]string{
+		"sub-706dcf33-x9": "excluded",
+		"sub-706dcf33-f7": "filter",
+	} {
+		_, err = l.GetSingboxOutbound(ctx, tag)
+		if err == nil || !strings.Contains(err.Error(), want) || strings.Contains(err.Error(), "not found") {
+			t.Fatalf("%s: err = %v, want it to say %q and not \"not found\"", tag, err, want)
+		}
+	}
 }
 
 func TestLocal_GetSingboxOutboundCarriesNoSecrets(t *testing.T) {
@@ -988,11 +1000,16 @@ func TestLocal_MonitoringMatrixLabelsRows(t *testing.T) {
 			{ID: "tn-1", Name: "Amsterdam", Source: "awg", SelfTarget: "connectivity.example", SelfMethod: "http"},
 			{ID: "tn-2", Name: "Frankfurt", Source: "awg", SelfMethod: "handshake"},
 			{ID: "tn-3", Name: "Oslo", Source: "awg", SelfTarget: "connectivity.example", SelfMethod: "http"},
+			// list_tunnels returns a name up to tunnel.MaxNameBytes whole;
+			// the matrix must not shorten it, or the two stop matching.
+			{ID: "tn-4", Name: strings.Repeat("я", 80), Source: "awg"},
 			// The scheduler gives a system row neither a self-target nor a
 			// cell (monitoring/scheduler.go, runOnce).
 			{ID: "Wireguard0", Name: "Home", Source: "system"},
 			{ID: "vless-nl", Name: "vless-nl", Source: "singbox", SingboxTag: "vless-nl"},
 			{ID: "sub-706dcf33-a1", Name: "AXO auto", Source: "singbox", SingboxTag: "sub-706dcf33-a1", Subscription: true, ClashDelay: 48, UrltestGroup: "sub-706dcf33"},
+			// A sing-box row's name is the provider's text.
+			{ID: "sub-706dcf33-b2", Name: "AXO\x1b[31m " + strings.Repeat("x", 80), Source: "singbox", SingboxTag: "sub-706dcf33-b2"},
 		},
 		Cells: []monitoring.Cell{
 			{TargetID: "cc-connectivity.example", TunnelID: "tn-1", OK: true, LatencyMs: &lat},
@@ -1018,6 +1035,12 @@ func TestLocal_MonitoringMatrixLabelsRows(t *testing.T) {
 	if r := rows["Wireguard0"]; r.Source != "system" || r.Probed {
 		t.Fatalf("Wireguard0 = %+v, want probed=false for a system row", r)
 	}
+	if r := rows["tn-4"]; r.Name != strings.Repeat("я", 80) {
+		t.Fatalf("tn-4 name = %q, want the AWG name whole as list_tunnels returns it", r.Name)
+	}
+	if r := rows["sub-706dcf33-b2"]; strings.ContainsRune(r.Name, 0x1b) || len([]rune(r.Name)) > mcpsrv.MaxSingboxLabelRunes {
+		t.Fatalf("sub-706dcf33-b2 name = %q, want provider text sanitised and capped", r.Name)
+	}
 	// An AWG tunnel whose check method probes no host has no cell either.
 	if r := rows["tn-2"]; r.Probed {
 		t.Fatalf("tn-2 = %+v, want probed=false for a handshake-only check", r)
@@ -1032,5 +1055,40 @@ func TestLocal_MonitoringMatrixLabelsRows(t *testing.T) {
 	r := rows["sub-706dcf33-a1"]
 	if !r.Subscription || r.Probed || r.UrltestGroup != "sub-706dcf33" || r.UrltestDelayMs == nil || *r.UrltestDelayMs != 48 {
 		t.Fatalf("sub-706dcf33-a1 = %+v", r)
+	}
+}
+
+// TestLocal_ProxiesAreReadOnlyWhereATagIsClassified — Operator.ListTunnels
+// спрашивает Clash про каждый ручной прокси (operator_tunnels.go, HasOutbound,
+// таймаут 5 с на запрос), а list_singbox_outbounds прокси не показывает
+// вовсе. И если файл туннелей не читается, известный тег не должен стать
+// «не найден»: агент пошёл бы искать опечатку вместо ошибки конфига.
+func TestLocal_ProxiesAreReadOnlyWhereATagIsClassified(t *testing.T) {
+	l, _, _ := groupsHarness()
+	op := l.c.Singbox.(*fakeSingboxOp)
+	ctx := context.Background()
+
+	if _, _, err := l.ListSingboxOutbounds(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if op.listed != 0 {
+		t.Fatalf("list_singbox_outbounds read the proxies %d times, want 0", op.listed)
+	}
+
+	op.err = errors.New("10-tunnels.json: unexpected end of JSON input")
+	if _, _, err := l.ListSingboxOutbounds(ctx); err != nil {
+		t.Fatalf("list_singbox_outbounds does not need the proxies, got %v", err)
+	}
+	for name, call := range map[string]func() error{
+		"get_singbox_outbound": func() error { _, err := l.GetSingboxOutbound(ctx, "vless-nl"); return err },
+		"singbox_delay_check":  func() error { _, err := l.CheckSingboxDelay(ctx, "vless-nl"); return err },
+	} {
+		err := call()
+		if err == nil || !strings.Contains(err.Error(), "10-tunnels.json") || strings.Contains(err.Error(), "not found") {
+			t.Errorf("%s: err = %v, want the read failure, not \"not found\"", name, err)
+		}
+	}
+	if len(op.asked) != 0 {
+		t.Fatalf("nothing may be probed when the tag could not be classified: %v", op.asked)
 	}
 }

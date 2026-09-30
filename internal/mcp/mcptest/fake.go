@@ -1201,6 +1201,11 @@ func (f *Fake) GetSingboxOutbound(_ context.Context, tag string) (mcpsrv.Singbox
 			}
 		}
 	}
+	// Mirrors localdeps.GetSingboxOutbound: an excluded or filtered
+	// server is named for what it is, not reported as missing.
+	if why, ok := f.NotOutbound[tag]; ok {
+		return mcpsrv.SingboxOutboundDetail{}, fmt.Errorf("%q is not a group: %s (groups are in list_singbox_outbounds)", tag, why)
+	}
 	return mcpsrv.SingboxOutboundDetail{}, fmt.Errorf("sing-box group %q not found (use list_singbox_outbounds)", tag)
 }
 

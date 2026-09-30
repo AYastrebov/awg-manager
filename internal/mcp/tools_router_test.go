@@ -229,6 +229,12 @@ func TestTools_GetSingboxOutboundRejectsNonsense(t *testing.T) {
 	if txt := toolText(res); !strings.Contains(txt, "not a group") {
 		t.Errorf("the refusal must say why: %q", txt)
 	}
+	// So must a server the user excluded: the agent saw it in the web
+	// interface, and "not found" would send it hunting a typo.
+	res, _ = callTool(t, s, "get_singbox_outbound", map[string]any{"tag": "sub-706dcf33-x9"})
+	if txt := toolText(res); !res.IsError || !strings.Contains(txt, "excluded") || strings.Contains(txt, "not found") {
+		t.Errorf("an excluded server must be refused with the reason: %q", txt)
+	}
 }
 
 // TestTools_SingboxStagingStatus — правки правил не применяются сразу, а
