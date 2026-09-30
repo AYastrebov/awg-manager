@@ -186,7 +186,9 @@ type DNSSubscription struct {
 	Name        string `json:"name,omitempty"`
 	LastFetched string `json:"lastFetched,omitempty"`
 	LastCount   int    `json:"lastCount,omitempty"`
-	LastError   string `json:"lastError,omitempty" jsonschema:"non-empty when the last fetch failed — the list may be stale"`
+	// LastFetchFailed replaces the stored error text, which quoted the
+	// list's address whole — token in the path or query included.
+	LastFetchFailed bool `json:"lastFetchFailed,omitempty" jsonschema:"true when the last download of this list failed, so its domains may be stale. The reason is not returned; the user can read it in the web interface"`
 }
 
 // DNSRouteDetail is one domain list in full: Domains is NOT capped, and
@@ -317,7 +319,7 @@ type LogsQuery struct {
 	Level    string   `json:"level,omitempty" jsonschema:"minimum level: debug|info|warn|error"`
 	Lines    int      `json:"lines,omitempty" jsonschema:"1..500, default 100"`
 	Contains string   `json:"contains,omitempty" jsonschema:"case-insensitive substring filter on message"`
-	Raw      bool     `json:"raw,omitempty" jsonschema:"true returns IPs and domains unmasked; by default they are partially redacted, as in the web UI"`
+	Raw      bool     `json:"raw,omitempty" jsonschema:"true returns IPs and domains unmasked (full-access key only); by default they are partially redacted, as in the web UI"`
 }
 
 type LogEntry struct {

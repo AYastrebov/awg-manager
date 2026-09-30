@@ -760,7 +760,7 @@ func dnsRouteDetail(dl *dnsroute.DomainList) mcpsrv.DNSRouteDetail {
 	}
 	for _, sub := range dl.Subscriptions {
 		out.Subscriptions = append(out.Subscriptions, mcpsrv.DNSSubscription{
-			URL: redactURL(sub.URL), Name: sub.Name, LastFetched: sub.LastFetched, LastCount: sub.LastCount, LastError: sub.LastError,
+			URL: redactURL(sub.URL), Name: sub.Name, LastFetched: sub.LastFetched, LastCount: sub.LastCount, LastFetchFailed: sub.LastError != "",
 		})
 	}
 	return out

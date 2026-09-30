@@ -79,7 +79,10 @@ a comment so the next reader can re-check:
   because a skimming model reads any successful result as "done".
 - **Redact what a reader must not carry away.** Subscription URLs embed
   tokens in the query or userinfo; `redactURL` keeps host and path only. A
-  read-only key is meant for an agent you do not fully trust.
+  read-only key is meant for an agent you do not fully trust. A stored
+  fetch error quotes the address whole, redirect hops included, so return
+  a flag (`lastFetchFailed`), not the text; services scrub what they store
+  and journal with `logging.RedactURLs`.
 - **Warn about losses the caller did not ask for.** Re-pointing a multi-target
   list to one tunnel drops the others; return `warnings` naming what was lost.
 
@@ -137,6 +140,8 @@ A tool that changes nothing but returns private keys (`export_tunnel_config`,
 `get_server_peer_config`) is annotated read-only AND listed in
 `credentialTools`, so a read-only key is still refused. The UI promises that
 key "cannot change anything"; walking away with VPN credentials is not that.
+For the same reason `get_logs` refuses `raw=true` on a read-only key: the
+masked journal is the read-only view.
 
 ## Secrets stay behind the boundary
 

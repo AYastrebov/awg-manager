@@ -258,21 +258,27 @@ func (s *Service) SetAppLogger(app logging.AppLogger) {
 	s.appLog = logging.NewScopedLogger(app, logging.GroupRouting, logging.SubSubscription)
 }
 
+// The three journal helpers reduce every address in the message to its
+// scheme and host (logging.RedactURLs). Their callers pass error text as
+// is: net/http quotes a redirect hop whole, the parser quotes a share link
+// with the server's uuid, and the journal is readable through get_logs by
+// a read-only MCP key. The display-time mask (logging.SanitizeLogText)
+// hides hosts but not paths or queries, where the tokens are.
 func (s *Service) logInfo(action, target, msg string) {
 	if s.log != nil {
-		s.log.Info(action, target, msg)
+		s.log.Info(action, target, logging.RedactURLs(msg))
 	}
 }
 
 func (s *Service) logDebug(action, target, msg string) {
 	if s.log != nil {
-		s.log.Debug(action, target, msg)
+		s.log.Debug(action, target, logging.RedactURLs(msg))
 	}
 }
 
 func (s *Service) logWarn(action, target, msg string) {
 	if s.log != nil {
-		s.log.Warn(action, target, msg)
+		s.log.Warn(action, target, logging.RedactURLs(msg))
 	}
 }
 

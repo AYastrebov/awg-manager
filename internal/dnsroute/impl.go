@@ -750,9 +750,14 @@ func (s *ServiceImpl) refreshSubscriptions(ctx context.Context, id string) error
 		domains, err := s.fetchSubscription(ctx, sub.URL)
 		sub.LastFetched = now
 		if err != nil {
-			sub.LastError = err.Error()
+			// net/http quotes the address whole, a redirect hop's too, and
+			// a list's address can carry a token in its path or query. The
+			// stored text is what REST, the web interface and MCP read, so
+			// it keeps only scheme and host, and so does the journal line.
+			reason := logging.RedactURLs(err.Error())
+			sub.LastError = reason
 			sub.LastCount = 0
-			s.appLog.Warn("subscription-fetch", id, fmt.Sprintf("url=%s err=%s", sub.URL, err.Error()))
+			s.appLog.Warn("subscription-fetch", id, fmt.Sprintf("url=%s err=%s", logging.RedactURLs(sub.URL), reason))
 			// Keep going — one failed subscription shouldn't block others
 			continue
 		}

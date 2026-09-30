@@ -2,6 +2,7 @@ package localdeps
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -1304,7 +1305,7 @@ func TestLocal_GetDNSRouteIsUncappedAndCarriesTheDroppedFields(t *testing.T) {
 		t.Fatalf("subscriptions = %v", got.Subscriptions)
 	}
 	sub := got.Subscriptions[0]
-	if sub.URL != "https://example.invalid/list" || sub.Name != "Geo feed" || sub.LastCount != 12 || sub.LastError != "timeout" {
+	if sub.URL != "https://example.invalid/list" || sub.Name != "Geo feed" || sub.LastCount != 12 || !sub.LastFetchFailed {
 		t.Errorf("subscription mapping lost fields: %+v", sub)
 	}
 	want := mcpsrv.RouteTarget{Interface: "nwg0", TunnelID: "tn-1", Fallback: "bypass"}
@@ -2601,5 +2602,34 @@ func TestLocal_DNSRouteDetailRedactsSubscriptionSecrets(t *testing.T) {
 	}
 	if got.Subscriptions[1].URL != "https://lists.example/plain.txt" {
 		t.Fatalf("a plain URL must pass unchanged: %q", got.Subscriptions[1].URL)
+	}
+}
+
+// TestLocal_GetDNSRouteCarriesNoFetchErrorText — the url field loses its
+// query and userinfo (redactURL), but the fetch error quoted the address
+// whole: net/http writes Get "https://host/path?token=…". The text does
+// not cross the boundary at all; the agent learns that the fetch failed
+// and reads the reason in the web interface, as with list_singbox_subscriptions.
+func TestLocal_GetDNSRouteCarriesNoFetchErrorText(t *testing.T) {
+	h := newHarness(t)
+	h.dns.lists = []dnsroute.DomainList{{
+		ID: "dl-1", Name: "Geo", Enabled: true,
+		Subscriptions: []dnsroute.Subscription{
+			{URL: "https://lists.example/l?token=Tok3n", LastError: `Get "https://lists.example/l?token=Tok3n": i/o timeout`},
+			{URL: "https://ok.example/list", LastCount: 3},
+		},
+	}}
+	got, err := h.l.GetDNSRoute(context.Background(), "dl-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(got)
+	for _, leak := range []string{"Tok3n", "i/o timeout", "lastError"} {
+		if strings.Contains(string(raw), leak) {
+			t.Fatalf("%q crossed the boundary: %s", leak, raw)
+		}
+	}
+	if !got.Subscriptions[0].LastFetchFailed || got.Subscriptions[1].LastFetchFailed {
+		t.Fatalf("lastFetchFailed = %v, %v; want true, false", got.Subscriptions[0].LastFetchFailed, got.Subscriptions[1].LastFetchFailed)
 	}
 }
