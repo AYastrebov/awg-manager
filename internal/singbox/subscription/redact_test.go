@@ -1,34 +1,12 @@
 package subscription
 
 import (
-	"context"
-	"errors"
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
-	"time"
-
-	"github.com/hoaxisr/awg-manager/internal/logging"
 )
-
-// captureLog keeps every journal line the service writes.
-type captureLog struct {
-	mu    sync.Mutex
-	lines []string
-}
-
-func (c *captureLog) AppLog(_ logging.Level, _, _, _, target, message string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.lines = append(c.lines, target+" "+message)
-}
-
-func (c *captureLog) all() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return strings.Join(c.lines, "\n")
-}
 
 const (
 	subURL      = "https://sub.example.com/sub/Tok3nAbc"
@@ -63,43 +41,36 @@ func TestMaskURL_CatchesWhatExactMatchMisses(t *testing.T) {
 	}
 }
 
-// TestService_JournalCarriesNoURL — сервис пишет причину сбоя в журнал
-// (бакет singbox), а get_logs отдаёт его и ключу только для чтения.
-// SanitizeLogText там маскирует хост, но не путь и не query.
-func TestService_JournalCarriesNoURL(t *testing.T) {
-	logs := &captureLog{}
-	svc := NewService(nil, nil)
-	svc.SetAppLogger(logs)
-	svc.logWarn("subscription-refresh", "id1", "fetch failed: Get \""+redirectURL+"\": EOF")
-	svc.logInfo("subscription-refresh", "id1", "parser: "+shareLink)
-	svc.logDebug("subscription-refresh", "id1", subURL)
-	assertNoSecret(t, "journal", logs.all())
-	if !strings.Contains(logs.all(), "cdn.example.net") {
-		t.Fatalf("the host must stay for diagnosis: %q", logs.all())
+// TestStore_ScrubsLastErrorSavedBeforeTheFix — ошибка, записанная до
+// исправления, лежит на диске с токеном и отдаётся REST до следующей
+// удачной загрузки, а у выключенной подписки или без автообновления —
+// бессрочно. Загрузка хранилища очищает её и сохраняет файл.
+func TestStore_ScrubsLastErrorSavedBeforeTheFix(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s.json")
+	legacy := `[{"id":"a1","label":"x","url":"` + subURL + `","enabled":false,"lastError":"Get \"` + redirectURL + `\": EOF; parse \"` + shareLink + `\""}]`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
 	}
-}
-
-// TestScheduler_JournalCarriesNoURL — планировщик пишет ошибку refresh как
-// есть, а ошибка парсера возвращается немаскированной.
-func TestScheduler_JournalCarriesNoURL(t *testing.T) {
-	store, _ := NewStore(filepath.Join(t.TempDir(), "s.json"))
-	store.Create(CreateInput{Label: "a", URL: "u", RefreshHours: 1, Enabled: true})
-	logs := &captureLog{}
-	done := make(chan struct{})
-	sched := NewScheduler(store, func(context.Context, string) error {
-		defer close(done)
-		return errors.New(`subscription: ни одной валидной ссылки. Первая ошибка парсера: line 1 (vless): parse "` + shareLink + `": invalid port`)
-	})
-	sched.SetAppLogger(logs)
-	sched.tick(context.Background(), time.Now().Add(2*time.Hour))
-	<-done
-	// The warning is written after doRefresh returns.
-	deadline := time.Now().Add(time.Second)
-	for !strings.Contains(logs.all(), "refresh failed") && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(logs.all(), "refresh failed") {
-		t.Fatalf("no warning written: %q", logs.all())
+	sub, err := store.Get("a1")
+	if err != nil {
+		t.Fatal(err)
 	}
-	assertNoSecret(t, "scheduler journal", logs.all())
+	assertNoSecret(t, "loaded lastError", sub.LastError)
+	if sub.LastError == "" {
+		t.Fatal("the failure must stay recorded, only scrubbed")
+	}
+	// The file keeps the subscription's own url, token and all: that is
+	// its configuration. Only the stored error is checked.
+	onDisk, _ := os.ReadFile(path)
+	var saved []struct {
+		LastError string `json:"lastError"`
+	}
+	if err := json.Unmarshal(onDisk, &saved); err != nil || len(saved) != 1 {
+		t.Fatalf("file on disk: %v %s", err, onDisk)
+	}
+	assertNoSecret(t, "lastError on disk", saved[0].LastError)
 }

@@ -78,11 +78,12 @@ a comment so the next reader can re-check:
   Structured `staged: true` is not enough — attach a `TextContent` sentence,
   because a skimming model reads any successful result as "done".
 - **Redact what a reader must not carry away.** Subscription URLs embed
-  tokens in the query or userinfo; `redactURL` keeps host and path only. A
-  read-only key is meant for an agent you do not fully trust. A stored
-  fetch error quotes the address whole, redirect hops included, so return
-  a flag (`lastFetchFailed`), not the text; services scrub what they store
-  and journal with `logging.RedactURLs`.
+  tokens in the path, the query or the userinfo; `logging.RedactURLs`
+  keeps scheme and host only. A read-only key is meant for an agent you
+  do not fully trust. A stored fetch error quotes the address whole,
+  redirect hops included, so return a flag (`lastFetchFailed`), not the
+  text. The journal is scrubbed once, in `logging.Service.AppLog`; a
+  `contains` filter matches the text it will return, masked unless raw.
 - **Warn about losses the caller did not ask for.** Re-pointing a multi-target
   list to one tunnel drops the others; return `warnings` naming what was lost.
 

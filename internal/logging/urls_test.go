@@ -47,6 +47,39 @@ func TestRedactURLs(t *testing.T) {
 			`plain text со ссылками vless://, trojan://, ss://, tt:// (TrustTunnel)`,
 		},
 		"no url": {`HTTP 404`, `HTTP 404`},
+		// Userinfo may start with anything a URL allows: a percent-encoded
+		// trojan password, base64 ss userinfo starting with + or /.
+		"percent-encoded password": {
+			`bad trojan://%21secret@h.example:443 link`,
+			`bad trojan://h.example:443/… link`,
+		},
+		"underscore password": {
+			`trojan://_secretpw@h.example:443`,
+			`trojan://h.example:443/…`,
+		},
+		"base64 userinfo with plus": {
+			`ss://+YWVzLTI1@h.example:1`,
+			`ss://h.example:1/…`,
+		},
+		// Parentheses and quotes inside a path are part of it.
+		"parenthesis in path": {
+			`fetch https://sub.example.com/sub/tok(en)abc failed`,
+			`fetch https://sub.example.com/… failed`,
+		},
+		// A scheme glued to a word character is still a URL.
+		"no word boundary": {
+			`x_https://sub.example.com/tok`,
+			`x_https://sub.example.com/…`,
+		},
+		// Sentence punctuation after a URL is not part of the host.
+		"trailing period": {
+			`could not reach https://sub.example.com.`,
+			`could not reach https://sub.example.com.`,
+		},
+		"trailing period after path": {
+			`see https://sub.example.com/tok.`,
+			`see https://sub.example.com/….`,
+		},
 		"two urls": {
 			`https://a.example/t1 then https://b.example/t2`,
 			`https://a.example/… then https://b.example/…`,

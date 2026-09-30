@@ -95,9 +95,7 @@ func (s *Scheduler) tick(ctx context.Context, now time.Time) {
 				s.mu.Unlock()
 			}()
 			if err := s.doRefresh(ctx, id); err != nil && s.log != nil {
-				// A parser error is returned unmasked and can quote a
-				// share link; see Service.logWarn.
-				s.log.Warn("subscription-scheduler", id, "refresh failed: "+logging.RedactURLs(err.Error()))
+				s.log.Warn("subscription-scheduler", id, "refresh failed: "+err.Error())
 			}
 		}()
 	}

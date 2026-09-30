@@ -70,6 +70,13 @@ func sanitizeLegacySubscriptionLastError(sub *Subscription) bool {
 		sub.LastError = ""
 		return true
 	}
+	// Text saved before MaskURL reduced every address kept the token of a
+	// redirect hop or the uuid of a share link, and REST served it until
+	// the next successful fetch — for a disabled subscription, forever.
+	if scrubbed := MaskURL(sub.LastError, sub.URL); scrubbed != sub.LastError {
+		sub.LastError = scrubbed
+		return true
+	}
 	return false
 }
 

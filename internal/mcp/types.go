@@ -182,7 +182,7 @@ const MaxDomainsInDetail = 200
 // DNSSubscription is a remote domain list feeding a routing list. Only
 // the fields that explain where the domains came from are carried over.
 type DNSSubscription struct {
-	URL         string `json:"url"`
+	URL         string `json:"url" jsonschema:"scheme and host of the list's address only: its path, query or userinfo can carry a token. The full address is in the web interface"`
 	Name        string `json:"name,omitempty"`
 	LastFetched string `json:"lastFetched,omitempty"`
 	LastCount   int    `json:"lastCount,omitempty"`
