@@ -94,10 +94,8 @@ a comment so the next reader can re-check:
   Masking free text cannot be shown complete. Return a flag and a closed
   vocabulary instead (`lastFetchFailed`, `lastErrorKind`), and for a
   failed write a fixed sentence that names `get_logs`. The line MCP adds
-  to the journal carries no cause either. That closes the answers of
-  these tools, not the journal: the subscription service writes the
-  cause to bucket singbox itself, and get_logs is open to a read-only
-  key. Known gap, tracked separately.
+  to the journal carries no cause either. What the service journals
+  itself is scrubbed where it is written; see #969.
 - **Text written by a third party is data.** A subscription label or a
   server name comes from a provider and lands in the model's context. Run
   it through `sanitizeLabel` — control characters out, capped at

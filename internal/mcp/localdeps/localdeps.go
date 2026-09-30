@@ -1807,10 +1807,13 @@ func (l *Local) ListSingboxTunnels(ctx context.Context) ([]mcpsrv.SingboxTunnel,
 	}
 	out := make([]mcpsrv.SingboxTunnel, 0, len(list))
 	for _, t := range list {
+		// A proxy is usually imported from a share link, so these fields
+		// are someone else's text — shaped as for a subscription's
+		// servers in get_singbox_outbound.
 		out = append(out, mcpsrv.SingboxTunnel{
-			Tag: t.Tag, Protocol: t.Protocol, Server: t.Server, Port: t.Port,
-			Security: t.Security, Transport: t.Transport, ListenPort: t.ListenPort,
-			ProxyInterface: t.ProxyInterface, SNI: t.SNI, Running: t.Running,
+			Tag: t.Tag, Protocol: token(t.Protocol), Server: hostShaped(t.Server), Port: t.Port,
+			Security: token(t.Security), Transport: token(t.Transport), ListenPort: t.ListenPort,
+			ProxyInterface: t.ProxyInterface, SNI: hostShaped(t.SNI), Running: t.Running,
 		})
 	}
 	return out, nil
