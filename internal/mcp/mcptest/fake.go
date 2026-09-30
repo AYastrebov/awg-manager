@@ -65,6 +65,11 @@ type Fake struct {
 	// ClashDown makes every read of the engine fail, as it does while
 	// sing-box is stopped or restarting.
 	ClashDown bool
+	// EngineLacks marks a configured proxy or server the engine does not
+	// run (a draft not applied, a reload in progress). The adapter refuses
+	// to probe any tag missing from the engine's /proxies, not only a
+	// group (localdeps.CheckSingboxDelay).
+	EngineLacks map[string]bool
 	// NotOutbound maps a tag that is in a subscription but not in the
 	// engine's configuration to the reason: excluded by the user, or
 	// hidden by the subscription's filter.
@@ -1035,6 +1040,9 @@ func (f *Fake) CheckSingboxDelay(_ context.Context, tag string) (mcpsrv.SingboxD
 		if why, ok := f.NotOutbound[tag]; ok {
 			return mcpsrv.SingboxDelay{}, fmt.Errorf("%q cannot be probed: %s", tag, why)
 		}
+		if err := f.unbuiltGroup(tag); err != nil {
+			return mcpsrv.SingboxDelay{}, err
+		}
 		return mcpsrv.SingboxDelay{}, fmt.Errorf("sing-box outbound %q not found (proxies are in list_singbox_tunnels, groups in list_singbox_outbounds, a group's servers in get_singbox_outbound)", tag)
 	}
 	// Mirrors the adapter: DelayChecker.Probe swallows every transport
@@ -1046,9 +1054,8 @@ func (f *Fake) CheckSingboxDelay(_ context.Context, tag string) (mcpsrv.SingboxD
 	// A group the engine answered about and does not run (a draft not
 	// applied, or the router switched off) is refused, not probed — the
 	// prober would answer the same 0 it answers for a group that is down.
-	// The adapter refuses a server or a proxy the engine lacks too; the
-	// fake keeps no record of which servers the engine runs, so it cannot.
-	if _, running := f.ActiveMembers[tag]; kind == "group" && !running {
+	// A server or a proxy is refused the same way when EngineLacks says so.
+	if _, running := f.ActiveMembers[tag]; (kind == "group" && !running) || f.EngineLacks[tag] {
 		return mcpsrv.SingboxDelay{}, fmt.Errorf("%q is configured but sing-box is not running it. Either it comes from a draft that is not applied yet (get_singbox_staging says whether one exists), or the sing-box router is switched off, or sing-box is still reloading. Nothing was measured, and this says nothing about whether it works", tag)
 	}
 	if f.BusyDelays[tag] {
@@ -1177,6 +1184,18 @@ func (f *Fake) ListSingboxOutbounds(context.Context) ([]mcpsrv.SingboxOutbound, 
 	return out, f.Draft != nil, nil
 }
 
+// unbuiltGroup mirrors localdeps' whyNoGroup: a subscription's group tag
+// with no group in configuration (a failed first fetch, a filter hiding
+// every server) is named for what it is. Called with f.mu held.
+func (f *Fake) unbuiltGroup(tag string) error {
+	for _, s := range f.Subscriptions {
+		if s.GroupTag == tag {
+			return fmt.Errorf("%q is the group of subscription %q, but sing-box has no such group yet: the subscription has no servers in the configuration. It may be disabled, its last fetch may have failed, or its filter may hide every server; list_singbox_subscriptions shows its state", tag, s.Label)
+		}
+	}
+	return nil
+}
+
 func (f *Fake) GetSingboxOutbound(_ context.Context, tag string) (mcpsrv.SingboxOutboundDetail, error) {
 	if f.Err != nil {
 		return mcpsrv.SingboxOutboundDetail{}, f.Err
@@ -1205,6 +1224,9 @@ func (f *Fake) GetSingboxOutbound(_ context.Context, tag string) (mcpsrv.Singbox
 	// server is named for what it is, not reported as missing.
 	if why, ok := f.NotOutbound[tag]; ok {
 		return mcpsrv.SingboxOutboundDetail{}, fmt.Errorf("%q is not a group: %s (groups are in list_singbox_outbounds)", tag, why)
+	}
+	if err := f.unbuiltGroup(tag); err != nil {
+		return mcpsrv.SingboxOutboundDetail{}, err
 	}
 	return mcpsrv.SingboxOutboundDetail{}, fmt.Errorf("sing-box group %q not found (use list_singbox_outbounds)", tag)
 }

@@ -217,7 +217,7 @@ func TestTools_GetSingboxOutboundRejectsNonsense(t *testing.T) {
 		"an unknown tag":               {"tag": "nope"},
 		"a negative offset":            {"tag": "auto", "membersOffset": -1},
 		"a control character":          {"tag": "auto\nx"},
-		"a tag longer than a tag":      {"tag": strings.Repeat("a", 200)},
+		"a tag longer than a tag":      {"tag": strings.Repeat("a", 2000)},
 		"a single server, not a group": {"tag": "vless-nl"},
 	} {
 		if res, _ := callTool(t, s, "get_singbox_outbound", args); !res.IsError {

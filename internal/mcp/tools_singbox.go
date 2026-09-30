@@ -21,9 +21,12 @@ type singboxIn struct {
 	Action string `json:"action" jsonschema:"start|stop|restart"`
 }
 
-// maxSingboxTagLen bounds a tag before it reaches the engine. Tags the
-// daemon generates are under 40 bytes; a user's group tag is a short name.
-const maxSingboxTagLen = 128
+// maxSingboxTagLen bounds a tag before it reaches the engine. It is
+// generous on purpose: an imported proxy's tag is its share link's
+// #fragment, which has no length limit of its own (vlink; the operator's
+// allocUniqueTunnelTag keeps it as given), and a provider's name in
+// Cyrillic or with flag emoji runs two to four bytes a character.
+const maxSingboxTagLen = 1024
 
 // requireSingboxTag checks a tag's shape before Deps. The tag travels
 // into a URL path of the engine's local API, so it is bounded and free of

@@ -2216,10 +2216,16 @@ type fakeRouter struct {
 	discarded int
 	applyErr  error
 	applyRes  singboxorch.ValidationResult
+	// listErr mirrors a draft or config file the router cannot parse
+	// (orchestrator.LoadEffective).
+	listErr error
 }
 
 func (f *fakeRouter) ListRules(context.Context) ([]router.Rule, error) { return f.rules, nil }
 func (f *fakeRouter) ListCompositeOutbounds(context.Context) ([]router.CompositeOutboundView, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	return f.outbounds, nil
 }
 func (f *fakeRouter) StagingStatus(context.Context) router.StagingStatus { return f.staging }

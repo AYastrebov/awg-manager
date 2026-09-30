@@ -1092,3 +1092,55 @@ func TestLocal_ProxiesAreReadOnlyWhereATagIsClassified(t *testing.T) {
 		t.Fatalf("nothing may be probed when the tag could not be classified: %v", op.asked)
 	}
 }
+
+// TestLocal_RouterErrorDoesNotBlockAProxyProbe — до этого PR
+// singbox_delay_check зависел только от списка прокси. Индекс групп читает
+// ещё и конфиг маршрутизатора, и битый черновик блокировал пробу прокси,
+// к которому маршрутизатор отношения не имеет.
+func TestLocal_RouterErrorDoesNotBlockAProxyProbe(t *testing.T) {
+	l, _, _ := groupsHarness()
+	l.c.Router.(*fakeRouter).listErr = errors.New("router draft: unexpected end of JSON input")
+	op := l.c.Singbox.(*fakeSingboxOp)
+	ctx := context.Background()
+
+	for _, tag := range []string{"vless-nl", "sub-706dcf33-a1"} {
+		if _, err := l.CheckSingboxDelay(ctx, tag); err != nil {
+			t.Errorf("%s: err = %v, want it probed: proxies and subscription servers do not come from the router", tag, err)
+		}
+	}
+	if len(op.asked) != 2 {
+		t.Fatalf("asked = %v, want both probed", op.asked)
+	}
+	// A tag only the router could classify gets the router's error, not
+	// "not found".
+	for name, call := range map[string]func() error{
+		"singbox_delay_check":  func() error { _, err := l.CheckSingboxDelay(ctx, "auto"); return err },
+		"get_singbox_outbound": func() error { _, err := l.GetSingboxOutbound(ctx, "auto"); return err },
+	} {
+		if err := call(); err == nil || !strings.Contains(err.Error(), "unexpected end of JSON input") {
+			t.Errorf("%s(auto): err = %v, want the router's error", name, err)
+		}
+	}
+}
+
+// TestLocal_SubscriptionGroupNotBuiltYet — list_singbox_subscriptions
+// отдаёт groupTag и отправляет с ним в get_singbox_outbound. Если первая
+// загрузка упала или фильтр скрыл все серверы, группы в конфиге нет, и
+// «не найдено» отправляло агента искать опечатку в выданном ему теге.
+func TestLocal_SubscriptionGroupNotBuiltYet(t *testing.T) {
+	l, subs, _ := groupsHarness()
+	subs.subs = append(subs.subs, subscription.Subscription{
+		ID: "deadbeef00112233445566ff", Label: "New provider", SelectorTag: "sub-deadbeef", Enabled: true,
+	})
+	ctx := context.Background()
+	for name, call := range map[string]func() error{
+		"get_singbox_outbound": func() error { _, err := l.GetSingboxOutbound(ctx, "sub-deadbeef"); return err },
+		"singbox_delay_check":  func() error { _, err := l.CheckSingboxDelay(ctx, "sub-deadbeef"); return err },
+	} {
+		err := call()
+		if err == nil || strings.Contains(err.Error(), "not found") ||
+			!strings.Contains(err.Error(), "New provider") || !strings.Contains(err.Error(), "list_singbox_subscriptions") {
+			t.Errorf("%s: err = %v, want it to name the subscription and where to look", name, err)
+		}
+	}
+}

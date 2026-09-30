@@ -222,3 +222,54 @@ func TestTools_SingboxDelayCheckWithTheEngineDown(t *testing.T) {
 		t.Fatalf("a mistyped tag with the engine down = %q, want not found", txt)
 	}
 }
+
+// TestTools_SingboxTagsFromShareLinksAreAccepted — тег импортированного
+// прокси — это #fragment share-link без ограничения длины (vlink,
+// allocUniqueTunnelTag). Кириллица — два байта на букву, эмодзи —
+// четыре, и имя вроде «🇩🇪 Германия | Франкфурт | …» легко длиннее
+// 128 байт. До этого PR проба таких тегов работала.
+func TestTools_SingboxTagsFromShareLinksAreAccepted(t *testing.T) {
+	s, _ := newTestSession(t)
+	long := "🇩🇪 " + strings.Repeat("Германия | Франкфурт | ", 6)
+	if len(long) <= 128 {
+		t.Fatalf("fixture is only %d bytes", len(long))
+	}
+	for _, tool := range []string{"singbox_delay_check", "get_singbox_outbound"} {
+		res, _ := callTool(t, s, tool, map[string]any{"tag": long})
+		if txt := toolText(res); strings.Contains(txt, "longer than") {
+			t.Errorf("%s refused a share-link tag for its length: %q", tool, txt)
+		}
+	}
+}
+
+// TestTools_SingboxDelayCheckRefusesWhatTheEngineLacks — адаптер отказывает
+// любому тегу, которого нет в /proxies движка, а не только группе. Фейк,
+// который меряет такой прокси, соглашается сам с собой.
+func TestTools_SingboxDelayCheckRefusesWhatTheEngineLacks(t *testing.T) {
+	fake := mcptest.New()
+	fake.EngineLacks = map[string]bool{"vless-nl": true, "sub-706dcf33-a1": true}
+	s := connect(t, mcpsrv.NewServer(fake, "test"))
+	for _, tag := range []string{"vless-nl", "sub-706dcf33-a1"} {
+		res, _ := callTool(t, s, "singbox_delay_check", map[string]any{"tag": tag})
+		if !res.IsError || !strings.Contains(toolText(res), "not running it") {
+			t.Errorf("%s: a tag the engine does not run must be refused, got %q", tag, toolText(res))
+		}
+	}
+}
+
+// TestTools_SubscriptionGroupNotBuiltYet mirrors the adapter: a group tag
+// list_singbox_subscriptions handed out must not come back as "not found".
+func TestTools_SubscriptionGroupNotBuiltYet(t *testing.T) {
+	fake := mcptest.New()
+	fake.Subscriptions = append(fake.Subscriptions, mcpsrv.SingboxSubscription{
+		ID: "deadbeef00112233445566ff", Label: "New provider", SourceType: "url", Enabled: true, Mode: "urltest", GroupTag: "sub-deadbeef",
+	})
+	s := connect(t, mcpsrv.NewServer(fake, "test"))
+	for _, tool := range []string{"get_singbox_outbound", "singbox_delay_check"} {
+		res, _ := callTool(t, s, tool, map[string]any{"tag": "sub-deadbeef"})
+		txt := toolText(res)
+		if !res.IsError || strings.Contains(txt, "not found") || !strings.Contains(txt, "New provider") {
+			t.Errorf("%s: want the subscription named, got %q", tool, txt)
+		}
+	}
+}

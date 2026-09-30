@@ -91,6 +91,7 @@ type sbIndex struct {
 	groups      map[string]router.CompositeOutboundView
 	order       []string          // group tags, in configuration order
 	subByGroup  map[string]string // a subscription's own group tag → its id
+	subLabel    map[string]string // subscription id → its sanitised label
 	aggByTag    map[string]subscription.AggregateGroup
 	member      map[string]subscription.MemberInfo // subscription server tag → what it is
 	isMember    map[string]bool                    // tags that are outbounds of a subscription
@@ -102,21 +103,27 @@ type sbIndex struct {
 // a daemon without subscriptions still lists its groups, and the fields
 // that would link them stay empty. The hand-configured proxies are not
 // read here — see withProxies.
+//
+// A router that cannot be read (a draft that does not parse) does not
+// stop the rest: the error is returned beside an index whose groups are
+// empty, so a caller that only needs a proxy or a subscription's server
+// can still proceed, and one that needs a group reports the router's
+// error rather than "not found".
 func (l *Local) singboxIndex(ctx context.Context) (sbIndex, error) {
 	idx := sbIndex{
 		groups:      map[string]router.CompositeOutboundView{},
 		subByGroup:  map[string]string{},
+		subLabel:    map[string]string{},
 		aggByTag:    map[string]subscription.AggregateGroup{},
 		member:      map[string]subscription.MemberInfo{},
 		isMember:    map[string]bool{},
 		notOutbound: map[string]string{},
 		proxies:     map[string]singbox.TunnelInfo{},
 	}
+	var routerErr error
 	if l.c.Router != nil {
 		list, err := l.c.Router.ListCompositeOutbounds(ctx)
-		if err != nil {
-			return idx, err
-		}
+		routerErr = err
 		for _, o := range list {
 			idx.groups[o.Tag] = o
 			idx.order = append(idx.order, o.Tag)
@@ -126,6 +133,7 @@ func (l *Local) singboxIndex(ctx context.Context) (sbIndex, error) {
 		for _, s := range l.c.Subscriptions.List() {
 			name := sanitizeLabel(s.Label)
 			idx.subByGroup[s.SelectorTag] = s.ID
+			idx.subLabel[s.ID] = name
 			// A server orphaned by the last refresh stays an outbound until
 			// the user deletes it (subscription.Service.DeleteOrphans).
 			for _, tag := range s.MemberTags {
@@ -148,7 +156,7 @@ func (l *Local) singboxIndex(ctx context.Context) (sbIndex, error) {
 			idx.aggByTag[g.Tag] = g
 		}
 	}
-	return idx, nil
+	return idx, routerErr
 }
 
 // withProxies adds the hand-configured proxies to the index. It is a
@@ -169,6 +177,23 @@ func (l *Local) withProxies(ctx context.Context, idx *sbIndex) error {
 	}
 	for _, t := range list {
 		idx.proxies[t.Tag] = t
+	}
+	return nil
+}
+
+// whyNoGroup explains a tag that is not a group in the configuration but
+// was not made up either. It is checked after kindOf found nothing.
+// routerErr comes first: with the router unread, every group is missing,
+// and a subscription's tag would be wrongly called unbuilt.
+func (idx sbIndex) whyNoGroup(tag string, routerErr error) error {
+	if routerErr != nil {
+		return fmt.Errorf("the sing-box router configuration could not be read, so %q could not be looked up: %w", tag, routerErr)
+	}
+	if id, ok := idx.subByGroup[tag]; ok {
+		// The service builds a subscription's group only from its
+		// servers: a failed first fetch, or a filter that hides them
+		// all, leaves no group (subscription.Service, ErrAllMembersFiltered).
+		return fmt.Errorf("%q is the group of subscription %q, but sing-box has no such group yet: the subscription has no servers in the configuration. It may be disabled, its last fetch may have failed, or its filter may hide every server; list_singbox_subscriptions shows its state", tag, idx.subLabel[id])
 	}
 	return nil
 }
@@ -316,10 +341,7 @@ func (l *Local) GetSingboxOutbound(ctx context.Context, tag string) (mcpsrv.Sing
 	if l.c.Router == nil {
 		return mcpsrv.SingboxOutboundDetail{}, errUnavailable("sing-box router")
 	}
-	idx, err := l.singboxIndex(ctx)
-	if err != nil {
-		return mcpsrv.SingboxOutboundDetail{}, err
-	}
+	idx, routerErr := l.singboxIndex(ctx)
 	// A group's members may be hand-configured proxies, and a tag that is
 	// not a group is told apart from a typo by the proxies too.
 	if err := l.withProxies(ctx, &idx); err != nil {
@@ -335,6 +357,9 @@ func (l *Local) GetSingboxOutbound(ctx context.Context, tag string) (mcpsrv.Sing
 		}
 		if why, ok := idx.notOutbound[tag]; ok {
 			return mcpsrv.SingboxOutboundDetail{}, fmt.Errorf("%q is not a group: %s (groups are in list_singbox_outbounds)", tag, why)
+		}
+		if err := idx.whyNoGroup(tag, routerErr); err != nil {
+			return mcpsrv.SingboxOutboundDetail{}, err
 		}
 		return mcpsrv.SingboxOutboundDetail{}, fmt.Errorf("sing-box group %q not found (use list_singbox_outbounds)", tag)
 	}
@@ -358,10 +383,9 @@ func (l *Local) CheckSingboxDelay(ctx context.Context, tag string) (mcpsrv.Singb
 	if l.c.Singbox == nil {
 		return mcpsrv.SingboxDelay{}, errUnavailable("sing-box")
 	}
-	idx, err := l.singboxIndex(ctx)
-	if err != nil {
-		return mcpsrv.SingboxDelay{}, err
-	}
+	// A router that cannot be read blocks only the tags it would have
+	// classified: a proxy or a subscription's server is known without it.
+	idx, routerErr := l.singboxIndex(ctx)
 	if err := l.withProxies(ctx, &idx); err != nil {
 		return mcpsrv.SingboxDelay{}, err
 	}
@@ -369,6 +393,9 @@ func (l *Local) CheckSingboxDelay(ctx context.Context, tag string) (mcpsrv.Singb
 	if kind == "" {
 		if why, ok := idx.notOutbound[tag]; ok {
 			return mcpsrv.SingboxDelay{}, fmt.Errorf("%q cannot be probed: %s", tag, why)
+		}
+		if err := idx.whyNoGroup(tag, routerErr); err != nil {
+			return mcpsrv.SingboxDelay{}, err
 		}
 		return mcpsrv.SingboxDelay{}, fmt.Errorf("sing-box outbound %q not found (proxies are in list_singbox_tunnels, groups in list_singbox_outbounds, a group's servers in get_singbox_outbound)", tag)
 	}
