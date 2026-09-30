@@ -93,6 +93,21 @@ func (g *restoreLiveGetter) applyPost(payload map[string]interface{}) {
 		if !ok {
 			continue
 		}
+		// Создание и снятие интерфейса видны в списке сразу, как на роутере:
+		// иначе кэш InterfaceStore счёл бы созданный отсутствующим (F546).
+		if no, _ := cfg["no"].(bool); no {
+			if ent, ok := g.live[ifaceName]; ok {
+				ent.Present = false
+				g.live[ifaceName] = ent
+			}
+		} else if len(cfg) == 0 {
+			if g.live == nil {
+				g.live = map[string]restoreLiveEntry{}
+			}
+			ent := g.live[ifaceName]
+			ent.Present = true
+			g.live[ifaceName] = ent
+		}
 		wg, ok := cfg["wireguard"].(map[string]interface{})
 		if !ok {
 			continue

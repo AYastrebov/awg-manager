@@ -339,8 +339,17 @@ func TestDispatcher_InvalidatesPeersOnDestroyAndLayerChange(t *testing.T) {
 			d.Enqueue(tc.ev)
 			waitDrain(t, drained)
 
-			if _, err := q.Peers.GetPeers(context.Background(), "Wireguard0"); err != nil {
+			peers, err := q.Peers.GetPeers(context.Background(), "Wireguard0")
+			if err != nil {
 				t.Fatalf("peers after event: %v", err)
+			}
+			if tc.ev.Type == EventIfDestroyed {
+				// Снятого интерфейса нет в кэше — пиры пусты и без запроса
+				// (F546); прежние пиры значили бы несброшенный кэш.
+				if len(peers) != 0 {
+					t.Errorf("кэш пиров не сброшен: после сноса %d пиров", len(peers))
+				}
+				return
 			}
 			if after := fg.Calls(peersPath); after <= primed {
 				t.Errorf("кэш пиров не сброшен: запросов было %d, стало %d", primed, after)

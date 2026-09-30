@@ -134,6 +134,7 @@ func (r *simRouter) apply(orig map[string]interface{}) {
 	r.mu.Lock()
 	if ifs, ok := m["interface"].(map[string]any); ok {
 		for iface, v := range ifs {
+			r.trackInterfaceLocked(iface, v.(map[string]any))
 			wg, _ := v.(map[string]any)["wireguard"].(map[string]any)
 			peerList, _ := wg["peer"].([]any)
 			for _, pv := range peerList {
@@ -179,6 +180,28 @@ func (r *simRouter) apply(orig map[string]interface{}) {
 	if after != nil {
 		after(orig)
 	}
+}
+
+// trackInterfaceLocked — создание (`interface X {}`) и снятие (`no`) интерфейса
+// сразу видны в списке /show/interface/, как на роутере: иначе кэш
+// InterfaceStore счёл бы созданный отсутствующим (F546).
+func (r *simRouter) trackInterfaceLocked(iface string, cfg map[string]any) {
+	no, _ := cfg["no"].(bool)
+	if !no && len(cfg) != 0 {
+		return
+	}
+	var list map[string]json.RawMessage
+	_ = r.fg.Get(context.Background(), "/show/interface/", &list)
+	if list == nil {
+		list = map[string]json.RawMessage{}
+	}
+	if no {
+		delete(list, iface)
+	} else {
+		list[iface] = json.RawMessage(`{"id":"` + iface + `","type":"Wireguard"}`)
+	}
+	b, _ := json.Marshal(list)
+	r.fg.SetJSON("/show/interface/", string(b))
 }
 
 // state — allow-ips пира и сети маршрутов с меткой, для проверок итога.

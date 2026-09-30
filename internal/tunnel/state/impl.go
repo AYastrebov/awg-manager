@@ -18,8 +18,9 @@ import (
 // whole query store.
 //
 // Get reads cached existence (1 HTTP at bootstrap, then in-memory).
-// FetchSummary ходит к роутеру на КАЖДЫЙ вызов, мимо кэша (сегодня —
-// командой show interface через батчер, а не сырым GET) — состояние
+// FetchSummary ходит к роутеру на КАЖДЫЙ вызов по существующему интерфейсу
+// (кэш отвечает только «интерфейса нет», F546; запрос — командой show
+// interface через батчер, а не сырым GET) — состояние
 // kernel-туннеля определяется по нему, потому что кэшированный Link
 // протухает: хуки слоёв NDMS для OpkgTun срабатывают не всегда
 // (см. InterfaceStore.FetchSummary).

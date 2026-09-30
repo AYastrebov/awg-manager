@@ -37,6 +37,9 @@ type stateAwareGetter struct {
 	mu      sync.Mutex
 	asc     map[string]map[string]string
 	bridges []fakeBridge // static bridge entries injected by tests
+	// created — интерфейсы, созданные POST-ом и ещё не снятые: настоящий NDMS
+	// показывает их в списке сразу, до записи сервера в настройки (F546).
+	created map[string]bool
 }
 
 func (g *stateAwareGetter) Get(ctx context.Context, path string, out any) error {
@@ -95,6 +98,11 @@ func (g *stateAwareGetter) Get(ctx context.Context, path string, out any) error 
 	}
 	g.mu.Lock()
 	brs := g.bridges
+	for name := range g.created {
+		if _, ok := m[name]; !ok {
+			m[name] = json.RawMessage(`{"id":"` + name + `","interface-name":"` + name + `","type":"Wireguard"}`)
+		}
+	}
 	g.mu.Unlock()
 	for _, br := range brs {
 		entry := map[string]any{
@@ -126,6 +134,16 @@ func (g *stateAwareGetter) applyPost(payload map[string]interface{}) {
 		if !ok {
 			continue
 		}
+		g.mu.Lock()
+		if no, _ := cfg["no"].(bool); no {
+			delete(g.created, ifaceName)
+		} else if len(cfg) == 0 {
+			if g.created == nil {
+				g.created = map[string]bool{}
+			}
+			g.created[ifaceName] = true
+		}
+		g.mu.Unlock()
 		wg, ok := cfg["wireguard"].(map[string]interface{})
 		if !ok {
 			continue

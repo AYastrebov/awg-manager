@@ -17,6 +17,20 @@ import (
 	"github.com/hoaxisr/awg-manager/internal/ndms/transport"
 )
 
+// absentErr — ошибка без запроса по имени, если интерфейса name нет в кэше:
+// на show interface и GET /show/rc/interface/<name> по отсутствующему имени
+// NDMS пишет E в свой журнал (F546). Вызывающие и раньше получали здесь
+// ошибку — 404 чтения rc. Только кэш, без свежего списка: ошибка в
+// KeyedStore не кэшируется, и опрос статистики сервера-сироты читал бы
+// список на каждом вызове; созданные нами интерфейсы кэш видит сразу
+// (InvalidateAll после создания).
+func (s *WGServerStore) absentErr(ctx context.Context, name string) error {
+	if s.interfaces != nil && !s.interfaces.mayExist(ctx, name) {
+		return fmt.Errorf("interface %s: нет в NDMS", name)
+	}
+	return nil
+}
+
 // fetchInterfaceDetail POSTs ShowInterface(name) and decodes the inner
 // object into dst. Centralises the "GET /show/interface/<name> → POST
 // {"show":{"interface":{"name":…}}}" migration for this package — name
@@ -26,6 +40,11 @@ import (
 // Empty response leaves dst untouched (legacy GET behaviour returned
 // the zero-valued struct on absent body).
 func (s *WGServerStore) fetchInterfaceDetail(ctx context.Context, name string, dst any) error {
+	// Интерфейса нет в кэше — пустой ответ без запроса (F546): так же
+	// выглядело «unable to find» от NDMS, но без E в его журнале.
+	if s.interfaces != nil && !s.interfaces.mayExist(ctx, name) {
+		return nil
+	}
 	raw, err := s.getter.Post(ctx, transport.ShowInterface(name, nil))
 	if err != nil {
 		return err
@@ -206,6 +225,13 @@ func (s *WGServerStore) GetConfig(ctx context.Context, name string) (*ndms.Wireg
 // записью (#713). List на сбое обогащения тоже ошибка (F510), но отдаёт
 // прежний список из кэша (stale-on-error) — для проверки пересечений мало.
 func (s *WGServerStore) PeersRCFresh(ctx context.Context, name string) ([]ndms.WireguardServerPeerConfig, error) {
+	// Свежее чтение — и отсутствие проверяется свежим списком, не кэшем:
+	// сервер, появившийся без хука, обязан попасть в проверку пересечений.
+	if s.interfaces != nil {
+		if ok, err := s.interfaces.exists(ctx, name); err == nil && !ok {
+			return nil, fmt.Errorf("get wireguard server config %s: интерфейса нет в NDMS", name)
+		}
+	}
 	var rc rciRCInterface
 	if err := s.getter.Get(ctx, "/show/rc/interface/"+name, &rc); err != nil {
 		return nil, fmt.Errorf("get wireguard server config %s: %w", name, err)
@@ -460,6 +486,9 @@ func (s *WGServerStore) fetchAll(ctx context.Context) ([]ndms.WireguardServer, e
 }
 
 func (s *WGServerStore) fetchItem(ctx context.Context, name string) (*ndms.WireguardServer, error) {
+	if err := s.absentErr(ctx, name); err != nil {
+		return nil, fmt.Errorf("get wireguard server %s: %w", name, err)
+	}
 	var detail rciWireguardDetail
 	if err := s.fetchInterfaceDetail(ctx, name, &detail); err != nil {
 		return nil, fmt.Errorf("get wireguard server %s: %w", name, err)
@@ -520,6 +549,9 @@ func (s *WGServerStore) fetchPeerRCByKey(ctx context.Context, name string) (map[
 }
 
 func (s *WGServerStore) fetchConfig(ctx context.Context, name string) (*ndms.WireguardServerConfig, error) {
+	if err := s.absentErr(ctx, name); err != nil {
+		return nil, fmt.Errorf("get wireguard server %s: %w", name, err)
+	}
 	// Runtime for public key.
 	var detail rciWireguardDetail
 	if err := s.fetchInterfaceDetail(ctx, name, &detail); err != nil {
@@ -539,6 +571,9 @@ func (s *WGServerStore) fetchConfig(ctx context.Context, name string) (*ndms.Wir
 }
 
 func (s *WGServerStore) fetchASC(ctx context.Context, name string, extended bool) (json.RawMessage, error) {
+	if err := s.absentErr(ctx, name); err != nil {
+		return nil, fmt.Errorf("get ASC params %s: %w", name, err)
+	}
 	var fields map[string]json.RawMessage
 	path := "/show/rc/interface/" + name + "/wireguard/asc"
 	if err := s.getter.Get(ctx, path, &fields); err != nil {
