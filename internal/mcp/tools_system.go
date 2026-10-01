@@ -33,9 +33,17 @@ func registerSystemTools(s *mcp.Server, d Deps) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name: "get_logs",
 		Description: "Read recent awg-manager (bucket=app) or sing-box (bucket=singbox) log entries, newest last. Filter by group, minimum level and message substring. At most 500 lines. " +
-			"IPs and domains in messages are partially masked unless raw=true; repeats>1 marks a line the buffer collapsed.",
+			"IPs and domains in messages are partially masked unless raw=true, which needs a full-access key; repeats>1 marks a line the buffer collapsed.",
 		Annotations: readOnly("Logs"),
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, q LogsQuery) (*mcp.CallToolResult, logsOut, error) {
+		// Unmasked lines carry the router's peers, servers and subscription
+		// hosts. A read-only key is for an agent the user does not fully
+		// trust, so it reads the masked journal only — the same line the
+		// scope draws around credentialTools. No key at all is the dev
+		// server (see RequireWriteScope) and is left alone.
+		if key, ok := KeyFromContext(ctx); ok && key.ReadOnly && q.Raw {
+			return nil, logsOut{}, fmt.Errorf("raw=true returns unmasked addresses, and this MCP key is read-only. Nothing was read. Call get_logs without raw, or ask the user for a full-access key")
+		}
 		if q.Lines <= 0 {
 			q.Lines = 100
 		}

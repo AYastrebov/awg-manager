@@ -193,3 +193,25 @@ func TestScope_ReadOnlyKeyCannotExportCredentials(t *testing.T) {
 		}
 	}
 }
+
+// TestScope_ReadOnlyKeyGetsMaskedLogsOnly — get_logs masks hosts and IPs
+// by default; raw=true lifts that. A read-only key is meant for an agent
+// the user does not fully trust, and unmasked journal lines carry the
+// router's peers, servers and subscription hosts. Masked reading stays
+// open to it; a full-access key may still ask for raw.
+func TestScope_ReadOnlyKeyGetsMaskedLogsOnly(t *testing.T) {
+	ro := scopedSession(t, true)
+	res, _ := callTool(t, ro, "get_logs", map[string]any{"raw": true})
+	if !res.IsError {
+		t.Fatal("raw logs were handed to a read-only key")
+	}
+	if txt := toolText(res); !strings.Contains(strings.ToLower(txt), "read-only") || !strings.Contains(txt, "raw") {
+		t.Errorf("the refusal must name the key and the flag, got %q", txt)
+	}
+	if res, _ := callTool(t, ro, "get_logs", map[string]any{}); res.IsError {
+		t.Errorf("masked logs must stay readable on a read-only key: %q", toolText(res))
+	}
+	if res, _ := callTool(t, scopedSession(t, false), "get_logs", map[string]any{"raw": true}); res.IsError {
+		t.Errorf("a full-access key may read raw logs: %q", toolText(res))
+	}
+}
