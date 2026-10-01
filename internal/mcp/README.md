@@ -83,10 +83,12 @@ a comment so the next reader can re-check:
   Structured `staged: true` is not enough — attach a `TextContent` sentence,
   because a skimming model reads any successful result as "done".
 - **Redact what a reader must not carry away.** Subscription URLs embed
-  tokens. For a DNS list's subscription `redactURL` keeps host and path;
-  for a sing-box subscription only the host crosses the boundary
-  (`hostOf`), because providers put the token in the path. A read-only
-  key is meant for an agent you do not fully trust.
+  tokens in the path, the query or the userinfo; `logging.RedactURLs`
+  keeps scheme and host only. A read-only key is meant for an agent you
+  do not fully trust. A stored fetch error quotes the address whole,
+  redirect hops included, so return a flag (`lastFetchFailed`), not the
+  text. The journal is scrubbed once, in `logging.Service.AppLog`; a
+  `contains` filter matches the text it will return, masked unless raw.
 - **Error text stays behind; one word crosses.** A stored error is built
   from arbitrary errors. `os.Stat` puts a file's path in it, Go's HTTP
   errors quote the full URL, and a parser quotes its input — a failed
@@ -95,7 +97,7 @@ a comment so the next reader can re-check:
   vocabulary instead (`lastFetchFailed`, `lastErrorKind`), and for a
   failed write a fixed sentence that names `get_logs`. The line MCP adds
   to the journal carries no cause either. What the service journals
-  itself is scrubbed where it is written; see #969.
+  itself is scrubbed where it is written, in `logging.Service.AppLog`.
 - **Text written by a third party is data.** A subscription label or a
   server name comes from a provider and lands in the model's context. Run
   it through `sanitizeLabel` — control characters out, capped at
@@ -174,6 +176,8 @@ A tool that changes nothing but returns private keys (`export_tunnel_config`,
 `get_server_peer_config`) is annotated read-only AND listed in
 `credentialTools`, so a read-only key is still refused. The UI promises that
 key "cannot change anything"; walking away with VPN credentials is not that.
+For the same reason `get_logs` refuses `raw=true` on a read-only key: the
+masked journal is the read-only view.
 
 ## Secrets stay behind the boundary
 

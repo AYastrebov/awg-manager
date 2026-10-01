@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -331,13 +330,22 @@ func (l *Local) GetLogs(_ context.Context, q mcpsrv.LogsQuery) ([]mcpsrv.LogEntr
 	// GetLogsMulti returns entries NEWEST-first (logbuf.Buffer.FilterPage
 	// walks the ring from the end). get_logs promises "newest last", and the
 	// tail-slice below must keep the NEWEST matches — so reverse first.
-	// Matching keeps pointers only; mapping (and the regex-heavy masking)
-	// runs on the entries actually returned, not on every match.
+	// Matching keeps pointers only; mapping runs on the entries actually
+	// returned. contains is matched against the text the caller will see:
+	// matched against the unmasked text, it would let a caller without
+	// raw (a read-only key is refused raw) learn a masked address by
+	// probing which filters return lines.
 	matched := make([]*logging.LogEntry, 0, len(entries))
 	for i := len(entries) - 1; i >= 0; i-- {
 		e := &entries[i]
-		if contains != "" && !strings.Contains(strings.ToLower(e.Message), contains) {
-			continue
+		if contains != "" {
+			msg := e.Message
+			if !q.Raw {
+				msg = logging.SanitizeLogText(msg)
+			}
+			if !strings.Contains(strings.ToLower(msg), contains) {
+				continue
+			}
 		}
 		if filterByLevel {
 			// An entry whose level is not one of debug|info|warn|error (e.g.
@@ -810,7 +818,7 @@ func dnsRouteDetail(dl *dnsroute.DomainList) mcpsrv.DNSRouteDetail {
 	}
 	for _, sub := range dl.Subscriptions {
 		out.Subscriptions = append(out.Subscriptions, mcpsrv.DNSSubscription{
-			URL: redactURL(sub.URL), Name: sub.Name, LastFetched: sub.LastFetched, LastCount: sub.LastCount, LastError: sub.LastError,
+			URL: logging.RedactURLs(sub.URL), Name: sub.Name, LastFetched: sub.LastFetched, LastCount: sub.LastCount, LastFetchFailed: sub.LastError != "",
 		})
 	}
 	return out
@@ -859,21 +867,6 @@ func (l *Local) ListDNSRouteDetails(ctx context.Context) ([]mcpsrv.DNSRouteDetai
 		out = append(out, dnsRouteDetail(&list[i]))
 	}
 	return out, nil
-}
-
-// redactURL strips userinfo and the query from a subscription URL. Private
-// feeds carry their token there, and a read-only key must not walk away
-// with it along with the list. Host and path stay so the feed is still
-// recognisable.
-func redactURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return ""
-	}
-	u.User = nil
-	u.RawQuery = ""
-	u.Fragment = ""
-	return u.String()
 }
 
 // GetDNSRoute reads one list in full for get_dns_route.
